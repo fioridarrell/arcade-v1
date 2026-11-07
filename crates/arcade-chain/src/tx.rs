@@ -1,0 +1,189 @@
+//! Transactions. Parsed for their structure; the raw bytes stay the source of truth.
+
+use crate::encode::{write_varint, DecodeError, Reader};
+use crate::hash::{sha256d, Hash256};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct OutPoint {
+    pub txid: Hash256,
+    pub vout: u32,
+}
+
+impl OutPoint {
+    pub fn is_null(&self) -> bool {
+        self.txid == Hash256::ZERO && self.vout == u32::MAX
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TxIn {
+    pub prevout: OutPoint,
+    pub script_sig: Vec<u8>,
+    pub sequence: u32,
+    pub witness: Vec<Vec<u8>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TxOut {
+    /// Amount in the chain's smallest unit.
+    pub value: u64,
+    pub script_pubkey: Vec<u8>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Tx {
+    pub version: i32,
+    pub inputs: Vec<TxIn>,
+    pub outputs: Vec<TxOut>,
+    pub lock_time: u32,
+    pub txid: Hash256,
+    /// Exact bytes as on the wire (including any witness).
+    pub raw: Vec<u8>,
+}
+
+impl Tx {
+    pub fn is_coinbase(&self) -> bool {
+        self.inputs.len() == 1 && self.inputs[0].prevout.is_null()
+    }
+
+    pub fn has_witness(&self) -> bool {
+        self.inputs.iter().any(|i| !i.witness.is_empty())
+    }
+
+    pub fn parse(bytes: &[u8]) -> Result<Tx, DecodeError> {
+        let mut r = Reader::new(bytes);
+        let tx = Self::decode(&mut r)?;
+        if !r.is_empty() {
+            return Err(DecodeError::Invalid("trailing bytes after transaction"));
+        }
+        Ok(tx)
+    }
+
+    /// Decode one transaction from the reader (it may be followed by more data).
+    pub fn decode(r: &mut Reader) -> Result<Tx, DecodeError> {
+        let start = r.pos();
+        let version = r.i32()?;
+
+        // SegWit marker: 0x00 then flag 0x01 where the input count would be.
+        let segwit = r.peek(2).map(|b| b[0] == 0 && b[1] == 1).unwrap_or(false);
+        if segwit {
+            r.bytes(2)?;
+        }
+
+        let n_in = r.len()?;
+        let mut inputs = Vec::with_capacity(n_in.min(10_000));
+        for _ in 0..n_in {
+            let txid = r.hash()?;
+            let vout = r.u32()?;
+            let script_sig = r.var_bytes()?.to_vec();
+            let sequence = r.u32()?;
+            inputs.push(TxIn {
+                prevout: OutPoint { txid, vout },
+                script_sig,
+                sequence,
+                witness: Vec::new(),
+            });
+        }
+        let n_out = r.len()?;
+        let mut outputs = Vec::with_capacity(n_out.min(10_000));
+        for _ in 0..n_out {
+            let value = r.u64()?;
+            let script_pubkey = r.var_bytes()?.to_vec();
+            outputs.push(TxOut { value, script_pubkey });
+        }
+        let after_outputs = r.pos();
+        if segwit {
+            for inp in inputs.iter_mut() {
+                let n = r.len()?;
+                for _ in 0..n {
+                    inp.witness.push(r.var_bytes()?.to_vec());
+                }
+            }
+        }
+        let witness_end = r.pos();
+        let lock_time = r.u32()?;
+        let raw = r.since(start).to_vec();
+
+        // txid is over the serialization without marker, flag and witness.
+        let txid = if segwit {
+            let mut s = Vec::with_capacity(raw.len());
+            s.extend_from_slice(&raw[..4]);
+            s.extend_from_slice(&raw[6..after_outputs - start]);
+            s.extend_from_slice(&raw[witness_end - start..]);
+            sha256d(&s)
+        } else {
+            sha256d(&raw)
+        };
+
+        Ok(Tx { version, inputs, outputs, lock_time, txid, raw })
+    }
+
+    /// Serialize without witness (used by tests and tx building).
+    pub fn encode_legacy(&self) -> Vec<u8> {
+        let mut o = Vec::new();
+        o.extend_from_slice(&self.version.to_le_bytes());
+        write_varint(&mut o, self.inputs.len() as u64);
+        for i in &self.inputs {
+            o.extend_from_slice(&i.prevout.txid.0);
+            o.extend_from_slice(&i.prevout.vout.to_le_bytes());
+            write_varint(&mut o, i.script_sig.len() as u64);
+            o.extend_from_slice(&i.script_sig);
+            o.extend_from_slice(&i.sequence.to_le_bytes());
+        }
+        write_varint(&mut o, self.outputs.len() as u64);
+        for out in &self.outputs {
+            o.extend_from_slice(&out.value.to_le_bytes());
+            write_varint(&mut o, out.script_pubkey.len() as u64);
+            o.extend_from_slice(&out.script_pubkey);
+        }
+        o.extend_from_slice(&self.lock_time.to_le_bytes());
+        o
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bitcoin genesis coinbase transaction.
+    pub const GENESIS_TX: &str = "01000000010000000000000000000000000000000000000000000000000000000000000000ffffffff4d04ffff001d0104455468652054696d65732030332f4a616e2f32303039204368616e63656c6c6f72206f6e206272696e6b206f66207365636f6e64206261696c6f757420666f722062616e6b73ffffffff0100f2052a01000000434104678afdb0fe5548271967f1a67130b7105cd6a828e03909a67962e0ea1f61deb649f6bc3f4cef38c4f35504e51ec112de5c384df7ba0b8d578a4c702b6bf11d5fac00000000";
+
+    #[test]
+    fn parses_genesis_coinbase() {
+        let raw = hex::decode(GENESIS_TX).unwrap();
+        let tx = Tx::parse(&raw).unwrap();
+        assert!(tx.is_coinbase());
+        assert_eq!(tx.outputs.len(), 1);
+        assert_eq!(tx.outputs[0].value, 5_000_000_000);
+        assert_eq!(
+            tx.txid.to_hex(),
+            "4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"
+        );
+        assert_eq!(tx.raw, raw);
+        assert_eq!(tx.encode_legacy(), raw);
+    }
+
+    #[test]
+    fn segwit_txid_excludes_witness() {
+        // Build a legacy tx, then the same tx with a witness; txids must match.
+        let legacy = Tx::parse(&hex::decode(GENESIS_TX).unwrap()).unwrap();
+        let mut sw = Vec::new();
+        sw.extend_from_slice(&legacy.raw[..4]);
+        sw.extend_from_slice(&[0x00, 0x01]);
+        let body_end = legacy.raw.len() - 4;
+        sw.extend_from_slice(&legacy.raw[4..body_end]);
+        sw.extend_from_slice(&[0x01, 0x02, 0xaa, 0xbb]); // 1 witness item, 2 bytes
+        sw.extend_from_slice(&legacy.raw[body_end..]);
+        let tx = Tx::parse(&sw).unwrap();
+        assert!(tx.has_witness());
+        assert_eq!(tx.txid, legacy.txid);
+        assert_eq!(tx.raw, sw);
+    }
+
+    #[test]
+    fn rejects_trailing_bytes() {
+        let mut raw = hex::decode(GENESIS_TX).unwrap();
+        raw.push(0);
+        assert!(Tx::parse(&raw).is_err());
+    }
+}

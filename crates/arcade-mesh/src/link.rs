@@ -278,6 +278,11 @@ impl Link {
         decode_plain(&pt)
     }
 
+    /// How long `recv` waits before returning a timeout error (WouldBlock / TimedOut).
+    pub fn set_read_timeout(&self, d: Duration) -> std::io::Result<()> {
+        self.stream.set_read_timeout(Some(d))
+    }
+
     pub fn try_clone_stream(&self) -> std::io::Result<TcpStream> {
         self.stream.try_clone()
     }

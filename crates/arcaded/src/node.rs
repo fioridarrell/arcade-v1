@@ -1,0 +1,52 @@
+//! Shared state of one running arcade.
+
+use arcade_app::AppDb;
+use arcade_chain::params::ChainParams;
+use arcade_chaindb::ChainDb;
+use arcade_ledger::tags::Tags;
+use ed25519_dalek::SigningKey;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::sync::Mutex;
+
+/// What the mesh told us about a chain's index (an `ix` tip).
+#[derive(Debug, Clone, Default)]
+pub struct MeshTip {
+    pub height: u64,
+    pub names_digest: Option<String>,
+    #[allow(dead_code)]
+    pub from: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct LinkInfo {
+    pub addr: String,
+    pub node_id: String,
+    pub since: u64,
+}
+
+pub struct Node {
+    #[allow(dead_code)]
+    pub home: std::path::PathBuf,
+    pub app: AppDb,
+    pub chain: ChainDb,
+    pub params: &'static ChainParams,
+    pub identity: SigningKey,
+    /// The @tag table, rebuilt from stored blocks and kept current.
+    pub tags: Mutex<TagIndex>,
+    /// Raw transactions waiting to be sent to coin peers.
+    pub tx_outbox: Mutex<Vec<Vec<u8>>>,
+    /// Frames waiting to be sent to every mesh link.
+    pub mesh_outbox: Mutex<Vec<Value>>,
+    pub links: Mutex<BTreeMap<String, LinkInfo>>,
+    pub mesh_tips: Mutex<BTreeMap<String, MeshTip>>,
+    pub sync_state: Mutex<String>,
+}
+
+#[derive(Default)]
+pub struct TagIndex {
+    pub tags: Tags,
+    /// Last block folded in (index never runs ahead of the stored chain).
+    pub height: u32,
+    pub hash: Option<arcade_chain::Hash256>,
+}

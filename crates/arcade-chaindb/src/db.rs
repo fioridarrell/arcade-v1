@@ -230,6 +230,23 @@ impl ChainDb {
         })
     }
 
+    /// Full txids of stored transactions whose id starts with `t12` (normally one).
+    pub fn txids_by_t12(&self, params: &ChainParams, t12: &[u8; 12]) -> Result<Vec<Hash256>> {
+        let c = params.chain_no;
+        self.store.read(|r| {
+            let mut out = Vec::new();
+            for (_, bp) in r.scan_prefix(TXS, &k_txs(c, t12))? {
+                if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, be_u32(&bp, 0), be_u32(&bp, 4)))? {
+                    let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
+                    if !out.contains(&tx.txid) {
+                        out.push(tx.txid);
+                    }
+                }
+            }
+            Ok(out)
+        })
+    }
+
     /// An unspent output.
     pub fn coin(&self, c: u16, op: &OutPoint) -> Result<Option<Coin>> {
         self.store

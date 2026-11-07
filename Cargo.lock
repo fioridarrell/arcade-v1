@@ -59,6 +59,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcade-cli"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+]
+
+[[package]]
 name = "arcade-ledger"
 version = "0.1.0"
 dependencies = [
@@ -107,6 +114,23 @@ dependencies = [
  "sha2 0.11.1",
  "thiserror 1.0.69",
  "zeroize",
+]
+
+[[package]]
+name = "arcaded"
+version = "0.1.0"
+dependencies = [
+ "arcade-app",
+ "arcade-chain",
+ "arcade-chaindb",
+ "arcade-ledger",
+ "arcade-mesh",
+ "arcade-store",
+ "arcade-wallet",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

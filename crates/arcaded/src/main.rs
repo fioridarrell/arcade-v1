@@ -2,13 +2,14 @@
 //! keeps mesh links to other arcades, maintains the @tag index, runs tag claims, and
 //! serves the local API for the `arcade` CLI and the desktop app.
 //!
-//!   arcaded [--home DIR] [--no-mesh] [--no-seeds] [--mesh-port N|0] [--mesh-peer HOST:PORT]... [--p2p-only]
+//!   arcaded [--home DIR] [--no-mesh] [--no-seeds] [--mesh-port N|0] [--mesh-peer HOST:PORT]... [--p2p-only] [--http-port N|0]
 
 mod api;
 mod chainsvc;
 mod claims;
 mod coreshare;
 mod faucet;
+mod http;
 mod ledger;
 mod meshsource;
 mod miner;
@@ -119,6 +120,11 @@ fn main() {
             let n = node.clone();
             std::thread::Builder::new().name("mesh listen".into()).spawn(move || meshsvc::listen(n, port)).unwrap();
         }
+    }
+    let http_port: u16 = opt("--http-port").and_then(|v| v.parse().ok()).unwrap_or(8420);
+    if http_port != 0 {
+        let n = node.clone();
+        std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, http_port)).unwrap();
     }
     api::serve(node, home.join("arcaded.sock"));
 }

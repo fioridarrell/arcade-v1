@@ -23,9 +23,57 @@ fn set_state(node: &Node, s: String) {
     *node.sync_state.lock().unwrap() = s;
 }
 
+/// Mesh first: sync from V1.0 arcades that are ahead of us, until none has more.
+fn mesh_bootstrap(node: &Node, syncer: &Syncer) {
+    let p = node.params;
+    let peers: Vec<(String, u64)> = node.bk_peers.lock().unwrap().iter().map(|(a, h)| (a.clone(), *h)).collect();
+    for (addr, their) in peers {
+        let ours = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
+        if their <= ours {
+            continue;
+        }
+        let mut src = match crate::meshsource::MeshSource::dial(node, &addr) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = node.app.event("bootstrap", &format!("mesh peer {addr}: {e}"));
+                continue;
+            }
+        };
+        let _ = node.app.event("bootstrap", &format!("bootstrapping from mesh peer {addr} (their tip {their}, ours {ours})"));
+        if let Err(e) = syncer.ensure_genesis(&mut src) {
+            let _ = node.app.event("bootstrap", &format!("mesh peer {addr}: {e}"));
+            continue;
+        }
+        loop {
+            let h = syncer.sync_headers_once(&mut src);
+            let b = syncer.sync_blocks(&mut src, 5000, 250);
+            match (h, b) {
+                (Ok(hn), Ok(pr)) => {
+                    let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+                    set_state(node, format!("bootstrapping from mesh {addr}: {tip}"));
+                    if hn == 0 && pr.blocks == 0 {
+                        break;
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = node.app.event("bootstrap", &format!("mesh peer {addr} stopped: {e}"));
+                    break;
+                }
+            }
+        }
+        let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+        let _ = node.app.event("bootstrap", &format!("mesh bootstrap from {addr} reached {tip}"));
+    }
+}
+
 pub fn run(node: Arc<Node>) {
     let p = node.params;
     let syncer = Syncer::new(&node.chain, p);
+    if node.mesh_bootstrap {
+        // Give mesh links a moment to announce themselves.
+        std::thread::sleep(Duration::from_secs(8));
+        mesh_bootstrap(&node, &syncer);
+    }
     loop {
         let Some(mut peer) = candidates(&node).iter().find_map(|a| Peer::connect(p, a, Duration::from_secs(20)).ok())
         else {
@@ -69,6 +117,9 @@ pub fn run(node: Arc<Node>) {
             let best = node.chain.best_header(p.chain_no).ok().flatten().and_then(|h| node.chain.header(p.chain_no, &h).ok().flatten());
             let (th, bh) = (tip.map(|t| t.height).unwrap_or(0), best.map(|b| b.height).unwrap_or(0));
             set_state(&node, if th >= bh { format!("synced at {th}") } else { format!("syncing {th} / {bh}") });
+            if node.mesh_bootstrap && th + 100 < bh {
+                mesh_bootstrap(&node, &syncer);
+            }
             if new == 0 {
                 // Caught up: wait a little for new blocks (testnet: one a minute).
                 std::thread::sleep(Duration::from_secs(10));

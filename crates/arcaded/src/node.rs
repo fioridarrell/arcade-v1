@@ -41,6 +41,12 @@ pub struct Node {
     pub links: Mutex<BTreeMap<String, LinkInfo>>,
     pub mesh_tips: Mutex<BTreeMap<String, MeshTip>>,
     pub sync_state: Mutex<String>,
+    /// V1.0 arcades that serve blocks: dial address -> their tip height.
+    pub bk_peers: Mutex<BTreeMap<String, u64>>,
+    /// Port we accept mesh links on (None = dial out only).
+    pub mesh_port: Option<u16>,
+    /// Set false to skip mesh bootstrap (P2P only).
+    pub mesh_bootstrap: bool,
 }
 
 #[derive(Default)]

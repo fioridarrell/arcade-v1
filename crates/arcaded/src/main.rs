@@ -2,13 +2,14 @@
 //! keeps mesh links to other arcades, maintains the @tag index, runs tag claims, and
 //! serves the local API for the `arcade` CLI and the desktop app.
 //!
-//!   arcaded [--home DIR] [--no-mesh]
+//!   arcaded [--home DIR] [--no-mesh] [--no-seeds] [--mesh-port N|0] [--mesh-peer HOST:PORT]... [--p2p-only]
 
 mod api;
 mod chainsvc;
 mod claims;
 mod faucet;
 mod ledger;
+mod meshsource;
 mod meshsvc;
 mod node;
 
@@ -34,6 +35,15 @@ fn main() {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(default_home);
     let mesh = !args.iter().any(|a| a == "--no-mesh");
+    let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
+    let mesh_port: Option<u16> = match opt("--mesh-port").map(|v| v.parse::<u16>().expect("--mesh-port N")) {
+        Some(0) => None,
+        Some(p) => Some(p),
+        None => Some(8421),
+    };
+    let extra_peers: Vec<String> =
+        args.iter().enumerate().filter(|(_, a)| *a == "--mesh-peer").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
+    let no_seeds = args.iter().any(|a| a == "--no-seeds");
     std::fs::create_dir_all(&home).expect("create home");
 
     let app = arcade_app::AppDb::open(&home).expect("open arcade.mdbx");
@@ -51,6 +61,9 @@ fn main() {
         links: Mutex::new(Default::default()),
         mesh_tips: Mutex::new(Default::default()),
         sync_state: Mutex::new("starting".into()),
+        bk_peers: Mutex::new(Default::default()),
+        mesh_port,
+        mesh_bootstrap: !args.iter().any(|a| a == "--p2p-only"),
     });
     let _ = node.app.event("service", "arcaded started");
     eprintln!(
@@ -77,10 +90,14 @@ fn main() {
             .unwrap();
     }
     if mesh {
-        for seed in meshsvc::SEEDS {
+        let seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
+        for a in seeds.into_iter().chain(extra_peers) {
             let n = node.clone();
-            let a = seed.to_string();
             std::thread::Builder::new().name(format!("mesh {a}")).spawn(move || meshsvc::run(n, a)).unwrap();
+        }
+        if let Some(port) = mesh_port {
+            let n = node.clone();
+            std::thread::Builder::new().name("mesh listen".into()).spawn(move || meshsvc::listen(n, port)).unwrap();
         }
     }
     api::serve(node, home.join("arcaded.sock"));

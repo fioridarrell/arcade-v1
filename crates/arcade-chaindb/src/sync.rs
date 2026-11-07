@@ -8,7 +8,7 @@
 
 use crate::db::{ChainDb, HeaderRec, Tip, STATUS_HEADER};
 use arcade_chain::params::{check_block_work, check_header, ChainParams, PowCheck};
-use arcade_chain::p2p::Peer;
+use arcade_chain::p2p::{HeaderEntry, Peer};
 use arcade_chain::pow::{meets_target, pow_hash, work_from_bits, PowAlgo};
 use arcade_chain::{Block, Hash256};
 use std::collections::HashMap;
@@ -19,6 +19,8 @@ pub enum SyncError {
     Store(#[from] arcade_store::StoreError),
     #[error("p2p: {0}")]
     P2p(#[from] arcade_chain::p2p::P2pError),
+    #[error("source: {0}")]
+    Source(String),
     #[error("peer sent a bad header at height {height}: {why}")]
     BadHeader { height: u32, why: String },
     #[error("peer sent a bad block {hash}: {why}")]
@@ -28,6 +30,26 @@ pub enum SyncError {
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
+
+/// Where headers and blocks come from: a coin P2P peer or an arcade on the mesh.
+/// Everything a source returns is checked the same way, so no source is trusted.
+pub trait BlockSource {
+    fn get_headers(&mut self, locator: &[Hash256]) -> std::result::Result<Vec<HeaderEntry>, String>;
+    fn get_blocks(&mut self, hashes: &[Hash256]) -> std::result::Result<Vec<Vec<u8>>, String>;
+    fn describe(&self) -> String;
+}
+
+impl BlockSource for Peer {
+    fn get_headers(&mut self, locator: &[Hash256]) -> std::result::Result<Vec<HeaderEntry>, String> {
+        Peer::get_headers(self, locator).map_err(|e| e.to_string())
+    }
+    fn get_blocks(&mut self, hashes: &[Hash256]) -> std::result::Result<Vec<Vec<u8>>, String> {
+        Peer::get_blocks(self, hashes).map_err(|e| e.to_string())
+    }
+    fn describe(&self) -> String {
+        format!("p2p {} {}", self.addr, self.version.user_agent)
+    }
+}
 
 pub struct Syncer<'a> {
     pub db: &'a ChainDb,
@@ -54,12 +76,12 @@ impl<'a> Syncer<'a> {
     }
 
     /// Make sure genesis is stored and connected (fetching it from the peer if needed).
-    pub fn ensure_genesis(&self, peer: &mut Peer) -> Result<Tip> {
+    pub fn ensure_genesis(&self, peer: &mut dyn BlockSource) -> Result<Tip> {
         if let Some(t) = self.db.tip(self.c())? {
             return Ok(t);
         }
         let g = self.params.genesis_hash();
-        let raw = peer.get_blocks(&[g])?.remove(0);
+        let raw = peer.get_blocks(&[g]).map_err(SyncError::Source)?.into_iter().next().ok_or_else(|| SyncError::Source("genesis not sent".into()))?;
         let b = Block::parse_with(&raw, &self.params.format)
             .map_err(|e| SyncError::BadBlock { hash: g, why: e.to_string() })?;
         if b.hash() != g {
@@ -82,7 +104,7 @@ impl<'a> Syncer<'a> {
         Ok(self.db.connect_blocks(self.params, &[b])?)
     }
 
-    fn locator(&self) -> Result<Vec<Hash256>> {
+    pub fn locator(&self) -> Result<Vec<Hash256>> {
         let c = self.c();
         let mut loc = Vec::new();
         if let Some(b) = self.db.best_header(c)? {
@@ -107,9 +129,9 @@ impl<'a> Syncer<'a> {
     }
 
     /// One round of getheaders. Returns how many new headers were stored (0 = caught up).
-    pub fn sync_headers_once(&self, peer: &mut Peer) -> Result<u32> {
+    pub fn sync_headers_once(&self, peer: &mut dyn BlockSource) -> Result<u32> {
         let c = self.c();
-        let entries = peer.get_headers(&self.locator()?)?;
+        let entries = peer.get_headers(&self.locator()?).map_err(SyncError::Source)?;
         let mut batch: Vec<(Hash256, HeaderRec)> = Vec::with_capacity(entries.len());
         let mut pending: HashMap<Hash256, HeaderRec> = HashMap::new();
         for e in entries {
@@ -195,7 +217,7 @@ impl<'a> Syncer<'a> {
     }
 
     /// Connect up to `max` blocks toward the best header. Returns progress.
-    pub fn sync_blocks(&self, peer: &mut Peer, max: u32, batch: usize) -> Result<Progress> {
+    pub fn sync_blocks(&self, peer: &mut dyn BlockSource, max: u32, batch: usize) -> Result<Progress> {
         let c = self.c();
         let mut prog = Progress::default();
         let (fork, path) = self.path_to_best()?;
@@ -213,7 +235,7 @@ impl<'a> Syncer<'a> {
         let path: Vec<_> = path.into_iter().take(max as usize).collect();
         let mut height = fork;
         for chunk in path.chunks(batch.max(1)) {
-            let raws = peer.get_blocks(chunk)?;
+            let raws = peer.get_blocks(chunk).map_err(SyncError::Source)?;
             let mut by_hash: HashMap<Hash256, Block> = HashMap::new();
             for raw in raws {
                 let b = Block::parse_with(&raw, &self.params.format)

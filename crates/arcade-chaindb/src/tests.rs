@@ -194,3 +194,18 @@ fn block_must_extend_tip() {
     let stray = block(Hash256([1; 32]), vec![tx(&[], &[(1, p2pkh(1))], 5)], 2);
     assert!(f.db.connect_blocks(f.p, &[stray]).is_err());
 }
+
+#[test]
+fn serves_headers_like_p2p() {
+    let f = fixture();
+    let b1 = block(f.g.hash(), vec![tx(&[], &[(10, p2pkh(1))], 1)], 2);
+    let b2 = block(b1.hash(), vec![tx(&[], &[(10, p2pkh(1))], 2)], 3);
+    f.db.connect_blocks(f.p, &[b1.clone(), b2.clone()]).unwrap();
+    let pl = f.db.headers_payload(f.p, &[f.g.hash()], 2000).unwrap();
+    let hs = arcade_chain::p2p::parse_headers(&pl, &f.p.format).unwrap();
+    assert_eq!(hs.iter().map(|e| e.header.hash()).collect::<Vec<_>>(), vec![b1.hash(), b2.hash()]);
+    let pl = f.db.headers_payload(f.p, &[b2.hash(), f.g.hash()], 2000).unwrap();
+    assert_eq!(arcade_chain::p2p::parse_headers(&pl, &f.p.format).unwrap().len(), 0);
+    let pl = f.db.headers_payload(f.p, &[Hash256([9; 32])], 1).unwrap();
+    assert_eq!(arcade_chain::p2p::parse_headers(&pl, &f.p.format).unwrap()[0].header.hash(), f.g.hash());
+}

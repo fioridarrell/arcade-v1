@@ -212,6 +212,46 @@ impl ChainDb {
         })
     }
 
+    /// Headers after the first locator hash on our main chain, as a P2P `headers` payload
+    /// (header [+ AuxPoW] + tx count 0 [+ sig length 0]); at most `max`.
+    pub fn headers_payload(&self, params: &ChainParams, locator: &[Hash256], max: u32) -> Result<Vec<u8>> {
+        let c = params.chain_no;
+        let tip = match self.tip(c)? {
+            Some(t) => t,
+            None => return Ok(vec![0]),
+        };
+        let mut start = 0u32;
+        for h in locator {
+            if let Some(rec) = self.header(c, h)? {
+                if self.hash_at(c, rec.height)? == Some(*h) {
+                    start = rec.height + 1;
+                    break;
+                }
+            }
+        }
+        let end = tip.height.min(start.saturating_add(max).saturating_sub(1));
+        let n = if start > tip.height { 0 } else { end - start + 1 };
+        self.store.read(|r| {
+            let mut o = Vec::new();
+            arcade_chain::encode::write_varint(&mut o, n as u64);
+            for h in start..start + n {
+                let v = r.get(HEIGHT, &k_height(c, h))?.ok_or(StoreError::Corrupt { table: HEIGHT, why: "gap" })?;
+                let b = be_u32(&v, 32);
+                let m = parse_meta(&r.get(BLOCK_META, &k_block(c, b))?.ok_or(StoreError::Corrupt {
+                    table: BLOCK_META,
+                    why: "missing block",
+                })?)?;
+                o.extend_from_slice(&m.header80);
+                o.extend_from_slice(&m.auxpow);
+                o.push(0);
+                if params.format.block_sig {
+                    o.push(0);
+                }
+            }
+            Ok(o)
+        })
+    }
+
     /// Raw transaction by txid (main chain preferred), checked by full hash.
     pub fn tx_raw(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(Vec<u8>, u32)>> {
         let c = params.chain_no;

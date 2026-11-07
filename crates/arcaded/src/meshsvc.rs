@@ -52,8 +52,36 @@ pub fn run(node: Arc<Node>, addr: String) {
     }
 }
 
+/// Accept inbound mesh links (other V1.0 arcades, and existing arcades dialing us).
+pub fn listen(node: Arc<Node>, port: u16) {
+    let l = match std::net::TcpListener::bind(("0.0.0.0", port)) {
+        Ok(l) => l,
+        Err(e) => {
+            let _ = node.app.event("mesh", &format!("cannot listen on {port}: {e}"));
+            return;
+        }
+    };
+    for s in l.incoming().flatten() {
+        let node = node.clone();
+        std::thread::spawn(move || {
+            let peer_ip = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
+            let Ok(mut link) = Link::handshake(s, NET, &node.identity, false, node.mesh_port) else { return };
+            let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
+            node.links.lock().unwrap().insert(addr.clone(), LinkInfo { addr: addr.clone(), node_id: link.peer_id.clone(), since: now() });
+            let _ = serve(&node, &mut link, &addr);
+            node.links.lock().unwrap().remove(&addr);
+        });
+    }
+}
+
+fn our_tip(node: &Node) -> u64 {
+    node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0)
+}
+
 fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
+    // Tell V1.0 peers what we can serve (existing arcades ignore this kind).
+    link.send(&arcade_mesh::bk::hi(json!({ node.params.key: {"h": our_tip(node)} }), node.mesh_port))?;
     let mut last_ping = std::time::Instant::now();
     let mut sent_outbox = 0usize;
     loop {
@@ -90,7 +118,55 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
                 }
             }
             "wl" => crate::faucet::on_welcome(node, &f.head),
+            "bk" => serve_bk(node, link, addr, &f.head)?,
             _ => {} // unknown kinds are ignored, as the existing arcade does
         }
     }
+}
+
+fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), LinkError> {
+    use arcade_chain::Hash256;
+    use arcade_mesh::bk;
+    let p = node.params;
+    let hashes = |k: &str| -> Vec<Hash256> {
+        h[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| Hash256::from_hex(s).ok())).collect()).unwrap_or_default()
+    };
+    let id = h["id"].as_u64().unwrap_or(0);
+    match h["op"].as_str().unwrap_or("") {
+        "hi" => {
+            if let (Some(t), Some(port)) = (h["nets"][p.key]["h"].as_u64(), h["port"].as_u64()) {
+                let host = addr.rsplit_once(':').map(|x| x.0).unwrap_or(addr);
+                node.bk_peers.lock().unwrap().insert(format!("{host}:{port}"), t);
+            }
+        }
+        "hq" if h["net"] == p.key => {
+            let r = node.chain.headers_payload(p, &hashes("loc"), 2000).map_err(|e| e.to_string());
+            bk::send_answer(link, id, r)?;
+        }
+        "bq" if h["net"] == p.key => {
+            let want = hashes("h");
+            let r = if want.len() > bk::MAX_BLOCKS {
+                Err("too many blocks asked".to_string())
+            } else {
+                let mut out = Vec::new();
+                let mut err = None;
+                for x in &want {
+                    match node.chain.block_raw(p.chain_no, x) {
+                        Ok(Some(b)) => out.push(b),
+                        _ => {
+                            err = Some(format!("do not have {x}"));
+                            break;
+                        }
+                    }
+                }
+                match err {
+                    Some(e) => Err(e),
+                    None => Ok(bk::join_blocks(&out)),
+                }
+            };
+            bk::send_answer(link, id, r)?;
+        }
+        _ => {}
+    }
+    Ok(())
 }

@@ -7,6 +7,7 @@ pub mod auxpow;
 pub mod block;
 pub mod encode;
 pub mod hash;
+pub mod p2p;
 pub mod params;
 pub mod header;
 pub mod pow;

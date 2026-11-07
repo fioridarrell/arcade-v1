@@ -1,0 +1,16 @@
+[package]
+name = "arcade-ledger"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arcade-chain = { version = "0.1.0", path = "../arcade-chain" }
+bs58 = { version = "0.5.1", features = ["check"] }
+hex = "0.4.3"
+ripemd = "0.2.0"
+sha2 = "0.11.1"
+thiserror = "1"
+
+[dev-dependencies]
+arcade-chaindb = { path = "../arcade-chaindb" }

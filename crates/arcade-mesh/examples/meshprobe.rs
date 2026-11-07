@@ -30,6 +30,9 @@ fn main() {
                                     let _ = l.send(&Frame::new(json!({"t":"pong","n":n})));
                                 }
                                 let k = f.kind().to_string();
+                                if let Ok(key) = std::env::var("SHOW") {
+                                    if k == key { println!("  {key}: {}", f.head); }
+                                }
                                 if !kinds.contains_key(&k) && samples.len() < 8 {
                                     let mut s = f.head.to_string(); s.truncate(220);
                                     samples.push(s);

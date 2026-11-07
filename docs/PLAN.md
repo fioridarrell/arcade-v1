@@ -61,6 +61,20 @@ drops only that chain's keys. Add-ons the P2P core must support (requested 2026-
 | Flopcoin | spec requested |
 | More Bitcoin-family coins | A chain is a `ChainParams` entry (wire `Format` + `PowRule` + address versions); new coins are data, plus code only where a coin genuinely differs |
 
+
+**Storage mode per chain** (chosen when adding a chain; can be changed later):
+
+| Mode | Stores | Borrows from the mesh (verified by headers + hashes) | Good for |
+|---|---|---|---|
+| Light | headers only | blocks, transactions, coins, index answers | phones, tiny devices |
+| Blockchain only | headers + blocks + core indexes (txids, coins, spends, every address) | nothing | serving the chain to the mesh; wallets |
+| Index only | headers + chosen protocol indexes (ord, INSC, tokens, names) + coin values + content cache | new blocks (indexed, then dropped), inscription content on request | big chains (Dogecoin) on small disks |
+| Full | everything: blocks + core indexes + chosen protocol indexes | nothing | full independence; serves blocks, indexes and content |
+
+Protocol indexes can be built in the same commit as blocks during sync (`--with ord,tokens,names`), from a
+verified mesh snapshot (block hash + majority of peers' chunk fingerprints, re-checked in the background), or by
+replaying stored blocks later. Switching Light/Index only -> Blockchain only/Full downloads the blocks from the mesh.
+
 **Out of scope for V1.0:** mainnet, other chains, inscriptions (Pepinals/PRC-20), trading, creating/collections,
 messenger/feed/games, LLM credits. The schema carries a chain number everywhere so these add on without a rebuild.
 

@@ -82,6 +82,11 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
     // Tell V1.0 peers what we can serve (existing arcades ignore this kind).
     link.send(&arcade_mesh::bk::hi(json!({ node.params.key: {"h": our_tip(node)} }), node.mesh_port))?;
+    // Offer our chain to arcades that borrow one (existing arcades' coreshare).
+    if let Some(o) = crate::coreshare::offer(node) {
+        link.send(&o)?;
+    }
+    let mut cr_reqs = crate::coreshare::Requests::default();
     let mut last_ping = std::time::Instant::now();
     let mut sent_outbox = 0usize;
     loop {
@@ -119,6 +124,7 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
             }
             "wl" => crate::faucet::on_welcome(node, &f.head),
             "bk" => serve_bk(node, link, addr, &f.head)?,
+            "cr" => crate::coreshare::handle(node, link, &mut cr_reqs, &f)?,
             _ => {} // unknown kinds are ignored, as the existing arcade does
         }
     }

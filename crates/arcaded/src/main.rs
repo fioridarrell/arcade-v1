@@ -7,11 +7,13 @@
 mod api;
 mod chainsvc;
 mod claims;
+mod coreshare;
 mod faucet;
 mod ledger;
 mod meshsource;
 mod meshsvc;
 mod node;
+mod rpc;
 
 use node::Node;
 use std::sync::{Arc, Mutex};

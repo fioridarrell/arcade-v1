@@ -33,11 +33,13 @@ Traps: signatures cover `json.dumps(h, separators=(",",":"), sort_keys=True)` wi
 - Transports: TCP port **8421**; WebSocket path `/mesh` (binary messages, client-masked, max 128 KiB);
   optional UDP (AUDP1, XChaCha20-Poly1305) only after a link is up.
 - Identity: Ed25519 seed in `~/.dogecoinarcade/mesh.key` (hex + newline, 0600). Node id = hex verify key.
-- Network string `arcade-{name}`: `arcade-test` / `arcade-main`.
+- Network string `arcade-{name}`. **Verified live 2026-11-07: every public arcade answers `arcade-main`,
+  and that one mesh carries all chains (SUB `res` lists `c:test`, `c:dgb`, `c:kot`, ...). V1.0 joins `arcade-main`.**
 - Handshake (mesh/link.py:287-334), VERSION 2, MAGIC `ARCM`, 10 s timeout:
   1. Both send HELLO in clear: u32 BE len + `ARCM` + [2, len(net)] + net + 32-byte X25519 ephemeral pk.
   2. shared = X25519. (first, second) = (mine, theirs) if dialer else (theirs, mine);
-     transcript = blake2b(first+second, 32).
+     transcript = blake2b(first+second, 32) where first/second are the **full HELLO bodies**
+     (magic..ephemeral), dialer's first — verified against a live arcade 2026-11-07.
   3. derive(label) = blake2b(shared+transcript, 32, person=label padded to 16 with NUL).
      k_out = derive(`arcm-dialer`), k_in = derive(`arcm-listener`); dialer sends with k_out, listener with k_in.
   4. Encrypted AUTH `{"t":"auth","key":hex,"sig":hex,"listen":port|null}`;

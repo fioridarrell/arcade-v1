@@ -6,6 +6,7 @@ use std::os::unix::net::UnixStream;
 
 const HELP: &str = "arcade — Arcade V1.0
 
+  arcade setup                   first-run setup (mesh, chain, wallet, handle)
   arcade status                  sync, tag index, mesh links
   arcade peers                   mesh links
   arcade wallet create           new wallet; shows the 12-word recovery phrase ONCE
@@ -41,6 +42,156 @@ fn home(args: &[String]) -> std::path::PathBuf {
     base.join("arcade")
 }
 
+fn call(sock: &std::path::Path, req: Value) -> Result<Value, String> {
+    let mut s = UnixStream::connect(sock).map_err(|e| format!("arcaded is not running ({}: {e})", sock.display()))?;
+    writeln!(s, "{req}").map_err(|e| e.to_string())?;
+    let mut line = String::new();
+    BufReader::new(s).read_line(&mut line).map_err(|e| e.to_string())?;
+    let v: Value = serde_json::from_str(&line).map_err(|_| "bad reply".to_string())?;
+    if v["ok"] == true {
+        Ok(v["result"].clone())
+    } else {
+        Err(v["error"].as_str().unwrap_or("unknown error").to_string())
+    }
+}
+
+fn ask(prompt: &str) -> String {
+    print!("{prompt}");
+    std::io::stdout().flush().ok();
+    let mut s = String::new();
+    std::io::stdin().read_line(&mut s).ok();
+    s.trim().to_string()
+}
+
+fn step(n: u32, title: &str) {
+    println!("\n[{n}/12] {title}");
+}
+
+/// Wait until `done(status)` holds, redrawing one progress line.
+fn wait_status(sock: &std::path::Path, what: &str, done: impl Fn(&Value) -> bool, line: impl Fn(&Value) -> String) -> Value {
+    loop {
+        if let Ok(st) = call(sock, json!({"cmd": "status"})) {
+            if done(&st) {
+                println!("\r      {:<70}", line(&st));
+                return st;
+            }
+            print!("\r      {:<70}", line(&st));
+            std::io::stdout().flush().ok();
+        } else {
+            print!("\r      waiting for the arcade service ({what})…{:<20}", "");
+            std::io::stdout().flush().ok();
+        }
+        std::thread::sleep(std::time::Duration::from_secs(2));
+    }
+}
+
+/// First-run setup: the whiteboard steps, in order, on the command line.
+fn setup(sock: &std::path::Path) {
+    println!("Arcade V1.0 setup — Pepecoin testnet");
+
+    step(1, "Install arcade");
+    match call(sock, json!({"cmd": "status"})) {
+        Ok(_) => println!("      the arcade service is running"),
+        Err(e) => {
+            println!("      {e}\n      start it with:  sudo systemctl enable --now arcaded   then run  arcade setup  again");
+            std::process::exit(2);
+        }
+    }
+
+    step(2, "Connect to the mesh");
+    wait_status(sock, "mesh", |s| s["mesh"]["links"].as_u64().unwrap_or(0) > 0, |s| format!("{} arcade(s) linked", s["mesh"]["links"]));
+
+    step(3, "Pepecoin testnet");
+    let st = call(sock, json!({"cmd": "status"})).unwrap_or_default();
+    println!("      chain: {}", st["chain"].as_str().unwrap_or("?"));
+
+    step(4, "Get the Pepecoin testnet blockchain (mesh first, Pepecoin P2P as fallback)");
+    wait_status(sock, "sync", |s| s["sync"].as_str().unwrap_or("").starts_with("synced"), |s| s["sync"].as_str().unwrap_or("").to_string());
+
+    step(5, "Build the tag index");
+    let st = wait_status(
+        sock,
+        "index",
+        |s| s["tip"]["height"].as_u64().map(|t| s["tags"]["indexed_to"].as_u64().unwrap_or(0) >= t).unwrap_or(false),
+        |s| format!("indexed to {} ({} tags)", s["tags"]["indexed_to"], s["tags"]["count"]),
+    );
+    let ours = st["tags"]["names_digest"].as_str().unwrap_or("");
+    let tips = st["mesh"]["tips"].as_array().cloned().unwrap_or_default();
+    let told: Vec<_> = tips.iter().filter(|t| t["names_digest"].is_string()).collect();
+    let same = told.iter().filter(|t| t["names_digest"] == ours).count();
+    println!("      matches {same} of {} arcades that reported", told.len());
+
+    step(6, "Your wallet");
+    if st["wallet"] == true {
+        println!("      a wallet already exists on this arcade");
+    } else {
+        loop {
+            match ask("      (n)ew wallet or (r)estore from 12 words? ").as_str() {
+                "n" | "N" => {
+                    let r = call(sock, json!({"cmd": "wallet.create"})).unwrap_or_else(|e| { eprintln!("      {e}"); std::process::exit(1) });
+                    println!("\n      Your recovery phrase — write it down now, it is shown only once:\n\n        {}\n", r["phrase"].as_str().unwrap_or(""));
+                    while ask("      Type  yes  when you have written it down: ") != "yes" {}
+                    print!("\x1b[2J\x1b[H"); // clear the screen so the phrase does not stay visible
+                    println!("Arcade V1.0 setup — continuing");
+                    break;
+                }
+                "r" | "R" => {
+                    let words = ask("      your 12 words: ");
+                    match call(sock, json!({"cmd": "wallet.create", "phrase": words})) {
+                        Ok(_) => { println!("      wallet restored"); break; }
+                        Err(e) => println!("      {e}"),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    step(7, "Ask for a handle");
+    let keys = call(sock, json!({"cmd": "wallet.keys"})).unwrap_or_default();
+    if let Some(t) = keys.as_array().and_then(|k| k.iter().find_map(|k| k["tag"].as_str().map(String::from))) {
+        println!("      you already hold @{t}");
+    } else {
+        let tag = loop {
+            let t = ask("      which @tag would you like? ");
+            step(8, "Check the handle");
+            match call(sock, json!({"cmd": "tag.check", "tag": t})) {
+                Ok(r) if r["available"] == true => { println!("      @{} is free", r["tag"].as_str().unwrap_or("")); break t; }
+                Ok(r) => println!("      @{} is not available: {}", r["tag"].as_str().unwrap_or(""), r["reason"].as_str().unwrap_or("")),
+                Err(e) => println!("      {e}"),
+            }
+        };
+        step(9, "Get test coins and claim the handle");
+        match call(sock, json!({"cmd": "tag.claim", "tag": tag})) {
+            Err(e) => println!("      {e}"),
+            Ok(c) => {
+                let id = c["id"].as_str().unwrap_or("").to_string();
+                let mut last = String::new();
+                loop {
+                    let list = call(sock, json!({"cmd": "tag.list"})).unwrap_or_default();
+                    if let Some(c) = list.as_array().and_then(|l| l.iter().find(|c| c["id"] == id.as_str())) {
+                        let line = format!("{}: {}", c["status"].as_str().unwrap_or(""), c["note"].as_str().unwrap_or(""));
+                        if line != last { println!("      {line}"); last = line; }
+                        if c["status"] == "confirmed" || c["status"] == "failed" { break; }
+                    }
+                    std::thread::sleep(std::time::Duration::from_secs(5));
+                }
+            }
+        }
+    }
+
+    step(10, "Start at boot");
+    let enabled = std::process::Command::new("systemctl").args(["is-enabled", "arcaded"]).output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
+    println!("      {}", if enabled { "arcaded starts at boot" } else { "not enabled: sudo systemctl enable arcaded" });
+
+    step(11, "Share bootstraps");
+    println!("      your arcade serves its chain to other arcades on the mesh (always on)");
+
+    step(12, "Command line");
+    println!("      run  arcade  for every command; the desktop app shows the same arcade.\n\nSetup complete.");
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let sock = home(&args).join("arcaded.sock");
@@ -48,6 +199,10 @@ fn main() {
         args.drain(i..i + 2);
     }
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
+    if a.as_slice() == ["setup"] {
+        setup(&sock);
+        return;
+    }
     let req = match a.as_slice() {
         ["status"] => json!({"cmd": "status"}),
         ["peers"] => json!({"cmd": "peers"}),

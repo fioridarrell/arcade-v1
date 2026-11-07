@@ -10,4 +10,10 @@ if [ "$1" = "configure" ]; then
     fi
     systemctl daemon-reload || true
     systemctl enable --now arcaded.service || true
+    echo
+    echo "Arcade V1.0 is installed and running."
+    echo "Finish the first-time setup (mesh, chain, wallet, your @handle) with:"
+    echo
+    echo "    arcade setup"
+    echo
 fi

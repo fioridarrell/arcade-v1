@@ -32,10 +32,6 @@ h2 { font-size: 15px; margin: 24px 0 8px; color: var(--muted); font-weight: 600;
 .k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
 .v { font-size: 18px; font-weight: 650; margin-top: 4px; overflow-wrap: anywhere; }
 .s { color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
-.steps { padding-left: 20px; }
-.steps li { margin: 6px 0; }
-.steps li.done { color: var(--muted); }
-.steps li.done::marker { color: var(--accent); }
 .row { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
 button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
 button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }

@@ -51,19 +51,6 @@ async function refreshHome() {
   } else { $("h-bal").textContent = ""; }
   state.claims = await api("tag.list");
 
-  const synced = s.sync.startsWith("synced");
-  const steps = [
-    ["Install arcade", true],
-    ["Connect to the mesh", s.mesh.links > 0],
-    ["Pepecoin testnet", !!s.tip],
-    ["Bootstrap the chain", synced],
-    ["Build the tag index", s.tip && s.tags.indexed_to >= s.tip.height],
-    ["Create your wallet", s.wallet],
-    ["Get test coins", bal > 0],
-    ["Pick a handle", state.claims.length > 0],
-    ["Claim your handle", !!tag],
-  ];
-  $("steps").replaceChildren(...steps.map(([t, done]) => { const li = document.createElement("li"); li.textContent = t + (done ? " ✓" : ""); if (done) li.className = "done"; return li; }));
 }
 
 async function refreshWallet() {

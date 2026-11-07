@@ -2,12 +2,11 @@
 
 use crate::schema::*;
 use crate::undo::{self, Logged};
-use arcade_chain::hash::sha256;
 use arcade_chain::params::ChainParams;
 use arcade_chain::pow::{work_from_bits, U256};
 use arcade_chain::{Block, Hash256, Header, OutPoint, Tx};
 use arcade_store::key::{be_u32, be_u64};
-use arcade_store::{Result, Store, StoreError, WriteTxn};
+use arcade_store::{ReadTxn, Result, Store, StoreError, WriteTxn};
 use std::path::Path;
 
 /// Headers kept in the undo window; deeper reorgs are refused.
@@ -31,28 +30,18 @@ pub struct HeaderRec {
 }
 
 impl HeaderRec {
-    pub fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(4 + 4 + 1 + 32 + 80 + self.auxpow.len());
-        v.extend_from_slice(&self.b.to_be_bytes());
+    fn index_value(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(9);
         v.extend_from_slice(&self.height.to_be_bytes());
+        v.extend_from_slice(&self.b.to_be_bytes());
         v.push(self.status);
-        v.extend_from_slice(&self.work.to_be_bytes());
-        v.extend_from_slice(&self.header.encode());
-        v.extend_from_slice(&self.auxpow);
         v
     }
-    pub fn decode(v: &[u8]) -> Result<HeaderRec> {
-        if v.len() < 121 {
-            return Err(StoreError::Corrupt { table: HEADERS, why: "short header record" });
-        }
-        Ok(HeaderRec {
-            b: be_u32(v, 0),
-            height: be_u32(v, 4),
-            status: v[8],
-            work: U256::from_be_bytes(v[9..41].try_into().unwrap()),
-            header: Header::parse(v[41..121].try_into().unwrap()),
-            auxpow: v[121..].to_vec(),
-        })
+    fn data_value(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(112);
+        v.extend_from_slice(&self.header.encode());
+        v.extend_from_slice(&self.work.to_be_bytes());
+        v
     }
 }
 
@@ -71,39 +60,81 @@ pub struct Coin {
     pub script: Vec<u8>,
 }
 
-impl Coin {
-    fn encode(&self) -> Vec<u8> {
-        let mut v = Vec::with_capacity(13 + self.script.len());
-        v.extend_from_slice(&self.value.to_le_bytes());
-        v.extend_from_slice(&self.height.to_le_bytes());
-        v.push(self.coinbase as u8);
-        v.extend_from_slice(&self.script);
-        v
-    }
-    fn decode(v: &[u8]) -> Result<Coin> {
-        if v.len() < 13 {
-            return Err(StoreError::Corrupt { table: OUTPUTS, why: "short coin" });
-        }
-        Ok(Coin {
-            value: u64::from_le_bytes(v[0..8].try_into().unwrap()),
-            height: u32::from_le_bytes(v[8..12].try_into().unwrap()),
-            coinbase: v[12] != 0,
-            script: v[13..].to_vec(),
-        })
-    }
-}
-
 /// Outputs that can never be spent are not coins.
 pub fn is_unspendable(value: u64, script: &[u8]) -> bool {
     script.first() == Some(&0x6a) || (value == 0 && script.is_empty())
 }
 
-pub fn script_hash(script: &[u8]) -> [u8; 32] {
-    sha256(script)
-}
-
 fn other(e: impl std::fmt::Display) -> StoreError {
     StoreError::Other(e.to_string())
+}
+
+// ---------- script compression (outputs value) ----------
+// 00+h160 P2PKH | 01+h160 P2SH | 02/03+32 P2PK compressed | 05+65 P2PK uncompressed
+// | FE = read the script from the stored transaction (anything else).
+
+const SCRIPT_IN_TX: u8 = 0xfe;
+
+fn compress_script(s: &[u8]) -> Vec<u8> {
+    if s.len() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac {
+        let mut v = vec![0x00];
+        v.extend_from_slice(&s[3..23]);
+        v
+    } else if s.len() == 23 && s[0] == 0xa9 && s[1] == 0x14 && s[22] == 0x87 {
+        let mut v = vec![0x01];
+        v.extend_from_slice(&s[2..22]);
+        v
+    } else if s.len() == 35 && s[0] == 33 && s[34] == 0xac && (s[1] == 2 || s[1] == 3) {
+        s[1..34].to_vec()
+    } else if s.len() == 67 && s[0] == 65 && s[66] == 0xac {
+        let mut v = vec![0x05];
+        v.extend_from_slice(&s[1..66]);
+        v
+    } else {
+        vec![SCRIPT_IN_TX]
+    }
+}
+
+/// Expand a compressed script; `from_tx` reads the full script when it was not inlined.
+fn expand_script(r: &[u8], from_tx: impl FnOnce() -> Result<Vec<u8>>) -> Result<Vec<u8>> {
+    let bad = || StoreError::Corrupt { table: OUTPUTS, why: "bad script ref" };
+    Ok(match r.first().copied().ok_or_else(bad)? {
+        0x00 => {
+            let mut s = vec![0x76, 0xa9, 0x14];
+            s.extend_from_slice(r.get(1..21).ok_or_else(bad)?);
+            s.extend_from_slice(&[0x88, 0xac]);
+            s
+        }
+        0x01 => {
+            let mut s = vec![0xa9, 0x14];
+            s.extend_from_slice(r.get(1..21).ok_or_else(bad)?);
+            s.push(0x87);
+            s
+        }
+        0x02 | 0x03 => {
+            let mut s = vec![33];
+            s.extend_from_slice(r.get(..33).ok_or_else(bad)?);
+            s.push(0xac);
+            s
+        }
+        0x05 => {
+            let mut s = vec![65];
+            s.extend_from_slice(r.get(1..66).ok_or_else(bad)?);
+            s.push(0xac);
+            s
+        }
+        SCRIPT_IN_TX => from_tx()?,
+        _ => return Err(bad()),
+    })
+}
+
+fn encode_coin(value: u64, height: u32, coinbase: bool, script: &[u8]) -> Vec<u8> {
+    let mut v = Vec::with_capacity(13 + 22);
+    v.extend_from_slice(&value.to_le_bytes());
+    v.extend_from_slice(&height.to_le_bytes());
+    v.push(coinbase as u8);
+    v.extend_from_slice(&compress_script(script));
+    v
 }
 
 fn block_meta(b: &Block) -> Vec<u8> {
@@ -154,6 +185,81 @@ fn parse_meta(v: &[u8]) -> Result<Meta> {
     Ok(Meta { header80, auxpow, sig, extra, tx_count })
 }
 
+/// Read access shared by read and write transactions.
+pub trait Rd {
+    fn get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
+    fn scan(&self, table: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+}
+impl Rd for ReadTxn<'_> {
+    fn get(&self, t: &str, k: &[u8]) -> Result<Option<Vec<u8>>> {
+        ReadTxn::get(self, t, k)
+    }
+    fn scan(&self, t: &str, p: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_prefix(t, p)
+    }
+}
+impl Rd for WriteTxn<'_> {
+    fn get(&self, t: &str, k: &[u8]) -> Result<Option<Vec<u8>>> {
+        WriteTxn::get(self, t, k)
+    }
+    fn scan(&self, t: &str, p: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.scan_prefix(t, p)
+    }
+}
+
+fn header_rec<R: Rd>(r: &R, c: u16, hash: &Hash256) -> Result<Option<HeaderRec>> {
+    let Some(ix) = r.get(HEADERS, &k_header(c, &hash.0))? else { return Ok(None) };
+    let (height, b, status) = (be_u32(&ix, 0), be_u32(&ix, 4), ix[8]);
+    let d = r
+        .get(HDR, &k_hdr(c, height, &hash.0))?
+        .ok_or(StoreError::Corrupt { table: HDR, why: "header index without header data" })?;
+    Ok(Some(HeaderRec {
+        b,
+        height,
+        status,
+        work: U256::from_be_bytes(d[80..112].try_into().unwrap()),
+        header: Header::parse(d[..80].try_into().unwrap()),
+        auxpow: Vec::new(),
+    }))
+}
+
+/// Where a transaction is stored: (B, P). Several candidates only on a T12 collision or a
+/// duplicate txid; then each is checked by full hash.
+fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
+    let c = params.chain_no;
+    let cands = r.scan(TXS, &k_txs(c, &txid.t12()))?;
+    if cands.len() == 1 {
+        let bp = &cands[0].1;
+        return Ok(Some((be_u32(bp, 0), be_u32(bp, 4))));
+    }
+    let mut found = None;
+    for (_, bp) in cands {
+        let (b, p) = (be_u32(&bp, 0), be_u32(&bp, 4));
+        if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
+            if Tx::parse_with(&raw, &params.format).map_err(other)?.txid == *txid {
+                found = Some((b, p)); // the latest stored copy wins (BIP30-style duplicates)
+            }
+        }
+    }
+    Ok(found)
+}
+
+fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Result<Option<Coin>> {
+    let c = params.chain_no;
+    let Some(v) = r.get(OUTPUTS, &k_pos(c, b, p, vout))? else { return Ok(None) };
+    let script = expand_script(&v[13..], || {
+        let raw = r.get(BLOCK_TX, &k_block_tx(c, b, p))?.ok_or(StoreError::Corrupt { table: BLOCK_TX, why: "coin's tx missing" })?;
+        let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
+        Ok(tx.outputs.get(vout as usize).ok_or(StoreError::Corrupt { table: OUTPUTS, why: "bad vout" })?.script_pubkey.clone())
+    })?;
+    Ok(Some(Coin {
+        value: u64::from_le_bytes(v[0..8].try_into().unwrap()),
+        height: u32::from_le_bytes(v[8..12].try_into().unwrap()),
+        coinbase: v[12] != 0,
+        script,
+    }))
+}
+
 pub struct ChainDb {
     pub store: Store,
 }
@@ -166,7 +272,7 @@ impl ChainDb {
     // ---------- reads ----------
 
     pub fn header(&self, c: u16, hash: &Hash256) -> Result<Option<HeaderRec>> {
-        self.store.read(|r| r.get(HEADERS, &k_header(c, &hash.0))?.map(|v| HeaderRec::decode(&v)).transpose())
+        self.store.read(|r| header_rec(r, c, hash))
     }
 
     pub fn tip(&self, c: u16) -> Result<Option<Tip>> {
@@ -175,15 +281,11 @@ impl ChainDb {
 
     /// Best known header (most work), which may be ahead of the tip.
     pub fn best_header(&self, c: u16) -> Result<Option<Hash256>> {
-        self.store.read(|r| {
-            Ok(r.get(STATE, &k_state(c, "best"))?.map(|v| Hash256(v[..32].try_into().unwrap())))
-        })
+        self.store.read(|r| Ok(r.get(STATE, &k_state(c, "best"))?.map(|v| Hash256(v[..32].try_into().unwrap()))))
     }
 
     pub fn hash_at(&self, c: u16, height: u32) -> Result<Option<Hash256>> {
-        self.store.read(|r| {
-            Ok(r.get(HEIGHT, &k_height(c, height))?.map(|v| Hash256(v[..32].try_into().unwrap())))
-        })
+        self.store.read(|r| Ok(r.get(HEIGHT, &k_height(c, height))?.map(|v| Hash256(v[..32].try_into().unwrap()))))
     }
 
     /// Raw block bytes, rebuilt exactly from the stored parts.
@@ -252,21 +354,18 @@ impl ChainDb {
         })
     }
 
-    /// Raw transaction by txid (main chain preferred), checked by full hash.
+    /// Raw transaction by txid (checked by full hash) and its block number.
     pub fn tx_raw(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(Vec<u8>, u32)>> {
         let c = params.chain_no;
         self.store.read(|r| {
-            let mut found = None;
             for (_, bp) in r.scan_prefix(TXS, &k_txs(c, &txid.t12()))? {
                 let (b, p) = (be_u32(&bp, 0), be_u32(&bp, 4));
                 let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? else { continue };
-                let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
-                if tx.txid == *txid {
-                    found = Some((raw, b));
-                    break;
+                if Tx::parse_with(&raw, &params.format).map_err(other)?.txid == *txid {
+                    return Ok(Some((raw, b)));
                 }
             }
-            Ok(found)
+            Ok(None)
         })
     }
 
@@ -288,40 +387,69 @@ impl ChainDb {
     }
 
     /// An unspent output.
-    pub fn coin(&self, c: u16, op: &OutPoint) -> Result<Option<Coin>> {
-        self.store
-            .read(|r| r.get(OUTPUTS, &k_out(c, &op.txid.t12(), op.vout))?.map(|v| Coin::decode(&v)).transpose())
-    }
-
-    /// Every unspent coin paying `script`: (t12, vout, value, height).
-    pub fn coins_for_script(&self, c: u16, script: &[u8]) -> Result<Vec<([u8; 12], u32, u64, u32)>> {
-        let sh = script_hash(script);
-        self.store.read(|r| {
-            let pre = k_script(c, &sh);
-            Ok(r.scan_prefix(BY_SCRIPT, &pre)?
-                .into_iter()
-                .map(|(k, v)| {
-                    let n = pre.len();
-                    (
-                        k[n..n + 12].try_into().unwrap(),
-                        be_u32(&k, n + 12),
-                        u64::from_le_bytes(v[0..8].try_into().unwrap()),
-                        u32::from_le_bytes(v[8..12].try_into().unwrap()),
-                    )
-                })
-                .collect())
+    pub fn coin(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<Coin>> {
+        self.store.read(|r| match locate(r, params, &op.txid)? {
+            Some((b, p)) => coin_at(r, params, b, p, op.vout),
+            None => Ok(None),
         })
     }
 
+    /// Every unspent coin of the address `script` belongs to: (outpoint, value, height).
+    pub fn coins_for_script(&self, params: &ChainParams, script: &[u8]) -> Result<Vec<(OutPoint, u64, u32)>> {
+        let c = params.chain_no;
+        let sid = script_id(script);
+        self.store.read(|r| {
+            let pre = k_sid(c, &sid);
+            let mut out = Vec::new();
+            for (k, v) in r.scan_prefix(BY_SCRIPT, &pre)? {
+                let n = pre.len();
+                let (b, p, vout) = (be_u32(&k, n), be_u32(&k, n + 4), be_u32(&k, n + 8));
+                let raw = r.get(BLOCK_TX, &k_block_tx(c, b, p))?.ok_or(StoreError::Corrupt { table: BLOCK_TX, why: "coin's tx missing" })?;
+                let txid = Tx::parse_with(&raw, &params.format).map_err(other)?.txid;
+                out.push((
+                    OutPoint { txid, vout },
+                    u64::from_le_bytes(v[0..8].try_into().unwrap()),
+                    u32::from_le_bytes(v[8..12].try_into().unwrap()),
+                ));
+            }
+            Ok(out)
+        })
+    }
+
+    /// Sum of an address's unspent coins (no transaction reads).
     pub fn balance_for_script(&self, c: u16, script: &[u8]) -> Result<u64> {
-        Ok(self.coins_for_script(c, script)?.iter().map(|x| x.2).sum())
+        let sid = script_id(script);
+        Ok(self
+            .store
+            .read(|r| r.scan_prefix(BY_SCRIPT, &k_sid(c, &sid)))?
+            .iter()
+            .map(|(_, v)| u64::from_le_bytes(v[0..8].try_into().unwrap()))
+            .sum())
+    }
+
+    /// An address's history rows: (height, txid prefix, received, spent).
+    pub fn history_for_script(&self, c: u16, script: &[u8]) -> Result<Vec<(u32, [u8; 12], u64, u64)>> {
+        let sid = script_id(script);
+        let pre = k_sid(c, &sid);
+        Ok(self
+            .store
+            .read(|r| r.scan_prefix(SCRIPT_HIST, &pre))?
+            .iter()
+            .map(|(k, v)| {
+                let n = pre.len();
+                (be_u32(k, n), k[n + 4..n + 16].try_into().unwrap(), be_u64(v, 0), be_u64(v, 8))
+            })
+            .collect())
     }
 
     /// Who spent an outpoint: (block number, position, input index).
-    pub fn spender(&self, c: u16, op: &OutPoint) -> Result<Option<(u32, u32, u32)>> {
-        self.store.read(|r| {
-            Ok(r.get(SPENDS, &k_out(c, &op.txid.t12(), op.vout))?
-                .map(|v| (be_u32(&v, 0), be_u32(&v, 4), be_u32(&v, 8))))
+    pub fn spender(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<(u32, u32, u32)>> {
+        let c = params.chain_no;
+        self.store.read(|r| match locate(r, params, &op.txid)? {
+            Some((b, p)) => Ok(r
+                .get(SPENDS, &k_pos(c, b, p, op.vout))?
+                .map(|v| (be_u32(&v, 0), be_u32(&v, 4), be_u32(&v, 8)))),
+            None => Ok(None),
         })
     }
 
@@ -402,7 +530,8 @@ impl ChainDb {
                 if w.contains(HEADERS, &k)? {
                     continue;
                 }
-                w.put(HEADERS, &k, &rec.encode())?;
+                w.put(HEADERS, &k, &rec.index_value())?;
+                w.put(HDR, &k_hdr(c, rec.height, &hash.0), &rec.data_value())?;
                 if best.map(|b| rec.work > b).unwrap_or(true) {
                     best = Some(rec.work);
                     best_hash = Some(*hash);
@@ -493,28 +622,21 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
     blk.check().map_err(other)?;
 
     // The block's bytes: stored once, kept even if later disconnected (forks included).
-    let hk = k_header(c, &hash.0);
-    let mut hrec = match w.get(HEADERS, &hk)? {
-        Some(v) => HeaderRec::decode(&v)?,
-        None => HeaderRec {
-            b: 0,
-            height,
-            status: STATUS_HEADER,
-            work: match tip {
-                Some(t) => w
-                    .get(HEADERS, &k_header(c, &t.hash.0))?
-                    .map(|v| HeaderRec::decode(&v))
-                    .transpose()?
+    let mut hrec = match header_rec(w, c, &hash)? {
+        Some(r) => r,
+        None => {
+            let work = match tip {
+                Some(t) => header_rec(w, c, &t.hash)?
                     .map(|p| ChainDb::child_work(&p, blk.header.bits))
                     .unwrap_or_else(|| work_from_bits(blk.header.bits)),
                 None => work_from_bits(blk.header.bits),
-            },
-            header: blk.header,
-            auxpow: Vec::new(), // stored once, in block_meta
-        },
+            };
+            let r = HeaderRec { b: 0, height, status: STATUS_HEADER, work, header: blk.header, auxpow: Vec::new() };
+            w.put(HDR, &k_hdr(c, height, &hash.0), &r.data_value())?;
+            r
+        }
     };
-    let new_block = hrec.b == 0;
-    if new_block {
+    if hrec.b == 0 {
         hrec.b = next_b(w, c)?;
         w.put(BLOCK_META, &k_block(c, hrec.b), &block_meta(blk))?;
         for (p, tx) in blk.txs.iter().enumerate() {
@@ -526,58 +648,55 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
     // Index changes, undo-logged.
     let l = Logged::new(w);
     for (p, tx) in blk.txs.iter().enumerate() {
+        let p = p as u32;
         let t12 = tx.txid.t12();
         settle_mempool(w, params, tx)?;
         let mut bp = b.to_be_bytes().to_vec();
-        bp.extend_from_slice(&(p as u32).to_be_bytes());
+        bp.extend_from_slice(&p.to_be_bytes());
         l.dup_add(TXS, &k_txs(c, &t12), &bp)?;
 
         if !tx.is_coinbase() {
             for (vin, inp) in tx.inputs.iter().enumerate() {
-                let pt12 = inp.prevout.txid.t12();
-                let ok = k_out(c, &pt12, inp.prevout.vout);
-                let coin = l.get(OUTPUTS, &ok)?.ok_or_else(|| {
+                let missing = || {
                     other(format!(
                         "height {height}: tx {} spends unknown coin {}:{}",
                         tx.txid, inp.prevout.txid, inp.prevout.vout
                     ))
-                })?;
-                let coin = Coin::decode(&coin)?;
-                let sh = script_hash(&coin.script);
+                };
+                let (pb, pp) = locate(w, params, &inp.prevout.txid)?.ok_or_else(missing)?;
+                let coin = coin_at(w, params, pb, pp, inp.prevout.vout)?.ok_or_else(missing)?;
+                let sid = script_id(&coin.script);
+                let ok = k_pos(c, pb, pp, inp.prevout.vout);
                 l.del(OUTPUTS, &ok)?;
-                l.del(BY_SCRIPT, &k_by_script(c, &sh, &pt12, inp.prevout.vout))?;
+                l.del(BY_SCRIPT, &k_by_script(c, &sid, pb, pp, inp.prevout.vout))?;
                 let mut sp = bp.clone();
                 sp.extend_from_slice(&(vin as u32).to_be_bytes());
                 l.put(SPENDS, &ok, &sp)?;
-                add_hist(&l, c, &sh, height, &t12, 0, coin.value)?;
+                add_hist(&l, c, &sid, height, &t12, 0, coin.value)?;
             }
         }
         // Block 0's outputs are never coins (Bitcoin-family rule).
         if height == 0 {
             continue;
         }
+        let coinbase = tx.is_coinbase() || tx.is_coinstake();
         for (vout, out) in tx.outputs.iter().enumerate() {
             if is_unspendable(out.value, &out.script_pubkey) {
                 continue;
             }
-            let coin = Coin {
-                value: out.value,
-                height,
-                coinbase: tx.is_coinbase() || tx.is_coinstake(),
-                script: out.script_pubkey.clone(),
-            };
-            let sh = script_hash(&out.script_pubkey);
-            l.put(OUTPUTS, &k_out(c, &t12, vout as u32), &coin.encode())?;
+            let vout = vout as u32;
+            let sid = script_id(&out.script_pubkey);
+            l.put(OUTPUTS, &k_pos(c, b, p, vout), &encode_coin(out.value, height, coinbase, &out.script_pubkey))?;
             let mut v = out.value.to_le_bytes().to_vec();
             v.extend_from_slice(&height.to_le_bytes());
-            l.put(BY_SCRIPT, &k_by_script(c, &sh, &t12, vout as u32), &v)?;
-            add_hist(&l, c, &sh, height, &t12, out.value, 0)?;
+            l.put(BY_SCRIPT, &k_by_script(c, &sid, b, p, vout), &v)?;
+            add_hist(&l, c, &sid, height, &t12, out.value, 0)?;
         }
     }
 
     hrec.status = STATUS_MAIN;
     hrec.height = height;
-    l.put(HEADERS, &hk, &hrec.encode())?;
+    l.put(HEADERS, &k_header(c, &hash.0), &hrec.index_value())?;
     let mut hv = hash.0.to_vec();
     hv.extend_from_slice(&b.to_be_bytes());
     l.put(HEIGHT, &k_height(c, height), &hv)?;
@@ -630,8 +749,8 @@ fn settle_mempool(w: &WriteTxn, params: &ChainParams, tx: &Tx) -> Result<()> {
     Ok(())
 }
 
-fn add_hist(l: &Logged, c: u16, sh: &[u8; 32], height: u32, t12: &[u8; 12], recv: u64, spent: u64) -> Result<()> {
-    let k = k_hist(c, sh, height, t12);
+fn add_hist(l: &Logged, c: u16, sid: &[u8; 21], height: u32, t12: &[u8; 12], recv: u64, spent: u64) -> Result<()> {
+    let k = k_hist(c, sid, height, t12);
     let (r0, s0) = match l.get(SCRIPT_HIST, &k)? {
         Some(v) => (be_u64(&v, 0), be_u64(&v, 8)),
         None => (0, 0),
@@ -639,4 +758,25 @@ fn add_hist(l: &Logged, c: u16, sh: &[u8; 32], height: u32, t12: &[u8; 12], recv
     let mut v = (r0 + recv).to_be_bytes().to_vec();
     v.extend_from_slice(&(s0 + spent).to_be_bytes());
     l.put(SCRIPT_HIST, &k, &v)
+}
+
+#[cfg(test)]
+mod compress_tests {
+    use super::*;
+
+    #[test]
+    fn scripts_round_trip() {
+        let p2pkh = [&[0x76, 0xa9, 0x14][..], &[1; 20], &[0x88, 0xac]].concat();
+        let p2sh = [&[0xa9, 0x14][..], &[2; 20], &[0x87]].concat();
+        let p2pkc = [&[33, 0x02][..], &[3; 32], &[0xac]].concat();
+        let p2pku = [&[65, 0x04][..], &[4; 64], &[0xac]].concat();
+        for s in [&p2pkh, &p2sh, &p2pkc, &p2pku] {
+            let c = compress_script(s);
+            assert!(c.len() < s.len());
+            assert_eq!(&expand_script(&c, || unreachable!()).unwrap(), s);
+        }
+        let ms = vec![0x51, 0x21, 9, 9, 0xae];
+        assert_eq!(compress_script(&ms), vec![SCRIPT_IN_TX]);
+        assert_eq!(expand_script(&[SCRIPT_IN_TX], || Ok(ms.clone())).unwrap(), ms);
+    }
 }

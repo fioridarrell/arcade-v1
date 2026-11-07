@@ -143,7 +143,7 @@ pub fn call(node: &Node, method: &str, params: &[Value]) -> RpcResult {
             if param(2) != Value::Bool(false) && db.mempool_spender(c, &op).map_err(e)?.is_some() {
                 return Ok(Value::Null);
             }
-            match db.coin(c, &op).map_err(e)? {
+            match db.coin(p, &op).map_err(e)? {
                 None => Ok(Value::Null),
                 Some(coin) => Ok(json!({
                     "bestblock": tip.hash.to_hex(),

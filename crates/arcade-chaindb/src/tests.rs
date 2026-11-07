@@ -96,20 +96,20 @@ fn coins_spends_history_and_raw_reads() {
     assert_eq!(tip.height, 2);
 
     // Genesis outputs are not coins; OP_RETURN is never a coin.
-    assert!(f.db.coin(c, &OutPoint { txid: f.g.txs[0].txid, vout: 0 }).unwrap().is_none());
-    assert!(f.db.coin(c, &OutPoint { txid: cb1.txid, vout: 1 }).unwrap().is_none());
+    assert!(f.db.coin(f.p, &OutPoint { txid: f.g.txs[0].txid, vout: 0 }).unwrap().is_none());
+    assert!(f.db.coin(f.p, &OutPoint { txid: cb1.txid, vout: 1 }).unwrap().is_none());
     // cb1:0 was spent by `spend` (block 2's position 1, input 0).
-    assert!(f.db.coin(c, &OutPoint { txid: cb1.txid, vout: 0 }).unwrap().is_none());
-    let (_, p, vin) = f.db.spender(c, &OutPoint { txid: cb1.txid, vout: 0 }).unwrap().unwrap();
+    assert!(f.db.coin(f.p, &OutPoint { txid: cb1.txid, vout: 0 }).unwrap().is_none());
+    let (_, p, vin) = f.db.spender(f.p, &OutPoint { txid: cb1.txid, vout: 0 }).unwrap().unwrap();
     assert_eq!((p, vin), (1, 0));
     // Balances by address script.
     assert_eq!(f.db.balance_for_script(c, &p2pkh(1)).unwrap(), 1900);
     assert_eq!(f.db.balance_for_script(c, &p2pkh(2)).unwrap(), 3000);
-    assert_eq!(f.db.coins_for_script(c, &p2pkh(3)).unwrap().len(), 1);
+    assert_eq!(f.db.coins_for_script(f.p, &p2pkh(3)).unwrap().len(), 1);
     // History for address 1: received 5000 at h1; at h2 received 1900 and spent 5000.
-    let sh = script_hash(&p2pkh(1));
-    let hist = f.db.store.read(|r| r.scan_prefix(SCRIPT_HIST, &k_script(c, &sh))).unwrap();
+    let hist = f.db.history_for_script(c, &p2pkh(1)).unwrap();
     assert_eq!(hist.len(), 2);
+    assert_eq!((hist[1].2, hist[1].3), (1900, 5000), "h2: received change, spent the coinbase");
     // Raw reads rebuild exactly.
     assert_eq!(f.db.block_raw(c, &b2.hash()).unwrap().unwrap(), b2.encode());
     assert_eq!(f.db.tx_raw(f.p, &spend.txid).unwrap().unwrap().0, spend.raw);

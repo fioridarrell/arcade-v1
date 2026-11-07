@@ -47,6 +47,12 @@ pub fn sha256(data: &[u8]) -> [u8; 32] {
     Sha256::digest(data).into()
 }
 
+/// RIPEMD-160 of SHA-256: the hash inside P2PKH / P2SH addresses.
+pub fn hash160(data: &[u8]) -> [u8; 20] {
+    use ripemd::Digest as _;
+    ripemd::Ripemd160::digest(sha256(data)).into()
+}
+
 /// Double SHA-256, the hash used for txids, block ids and merkle trees.
 pub fn sha256d(data: &[u8]) -> Hash256 {
     Hash256(sha256(&sha256(data)))

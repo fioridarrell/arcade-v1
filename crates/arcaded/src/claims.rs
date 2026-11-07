@@ -85,13 +85,12 @@ fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     let c = p.chain_no;
     let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
     let mut out = Vec::new();
-    for (t12, vout, value, _h) in node.chain.coins_for_script(c, script).unwrap_or_default() {
-        for txid in node.chain.txids_by_t12(p, &t12).unwrap_or_default() {
-            let op = OutPoint { txid, vout };
+    for (op, value, _h) in node.chain.coins_for_script(p, script).unwrap_or_default() {
+        {
             if node.pending_spent.lock().unwrap().contains(&op) {
                 continue; // already spent by one of our unconfirmed transactions
             }
-            if let Ok(Some(coin)) = node.chain.coin(c, &op) {
+            if let Ok(Some(coin)) = node.chain.coin(p, &op) {
                 if coin.coinbase && coin.height + p.coinbase_maturity > tip {
                     continue; // immature
                 }
@@ -217,7 +216,7 @@ pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
     }
     // Forget coins the chain has since seen spent.
     let c = node.params.chain_no;
-    ps.retain(|op| node.chain.coin(c, op).ok().flatten().is_some());
+    ps.retain(|op| node.chain.coin(node.params, op).ok().flatten().is_some());
     for i in &tx.inputs {
         ps.insert(i.prevout);
     }
@@ -245,7 +244,7 @@ pub fn pending_tags(node: &Node) -> Vec<(String, String)> {
             .inputs
             .iter()
             .map(|i| {
-                if let Ok(Some(c)) = node.chain.coin(p.chain_no, &i.prevout) {
+                if let Ok(Some(c)) = node.chain.coin(p, &i.prevout) {
                     return Some(Prevout { value: c.value, script: c.script });
                 }
                 pool.iter()

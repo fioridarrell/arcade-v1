@@ -117,6 +117,9 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
                         MeshTip {
                             height: t["h"].as_u64().unwrap_or(0),
                             names_digest: t["n"].as_str().map(String::from),
+                            at: t["at"].as_u64().unwrap_or(0),
+                            d: t["d"].as_str().map(String::from),
+                            s: t["s"].as_str().map(String::from),
                             from: link.peer_id.clone(),
                         },
                     );

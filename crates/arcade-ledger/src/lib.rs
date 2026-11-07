@@ -2,8 +2,11 @@
 //! extraction and @tags. See docs/compat/SPEC.md §4.
 
 pub mod address;
+pub mod collections;
 pub mod digidollar;
+pub mod engine;
 pub mod extract;
 pub mod index;
+pub mod payload;
 pub mod script;
 pub mod tags;

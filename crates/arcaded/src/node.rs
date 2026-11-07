@@ -13,6 +13,10 @@ use std::sync::Mutex;
 pub struct MeshTip {
     pub height: u64,
     pub names_digest: Option<String>,
+    /// Index checkpoint and its range digest, and the consensus hash, as the peer reports them.
+    pub at: u64,
+    pub d: Option<String>,
+    pub s: Option<String>,
     #[allow(dead_code)]
     pub from: String,
 }

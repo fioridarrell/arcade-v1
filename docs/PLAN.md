@@ -11,7 +11,7 @@ Arcade V1.0 is a from-scratch rebuild of Dogecoin Arcade, in Rust, for Linux PCs
 | 2. Coins, spends, undo, reorgs | done | unit tests; **full testnet synced**: 1,561,536 blocks, 1.63 M txs, 4.56 M coins in 47 min |
 | 3. Mesh client (existing protocol) | link done | linked with live Python arcades on `arcade-main`; live welcome record signature verifies |
 | 4. Bootstraps | mesh-first done | empty node bootstrapped from another V1.0 arcade over the mesh (~1,600 blocks/s), P2P fallback |
-| 5. Ledger port | tags done | **names_digest matches the live mesh** (static at 1,561,536 and live as a new tag landed); INSC/ord/tokens next |
+| 5. Ledger port | **done** | full arcade ledger (tokens, MetaDEx, INSC NFTs, swaps, bundles, offers, asks, tags) in-commit; **d, s and n all equal the 3 live arcades** over 1,496,133-1,561,500; 6,988 inscriptions numbered identically; 119 profiles indexed |
 | 6. Wallet + faucet + tag claim | **done live** | `@arcade_v1` claimed at testnet block 1,561,561 (0-conf spend of a faucet payment); old arcade 156.67.28.112 reports the same names_digest (2523f1e8...) |
 | 6b. Testnet mining | **done live** | mined block 1,561,560 without Core; difficulty rule matches all 1,561,557 testnet blocks |
 | 7. arcaded + CLI | running | linked to 3 live arcades, synced at tip, serves coreshare `cr` (borrower test OK) and `bk` |

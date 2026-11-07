@@ -4,7 +4,7 @@
 
 use crate::node::Node;
 
-pub const INDEXES: &[&str] = &["tags.v1", "profiles.v1"];
+pub const INDEXES: &[&str] = &["ledger.v1", "profiles.v1"];
 
 /// Backfill lagging indexes a batch at a time. Returns blocks processed.
 pub fn catch_up(node: &Node) -> Result<u32, String> {

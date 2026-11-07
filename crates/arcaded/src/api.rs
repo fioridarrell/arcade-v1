@@ -44,7 +44,7 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             use arcade_ledger::index;
             let tag_count = index::read_tags(&node.chain, c).map(|t| t.len()).unwrap_or(0);
             let digest = index::names_digest(&node.chain, c).unwrap_or_default();
-            let indexed_to = node.chain.indexed_to(c, "tags.v1").ok().flatten();
+            let indexed_to = node.chain.indexed_to(c, "ledger.v1").ok().flatten();
             let tips = node.mesh_tips.lock().unwrap();
             let mesh: Vec<Value> = tips
                 .iter()
@@ -120,6 +120,39 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 "hashes": h,
                 "hash_rate": if secs > 0.0 { (h as f64 / secs).round() } else { 0.0 },
                 "found": node.miner.found.load(Ordering::Relaxed),
+            }))
+        }
+        "ledger" => {
+            // Our ledger fingerprints next to what the existing arcades report.
+            use arcade_ledger::engine;
+            let floor = engine::gates(p).activation;
+            let ours_h = node.chain.indexed_to(c, "ledger.v1").ok().flatten().unwrap_or(0);
+            let tips = node.mesh_tips.lock().unwrap().clone();
+            let mut peers = Vec::new();
+            for (addr, t) in &tips {
+                let mut v = json!({"peer": addr, "height": t.height, "at": t.at});
+                if let Some(d) = &t.d {
+                    if t.at as u32 >= floor && t.at as u32 <= ours_h.saturating_sub(6) {
+                        let ours = engine::range_digest(&node.chain, c, floor, t.at as u32).unwrap_or_default();
+                        v["d_match"] = json!(ours == *d);
+                        v["d_ours"] = json!(ours);
+                        v["d_theirs"] = json!(d);
+                    }
+                }
+                if let Some(sv) = &t.s {
+                    v["s_theirs"] = json!(sv);
+                    v["s_same_height"] = json!(t.height as u32 == ours_h);
+                }
+                peers.push(v);
+            }
+            let h = s("height").and_then(|x| x.parse::<u32>().ok());
+            Ok(json!({
+                "indexed_to": ours_h,
+                "checkpoint": engine::checkpoint(ours_h, floor),
+                "consensus_hash": engine::consensus_hash(&node.chain, c).unwrap_or_default(),
+                "names_digest": arcade_ledger::index::names_digest(&node.chain, c).unwrap_or_default(),
+                "peers": peers,
+                "block": h.map(|h| json!({"height": h, "digest": engine::block_digest(&node.chain, c, h).ok().flatten(), "rows": engine::block_records(&node.chain, c, h).unwrap_or_default()})),
             }))
         }
         "profile" => {

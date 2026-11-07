@@ -121,3 +121,20 @@ tip {nets:{net:{h,at,d,s,n}}}; q {t:"ix",op:"q",id,net,what:"d",lo,hi} → {op:"
 - 1513150 digest 0d4ed8bdb9d595afea6a9b5113a147f83b7e0cd3a8fd09b8789a3542af7cc6e9 (take; take_trade tokens 60000000000 coins 600000000).
 - 1529099 digest 2298037cf45949c7a72fc58cfb7310e0411f028428829ae469714e311c77db17 (pair trade 26 for 71).
 - Counts (valid/invalid): 0 3245/5, 25 69/0, 26 1/0, 27 4/6, 29 107/0, 50 16/0, 54 102/0, 55 3179/0, 56 2/0, 70 6/0, 200 31877/2069.
+
+## 11. Follow-ups (2026-11-07)
+- **Property digest uses the CURRENT issuer** (rows are read live; type 70 changes the creation block's digest). Latent old-arcade
+  bug: long-running nodes cache settled digests. Today every property's issuer equals its creator on every chain (testnet 70s are
+  out-and-back pairs on property 10), so current issuer == creator in practice. V1.0 uses the current issuer (matches a fresh old arcade).
+- **_fills_for** (swap give TOKEN / take COINS, from fills_from 1,496,133): rows = seller's book orders sale=pid, want=0, reserved>0,
+  sorted by (Fraction(want,sale), height, position, txid). Named (from named_fills_from): only that txid; price check
+  take*sale < want*give → none; taken = min(give, reserved, sale) > 0 → [(row, taken, want*taken//sale)]; else none (swap stands).
+  Unnamed: need = give - seller free balance; for rows: need<=0 stop; price check fails → skip; taken = min(need, reserved, sale) > 0;
+  append (row, taken, want*taken//sale); need -= taken.
+- **_bid_fills_for** (named only, from bid_fills_from): row = book txid=named, address=buyer, sale=0, want=pid; none → []; take*want > sale*give
+  → []; taken = min(give, want) > 0; spent = ceil(sale*taken/want) capped at sale. _reduce_bid: left = want - taken <= 0 → delete; else
+  want = left, sale = max(1, sale - spent).
+- **joins_collection**: already (creator, collection, edition) or (edition NULL and name) → no; supply = _declared_supply (the FILED #1's
+  json collection_details().supply, int > 0, else 0); no supply → yes; edition > supply → no; COUNT(creator, collection) < supply.
+- **collection_details.supply**: first of collection.supply, collection.total, collection.count, supply, total, count that is a non-bool
+  int in 1..10,000,000.

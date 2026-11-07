@@ -56,7 +56,7 @@ fn main() {
 
     let app = arcade_app::AppDb::open(&home).expect("open arcade.mdbx");
     let chain = arcade_chaindb::ChainDb::open(home.join("chain.mdbx")).expect("open chain.mdbx");
-    chain.add_indexer(Arc::new(arcade_ledger::index::TagIndexer)).expect("tag index");
+    chain.add_indexer(Arc::new(arcade_ledger::engine::LedgerIndexer)).expect("ledger index");
     chain.add_indexer(Arc::new(arcade_ledger::index::ProfileIndexer)).expect("profile index");
     let identity = app.node_identity().expect("node identity");
     let node = Arc::new(Node {
@@ -99,7 +99,10 @@ fn main() {
         std::thread::Builder::new()
             .name("claims".into())
             .spawn(move || loop {
-                let _ = ledger::catch_up(&n);
+                if let Err(e) = ledger::catch_up(&n) {
+                    let _ = n.app.event("index", &format!("index catch-up stopped: {e}"));
+                    *n.sync_state.lock().unwrap() = format!("index stopped: {e}");
+                }
                 claims::advance_all(&n);
                 faucet::pay_asks(&n);
                 std::thread::sleep(std::time::Duration::from_secs(15));

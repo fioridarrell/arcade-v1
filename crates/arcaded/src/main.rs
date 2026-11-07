@@ -69,6 +69,9 @@ fn main() {
         bk_peers: Mutex::new(Default::default()),
         mesh_port,
         mesh_bootstrap: !args.iter().any(|a| a == "--p2p-only"),
+        asks: Mutex::new(Default::default()),
+        asks_done: Mutex::new(Default::default()),
+        pending_spent: Mutex::new(Default::default()),
     });
     let _ = node.app.event("service", "arcaded started");
     eprintln!(
@@ -90,6 +93,7 @@ fn main() {
             .spawn(move || loop {
                 let _ = ledger::catch_up(&n);
                 claims::advance_all(&n);
+                faucet::pay_asks(&n);
                 std::thread::sleep(std::time::Duration::from_secs(15));
             })
             .unwrap();

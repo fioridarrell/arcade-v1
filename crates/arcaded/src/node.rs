@@ -47,6 +47,12 @@ pub struct Node {
     pub mesh_port: Option<u16>,
     /// Set false to skip mesh bootstrap (P2P only).
     pub mesh_bootstrap: bool,
+    /// Welcome asks seen on the mesh: asker arcade id -> latest ask record.
+    pub asks: Mutex<BTreeMap<String, Value>>,
+    /// Coins spent by our own transactions that are not in a block yet.
+    pub pending_spent: Mutex<std::collections::HashSet<arcade_chain::OutPoint>>,
+    /// Asker ids someone has already paid (a `sent` or `closed` record was seen).
+    pub asks_done: Mutex<std::collections::BTreeSet<String>>,
 }
 
 #[derive(Default)]

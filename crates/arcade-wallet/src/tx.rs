@@ -179,6 +179,44 @@ pub fn build_claim(
     Ok(sign_p2pkh(p, &chosen, &outs, key, time))
 }
 
+/// Pay `amount` to `to_script` from coins of `key`'s P2PKH address, change back to it.
+pub fn build_send(
+    p: &ChainParams,
+    to_script: &[u8],
+    amount: u64,
+    key: &SecretKey,
+    coins: &[Utxo],
+    fee_per_kb: u64,
+    dust: u64,
+    time: u32,
+) -> Result<Tx, BuildError> {
+    let pk = PublicKey::from_secret_key(SECP256K1, key);
+    let change_script =
+        arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
+    let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
+    sorted.sort_by(|a, b| b.value.cmp(&a.value));
+    let fee_for = |n_in: usize| (estimate_size(n_in, &[to_script.len(), 25]) as u64 * fee_per_kb).div_ceil(1000);
+    let mut chosen: Vec<Utxo> = Vec::new();
+    let mut have = 0u64;
+    for u in sorted {
+        chosen.push(u.clone());
+        have += u.value;
+        if have >= amount + fee_for(chosen.len()) {
+            break;
+        }
+    }
+    let fee = fee_for(chosen.len().max(1));
+    if chosen.is_empty() || have < amount + fee {
+        return Err(BuildError::InsufficientFunds { have, need: amount + fee });
+    }
+    let mut outs = vec![TxOutSpec { value: amount, script: to_script.to_vec() }];
+    let change = have - amount - fee;
+    if change >= dust {
+        outs.push(TxOutSpec { value: change, script: change_script });
+    }
+    Ok(sign_p2pkh(p, &chosen, &outs, key, time))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +264,21 @@ mod tests {
         let tx = build_claim(p, &tags::claim_payload("abc"), &k, &coins, 10_000, 100_000, 1792790000).unwrap();
         assert_eq!(tx.time, Some(1792790000));
         assert!(verify_p2pkh_input(p, &tx, &coins, 0));
+    }
+
+    #[test]
+    fn send_pays_and_changes() {
+        let p = &PEPECOIN_TEST;
+        let k = key();
+        let me = crate::keys::p2pkh_script_for(&PublicKey::from_secret_key(SECP256K1, &k));
+        let to = arcade_ledger::address::p2pkh_script(&[3; 20]);
+        let coins = vec![Utxo { outpoint: OutPoint { txid: Hash256([5; 32]), vout: 0 }, value: 500_000_000, script: me.clone() }];
+        let tx = build_send(p, &to, 100_000_000, &k, &coins, 1_000_000, 1_000_000, 0).unwrap();
+        assert!(verify_p2pkh_input(p, &tx, &coins, 0));
+        assert_eq!(tx.outputs[0].value, 100_000_000);
+        assert_eq!(tx.outputs[0].script_pubkey, to);
+        assert_eq!(tx.outputs[1].script_pubkey, me);
+        assert!(build_send(p, &to, 600_000_000, &k, &coins, 1_000_000, 1_000_000, 0).is_err());
     }
 
     #[test]

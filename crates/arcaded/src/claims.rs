@@ -37,6 +37,10 @@ pub fn check(node: &Node, tag: &str) -> Check {
 }
 
 /// Spendable coins of a tag key's address.
+pub fn spendable(node: &Node, script: &[u8]) -> Vec<Utxo> {
+    coins(node, script)
+}
+
 fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     let p = node.params;
     let c = p.chain_no;
@@ -45,6 +49,9 @@ fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     for (t12, vout, value, _h) in node.chain.coins_for_script(c, script).unwrap_or_default() {
         for txid in node.chain.txids_by_t12(p, &t12).unwrap_or_default() {
             let op = OutPoint { txid, vout };
+            if node.pending_spent.lock().unwrap().contains(&op) {
+                continue; // already spent by one of our unconfirmed transactions
+            }
             if let Ok(Some(coin)) = node.chain.coin(c, &op) {
                 if coin.coinbase && coin.height + p.coinbase_maturity > tip {
                     continue; // immature
@@ -107,6 +114,7 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
             let have = coins(node, &script);
             match build_claim(p, &tags::claim_payload(&c.tag), &sk, &have, FEE_PER_KB, DUST, arcade_app::now() as u32) {
                 Ok(tx) => {
+                    crate::claims::mark_spent(node, &tx);
                     node.tx_outbox.lock().unwrap().push(tx.raw.clone());
                     c.txid = Some(tx.txid.to_hex());
                     set(&mut c, ClaimStatus::Sent, "claim sent; waiting for a block");
@@ -158,5 +166,19 @@ pub fn advance_all(node: &Node) {
         if !matches!(c.status, ClaimStatus::Confirmed | ClaimStatus::Failed) {
             let _ = advance_one(node, c);
         }
+    }
+}
+
+/// Remember the coins a transaction we just built spends, until a block settles them.
+pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
+    let mut ps = node.pending_spent.lock().unwrap();
+    for i in &tx.inputs {
+        ps.insert(i.prevout);
+    }
+    // Forget coins the chain has since seen spent.
+    let c = node.params.chain_no;
+    ps.retain(|op| node.chain.coin(c, op).ok().flatten().is_some());
+    for i in &tx.inputs {
+        ps.insert(i.prevout);
     }
 }

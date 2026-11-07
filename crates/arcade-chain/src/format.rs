@@ -18,8 +18,10 @@ pub struct Format {
     /// Block id is scrypt(header) for header versions below this, sha256d above (Kotia: 7).
     /// 0 = always sha256d.
     pub scrypt_id_below_version: i32,
-    /// SegWit serialization can appear.
+    /// SegWit serialization can appear (ask peers for witness blocks).
     pub segwit: bool,
+    /// Litecoin MWEB: ask peers for blocks with the extension block.
+    pub mweb: bool,
 }
 
 impl Format {
@@ -30,7 +32,10 @@ impl Format {
         block_sig: false,
         scrypt_id_below_version: 0,
         segwit: true,
+        mweb: false,
     };
+    /// Litecoin: SegWit plus the MWEB extension block.
+    pub const LITECOIN: Format = Format { mweb: true, ..Format::BITCOIN };
     /// Dogecoin-family: AuxPoW, no SegWit.
     pub const AUXPOW: Format = Format { auxpow: true, segwit: false, ..Format::BITCOIN };
     /// Blackcoin/PPCoin-style proof of stake (Kotia).
@@ -40,6 +45,7 @@ impl Format {
         block_sig: true,
         scrypt_id_below_version: 7,
         segwit: false,
+        mweb: false,
     };
 
     /// The block id of a header on this chain.
@@ -53,6 +59,24 @@ impl Format {
 
     pub fn has_auxpow(&self, h: &Header) -> bool {
         self.auxpow && h.is_auxpow()
+    }
+}
+
+/// getdata inventory flags (BIP144; Litecoin LIP-0006).
+pub const MSG_WITNESS_FLAG: u32 = 1 << 30;
+pub const MSG_MWEB_FLAG: u32 = 1 << 29;
+
+impl Format {
+    /// Inventory type to request full blocks exactly as mined.
+    pub fn block_inv(&self) -> u32 {
+        let mut t = 2; // MSG_BLOCK
+        if self.segwit {
+            t |= MSG_WITNESS_FLAG;
+        }
+        if self.mweb {
+            t |= MSG_MWEB_FLAG;
+        }
+        t
     }
 }
 

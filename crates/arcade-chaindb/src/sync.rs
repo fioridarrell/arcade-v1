@@ -147,7 +147,8 @@ impl<'a> Syncer<'a> {
                 status: STATUS_HEADER,
                 work: ChainDb::child_work(&parent, e.header.bits),
                 header: e.header,
-                auxpow: e.auxpow.map(|a| a.raw).unwrap_or_default(),
+                // Checked above; the proof is kept once, with the block (block_meta).
+                auxpow: Vec::new(),
             };
             pending.insert(hash, rec.clone());
             batch.push((hash, rec));

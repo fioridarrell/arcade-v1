@@ -252,7 +252,7 @@ impl Peer {
 
     /// Request blocks; returns raw block bytes in the order received.
     pub fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>> {
-        self.send("getdata", &getdata_payload(MSG_BLOCK, hashes))?;
+        self.send("getdata", &getdata_payload(self.format.block_inv(), hashes))?;
         let mut out = Vec::with_capacity(hashes.len());
         while out.len() < hashes.len() {
             let m = self.recv()?;

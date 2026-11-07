@@ -234,6 +234,24 @@ impl Store {
         Ok(out)
     }
 
+    /// (table, entries, bytes on disk) for every declared and add-on table.
+    pub fn table_sizes(&self) -> Result<Vec<(String, u64, u64)>> {
+        let txn = self.db.begin_ro_txn()?;
+        let mut names: Vec<String> = self.schema.tables.iter().map(|t| t.name.to_string()).collect();
+        names.extend(self.addon_tables()?);
+        let mut out = Vec::new();
+        for n in names {
+            let Ok(t) = txn.open_table(Some(&n)) else { continue };
+            let st = txn.table_stat(&t)?;
+            let pages = st.leaf_pages() + st.branch_pages() + st.overflow_pages();
+            if std::env::var_os("ARCADE_STAT_DEBUG").is_some() {
+                eprintln!("{n}: page {} depth {} leaf {} branch {} overflow {}", st.page_size(), st.depth(), st.leaf_pages(), st.branch_pages(), st.overflow_pages());
+            }
+            out.push((n, st.entries() as u64, pages as u64 * st.page_size() as u64));
+        }
+        Ok(out)
+    }
+
     /// Number of entries in a table.
     pub fn count(&self, table: &str) -> Result<u64> {
         self.read(|r| {

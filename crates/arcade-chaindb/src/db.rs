@@ -26,7 +26,7 @@ pub struct HeaderRec {
     /// Total chain work up to and including this header.
     pub work: U256,
     pub header: Header,
-    /// Raw AuxPoW bytes (merge-mined chains), empty otherwise.
+    /// Unused (kept empty): AuxPoW proofs live once, with the block, in block_meta.
     pub auxpow: Vec<u8>,
 }
 
@@ -405,7 +405,7 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
                 None => work_from_bits(blk.header.bits),
             },
             header: blk.header,
-            auxpow: blk.auxpow.as_ref().map(|a| a.raw.clone()).unwrap_or_default(),
+            auxpow: Vec::new(), // stored once, in block_meta
         },
     };
     let new_block = hrec.b == 0;

@@ -45,6 +45,38 @@ pub fn spendable(node: &Node, script: &[u8]) -> Vec<Utxo> {
 }
 
 fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
+    let mut out = confirmed_coins(node, script);
+    out.extend(unconfirmed_coins(node, script));
+    out
+}
+
+/// Outputs of pooled (unconfirmed) transactions paying `script`, not already spent by
+/// another pooled transaction or by one of ours. Spending them is valid: parent and child
+/// confirm together (Core accepts chains of unconfirmed transactions).
+fn unconfirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
+    let p = node.params;
+    let c = p.chain_no;
+    let mut out = Vec::new();
+    for (_, raw) in node.chain.mempool(c).unwrap_or_default() {
+        let Ok(tx) = arcade_chain::Tx::parse_with(&raw, &p.format) else { continue };
+        for (vout, o) in tx.outputs.iter().enumerate() {
+            if o.script_pubkey != script {
+                continue;
+            }
+            let op = OutPoint { txid: tx.txid, vout: vout as u32 };
+            if node.pending_spent.lock().unwrap().contains(&op) {
+                continue;
+            }
+            if node.chain.mempool_spender(c, &op).ok().flatten().is_some() {
+                continue;
+            }
+            out.push(Utxo { outpoint: op, value: o.value, script: script.to_vec() });
+        }
+    }
+    out
+}
+
+fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     let p = node.params;
     let c = p.chain_no;
     let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
@@ -174,6 +206,7 @@ pub fn advance_all(node: &Node) {
 
 /// Remember the coins a transaction we just built spends, until a block settles them.
 pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
+    let _ = node.chain.mempool_add(node.params, tx, arcade_app::now());
     let mut ps = node.pending_spent.lock().unwrap();
     for i in &tx.inputs {
         ps.insert(i.prevout);

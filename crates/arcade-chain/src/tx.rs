@@ -42,7 +42,12 @@ pub struct Tx {
     pub txid: Hash256,
     /// Exact bytes as on the wire (including any witness).
     pub raw: Vec<u8>,
+    /// Litecoin's HogEx (integration tx for the MWEB extension block).
+    pub hogex: bool,
 }
+
+pub const FLAG_WITNESS: u8 = 0x01;
+pub const FLAG_MWEB: u8 = 0x08;
 
 impl Tx {
     pub fn is_coinbase(&self) -> bool {
@@ -85,11 +90,17 @@ impl Tx {
         let version = r.i32()?;
         let time = if fmt.tx_time { Some(r.u32()?) } else { None };
 
-        // SegWit marker: 0x00 then flag 0x01 where the input count would be.
-        let segwit = fmt.segwit && r.peek(2).map(|b| b[0] == 0 && b[1] == 1).unwrap_or(false);
-        if segwit {
-            r.bytes(2)?;
+        // Extended serialization: marker 0x00 then a flags byte where the input count would
+        // be. Flag 0x01 = witness; 0x08 = Litecoin MWEB part (after the witnesses).
+        let flags = if fmt.segwit && r.peek(2).map(|b| b[0] == 0 && b[1] != 0).unwrap_or(false) {
+            r.bytes(2)?[1]
+        } else {
+            0
+        };
+        if flags & !(FLAG_WITNESS | FLAG_MWEB) != 0 {
+            return Err(DecodeError::Invalid("unknown transaction flags"));
         }
+        let segwit = flags != 0;
 
         let n_in = r.len()?;
         let mut inputs = Vec::with_capacity(n_in.min(10_000));
@@ -113,12 +124,21 @@ impl Tx {
             outputs.push(TxOut { value, script_pubkey });
         }
         let after_outputs = r.pos();
-        if segwit {
+        if flags & FLAG_WITNESS != 0 {
             for inp in inputs.iter_mut() {
                 let n = r.len()?;
                 for _ in 0..n {
                     inp.witness.push(r.var_bytes()?.to_vec());
                 }
+            }
+        }
+        // MWEB: one optional part; 00 = none (the HogEx). A real MWEB part is not read
+        // (the arcade treats such a tx as unreadable too).
+        let mut hogex = false;
+        if flags & FLAG_MWEB != 0 {
+            match r.u8()? {
+                0 => hogex = true,
+                _ => return Err(DecodeError::Invalid("transaction carries an MWEB part")),
             }
         }
         let witness_end = r.pos();
@@ -137,7 +157,7 @@ impl Tx {
             sha256d(&raw)
         };
 
-        Ok(Tx { version, time, inputs, outputs, lock_time, txid, raw })
+        Ok(Tx { version, time, inputs, outputs, lock_time, txid, raw, hogex })
     }
 
     /// Serialize without witness (used by tests and tx building).
@@ -219,6 +239,27 @@ mod tests {
         assert_eq!(tx.encode_legacy(), raw);
         // Read as a Bitcoin tx it must not silently succeed with the same id.
         assert!(Tx::parse(&raw).map(|t| t.txid != tx.txid).unwrap_or(true));
+    }
+
+    #[test]
+    fn mweb_hogex_flag() {
+        let legacy = Tx::parse(&hex::decode(GENESIS_TX).unwrap()).unwrap();
+        let body_end = legacy.raw.len() - 4;
+        let mut hx = legacy.raw[..4].to_vec();
+        hx.extend_from_slice(&[0x00, 0x08]);
+        hx.extend_from_slice(&legacy.raw[4..body_end]);
+        hx.push(0x00); // empty MWEB part: this is the HogEx
+        hx.extend_from_slice(&legacy.raw[body_end..]);
+        let tx = Tx::parse(&hx).unwrap();
+        assert!(tx.hogex);
+        assert_eq!(tx.txid, legacy.txid);
+        let mut real = hx.clone();
+        let at = real.len() - 5;
+        real[at] = 0x01;
+        assert!(Tx::parse(&real).is_err(), "a real MWEB part is refused");
+        let mut bad = hx.clone();
+        bad[5] = 0x02;
+        assert!(Tx::parse(&bad).is_err(), "unknown flags are refused");
     }
 
     #[test]

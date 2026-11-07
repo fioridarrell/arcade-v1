@@ -22,6 +22,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcade-app"
+version = "0.1.0"
+dependencies = [
+ "arcade-store",
+ "arcade-wallet",
+ "chacha20poly1305",
+ "ed25519-dalek",
+ "hex",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "arcade-chain"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,18 @@
+[package]
+name = "arcade-app"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arcade-store = { version = "0.1.0", path = "../arcade-store" }
+arcade-wallet = { version = "0.1.0", path = "../arcade-wallet" }
+chacha20poly1305 = "0.11.0"
+ed25519-dalek = "2"
+hex = "0.4.3"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

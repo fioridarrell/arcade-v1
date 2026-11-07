@@ -32,6 +32,9 @@ pub type Result<T> = std::result::Result<T, SyncError>;
 pub struct Syncer<'a> {
     pub db: &'a ChainDb,
     pub params: &'static ChainParams,
+    /// Remaining path to the best header, cached between rounds (walking 1.5M headers
+    /// back every round would be quadratic). Valid while its first entry extends the tip.
+    path: std::cell::RefCell<(Hash256, Vec<Hash256>)>,
 }
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -43,7 +46,7 @@ pub struct Progress {
 
 impl<'a> Syncer<'a> {
     pub fn new(db: &'a ChainDb, params: &'static ChainParams) -> Self {
-        Syncer { db, params }
+        Syncer { db, params, path: Default::default() }
     }
 
     fn c(&self) -> u16 {
@@ -159,7 +162,25 @@ impl<'a> Syncer<'a> {
     /// Hashes from just above the fork point up to the best header, and the fork height.
     fn path_to_best(&self) -> Result<(u32, Vec<Hash256>)> {
         let c = self.c();
-        let Some(mut h) = self.db.best_header(c)? else { return Ok((0, vec![])) };
+        let Some(best) = self.db.best_header(c)? else { return Ok((0, vec![])) };
+        if let Some(tip) = self.db.tip(c)? {
+            let cached = self.path.borrow();
+            if cached.0 == best {
+                if let Some(first) = cached.1.first() {
+                    if self.db.header(c, first)?.map(|r| r.header.prev) == Some(tip.hash) {
+                        return Ok((tip.height, cached.1.clone()));
+                    }
+                }
+            }
+        }
+        let (fork, path) = self.walk_to_best(best)?;
+        *self.path.borrow_mut() = (best, path.clone());
+        Ok((fork, path))
+    }
+
+    fn walk_to_best(&self, best: Hash256) -> Result<(u32, Vec<Hash256>)> {
+        let c = self.c();
+        let mut h = best;
         let mut path = Vec::new();
         loop {
             let rec = self.db.header(c, &h)?.expect("best chain headers are stored");
@@ -219,6 +240,10 @@ impl<'a> Syncer<'a> {
             }
             self.db.connect_blocks(self.params, &blocks)?;
             prog.blocks += blocks.len() as u32;
+            // Drop what we connected from the cached path.
+            let mut cached = self.path.borrow_mut();
+            let n = blocks.len().min(cached.1.len());
+            cached.1.drain(..n);
         }
         Ok(prog)
     }

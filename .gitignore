@@ -1,3 +1,4 @@
 target/
 *.mdbx
 *.mdbx-lck
+var/

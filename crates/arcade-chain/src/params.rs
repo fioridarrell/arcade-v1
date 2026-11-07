@@ -335,8 +335,103 @@ pub static KOTIA_MAIN: ChainParams = ChainParams {
     index_start: 1_530_000,
 };
 
+/// Flopcoin: a Dogecoin 1.14 fork. AuxPoW required from 110,000 (chain id 0xA3, strict).
+pub static FLOPCOIN_MAIN: ChainParams = ChainParams {
+    key: "flop",
+    chain_no: 6,
+    name: "Flopcoin",
+    magic: [0xfa, 0xbf, 0xb5, 0xda], // since the v2.0.0.0 fork at 125,000 (was c0c0c0c0)
+    p2p_port: 32552,
+    genesis: "1f1037762db00882d3353b8d9dcfd52fc93cbc2d694c62f1ecd6a209cf9d30d0",
+    genesis_header: "0100000000000000000000000000000000000000000000000000000000000000000000006159e26e6bcfbb78b4308944c811ef090579427d0fc0a3788a70e241974546d677e15167f0ff0f1e089b0000",
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: Some(0xa3),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: None,
+    p2pkh_version: 35,
+    p2sh_version: 22,
+    wif_version: 158,
+    bip44_coin_type: 3,
+    protocol_version: 70016,
+    dns_seeds: &["seed.flopcoin.net", "seed2.flopcoin.net"],
+    fixed_peers: &["216.45.61.204:32552"],
+    checkpoints: &[],
+    coinbase_maturity: 240,
+    index_start: 914_000,
+};
+
+/// Litecoin: scrypt, SegWit, Taproot, MWEB (extension block after the HogEx tx).
+pub static LITECOIN_MAIN: ChainParams = ChainParams {
+    key: "ltc",
+    chain_no: 7,
+    name: "Litecoin",
+    magic: [0xfb, 0xc0, 0xb6, 0xdb],
+    p2p_port: 9333,
+    genesis: "12a765e31ffd4059bada1e25190f6e98c99d9714d334efa41a195a7e7e04bfe2",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000d9ced4ed1130f7b7faad9be25323ffafa33232a17c3edf6cfd97bee6bafbdd97b9aa8e4ef0ff0f1ecd513f7c",
+    format: Format::BITCOIN,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: None,
+    auxpow_strict_chain_id: false,
+    bech32_hrp: Some("ltc"),
+    p2pkh_version: 48,
+    p2sh_version: 50, // legacy 5 ("3...") also decodes
+    wif_version: 176,
+    bip44_coin_type: 3,
+    protocol_version: 70017,
+    dns_seeds: &["seed-a.litecoin.loshan.co.uk", "dnsseed.thrasher.io", "dnsseed.ltcpool.org", "dnsseed.koin-project.com"],
+    fixed_peers: &[],
+    checkpoints: &[],
+    coinbase_maturity: 100,
+    index_start: 3_197_300,
+};
+
+pub static LITECOIN_TEST: ChainParams = ChainParams {
+    key: "ltctest",
+    chain_no: 8,
+    name: "Litecoin testnet4",
+    magic: [0xfd, 0xd2, 0xc8, 0xf1],
+    p2p_port: 19335,
+    genesis: "4966625a4b2851d9fdee139e56211a0d88575f59ed816ff5e6a63deb4e3e29a0",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000d9ced4ed1130f7b7faad9be25323ffafa33232a17c3edf6cfd97bee6bafbdd97f60ba158f0ff0f1ee1790400",
+    format: Format::BITCOIN,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: true,
+    auxpow_chain_id: None,
+    auxpow_strict_chain_id: false,
+    bech32_hrp: Some("tltc"),
+    p2pkh_version: 111,
+    p2sh_version: 58, // legacy 196 ("2...") also decodes
+    wif_version: 239,
+    bip44_coin_type: 1,
+    protocol_version: 70017,
+    dns_seeds: &["seed-b.litecoin.loshan.co.uk", "dnsseed-testnet.thrasher.io"],
+    fixed_peers: &[],
+    checkpoints: &[],
+    coinbase_maturity: 100,
+    index_start: 4_926_300,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
-    &[&PEPECOIN_TEST, &PEPECOIN_MAIN, &DIGIBYTE_MAIN, &DIGIBYTE_TEST, &KOTIA_MAIN];
+    &[
+        &PEPECOIN_TEST,
+        &PEPECOIN_MAIN,
+        &DIGIBYTE_MAIN,
+        &DIGIBYTE_TEST,
+        &KOTIA_MAIN,
+        &FLOPCOIN_MAIN,
+        &LITECOIN_MAIN,
+        &LITECOIN_TEST,
+    ];
 
 pub fn by_key(key: &str) -> Option<&'static ChainParams> {
     ALL_CHAINS.iter().copied().find(|p| p.key == key)

@@ -1,0 +1,14 @@
+[package]
+name = "arcade-chaindb"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arcade-chain = { version = "0.1.0", path = "../arcade-chain" }
+arcade-store = { version = "0.1.0", path = "../arcade-store" }
+hex = "0.4.3"
+thiserror = "1"
+
+[dev-dependencies]
+tempfile = "3.27.0"

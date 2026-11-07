@@ -211,6 +211,9 @@ impl Peer {
     }
 
     pub fn send(&mut self, command: &str, payload: &[u8]) -> Result<()> {
+        if std::env::var_os("ARCADE_P2P_DEBUG").is_some() {
+            eprintln!("-> {} ({} bytes)", command, payload.len());
+        }
         self.stream.write_all(&encode_message(self.magic, command, payload))?;
         Ok(())
     }
@@ -219,6 +222,10 @@ impl Peer {
     pub fn recv(&mut self) -> Result<Message> {
         loop {
             let m = read_message(&mut self.stream, self.magic)?;
+            if std::env::var_os("ARCADE_P2P_DEBUG").is_some() {
+                eprintln!("<- {} ({} bytes) {}", m.command, m.payload.len(),
+                    if m.command == "reject" { String::from_utf8_lossy(&m.payload).into_owned() } else { String::new() });
+            }
             if m.command == "ping" {
                 self.send("pong", &m.payload)?;
                 continue;

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/arcade-store", "crates/arcade-chain"]
+members = ["crates/arcade-store", "crates/arcade-chain", "crates/arcade-chaindb"]
 
 [workspace.package]
 version = "0.1.0"

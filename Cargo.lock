@@ -23,6 +23,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcade-chaindb"
+version = "0.1.0"
+dependencies = [
+ "arcade-chain",
+ "arcade-store",
+ "hex",
+ "tempfile",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "arcade-store"
 version = "0.1.0"
 dependencies = [

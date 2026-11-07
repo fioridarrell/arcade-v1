@@ -18,6 +18,8 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade faucet                  ask the mesh for test coins
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
+  arcade mine start [threads]    mine Pepecoin testnet on this PC (pays your wallet)
+  arcade mine stop | status
 
   --home DIR   arcade data folder (default: $ARCADE_HOME or ~/.local/share/arcade)";
 
@@ -59,6 +61,10 @@ fn main() {
         ["faucet"] => json!({"cmd": "faucet.ask"}),
         ["events"] => json!({"cmd": "events"}),
         ["mempool"] => json!({"cmd": "mempool"}),
+        ["mine", "start"] => json!({"cmd": "mine.start"}),
+        ["mine", "start", n] => json!({"cmd": "mine.start", "threads": n}),
+        ["mine", "stop"] => json!({"cmd": "mine.stop"}),
+        ["mine"] | ["mine", "status"] => json!({"cmd": "mine.status"}),
         _ => {
             println!("{HELP}");
             return;

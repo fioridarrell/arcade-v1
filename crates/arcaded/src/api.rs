@@ -87,6 +87,37 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 .collect();
             Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": crate::claims::pending_tags(node)}))
         }
+        "mine.start" => {
+            use std::sync::atomic::Ordering;
+            if !node.app.has_wallet().map_err(|e| e.to_string())? {
+                return Err("create a wallet first (arcade wallet create)".into());
+            }
+            let threads = s("threads").and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(1));
+            if node.miner.running.swap(true, Ordering::Relaxed) {
+                return Ok(json!({"running": true, "note": "already mining"}));
+            }
+            node.miner.threads.store(threads, Ordering::Relaxed);
+            node.miner.hashes.store(0, Ordering::Relaxed);
+            let n = node.self_arc();
+            std::thread::Builder::new().name("miner".into()).spawn(move || crate::miner::run(n)).unwrap();
+            Ok(json!({"running": true, "threads": threads}))
+        }
+        "mine.stop" => {
+            node.miner.running.store(false, std::sync::atomic::Ordering::Relaxed);
+            Ok(json!({"running": false}))
+        }
+        "mine.status" => {
+            use std::sync::atomic::Ordering;
+            let secs = node.miner.started.lock().unwrap().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);
+            let h = node.miner.hashes.load(Ordering::Relaxed);
+            Ok(json!({
+                "running": node.miner.running.load(Ordering::Relaxed),
+                "threads": node.miner.threads.load(Ordering::Relaxed),
+                "hashes": h,
+                "hash_rate": if secs > 0.0 { (h as f64 / secs).round() } else { 0.0 },
+                "found": node.miner.found.load(Ordering::Relaxed),
+            }))
+        }
         "events" => Ok(json!(node.app.recent_events(30).map_err(|e| e.to_string())?)),
         other => Err(format!("unknown command {other:?}")),
     }

@@ -187,6 +187,30 @@ impl U256 {
         q
     }
 
+    /// self * m (None on overflow).
+    pub fn mul_u64(self, m: u64) -> Option<U256> {
+        let mut r = [0u64; 4];
+        let mut carry: u128 = 0;
+        for i in 0..4 {
+            let v = self.0[i] as u128 * m as u128 + carry;
+            r[i] = v as u64;
+            carry = v >> 64;
+        }
+        (carry == 0).then_some(U256(r))
+    }
+
+    /// self / d (truncating).
+    pub fn div_u64(self, d: u64) -> U256 {
+        let mut r = [0u64; 4];
+        let mut rem: u128 = 0;
+        for i in (0..4).rev() {
+            let cur = (rem << 64) | self.0[i] as u128;
+            r[i] = (cur / d as u128) as u64;
+            rem = cur % d as u128;
+        }
+        U256(r)
+    }
+
     fn shr1(self) -> U256 {
         let mut r = [0u64; 4];
         for i in 0..4 {

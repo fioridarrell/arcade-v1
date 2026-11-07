@@ -11,6 +11,7 @@ mod coreshare;
 mod faucet;
 mod ledger;
 mod meshsource;
+mod miner;
 mod meshsvc;
 mod node;
 mod rpc;
@@ -74,7 +75,11 @@ fn main() {
         asks: Mutex::new(Default::default()),
         asks_done: Mutex::new(Default::default()),
         pending_spent: Mutex::new(Default::default()),
+        block_outbox: Mutex::new(Vec::new()),
+        miner: Default::default(),
+        me: Default::default(),
     });
+    let _ = node.me.set(Arc::downgrade(&node));
     let _ = node.app.event("service", "arcaded started");
     eprintln!(
         "arcaded: home {}, node {}, chain {}",

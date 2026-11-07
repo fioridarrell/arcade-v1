@@ -49,6 +49,11 @@ pub struct Node {
     pub mesh_bootstrap: bool,
     /// Welcome asks seen on the mesh: asker arcade id -> latest ask record.
     pub asks: Mutex<BTreeMap<String, Value>>,
+    /// Blocks we mined, waiting to be sent to coin peers.
+    pub block_outbox: Mutex<Vec<Vec<u8>>>,
+    pub miner: crate::miner::MinerState,
+    /// Weak self-reference so API handlers can start threads that own the node.
+    pub me: std::sync::OnceLock<std::sync::Weak<Node>>,
     /// Coins spent by our own transactions that are not in a block yet.
     pub pending_spent: Mutex<std::collections::HashSet<arcade_chain::OutPoint>>,
     /// Asker ids someone has already paid (a `sent` or `closed` record was seen).
@@ -61,4 +66,10 @@ pub struct TagIndex {
     /// Last block folded in (index never runs ahead of the stored chain).
     pub height: u32,
     pub hash: Option<arcade_chain::Hash256>,
+}
+
+impl Node {
+    pub fn self_arc(&self) -> std::sync::Arc<Node> {
+        self.me.get().and_then(|w| w.upgrade()).expect("node is running")
+    }
 }

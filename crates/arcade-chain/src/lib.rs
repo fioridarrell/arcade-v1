@@ -10,6 +10,7 @@ pub mod format;
 pub mod hash;
 pub mod p2p;
 pub mod params;
+pub mod pepecoin;
 pub mod header;
 pub mod pow;
 pub mod tx;

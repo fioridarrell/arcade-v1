@@ -103,6 +103,18 @@ pub fn run(node: Arc<Node>) {
                     break;
                 }
             }
+            let blocks: Vec<Vec<u8>> = std::mem::take(&mut *node.block_outbox.lock().unwrap());
+            for raw in blocks {
+                match peer.send("block", &raw) {
+                    Ok(()) => {
+                        let _ = node.app.event("mine", &format!("sent our block to {}", peer.addr));
+                    }
+                    Err(e) => {
+                        node.block_outbox.lock().unwrap().push(raw);
+                        set_state(&node, format!("send block: {e}"));
+                    }
+                }
+            }
             let txs: Vec<Vec<u8>> = std::mem::take(&mut *node.tx_outbox.lock().unwrap());
             for raw in txs {
                 if let Err(e) = peer.send_tx(&raw) {
@@ -142,6 +154,9 @@ fn listen(node: &Node, peer: &mut Peer, dur: Duration) -> Result<(), String> {
     peer.set_read_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())?;
     let res = (|| {
         while std::time::Instant::now() < deadline {
+            if !node.block_outbox.lock().unwrap().is_empty() || !node.tx_outbox.lock().unwrap().is_empty() {
+                return Ok(());
+            }
             let m = match peer.recv() {
                 Ok(m) => m,
                 Err(arcade_chain::p2p::P2pError::Io(e))

@@ -8,17 +8,21 @@ Arcade V1.0 is a from-scratch rebuild of Dogecoin Arcade, in Rust, for Linux PCs
 | Milestone | State | Verified against |
 |---|---|---|
 | 1. Store + headers/blocks over P2P | done | Pepecoin testnet 1.1.0, DigiByte 9.26.7, Kotia 1.0.0, Litecoin 0.21.5.8 live peers; byte-identical blocks |
-| 2. Coins, spends, undo, reorgs | done | unit tests (byte-exact disconnect, reorg, rollback); full testnet sync in progress |
+| 2. Coins, spends, undo, reorgs | done | unit tests; **full testnet synced**: 1,561,536 blocks, 1.63 M txs, 4.56 M coins in 47 min |
 | 3. Mesh client (existing protocol) | link done | linked with live Python arcades on `arcade-main`; live welcome record signature verifies |
-| 4. Bootstraps | not started | blocks currently from P2P; plan: mesh first, P2P fallback |
-| 5. Ledger port | tags done | names_digest to compare with the mesh `ix` tip after sync |
+| 4. Bootstraps | mesh-first done | empty node bootstrapped from another V1.0 arcade over the mesh (~1,600 blocks/s), P2P fallback |
+| 5. Ledger port | tags done | **names_digest matches the live mesh** (static at 1,561,536 and live as a new tag landed); INSC/ord/tokens next |
 | 6. Wallet + faucet + tag claim | built | BIP32/BIP39 vectors; claim tx read back by our ledger; live claim pending sync + coins |
-| 7. arcaded + CLI | built | to run against the synced chain |
+| 7. arcaded + CLI | running | linked to 3 live arcades, synced at tip, serves coreshare `cr` (borrower test OK) and `bk` |
 | 8. Tauri desktop app | waiting | needs WebKit/GTK dev packages (sudo) |
 | 9. .deb installer | not started | |
 
 Crates: `arcade-store`, `arcade-chain`, `arcade-chaindb`, `arcade-mesh`, `arcade-ledger`, `arcade-wallet`,
 `arcade-app`, `arcaded`, `arcade-cli`.
+
+Size (testnet, 2026-11-07): chain.mdbx 4.4 GB — blocks 1.03 GB data (Core's blk files 1.3 GB), coin and address
+indexes 2.5 GB on disk (1.1 GB of data: random keys leave B-tree pages ~45% full; ~4.5 M unspent class-B multisig
+dust outputs). Planned: Core-style script compression, 20-byte script hashes, height-keyed headers (~3 GB).
 
 Open items: Flopcoin's only reachable node drops non-whitelisted peers; DigiByte groestl/qubit/odocrypt PoW and
 Kotia stake-kernel checks not implemented (accepted on link + merkle + heaviest chain, as the old arcade does);

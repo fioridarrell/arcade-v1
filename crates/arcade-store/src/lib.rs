@@ -252,6 +252,18 @@ impl Store {
         Ok(out)
     }
 
+    /// Write a compacted copy of the database to `dest` (a consistent snapshot; pages are
+    /// packed densely and free space dropped). Safe while the database is in use.
+    pub fn compact_copy(&self, dest: impl AsRef<Path>) -> Result<()> {
+        let c = std::ffi::CString::new(dest.as_ref().as_os_str().as_encoded_bytes())
+            .map_err(|_| StoreError::Other("bad path".into()))?;
+        let rc = unsafe { mdbx_sys::mdbx_env_copy(self.db.ptr().0, c.as_ptr(), mdbx_sys::MDBX_CP_COMPACT as _) };
+        if rc != 0 {
+            return Err(StoreError::Other(format!("mdbx_env_copy failed: {rc}")));
+        }
+        Ok(())
+    }
+
     /// Number of entries in a table.
     pub fn count(&self, table: &str) -> Result<u64> {
         self.read(|r| {

@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 libmdbx = "0.9.0"
+mdbx-sys = "14.4"
 thiserror = "1"
 
 [dev-dependencies]

@@ -103,6 +103,7 @@ name = "arcade-store"
 version = "0.1.0"
 dependencies = [
  "libmdbx",
+ "mdbx-sys",
  "tempfile",
  "thiserror 1.0.69",
 ]

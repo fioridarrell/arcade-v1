@@ -59,6 +59,10 @@ fn unconfirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     let mut out = Vec::new();
     for (_, raw) in node.chain.mempool(c).unwrap_or_default() {
         let Ok(tx) = arcade_chain::Tx::parse_with(&raw, &p.format) else { continue };
+        // BIP125: a parent that signals replaceability could be swapped out; never build on it.
+        if signals_rbf(&tx) {
+            continue;
+        }
         for (vout, o) in tx.outputs.iter().enumerate() {
             if o.script_pubkey != script {
                 continue;
@@ -258,4 +262,9 @@ pub fn pending_tags(node: &Node) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// BIP125 opt-in replace-by-fee: any input with nSequence < 0xfffffffe.
+pub fn signals_rbf(tx: &arcade_chain::Tx) -> bool {
+    tx.inputs.iter().any(|i| i.sequence < 0xffff_fffe)
 }

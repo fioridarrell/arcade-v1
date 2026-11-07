@@ -85,7 +85,7 @@ fn net_addr(out: &mut Vec<u8>, addr: Option<SocketAddr>) {
     out.extend_from_slice(&port.to_be_bytes());
 }
 
-pub fn version_payload(params: &ChainParams, peer: Option<SocketAddr>, start_height: i32) -> Vec<u8> {
+pub fn version_payload(params: &ChainParams, peer: Option<SocketAddr>, start_height: i32, relay: bool) -> Vec<u8> {
     let mut p = Vec::new();
     p.extend_from_slice(&params.protocol_version.to_le_bytes());
     p.extend_from_slice(&0u64.to_le_bytes()); // our services: none (we don't serve blocks yet)
@@ -99,7 +99,7 @@ pub fn version_payload(params: &ChainParams, peer: Option<SocketAddr>, start_hei
     write_varint(&mut p, ua.len() as u64);
     p.extend_from_slice(ua);
     p.extend_from_slice(&start_height.to_le_bytes());
-    p.push(0); // relay: no unsolicited tx inv until we ask
+    p.push(relay as u8); // relay: whether peers should announce unconfirmed transactions
     p
 }
 
@@ -181,6 +181,11 @@ pub struct Peer {
 
 impl Peer {
     pub fn connect(params: &ChainParams, addr: &str, timeout: Duration) -> Result<Peer> {
+        Self::connect_with(params, addr, timeout, false)
+    }
+
+    /// Connect; with `relay` the peer announces unconfirmed transactions (mempool).
+    pub fn connect_with(params: &ChainParams, addr: &str, timeout: Duration, relay: bool) -> Result<Peer> {
         let sa = addr
             .to_socket_addrs()?
             .next()
@@ -190,7 +195,7 @@ impl Peer {
         stream.set_write_timeout(Some(timeout))?;
         stream.set_nodelay(true)?;
         let magic = params.magic;
-        stream.write_all(&encode_message(magic, "version", &version_payload(params, Some(sa), 0)))?;
+        stream.write_all(&encode_message(magic, "version", &version_payload(params, Some(sa), 0, relay)))?;
 
         let mut version = None;
         let mut got_verack = false;
@@ -265,6 +270,16 @@ impl Peer {
         Ok(out)
     }
 
+    pub fn set_read_timeout(&self, d: Duration) -> Result<()> {
+        self.stream.set_read_timeout(Some(d))?;
+        Ok(())
+    }
+
+    /// Inventory type for asking a transaction exactly as relayed (witness included).
+    pub fn tx_inv(&self) -> u32 {
+        if self.format.segwit { MSG_TX | crate::format::MSG_WITNESS_FLAG } else { MSG_TX }
+    }
+
     pub fn send_tx(&mut self, raw: &[u8]) -> Result<()> {
         self.send("tx", raw)
     }
@@ -286,7 +301,7 @@ mod tests {
 
     #[test]
     fn version_parses_back() {
-        let p = version_payload(&PEPECOIN_TEST, None, 7);
+        let p = version_payload(&PEPECOIN_TEST, None, 7, false);
         let v = parse_version(&p).unwrap();
         assert_eq!(v.version, 70016);
         assert_eq!(v.user_agent, "/arcade:1.0.0/");

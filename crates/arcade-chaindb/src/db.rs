@@ -325,6 +325,71 @@ impl ChainDb {
         })
     }
 
+    // ---------- mempool ----------
+
+    /// Add an unconfirmed transaction (not undo-logged: the mempool is volatile).
+    /// Refused if it is already in a block, already pooled, or spends a coin another
+    /// pooled transaction spends. Returns whether it was added.
+    pub fn mempool_add(&self, params: &ChainParams, tx: &Tx, now: u64) -> Result<bool> {
+        let c = params.chain_no;
+        if self.tx_raw(params, &tx.txid)?.is_some() {
+            return Ok(false);
+        }
+        self.store.write(|w| {
+            let k = k_txs(c, &tx.txid.t12());
+            if w.contains(MEMPOOL, &k)? {
+                return Ok(false);
+            }
+            for i in &tx.inputs {
+                if w.contains(MEMPOOL_SPENDS, &k_out(c, &i.prevout.txid.t12(), i.prevout.vout))? {
+                    return Ok(false);
+                }
+            }
+            let mut v = now.to_le_bytes().to_vec();
+            v.extend_from_slice(&tx.raw);
+            w.put(MEMPOOL, &k, &v)?;
+            for i in &tx.inputs {
+                w.put(MEMPOOL_SPENDS, &k_out(c, &i.prevout.txid.t12(), i.prevout.vout), &tx.txid.0)?;
+            }
+            Ok(true)
+        })
+    }
+
+    /// Every pooled transaction: (first seen, raw).
+    pub fn mempool(&self, c: u16) -> Result<Vec<(u64, Vec<u8>)>> {
+        Ok(self
+            .store
+            .read(|r| r.scan_prefix(MEMPOOL, &k_chain(c)))?
+            .into_iter()
+            .map(|(_, v)| (u64::from_le_bytes(v[..8].try_into().unwrap()), v[8..].to_vec()))
+            .collect())
+    }
+
+    /// The pooled transaction spending an outpoint, if any.
+    pub fn mempool_spender(&self, c: u16, op: &OutPoint) -> Result<Option<Hash256>> {
+        self.store.read(|r| {
+            Ok(r.get(MEMPOOL_SPENDS, &k_out(c, &op.txid.t12(), op.vout))?.map(|v| Hash256(v[..32].try_into().unwrap())))
+        })
+    }
+
+    /// Drop pooled transactions older than `max_age` seconds.
+    pub fn mempool_expire(&self, params: &ChainParams, now: u64, max_age: u64) -> Result<u32> {
+        let c = params.chain_no;
+        self.store.write(|w| {
+            let mut n = 0;
+            for (k, v) in w.scan_prefix(MEMPOOL, &k_chain(c))? {
+                if now.saturating_sub(u64::from_le_bytes(v[..8].try_into().unwrap())) > max_age {
+                    if let Ok(tx) = Tx::parse_with(&v[8..], &params.format) {
+                        remove_pooled(w, c, &tx)?;
+                    }
+                    w.del(MEMPOOL, &k)?;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })
+    }
+
     // ---------- headers ----------
 
     /// Store headers (already checked by the caller) and move `best` if any has more work.
@@ -462,6 +527,7 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
     let l = Logged::new(w);
     for (p, tx) in blk.txs.iter().enumerate() {
         let t12 = tx.txid.t12();
+        settle_mempool(w, params, tx)?;
         let mut bp = b.to_be_bytes().to_vec();
         bp.extend_from_slice(&(p as u32).to_be_bytes());
         l.dup_add(TXS, &k_txs(c, &t12), &bp)?;
@@ -529,6 +595,39 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
         }
     }
     Ok(new_tip)
+}
+
+fn remove_pooled(w: &WriteTxn, c: u16, tx: &Tx) -> Result<()> {
+    w.del(MEMPOOL, &k_txs(c, &tx.txid.t12()))?;
+    for i in &tx.inputs {
+        let k = k_out(c, &i.prevout.txid.t12(), i.prevout.vout);
+        if w.get(MEMPOOL_SPENDS, &k)?.as_deref() == Some(&tx.txid.0[..]) {
+            w.del(MEMPOOL_SPENDS, &k)?;
+        }
+    }
+    Ok(())
+}
+
+/// A block confirmed `tx`: drop it from the pool, and drop pooled txs that spend the
+/// same coins (they can never confirm now).
+fn settle_mempool(w: &WriteTxn, params: &ChainParams, tx: &Tx) -> Result<()> {
+    let c = params.chain_no;
+    if w.contains(MEMPOOL, &k_txs(c, &tx.txid.t12()))? {
+        remove_pooled(w, c, tx)?;
+    }
+    for i in &tx.inputs {
+        let k = k_out(c, &i.prevout.txid.t12(), i.prevout.vout);
+        if let Some(other) = w.get(MEMPOOL_SPENDS, &k)? {
+            let ot12: [u8; 12] = other[..12].try_into().unwrap();
+            if let Some(v) = w.get(MEMPOOL, &k_txs(c, &ot12))? {
+                if let Ok(otx) = Tx::parse_with(&v[8..], &params.format) {
+                    remove_pooled(w, c, &otx)?;
+                }
+            }
+            w.del(MEMPOOL_SPENDS, &k)?;
+        }
+    }
+    Ok(())
 }
 
 fn add_hist(l: &Logged, c: u16, sh: &[u8; 32], height: u32, t12: &[u8; 12], recv: u64, spent: u64) -> Result<()> {

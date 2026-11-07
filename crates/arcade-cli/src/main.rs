@@ -17,6 +17,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade tag list                your claims and their status
   arcade faucet                  ask the mesh for test coins
   arcade events                  recent activity
+  arcade mempool                 unconfirmed transactions and pending tag claims
 
   --home DIR   arcade data folder (default: $ARCADE_HOME or ~/.local/share/arcade)";
 
@@ -57,6 +58,7 @@ fn main() {
         ["tag", "list"] => json!({"cmd": "tag.list"}),
         ["faucet"] => json!({"cmd": "faucet.ask"}),
         ["events"] => json!({"cmd": "events"}),
+        ["mempool"] => json!({"cmd": "mempool"}),
         _ => {
             println!("{HELP}");
             return;

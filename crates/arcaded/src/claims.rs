@@ -33,6 +33,9 @@ pub fn check(node: &Node, tag: &str) -> Check {
     if pending {
         return Check { tag, available: false, reason: Some("you already have a claim for it in progress".into()) };
     }
+    if let Some(by) = pending_tags(node).into_iter().find(|(t, _)| *t == tag).map(|(_, a)| a) {
+        return Check { tag, available: false, reason: Some(format!("a claim by {by} is waiting in the mempool")) };
+    }
     Check { tag, available: true, reason: None }
 }
 
@@ -181,4 +184,45 @@ pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
     for i in &tx.inputs {
         ps.insert(i.prevout);
     }
+}
+
+/// Tag claims waiting in the mempool: (tag, sender address).
+pub fn pending_tags(node: &Node) -> Vec<(String, String)> {
+    use arcade_ledger::extract::{class_b_marker, detect_class, extract, Prevout};
+    let p = node.params;
+    let marker = class_b_marker(p);
+    let mut out = Vec::new();
+    let pool: Vec<arcade_chain::Tx> = node
+        .chain
+        .mempool(p.chain_no)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(_, raw)| arcade_chain::Tx::parse_with(raw, &p.format).ok())
+        .collect();
+    for tx in &pool {
+        if detect_class(tx, &marker, p).is_none() {
+            continue;
+        }
+        // Prevouts from the coin set, or from another pooled transaction.
+        let prev: Option<Vec<Prevout>> = tx
+            .inputs
+            .iter()
+            .map(|i| {
+                if let Ok(Some(c)) = node.chain.coin(p.chain_no, &i.prevout) {
+                    return Some(Prevout { value: c.value, script: c.script });
+                }
+                pool.iter()
+                    .find(|t| t.txid == i.prevout.txid)
+                    .and_then(|t| t.outputs.get(i.prevout.vout as usize))
+                    .map(|o| Prevout { value: o.value, script: o.script_pubkey.clone() })
+            })
+            .collect();
+        let Some(prev) = prev else { continue };
+        if let Some(Ok(atx)) = extract(tx, &prev, p) {
+            if let Some(Ok(tags::TagOp::Claim(t))) = tags::parse(&atx.payload) {
+                out.push((t, atx.sender));
+            }
+        }
+    }
+    out
 }

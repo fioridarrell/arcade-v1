@@ -78,6 +78,15 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let (k, _) = node.app.tag_key(p, s("index").and_then(|i| i.parse().ok()).unwrap_or(0)).map_err(|e| e.to_string())?;
             Ok(json!(crate::faucet::ask(node, &k.address, &s("tag").unwrap_or_default())?))
         }
+        "mempool" => {
+            let pool = node.chain.mempool(c).map_err(|e| e.to_string())?;
+            let txs: Vec<Value> = pool
+                .iter()
+                .filter_map(|(seen, raw)| arcade_chain::Tx::parse_with(raw, &p.format).ok().map(|t| (seen, t)))
+                .map(|(seen, t)| json!({"txid": t.txid.to_hex(), "seen": seen, "size": t.raw.len(), "outputs": t.outputs.iter().map(|o| o.value).sum::<u64>()}))
+                .collect();
+            Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": crate::claims::pending_tags(node)}))
+        }
         "events" => Ok(json!(node.app.recent_events(30).map_err(|e| e.to_string())?)),
         other => Err(format!("unknown command {other:?}")),
     }

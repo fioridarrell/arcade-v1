@@ -209,3 +209,28 @@ fn serves_headers_like_p2p() {
     let pl = f.db.headers_payload(f.p, &[Hash256([9; 32])], 1).unwrap();
     assert_eq!(arcade_chain::p2p::parse_headers(&pl, &f.p.format).unwrap()[0].header.hash(), f.g.hash());
 }
+
+#[test]
+fn mempool_add_conflict_and_settle() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    let cb1 = tx(&[], &[(5000, p2pkh(1))], 1);
+    let b1 = block(f.g.hash(), vec![cb1.clone()], 2);
+    f.db.connect_blocks(f.p, &[b1.clone()]).unwrap();
+    let spend = tx(&[(cb1.txid, 0)], &[(4000, p2pkh(2))], 0);
+    let rival = tx(&[(cb1.txid, 0)], &[(4500, p2pkh(3))], 0);
+    assert!(f.db.mempool_add(f.p, &spend, 100).unwrap());
+    assert!(!f.db.mempool_add(f.p, &spend, 101).unwrap(), "already pooled");
+    assert!(!f.db.mempool_add(f.p, &rival, 102).unwrap(), "double spend of a pooled coin");
+    assert_eq!(f.db.mempool(c).unwrap().len(), 1);
+    assert_eq!(f.db.mempool_spender(c, &OutPoint { txid: cb1.txid, vout: 0 }).unwrap(), Some(spend.txid));
+    // The rival confirms instead: our pooled spend is dropped.
+    let b2 = block(b1.hash(), vec![tx(&[], &[(1, p2pkh(9))], 2), rival], 3);
+    f.db.connect_blocks(f.p, &[b2]).unwrap();
+    assert!(f.db.mempool(c).unwrap().is_empty());
+    assert_eq!(f.db.mempool_spender(c, &OutPoint { txid: cb1.txid, vout: 0 }).unwrap(), None);
+    // Expiry.
+    let cb3 = tx(&[], &[(1, p2pkh(4))], 3);
+    assert!(f.db.mempool_add(f.p, &cb3, 10).unwrap());
+    assert_eq!(f.db.mempool_expire(f.p, 10 + 3601, 3600).unwrap(), 1);
+}

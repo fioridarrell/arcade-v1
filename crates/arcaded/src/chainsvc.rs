@@ -75,7 +75,7 @@ pub fn run(node: Arc<Node>) {
         mesh_bootstrap(&node, &syncer);
     }
     loop {
-        let Some(mut peer) = candidates(&node).iter().find_map(|a| Peer::connect(p, a, Duration::from_secs(20)).ok())
+        let Some(mut peer) = candidates(&node).iter().find_map(|a| Peer::connect_with(p, a, Duration::from_secs(20), true).ok())
         else {
             set_state(&node, "no coin peer reachable; retrying".into());
             std::thread::sleep(Duration::from_secs(15));
@@ -121,10 +121,70 @@ pub fn run(node: Arc<Node>) {
                 mesh_bootstrap(&node, &syncer);
             }
             if new == 0 {
-                // Caught up: wait a little for new blocks (testnet: one a minute).
-                std::thread::sleep(Duration::from_secs(10));
+                // Caught up: listen for announced transactions (mempool) and blocks.
+                if let Err(e) = listen(&node, &mut peer, Duration::from_secs(10)) {
+                    set_state(&node, format!("listen: {e}"));
+                    break;
+                }
             }
         }
         std::thread::sleep(Duration::from_secs(3));
     }
+}
+
+/// Read announcements for up to `dur`: fetch announced transactions into the mempool;
+/// return early when a new block is announced (the caller then syncs it).
+fn listen(node: &Node, peer: &mut Peer, dur: Duration) -> Result<(), String> {
+    use arcade_chain::encode::Reader;
+    use arcade_chain::p2p::getdata_payload;
+    let p = node.params;
+    let deadline = std::time::Instant::now() + dur;
+    peer.set_read_timeout(Duration::from_secs(2)).map_err(|e| e.to_string())?;
+    let res = (|| {
+        while std::time::Instant::now() < deadline {
+            let m = match peer.recv() {
+                Ok(m) => m,
+                Err(arcade_chain::p2p::P2pError::Io(e))
+                    if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) =>
+                {
+                    continue
+                }
+                Err(e) => return Err(e.to_string()),
+            };
+            match m.command.as_str() {
+                "inv" => {
+                    let mut r = Reader::new(&m.payload);
+                    let n = r.len().map_err(|e| e.to_string())?;
+                    let mut txs = Vec::new();
+                    let mut block = false;
+                    for _ in 0..n {
+                        let kind = r.u32().map_err(|e| e.to_string())?;
+                        let h = r.hash().map_err(|e| e.to_string())?;
+                        match kind & 0xff {
+                            1 => txs.push(h),
+                            2 => block = true,
+                            _ => {}
+                        }
+                    }
+                    if !txs.is_empty() {
+                        peer.send("getdata", &getdata_payload(peer.tx_inv(), &txs)).map_err(|e| e.to_string())?;
+                    }
+                    if block {
+                        return Ok(());
+                    }
+                }
+                "headers" => return Ok(()),
+                "tx" => {
+                    if let Ok(tx) = arcade_chain::Tx::parse_with(&m.payload, &p.format) {
+                        let _ = node.chain.mempool_add(p, &tx, arcade_app::now());
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    })();
+    let _ = peer.set_read_timeout(Duration::from_secs(20));
+    let _ = node.chain.mempool_expire(p, arcade_app::now(), 14 * 24 * 3600);
+    res
 }

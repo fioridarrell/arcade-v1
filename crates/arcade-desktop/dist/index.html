@@ -1,0 +1,96 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Arcade V1.0</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="dot"></span> Arcade <small>V1.0</small></div>
+  <div id="conn" class="pill">connecting…</div>
+</header>
+
+<nav>
+  <button data-tab="home" class="on">Home</button>
+  <button data-tab="wallet">Wallet</button>
+  <button data-tab="handle">Handle</button>
+  <button data-tab="mine">Mine</button>
+  <button data-tab="activity">Activity</button>
+</nav>
+
+<main>
+  <!-- Home: the whiteboard steps at a glance -->
+  <section id="home" class="tab on">
+    <h1>Pepecoin testnet</h1>
+    <div class="grid">
+      <div class="card"><div class="k">Chain</div><div class="v" id="h-sync">—</div><div class="s" id="h-tip"></div></div>
+      <div class="card"><div class="k">Mesh</div><div class="v" id="h-mesh">—</div><div class="s" id="h-node"></div></div>
+      <div class="card"><div class="k">Tags</div><div class="v" id="h-tags">—</div><div class="s" id="h-match"></div></div>
+      <div class="card"><div class="k">Wallet</div><div class="v" id="h-wallet">—</div><div class="s" id="h-bal"></div></div>
+    </div>
+    <h2>Getting started</h2>
+    <ol class="steps" id="steps"></ol>
+  </section>
+
+  <!-- Wallet -->
+  <section id="wallet" class="tab">
+    <h1>Wallet</h1>
+    <div id="w-none" hidden>
+      <p>Your wallet is a 12-word recovery phrase. It lives on this PC with no password; the phrase is the only backup.</p>
+      <div class="row">
+        <button class="primary" id="w-create">Create a new wallet</button>
+      </div>
+      <h2>Or restore</h2>
+      <textarea id="w-words" rows="2" placeholder="twelve words …"></textarea>
+      <div class="row"><button id="w-restore">Restore</button></div>
+    </div>
+    <div id="w-phrase" hidden class="warn">
+      <b>Write these 12 words down.</b> They are shown once, and they are the only way to recover your tags.
+      <div class="phrase" id="w-phrase-words"></div>
+      <label><input type="checkbox" id="w-saved"> I wrote them down</label>
+      <div class="row"><button class="primary" id="w-done" disabled>Done</button></div>
+    </div>
+    <div id="w-keys" hidden>
+      <table><thead><tr><th>#</th><th>Address</th><th>Tag</th><th class="num">Balance</th></tr></thead><tbody id="w-rows"></tbody></table>
+      <div class="row"><button id="w-faucet">Ask the mesh for test coins</button></div>
+    </div>
+    <p class="msg" id="w-msg"></p>
+  </section>
+
+  <!-- Handle -->
+  <section id="handle" class="tab">
+    <h1>Your handle</h1>
+    <p>Pick an @tag: 2–24 characters, a–z, 0–9 and _. It is claimed on the Pepecoin testnet and every arcade sees it.</p>
+    <div class="row">
+      <span class="at">@</span><input id="t-tag" placeholder="yourname" maxlength="24" autocomplete="off">
+      <button id="t-check">Check</button>
+      <button class="primary" id="t-claim" disabled>Claim</button>
+    </div>
+    <p class="msg" id="t-msg"></p>
+    <h2>Claims</h2>
+    <table><thead><tr><th>Tag</th><th>Status</th><th>Note</th></tr></thead><tbody id="t-rows"></tbody></table>
+  </section>
+
+  <!-- Mine -->
+  <section id="mine" class="tab">
+    <h1>Mine testnet</h1>
+    <p>Mines Pepecoin testnet blocks on this PC and pays your wallet. Mined coins can be spent after 240 blocks (about 4 hours).</p>
+    <div class="grid">
+      <div class="card"><div class="k">State</div><div class="v" id="m-state">—</div></div>
+      <div class="card"><div class="k">Hash rate</div><div class="v" id="m-rate">—</div></div>
+      <div class="card"><div class="k">Blocks found</div><div class="v" id="m-found">—</div></div>
+    </div>
+    <div class="row"><button class="primary" id="m-start">Start</button><button id="m-stop">Stop</button></div>
+  </section>
+
+  <!-- Activity -->
+  <section id="activity" class="tab">
+    <h1>Activity</h1>
+    <ul class="events" id="a-list"></ul>
+  </section>
+</main>
+<script src="app.js"></script>
+</body>
+</html>

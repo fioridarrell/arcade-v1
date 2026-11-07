@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Arcade",
+  "version": "0.1.0",
+  "identifier": "com.dogecoinarcade.arcade",
+  "build": { "frontendDist": "dist" },
+  "app": {
+    "withGlobalTauri": true,
+    "windows": [
+      { "title": "Arcade V1.0", "width": 1000, "height": 760, "minWidth": 420, "minHeight": 500 }
+    ],
+    "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" }
+  },
+  "bundle": { "active": false, "icon": ["icons/icon.png"] }
+}

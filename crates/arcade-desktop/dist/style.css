@@ -1,0 +1,59 @@
+:root {
+  --bg: #f6f7f5; --panel: #ffffff; --ink: #1d231f; --muted: #66706a; --line: #dfe4df;
+  --accent: #2e8b44; --accent-ink: #ffffff; --warn-bg: #fff6e0; --warn-line: #e8c56a; --bad: #b3261e;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #121614; --panel: #1b201d; --ink: #e7ece8; --muted: #9aa59e; --line: #2c342f;
+    --accent: #4fbf68; --accent-ink: #0d1a10; --warn-bg: #2a2412; --warn-line: #7a6427; --bad: #ff8a80;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Ubuntu, sans-serif; background: var(--bg); color: var(--ink); }
+header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
+.brand { font-weight: 700; font-size: 17px; display: flex; align-items: center; gap: 8px; }
+.brand small { color: var(--muted); font-weight: 500; }
+.dot { width: 12px; height: 12px; border-radius: 50%; background: var(--accent); display: inline-block; }
+.pill { font-size: 12px; padding: 3px 10px; border-radius: 999px; border: 1px solid var(--line); color: var(--muted); }
+.pill.ok { color: var(--accent); border-color: var(--accent); }
+.pill.bad { color: var(--bad); border-color: var(--bad); }
+nav { display: flex; gap: 4px; padding: 8px 16px; background: var(--panel); border-bottom: 1px solid var(--line); flex-wrap: wrap; }
+nav button { background: none; border: 0; padding: 8px 14px; border-radius: 8px; color: var(--muted); font: inherit; cursor: pointer; }
+nav button.on { background: var(--bg); color: var(--ink); font-weight: 600; }
+main { max-width: 900px; margin: 0 auto; padding: 20px 16px 40px; }
+.tab { display: none; }
+.tab.on { display: block; }
+h1 { font-size: 22px; margin: 4px 0 14px; }
+h2 { font-size: 15px; margin: 24px 0 8px; color: var(--muted); font-weight: 600; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)); gap: 12px; }
+.card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 14px; }
+.k { color: var(--muted); font-size: 12px; text-transform: uppercase; letter-spacing: .04em; }
+.v { font-size: 18px; font-weight: 650; margin-top: 4px; overflow-wrap: anywhere; }
+.s { color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+.steps { padding-left: 20px; }
+.steps li { margin: 6px 0; }
+.steps li.done { color: var(--muted); }
+.steps li.done::marker { color: var(--accent); }
+.row { display: flex; gap: 8px; align-items: center; margin: 12px 0; flex-wrap: wrap; }
+button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); cursor: pointer; }
+button.primary { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+button:disabled { opacity: .5; cursor: default; }
+input, textarea { font: inherit; padding: 8px 10px; border-radius: 8px; border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
+textarea { width: 100%; }
+#t-tag { width: 220px; }
+.at { font-size: 18px; color: var(--muted); }
+.msg { min-height: 1.5em; }
+.msg.bad { color: var(--bad); }
+.msg.ok { color: var(--accent); }
+.warn { background: var(--warn-bg); border: 1px solid var(--warn-line); border-radius: 12px; padding: 14px; }
+.phrase { font: 600 16px/1.8 ui-monospace, "DejaVu Sans Mono", monospace; margin: 12px 0; word-spacing: 6px; }
+table { width: 100%; border-collapse: collapse; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+th { color: var(--muted); font-weight: 600; font-size: 12px; }
+.num { text-align: right; font-variant-numeric: tabular-nums; }
+.events { list-style: none; padding: 0; margin: 0; }
+.events li { padding: 8px 0; border-bottom: 1px solid var(--line); }
+.events time { color: var(--muted); font-size: 12px; margin-right: 8px; font-variant-numeric: tabular-nums; }
+.events .kind { font-size: 11px; padding: 1px 6px; border-radius: 6px; border: 1px solid var(--line); color: var(--muted); margin-right: 6px; }

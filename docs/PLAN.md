@@ -12,7 +12,8 @@ Arcade V1.0 is a from-scratch rebuild of Dogecoin Arcade, in Rust, for Linux PCs
 | 3. Mesh client (existing protocol) | link done | linked with live Python arcades on `arcade-main`; live welcome record signature verifies |
 | 4. Bootstraps | mesh-first done | empty node bootstrapped from another V1.0 arcade over the mesh (~1,600 blocks/s), P2P fallback |
 | 5. Ledger port | tags done | **names_digest matches the live mesh** (static at 1,561,536 and live as a new tag landed); INSC/ord/tokens next |
-| 6. Wallet + faucet + tag claim | built | BIP32/BIP39 vectors; claim tx read back by our ledger; live claim pending sync + coins |
+| 6. Wallet + faucet + tag claim | **done live** | `@arcade_v1` claimed at testnet block 1,561,561 (0-conf spend of a faucet payment); old arcade 156.67.28.112 reports the same names_digest (2523f1e8...) |
+| 6b. Testnet mining | **done live** | mined block 1,561,560 without Core; difficulty rule matches all 1,561,557 testnet blocks |
 | 7. arcaded + CLI | running | linked to 3 live arcades, synced at tip, serves coreshare `cr` (borrower test OK) and `bk` |
 | 8. Tauri desktop app | waiting | needs WebKit/GTK dev packages (sudo) |
 | 9. .deb installer | not started | |

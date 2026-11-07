@@ -1,0 +1,29 @@
+[Unit]
+Description=Arcade V1.0 (chain sync, mesh, tags)
+Documentation=file:///usr/share/doc/arcade/PLAN.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=arcade
+Group=arcade
+ExecStart=/usr/bin/arcaded --home /var/lib/arcade
+Restart=on-failure
+RestartSec=5
+StateDirectory=arcade
+StateDirectoryMode=0750
+UMask=0007
+# Hardening: the service needs its data folder and the network, nothing else.
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+
+[Install]
+WantedBy=multi-user.target

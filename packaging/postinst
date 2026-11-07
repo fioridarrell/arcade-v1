@@ -1,0 +1,13 @@
+#!/bin/sh
+set -e
+if [ "$1" = "configure" ]; then
+    if ! getent passwd arcade >/dev/null; then
+        adduser --system --group --home /var/lib/arcade --no-create-home arcade
+    fi
+    # Let the installing desktop user talk to the service (CLI and desktop app).
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        adduser "$SUDO_USER" arcade >/dev/null || true
+    fi
+    systemctl daemon-reload || true
+    systemctl enable --now arcaded.service || true
+fi

@@ -11,7 +11,7 @@ pub fn serve(node: Arc<Node>, path: std::path::PathBuf) {
     let _ = std::fs::remove_file(&path);
     let l = UnixListener::bind(&path).expect("bind API socket");
     use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660) /* service user + arcade group */);
     for s in l.incoming().flatten() {
         let node = node.clone();
         std::thread::spawn(move || handle(node, s));

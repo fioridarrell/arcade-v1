@@ -3,6 +3,28 @@
 Status: **plan only, nothing built.** Drafted 2026-11-07.
 Arcade V1.0 is a from-scratch rebuild of Dogecoin Arcade, in Rust, for Linux PCs.
 
+## Status (2026-11-07)
+
+| Milestone | State | Verified against |
+|---|---|---|
+| 1. Store + headers/blocks over P2P | done | Pepecoin testnet 1.1.0, DigiByte 9.26.7, Kotia 1.0.0, Litecoin 0.21.5.8 live peers; byte-identical blocks |
+| 2. Coins, spends, undo, reorgs | done | unit tests (byte-exact disconnect, reorg, rollback); full testnet sync in progress |
+| 3. Mesh client (existing protocol) | link done | linked with live Python arcades on `arcade-main`; live welcome record signature verifies |
+| 4. Bootstraps | not started | blocks currently from P2P; plan: mesh first, P2P fallback |
+| 5. Ledger port | tags done | names_digest to compare with the mesh `ix` tip after sync |
+| 6. Wallet + faucet + tag claim | built | BIP32/BIP39 vectors; claim tx read back by our ledger; live claim pending sync + coins |
+| 7. arcaded + CLI | built | to run against the synced chain |
+| 8. Tauri desktop app | waiting | needs WebKit/GTK dev packages (sudo) |
+| 9. .deb installer | not started | |
+
+Crates: `arcade-store`, `arcade-chain`, `arcade-chaindb`, `arcade-mesh`, `arcade-ledger`, `arcade-wallet`,
+`arcade-app`, `arcaded`, `arcade-cli`.
+
+Open items: Flopcoin's only reachable node drops non-whitelisted peers; DigiByte groestl/qubit/odocrypt PoW and
+Kotia stake-kernel checks not implemented (accepted on link + merkle + heaviest chain, as the old arcade does);
+DigiDollar and Litecoin MWEB parsing; old arcades pay welcome asks only by operator action, so V1.0 arcades
+will auto-pay.
+
 ## 1. Scope
 
 V1.0 is the **first-run path on Pepecoin testnet** (from Martin's whiteboard):

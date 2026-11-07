@@ -41,3 +41,13 @@ Coinbase out <= subsidy + fees ("bad-cb-amount"); paying less is allowed.
 6. No SegWit (no commitment, no witness). CSV failed: lock-time cutoff = block time.
 7. Size 1,000,000 base / weight 4,000,000; sigops cost 80,000; coinbase scriptSig 2-100 bytes; no mutated merkle.
 8. No required dev/fund outputs. Live tip coinbase: v1, scriptSig = height push only, one P2PKH output, locktime 0.
+
+## How the old arcade built blocks (blockminer.py / stratum.py)
+- Coinbase scriptSig = push(height minimal LE) | 08 extranonce u64 LE | 10 "/dogecoinarcade/" (16 bytes).
+  Input: null prevout, ffffffff sequence. tx version 1, locktime 0.
+- Outputs: miner (reward - share); optional 10% share to the borrowed-Core arcade (>= 546); no dev output;
+  no witness commitment on Pepecoin testnet.
+- Header: template version/bits/curtime (V1.0 computes these itself: Digishield, min-diff after 120 s from 1250,
+  0x003f0004, MTP < time <= now+2h). Merkle duplicates last. Nonce sequential; scrypt(h80,h80,1024,1,1) <= target.
+- Stratum: VERSION_MASK 0x1FFFE000, extranonce1 4 bytes BE + extranonce2 4 bytes, DIFF1 0xFFFF<<224, start diff
+  1024; heights 1..16 as OP_N in stratum coinbases.

@@ -75,6 +75,11 @@ pub struct Schema {
     pub max_size: isize,
 }
 
+/// Room for add-on index tables (ord, tokens, other chains' protocols) created later
+/// with [`Store::add_table`]; they must be named under a prefix in `ADDON_PREFIXES`.
+pub const ADDON_TABLE_SLOTS: u64 = 256;
+pub const ADDON_PREFIXES: &[&str] = &["ord.", "tok.", "names.", "sites.", "maps.", "ledger.", "msg.", "addon."];
+
 pub struct Store {
     db: Database<NoWriteMap>,
     schema: &'static Schema,
@@ -84,7 +89,7 @@ impl Store {
     /// Open (or create) the single-file database at `path`.
     pub fn open(path: impl AsRef<Path>, schema: &'static Schema) -> Result<Store> {
         let opts = DatabaseOptions {
-            max_tables: Some(schema.tables.len() as u64 + 1),
+            max_tables: Some(schema.tables.len() as u64 + 1 + ADDON_TABLE_SLOTS),
             no_sub_dir: true,
             mode: Mode::ReadWrite(ReadWriteOptions {
                 sync_mode: SyncMode::Durable,
@@ -180,6 +185,55 @@ impl Store {
         Ok(out)
     }
 
+    /// Create an add-on table (e.g. `ord.v1.insc`) if it does not exist yet. Add-on tables
+    /// are derived indexes: built by replaying stored blocks, dropped with [`Store::drop_table`].
+    pub fn add_table(&self, def: TableDef) -> Result<()> {
+        if !ADDON_PREFIXES.iter().any(|p| def.name.starts_with(p)) {
+            return Err(StoreError::UnknownTable(def.name.into()));
+        }
+        let txn = self.db.begin_rw_txn()?;
+        txn.create_table(Some(def.name), flags(&def))?;
+        let meta = txn.open_table(Some(META))?;
+        let k = format!("addon:{}", def.name);
+        txn.put(&meta, k.as_bytes(), [def.dup as u8], WriteFlags::UPSERT)?;
+        drop(meta);
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Remove an add-on table and all its data.
+    pub fn drop_table(&self, name: &str) -> Result<()> {
+        if !ADDON_PREFIXES.iter().any(|p| name.starts_with(p)) {
+            return Err(StoreError::UnknownTable(name.into()));
+        }
+        let txn = self.db.begin_rw_txn()?;
+        if let Ok(t) = txn.open_table(Some(name)) {
+            txn.clear_table(&t)?;
+        }
+        let meta = txn.open_table(Some(META))?;
+        let _ = txn.del(&meta, format!("addon:{name}").as_bytes(), None)?;
+        drop(meta);
+        txn.commit()?;
+        Ok(())
+    }
+
+    /// Add-on tables present in this file.
+    pub fn addon_tables(&self) -> Result<Vec<String>> {
+        let txn = self.db.begin_ro_txn()?;
+        let meta = txn.open_table(Some(META))?;
+        let mut c = txn.cursor(&meta)?;
+        let mut out = Vec::new();
+        let mut cur: Option<(Vec<u8>, Vec<u8>)> = c.set_range(b"addon:")?;
+        while let Some((k, _)) = cur {
+            if !k.starts_with(b"addon:") {
+                break;
+            }
+            out.push(String::from_utf8_lossy(&k[6..]).into_owned());
+            cur = c.next()?;
+        }
+        Ok(out)
+    }
+
     /// Number of entries in a table.
     pub fn count(&self, table: &str) -> Result<u64> {
         self.read(|r| {
@@ -195,7 +249,7 @@ fn flags(t: &TableDef) -> TableFlags {
 }
 
 fn check(schema: &Schema, table: &str) -> Result<()> {
-    if schema.tables.iter().any(|t| t.name == table) {
+    if schema.tables.iter().any(|t| t.name == table) || ADDON_PREFIXES.iter().any(|p| table.starts_with(p)) {
         Ok(())
     } else {
         Err(StoreError::UnknownTable(table.into()))
@@ -460,6 +514,23 @@ mod tests {
         let (_d, p) = tmp();
         drop(Store::open(&p, &SCHEMA_V1).unwrap());
         assert!(matches!(Store::open(&p, &OTHER), Err(StoreError::WrongSchema { .. })));
+    }
+
+    #[test]
+    fn addon_tables_come_and_go() {
+        let (_d, p) = tmp();
+        {
+            let s = Store::open(&p, &SCHEMA_V1).unwrap();
+            assert!(s.add_table(TableDef::plain("nope.v1.x")).is_err());
+            s.add_table(TableDef::plain("ord.v1.insc")).unwrap();
+            s.write(|w| w.put("ord.v1.insc", b"k", b"v")).unwrap();
+        }
+        let s = Store::open(&p, &SCHEMA_V1).unwrap();
+        assert_eq!(s.addon_tables().unwrap(), vec!["ord.v1.insc".to_string()]);
+        assert_eq!(s.read(|r| r.get("ord.v1.insc", b"k")).unwrap(), Some(b"v".to_vec()));
+        s.drop_table("ord.v1.insc").unwrap();
+        assert!(s.addon_tables().unwrap().is_empty());
+        assert_eq!(s.read(|r| r.get("ord.v1.insc", b"k")).unwrap(), None);
     }
 
     #[test]

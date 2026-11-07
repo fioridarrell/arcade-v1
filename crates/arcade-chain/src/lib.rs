@@ -6,6 +6,7 @@
 pub mod auxpow;
 pub mod block;
 pub mod encode;
+pub mod format;
 pub mod hash;
 pub mod p2p;
 pub mod params;
@@ -15,6 +16,7 @@ pub mod tx;
 
 pub use block::Block;
 pub use encode::{DecodeError, Reader};
+pub use format::Format;
 pub use hash::Hash256;
 pub use header::Header;
 pub use tx::{OutPoint, Tx, TxIn, TxOut};

@@ -1,16 +1,18 @@
 //! Per-chain parameters. A chain is data, not code.
 //!
-//! Sources (via the Arcade v1.0 session, 2026-11-07): Pepecoin Core chainparams.cpp
-//! (master 4fb5a0cd93), the GX10's live testnet node, and the Python arcade's
-//! config.py / rawchain.py.
+//! Sources (via the Arcade v1.0 session, 2026-11-07; see docs/compat/SPEC.md):
+//! Pepecoin Core chainparams.cpp (master 4fb5a0cd93) and the GX10's live testnet node;
+//! DigiByte Core v9.26.7; Kotia upstream (eleonoraandrea/kotiacash); the Python
+//! arcade's config.py / rawchain.py. Live peers checked from this PC.
 
+use crate::format::Format;
 use crate::hash::Hash256;
 use crate::header::Header;
-use crate::pow::{meets_target, pow_hash, target_from_bits, PowAlgo, U256};
+use crate::pow::{meets_target, target_from_bits, try_pow_hash, PowAlgo, PowRule, U256};
 
 #[derive(Clone, Debug)]
 pub struct ChainParams {
-    /// Short key, as the arcade names it ("test", "main", ...).
+    /// Short key, as the arcade names it ("test", "main", "dgb", "kot", ...).
     pub key: &'static str,
     /// Store chain number (2 bytes in every key). Assigned once, never reused.
     pub chain_no: u16,
@@ -18,15 +20,21 @@ pub struct ChainParams {
     pub magic: [u8; 4],
     pub p2p_port: u16,
     pub genesis: &'static str,
-    /// Raw genesis header hex (80 bytes).
+    /// Raw genesis header hex (80 bytes); empty = fetch the genesis block from a peer and
+    /// check it against `genesis`.
     pub genesis_header: &'static str,
-    pub pow: PowAlgo,
+    pub format: Format,
+    pub pow: PowRule,
+    /// Apply the arcade's MAX_EASIER rule. Off for DigiByte and Kotia, as in the existing
+    /// arcade (its DGB index halted on 2026-10-28 when the rule misfired on multi-algo).
+    pub max_easier: bool,
     pub pow_limit_bits: u32,
     /// A block at or below powLimit difficulty is always accepted (testnet rule).
     pub min_difficulty_blocks: bool,
-    /// AuxPoW chain id to check in merge-mined headers; None = not checked (as the arcade does on testnet).
+    /// AuxPoW chain id to check in merge-mined headers; None = not checked.
     pub auxpow_chain_id: Option<u32>,
     pub auxpow_strict_chain_id: bool,
+    pub bech32_hrp: Option<&'static str>,
     pub p2pkh_version: u8,
     pub p2sh_version: u8,
     pub wif_version: u8,
@@ -36,6 +44,8 @@ pub struct ChainParams {
     pub fixed_peers: &'static [&'static str],
     pub checkpoints: &'static [(u32, &'static str)],
     pub coinbase_maturity: u32,
+    /// The arcade's ledger index starts here (activation / index floor).
+    pub index_start: u32,
 }
 
 impl ChainParams {
@@ -43,12 +53,19 @@ impl ChainParams {
         Hash256::from_hex(self.genesis).expect("valid genesis hex")
     }
 
-    pub fn genesis_header(&self) -> Header {
+    pub fn genesis_header(&self) -> Option<Header> {
+        if self.genesis_header.is_empty() {
+            return None;
+        }
         let raw: [u8; 80] = hex::decode(self.genesis_header)
             .expect("hex")
             .try_into()
             .expect("80 bytes");
-        Header::parse(&raw)
+        Some(Header::parse(&raw))
+    }
+
+    pub fn block_id(&self, h: &Header) -> Hash256 {
+        self.format.block_id(h)
     }
 }
 
@@ -67,8 +84,8 @@ pub enum HeaderError {
     BadPow,
     #[error("difficulty drops more than {MAX_EASIER}x from parent")]
     TooEasy,
-    #[error("AuxPoW flag set but no AuxPoW data")]
-    MissingAuxPow,
+    #[error("unknown mining algorithm in header version")]
+    UnknownAlgo,
 }
 
 pub fn too_easy(params: &ChainParams, bits: u32, parent_bits: u32) -> bool {
@@ -93,26 +110,68 @@ pub fn too_easy(params: &ChainParams, bits: u32, parent_bits: u32) -> bool {
     t > pt4
 }
 
-/// Check a plain (non-AuxPoW) header against its parent: link, difficulty step and PoW.
-pub fn check_header(params: &ChainParams, h: &Header, parent: &Header) -> Result<(), HeaderError> {
-    if h.prev != parent.hash() {
+/// What a header check established about its work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PowCheck {
+    /// The header's own PoW hash meets its target.
+    Verified,
+    /// Merge-mined: the caller must check the AuxPoW's parent header.
+    AuxPow,
+    /// Not checkable yet (some DigiByte algorithms, Kotia proof of stake):
+    /// accepted on the heaviest-chain rule with link and merkle proofs only.
+    NotCheckable,
+    /// Header misses its PoW target but the chain allows proof-of-stake blocks here:
+    /// decided by [`check_block_work`] once the block is in hand.
+    NeedsBlock,
+}
+
+/// Check a header at `height` against its parent: link, difficulty step and work.
+pub fn check_header(
+    params: &ChainParams,
+    h: &Header,
+    parent: &Header,
+    height: u32,
+) -> Result<PowCheck, HeaderError> {
+    if h.prev != params.block_id(parent) {
         return Err(HeaderError::BadLink);
     }
     let t = target_from_bits(h.bits).ok_or(HeaderError::BadBits)?;
     if t == U256::ZERO {
         return Err(HeaderError::BadBits);
     }
-    if too_easy(params, h.bits, parent.bits) {
+    let algo = params.pow.algo(h.version, height).ok_or(HeaderError::UnknownAlgo)?;
+    if params.max_easier && too_easy(params, h.bits, parent.bits) {
         return Err(HeaderError::TooEasy);
     }
-    if h.is_auxpow() {
-        // Caller must check the AuxPoW (its parent header carries the work).
-        return Ok(());
+    if params.format.has_auxpow(h) {
+        return Ok(PowCheck::AuxPow);
     }
-    if !meets_target(&pow_hash(params.pow, &h.encode()), h.bits) {
-        return Err(HeaderError::BadPow);
+    let Some(algo) = algo else { return Ok(PowCheck::NotCheckable) };
+    let stake_possible = matches!(params.pow, PowRule::PowThenStake { .. });
+    match try_pow_hash(algo, &h.encode()) {
+        Some(ph) if meets_target(&ph, h.bits) => Ok(PowCheck::Verified),
+        // Blackcoin-style chains mix PoS blocks in before the last PoW height, and a
+        // header alone cannot say which it is.
+        Some(_) if stake_possible => Ok(PowCheck::NeedsBlock),
+        Some(_) => Err(HeaderError::BadPow),
+        None => Ok(PowCheck::NotCheckable),
     }
-    Ok(())
+}
+
+/// Settle a [`PowCheck::NeedsBlock`] header with its block: a proof-of-stake block (second
+/// transaction is a coinstake) passes as not checkable; anything else must meet its PoW.
+pub fn check_block_work(params: &ChainParams, b: &crate::block::Block, height: u32)
+    -> Result<PowCheck, HeaderError>
+{
+    if b.is_proof_of_stake() {
+        return Ok(PowCheck::NotCheckable);
+    }
+    let algo = params.pow.algo(b.header.version, height).ok_or(HeaderError::UnknownAlgo)?;
+    match algo.and_then(|a| try_pow_hash(a, &b.header.encode())) {
+        Some(ph) if meets_target(&ph, b.header.bits) => Ok(PowCheck::Verified),
+        Some(_) => Err(HeaderError::BadPow),
+        None => Ok(PowCheck::NotCheckable),
+    }
 }
 
 pub static PEPECOIN_TEST: ChainParams = ChainParams {
@@ -123,11 +182,14 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
     p2p_port: 44874,
     genesis: "f9f4ea4ae7f6ea4c55040ede2019ba0a53e262f46ec9bce3dcda2cb11f96fc52",
     genesis_header: "0100000000000000000000000000000000000000000000000000000000000000000000001265bca4002feac94c0c06971f12aa8b2c82fb3e93244690d5cb399aa51b2ad2dc1daf65f0ff0f1e940d0000",
-    pow: PowAlgo::Scrypt,
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: true,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
+    bech32_hrp: None,
     p2pkh_version: 0x71,
     p2sh_version: 0xc4,
     wif_version: 0xf1,
@@ -146,6 +208,7 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
         (42001, "1b111a1eb8cb3e35d0aa6b89a06245574a78ce65996e5f2932f0df17027a5cd1"),
     ],
     coinbase_maturity: 240,
+    index_start: 1_496_133,
 };
 
 pub static PEPECOIN_MAIN: ChainParams = ChainParams {
@@ -155,12 +218,15 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     magic: [0xc0, 0xa0, 0xf0, 0xe0],
     p2p_port: 33874,
     genesis: "37981c0c48b8d48965376c8a42ece9a0838daadb93ff975cb091f57f8c2a5faa",
-    genesis_header: "", // to fetch when mainnet is added
-    pow: PowAlgo::Scrypt,
+    genesis_header: "",
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
     auxpow_chain_id: Some(0x3f),
     auxpow_strict_chain_id: false,
+    bech32_hrp: None,
     p2pkh_version: 56,
     p2sh_version: 22,
     wif_version: 0x9e,
@@ -170,18 +236,141 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     fixed_peers: &[],
     checkpoints: &[],
     coinbase_maturity: 240,
+    index_start: 1_208_000,
 };
+
+pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
+    key: "dgb",
+    chain_no: 3,
+    name: "DigiByte",
+    magic: [0xfa, 0xc3, 0xb6, 0xda],
+    p2p_port: 12024,
+    genesis: "7497ea1b465eb39f1c8f507bc877078fe016d6fcb6dfad3a64c98dcc6e1e8496",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000ad0f7d7518fc1e90ed28bd0e444ccd8e24d94688355705ed2142006b49d9dd726a62d052f0ff0f1e24592500",
+    format: Format::BITCOIN,
+    pow: PowRule::DigiByte,
+    max_easier: false,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: None,
+    auxpow_strict_chain_id: false,
+    bech32_hrp: Some("dgb"),
+    p2pkh_version: 30,
+    p2sh_version: 63,
+    wif_version: 128,
+    bip44_coin_type: 3,
+    protocol_version: 70019,
+    dns_seeds: &[
+        "seed.digibyte.io",
+        "seed.diginode.tools",
+        "seed.digibyte.link",
+        "seed.aroundtheblock.app",
+        "seed.tuyul.cc",
+    ],
+    fixed_peers: &[],
+    checkpoints: &[],
+    coinbase_maturity: 100,
+    index_start: 24_450_000,
+};
+
+/// DigiByte testnet26 ("DigiDollar Reset"): DigiDollar active from height 600.
+pub static DIGIBYTE_TEST: ChainParams = ChainParams {
+    key: "dgbtest",
+    chain_no: 4,
+    name: "DigiByte testnet26",
+    magic: [0xfe, 0xc6, 0xb9, 0xe7],
+    p2p_port: 12033,
+    genesis: "0c9af936f28f7bd0e90c8f6235399063a026ed267bb53da398313b5d7aa55d82",
+    genesis_header: "",
+    format: Format::BITCOIN,
+    pow: PowRule::DigiByte,
+    max_easier: false,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: true,
+    auxpow_chain_id: None,
+    auxpow_strict_chain_id: false,
+    bech32_hrp: Some("dgbt"),
+    p2pkh_version: 126,
+    p2sh_version: 140,
+    wif_version: 254,
+    bip44_coin_type: 1,
+    protocol_version: 70019,
+    dns_seeds: &[
+        "testnetseed.digibyte.io",
+        "testnetseed.digibyte.link",
+        "testnetseed.digibyte.services",
+    ],
+    fixed_peers: &[],
+    checkpoints: &[],
+    coinbase_maturity: 100,
+    index_start: 595_000,
+};
+
+/// Kotia: Blackcoin-style PoS on Bitcoin 0.14. Scrypt PoW to block 1,000,000, then PoS.
+pub static KOTIA_MAIN: ChainParams = ChainParams {
+    key: "kot",
+    chain_no: 5,
+    name: "Kotia",
+    magic: [0x3d, 0xb5, 0x80, 0x00],
+    p2p_port: 46174,
+    genesis: "000008e4586479cd9dc5832b262414a60f152381e371cf7940ffe9f5aa4b80a0",
+    genesis_header: "01000000000000000000000000000000000000000000000000000000000000000000000013154d160a2cca0221b412d99a34545d9ab4c457c81b8d1c1ca526be311c70f0c0af8261ffff0f1e030f0000",
+    format: Format::POS_TIMED,
+    pow: PowRule::PowThenStake { algo: PowAlgo::Scrypt, last_pow_height: 1_000_000 },
+    max_easier: false,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: None,
+    auxpow_strict_chain_id: false,
+    bech32_hrp: None,
+    p2pkh_version: 46,
+    p2sh_version: 45,
+    wif_version: 173,
+    bip44_coin_type: 3,
+    protocol_version: 70013,
+    dns_seeds: &["node1.kotia.cash", "secondnode.kotia.cash"],
+    fixed_peers: &["94.156.144.178:46174"],
+    checkpoints: &[],
+    coinbase_maturity: 20,
+    index_start: 1_530_000,
+};
+
+pub static ALL_CHAINS: &[&ChainParams] =
+    &[&PEPECOIN_TEST, &PEPECOIN_MAIN, &DIGIBYTE_MAIN, &DIGIBYTE_TEST, &KOTIA_MAIN];
+
+pub fn by_key(key: &str) -> Option<&'static ChainParams> {
+    ALL_CHAINS.iter().copied().find(|p| p.key == key)
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::pow::bits_from_target;
+    use crate::pow::{bits_from_target, pow_hash};
+
+    #[test]
+    fn genesis_headers_hash_to_genesis() {
+        for p in ALL_CHAINS {
+            if let Some(g) = p.genesis_header() {
+                assert_eq!(p.block_id(&g), p.genesis_hash(), "{}", p.name);
+            }
+        }
+    }
+
+    #[test]
+    fn chain_numbers_and_keys_are_unique() {
+        for (i, a) in ALL_CHAINS.iter().enumerate() {
+            for b in &ALL_CHAINS[i + 1..] {
+                assert_ne!(a.chain_no, b.chain_no);
+                assert_ne!(a.key, b.key);
+                assert_ne!(a.magic, b.magic);
+            }
+        }
+    }
 
     #[test]
     fn pepecoin_testnet_genesis() {
         let p = &PEPECOIN_TEST;
-        let g = p.genesis_header();
-        assert_eq!(g.hash(), p.genesis_hash());
+        let g = p.genesis_header().unwrap();
         assert_eq!(
             g.merkle_root.to_hex(),
             "d22a1ba59a39cbd5904624933efb822c8baa121f97060c4cc9ea2f00a4bc6512"
@@ -191,23 +380,44 @@ mod tests {
     }
 
     #[test]
+    fn kotia_genesis_is_scrypt_id() {
+        let g = KOTIA_MAIN.genesis_header().unwrap();
+        assert_ne!(g.hash(), KOTIA_MAIN.genesis_hash(), "sha256d is NOT the id for v1 headers");
+        assert_eq!(KOTIA_MAIN.block_id(&g), KOTIA_MAIN.genesis_hash());
+    }
+
+    /// Real DigiByte mainnet block 24,450,197 (sha256d algo) from the arcade's fixtures.
+    #[test]
+    fn digibyte_sha256d_fixture() {
+        let raw: [u8; 80] = hex::decode("02a2f925994a1c8add99de9e8c12e798e70a2fab949b5d7a171f45b8cfd859c686ef944bec972620b6fcd7d2ab8c9fce88664ba4f5dc0c0c157249c95e5dca0f3e04c3788cd1de6ac73704199684e683").unwrap().try_into().unwrap();
+        let h = Header::parse(&raw);
+        assert_eq!(
+            h.hash().to_hex(),
+            "0000000000000000200889082393a1a2cfce39c18f23f7218e8a27ab25d080d6"
+        );
+        assert_eq!(DIGIBYTE_MAIN.pow.algo(h.version, 24_450_197), Some(Some(PowAlgo::Sha256d)));
+        assert!(meets_target(&pow_hash(PowAlgo::Sha256d, &raw), h.bits));
+    }
+
+    #[test]
     fn max_easier_rule() {
         let p = &PEPECOIN_MAIN; // no min-difficulty exemption
         let parent = 0x1c0fffff;
         let t = target_from_bits(parent).unwrap();
-        let x4 = bits_from_target(t.checked_add(t).unwrap().checked_add(t).unwrap().checked_add(t).unwrap());
+        let x4 = bits_from_target(
+            t.checked_add(t).unwrap().checked_add(t).unwrap().checked_add(t).unwrap(),
+        );
         assert!(!too_easy(p, x4, parent), "exactly 4x easier is allowed");
         assert!(too_easy(p, 0x1d0fffff, parent), "256x easier is not");
         assert!(!too_easy(p, 0x1b0fffff, parent), "harder is always fine");
-        // Testnet: powLimit blocks are always fine.
-        assert!(!too_easy(&PEPECOIN_TEST, 0x1e0fffff, 0x1b0fffff));
+        assert!(!too_easy(&PEPECOIN_TEST, 0x1e0fffff, 0x1b0fffff), "testnet powLimit is fine");
     }
 
     #[test]
     fn check_header_rejects_bad_link() {
-        let g = PEPECOIN_TEST.genesis_header();
+        let g = PEPECOIN_TEST.genesis_header().unwrap();
         let mut h = g;
         h.prev = Hash256::ZERO;
-        assert_eq!(check_header(&PEPECOIN_TEST, &h, &g), Err(HeaderError::BadLink));
+        assert_eq!(check_header(&PEPECOIN_TEST, &h, &g, 1), Err(HeaderError::BadLink));
     }
 }

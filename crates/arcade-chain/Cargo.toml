@@ -8,6 +8,7 @@ license.workspace = true
 hex = "0.4.3"
 scrypt = "0.12.0"
 sha2 = "0.11.1"
+skein = "0.1"
 thiserror = "1"
 
 [dev-dependencies]

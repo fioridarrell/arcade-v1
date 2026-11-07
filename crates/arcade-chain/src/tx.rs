@@ -1,6 +1,7 @@
 //! Transactions. Parsed for their structure; the raw bytes stay the source of truth.
 
 use crate::encode::{write_varint, DecodeError, Reader};
+use crate::format::Format;
 use crate::hash::{sha256d, Hash256};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -33,6 +34,8 @@ pub struct TxOut {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Tx {
     pub version: i32,
+    /// PPCoin-style transaction time (Kotia); None on chains without it.
+    pub time: Option<u32>,
     pub inputs: Vec<TxIn>,
     pub outputs: Vec<TxOut>,
     pub lock_time: u32,
@@ -46,13 +49,26 @@ impl Tx {
         self.inputs.len() == 1 && self.inputs[0].prevout.is_null()
     }
 
+    /// PPCoin coinstake: real first input, at least 2 outputs, first output empty.
+    pub fn is_coinstake(&self) -> bool {
+        !self.inputs.is_empty()
+            && !self.inputs[0].prevout.is_null()
+            && self.outputs.len() >= 2
+            && self.outputs[0].value == 0
+            && self.outputs[0].script_pubkey.is_empty()
+    }
+
     pub fn has_witness(&self) -> bool {
         self.inputs.iter().any(|i| !i.witness.is_empty())
     }
 
     pub fn parse(bytes: &[u8]) -> Result<Tx, DecodeError> {
+        Self::parse_with(bytes, &Format::BITCOIN)
+    }
+
+    pub fn parse_with(bytes: &[u8], fmt: &Format) -> Result<Tx, DecodeError> {
         let mut r = Reader::new(bytes);
-        let tx = Self::decode(&mut r)?;
+        let tx = Self::decode_with(&mut r, fmt)?;
         if !r.is_empty() {
             return Err(DecodeError::Invalid("trailing bytes after transaction"));
         }
@@ -61,11 +77,16 @@ impl Tx {
 
     /// Decode one transaction from the reader (it may be followed by more data).
     pub fn decode(r: &mut Reader) -> Result<Tx, DecodeError> {
+        Self::decode_with(r, &Format::BITCOIN)
+    }
+
+    pub fn decode_with(r: &mut Reader, fmt: &Format) -> Result<Tx, DecodeError> {
         let start = r.pos();
         let version = r.i32()?;
+        let time = if fmt.tx_time { Some(r.u32()?) } else { None };
 
         // SegWit marker: 0x00 then flag 0x01 where the input count would be.
-        let segwit = r.peek(2).map(|b| b[0] == 0 && b[1] == 1).unwrap_or(false);
+        let segwit = fmt.segwit && r.peek(2).map(|b| b[0] == 0 && b[1] == 1).unwrap_or(false);
         if segwit {
             r.bytes(2)?;
         }
@@ -104,7 +125,8 @@ impl Tx {
         let lock_time = r.u32()?;
         let raw = r.since(start).to_vec();
 
-        // txid is over the serialization without marker, flag and witness.
+        // txid is over the serialization without marker, flag and witness
+        // (nTime, where present, is part of it).
         let txid = if segwit {
             let mut s = Vec::with_capacity(raw.len());
             s.extend_from_slice(&raw[..4]);
@@ -115,13 +137,16 @@ impl Tx {
             sha256d(&raw)
         };
 
-        Ok(Tx { version, inputs, outputs, lock_time, txid, raw })
+        Ok(Tx { version, time, inputs, outputs, lock_time, txid, raw })
     }
 
     /// Serialize without witness (used by tests and tx building).
     pub fn encode_legacy(&self) -> Vec<u8> {
         let mut o = Vec::new();
         o.extend_from_slice(&self.version.to_le_bytes());
+        if let Some(t) = self.time {
+            o.extend_from_slice(&t.to_le_bytes());
+        }
         write_varint(&mut o, self.inputs.len() as u64);
         for i in &self.inputs {
             o.extend_from_slice(&i.prevout.txid.0);
@@ -178,6 +203,22 @@ mod tests {
         assert!(tx.has_witness());
         assert_eq!(tx.txid, legacy.txid);
         assert_eq!(tx.raw, sw);
+    }
+
+    /// Kotia fixture tx from the existing arcade (tests/test_kotia.py): nTime after version.
+    #[test]
+    fn kotia_timed_tx() {
+        let raw = hex::decode("01000000f0cddb6a01d17aa9770e9acc1951c5c0baa937d79ed1ef1ca2a4d682a5a38a59caf9b35a0b0100000000ffffffff03005a6202000000001976a914ecc6eedb31bc622d1f8dd722cacab2852113bfb888ac0000000000000000166a14617263616465206b6f7469612066697874757265f05f9303000000001976a914f627f2a55c5fd2f86c15d14c28dada92e7b8ccc088ac00000000").unwrap();
+        let tx = Tx::parse_with(&raw, &Format::POS_TIMED).unwrap();
+        assert_eq!(tx.time, Some(1792790000));
+        assert_eq!(tx.outputs.len(), 3);
+        assert_eq!(
+            tx.txid.to_hex(),
+            "bba0a60b2459c001a76c7797770c4366b5aedab73e5d4d77bc6f36a9a1b4878b"
+        );
+        assert_eq!(tx.encode_legacy(), raw);
+        // Read as a Bitcoin tx it must not silently succeed with the same id.
+        assert!(Tx::parse(&raw).map(|t| t.txid != tx.txid).unwrap_or(true));
     }
 
     #[test]

@@ -5,6 +5,7 @@
 
 use crate::auxpow::AuxPow;
 use crate::encode::{write_varint, DecodeError, Reader};
+use crate::format::Format;
 use crate::hash::{sha256d, Hash256};
 use crate::header::Header;
 use crate::params::ChainParams;
@@ -141,14 +142,18 @@ pub struct HeaderEntry {
     pub auxpow: Option<AuxPow>,
 }
 
-pub fn parse_headers(payload: &[u8]) -> Result<Vec<HeaderEntry>> {
+/// Entries are header [+ AuxPoW] + tx count (0) [+ block-sig length (0) on PoS chains].
+pub fn parse_headers(payload: &[u8], fmt: &Format) -> Result<Vec<HeaderEntry>> {
     let mut r = Reader::new(payload);
     let n = r.len()?;
     let mut v = Vec::with_capacity(n.min(2000));
     for _ in 0..n {
         let header = Header::decode(&mut r)?;
-        let auxpow = if header.is_auxpow() { Some(AuxPow::decode(&mut r)?) } else { None };
+        let auxpow = if fmt.has_auxpow(&header) { Some(AuxPow::decode(&mut r)?) } else { None };
         let _tx_count = r.varint()?;
+        if fmt.block_sig {
+            let _sig = r.var_bytes()?;
+        }
         v.push(HeaderEntry { header, auxpow });
     }
     Ok(v)
@@ -171,6 +176,7 @@ pub struct Peer {
     pub addr: SocketAddr,
     pub version: PeerVersion,
     protocol_version: i32,
+    pub format: Format,
 }
 
 impl Peer {
@@ -201,7 +207,7 @@ impl Peer {
         }
         let version = version.unwrap();
         let protocol_version = version.version.min(params.protocol_version);
-        Ok(Peer { stream, magic, addr: sa, version, protocol_version })
+        Ok(Peer { stream, magic, addr: sa, version, protocol_version, format: params.format })
     }
 
     pub fn send(&mut self, command: &str, payload: &[u8]) -> Result<()> {
@@ -234,7 +240,7 @@ impl Peer {
     pub fn get_headers(&mut self, locator: &[Hash256]) -> Result<Vec<HeaderEntry>> {
         self.send("getheaders", &getheaders_payload(self.protocol_version, locator, Hash256::ZERO))?;
         let m = self.recv_cmd("headers")?;
-        parse_headers(&m.payload)
+        parse_headers(&m.payload, &self.format)
     }
 
     /// Request blocks; returns raw block bytes in the order received.

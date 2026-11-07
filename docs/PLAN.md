@@ -22,6 +22,19 @@ V1.0 is the **first-run path on Pepecoin testnet** (from Martin's whiteboard):
 | 11 | Share bootstraps | Always serve verified bootstraps and index snapshots to peers |
 | 12 | CMD commands | `arcade` command line for everything above |
 
+**Chains are add-ons.** A fresh install carries **Pepecoin testnet only**. Every other chain is an optional
+add-on the user installs afterwards (`arcade chain add <key>`, or the desktop app's Chains screen); removing one
+drops only that chain's keys. Add-ons the P2P core must support (requested 2026-11-07):
+
+| Add-on | Notes |
+|---|---|
+| Pepecoin mainnet | AuxPoW (chain id 0x3f) |
+| DigiByte + DigiByte testnet26 | Multi-algo PoW (scrypt, sha256d, skein verified; qubit, odocrypt, groestl to implement); SegWit/Taproot; **DigiDollar** (tx version 0x0770, `OP_RETURN "DD"`, DD/TD addresses) |
+| Kotia | PoS (Blackcoin-style): tx nTime, block signature, scrypt block ids for header version < 7 |
+| Litecoin (+ testnet4) | **All address types**: P2PKH, P2SH (both version bytes), P2WPKH, P2WSH, P2TR (bech32/bech32m), MWEB (`ltcmweb1…`); MWEB extension data kept byte-exact |
+| Flopcoin | spec requested |
+| More Bitcoin-family coins | A chain is a `ChainParams` entry (wire `Format` + `PowRule` + address versions); new coins are data, plus code only where a coin genuinely differs |
+
 **Out of scope for V1.0:** mainnet, other chains, inscriptions (Pepinals/PRC-20), trading, creating/collections,
 messenger/feed/games, LLM credits. The schema carries a chain number everywhere so these add on without a rebuild.
 

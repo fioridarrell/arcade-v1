@@ -2,15 +2,20 @@
 
 use crate::auxpow::AuxPow;
 use crate::encode::{write_varint, DecodeError, Reader};
+use crate::format::Format;
 use crate::hash::{merkle_root, Hash256};
 use crate::header::Header;
 use crate::tx::Tx;
 
 #[derive(Clone, Debug)]
 pub struct Block {
+    /// Block id (sha256d of the header, or scrypt on old Kotia headers).
+    pub id: Hash256,
     pub header: Header,
     pub auxpow: Option<AuxPow>,
     pub txs: Vec<Tx>,
+    /// Block signature (PoS chains); None where the format has none.
+    pub sig: Option<Vec<u8>>,
     /// Bytes after the last transaction (e.g. Litecoin MWEB). Empty for most chains.
     pub extra: Vec<u8>,
 }
@@ -28,21 +33,32 @@ pub enum BlockError {
 }
 
 impl Block {
+    /// Parse with Bitcoin/Dogecoin layout (AuxPoW when the header says so).
     pub fn parse(bytes: &[u8]) -> Result<Block, BlockError> {
+        Self::parse_with(bytes, &Format { auxpow: true, ..Format::BITCOIN })
+    }
+
+    pub fn parse_with(bytes: &[u8], fmt: &Format) -> Result<Block, BlockError> {
         let mut r = Reader::new(bytes);
         let header = Header::decode(&mut r)?;
-        let auxpow = if header.is_auxpow() { Some(AuxPow::decode(&mut r)?) } else { None };
+        let auxpow = if fmt.has_auxpow(&header) { Some(AuxPow::decode(&mut r)?) } else { None };
         let n = r.len()?;
         let mut txs = Vec::with_capacity(n.min(100_000));
         for _ in 0..n {
-            txs.push(Tx::decode(&mut r)?);
+            txs.push(Tx::decode_with(&mut r, fmt)?);
         }
+        let sig = if fmt.block_sig { Some(r.var_bytes()?.to_vec()) } else { None };
         let extra = r.bytes(r.remaining())?.to_vec();
-        Ok(Block { header, auxpow, txs, extra })
+        Ok(Block { id: fmt.block_id(&header), header, auxpow, txs, sig, extra })
     }
 
     pub fn hash(&self) -> Hash256 {
-        self.header.hash()
+        self.id
+    }
+
+    /// Proof of stake: the second transaction is a coinstake (Kotia).
+    pub fn is_proof_of_stake(&self) -> bool {
+        self.txs.get(1).map(|t| t.is_coinstake()).unwrap_or(false)
     }
 
     pub fn computed_merkle_root(&self) -> Hash256 {
@@ -74,6 +90,10 @@ impl Block {
         for t in &self.txs {
             o.extend_from_slice(&t.raw);
         }
+        if let Some(sig) = &self.sig {
+            write_varint(&mut o, sig.len() as u64);
+            o.extend_from_slice(sig);
+        }
         o.extend_from_slice(&self.extra);
         o
     }
@@ -96,6 +116,28 @@ mod tests {
         b.check().unwrap();
         assert!(b.auxpow.is_none());
         assert!(b.extra.is_empty());
+        assert_eq!(b.encode(), raw);
+    }
+
+    /// Kotia genesis, rebuilt by the Arcade v1.0 session from upstream CreateGenesisBlock.
+    #[test]
+    fn kotia_genesis_block() {
+        let header = "01000000000000000000000000000000000000000000000000000000000000000000000013154d160a2cca0221b412d99a34545d9ab4c457c81b8d1c1ca526be311c70f0c0af8261ffff0f1e030f0000";
+        let coinbase = "01000000c0af8261010000000000000000000000000000000000000000000000000000000000000000ffffffff1500012a116f6d6e69612076696e63697420616d6f72ffffffff0100000000000000000000000000";
+        let raw = hex::decode(format!("{header}01{coinbase}00")).unwrap();
+        let b = Block::parse_with(&raw, &Format::POS_TIMED).unwrap();
+        b.check().unwrap();
+        assert_eq!(
+            b.hash().to_hex(),
+            "000008e4586479cd9dc5832b262414a60f152381e371cf7940ffe9f5aa4b80a0",
+            "version-1 Kotia blocks are identified by scrypt"
+        );
+        assert_eq!(
+            b.header.merkle_root.to_hex(),
+            "f0701c31be26a51c1c8d1bc857c4b49a5d54349ad912b42102ca2c0a164d1513"
+        );
+        assert_eq!(b.sig.as_deref(), Some(&[][..]));
+        assert!(!b.is_proof_of_stake());
         assert_eq!(b.encode(), raw);
     }
 

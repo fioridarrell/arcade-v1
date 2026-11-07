@@ -2,24 +2,85 @@
 
 use crate::hash::{sha256d, Hash256};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// A proof-of-work hash function.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum PowAlgo {
     Scrypt,
     Sha256d,
+    // DigiByte multi-algo. Not yet implemented: headers mined with these are accepted
+    // on the heaviest-chain rule without a PoW check (as the existing arcade does for DGB).
+    Groestl,
+    Skein,
+    Qubit,
+    Odocrypt,
 }
 
-/// The PoW hash of an 80-byte header.
-pub fn pow_hash(algo: PowAlgo, header80: &[u8; 80]) -> Hash256 {
+impl PowAlgo {
+    pub fn checkable(self) -> bool {
+        matches!(self, PowAlgo::Scrypt | PowAlgo::Sha256d | PowAlgo::Skein)
+    }
+}
+
+/// How a chain picks the algorithm for a header.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PowRule {
+    /// One algorithm for every block (Pepecoin, Dogecoin, Litecoin...).
+    Single(PowAlgo),
+    /// DigiByte: algorithm in the version's BLOCK_VERSION_ALGO bits (0x0F00).
+    DigiByte,
+    /// Proof of work up to and including `last_pow_height`, proof of stake after (Kotia).
+    PowThenStake { algo: PowAlgo, last_pow_height: u32 },
+}
+
+/// DigiByte BLOCK_VERSION_ALGO = 15 << 8 (primitives/block.h).
+pub const DGB_ALGO_MASK: i32 = 0x0F00;
+
+impl PowRule {
+    /// The work algorithm for a header: `None` = unknown algorithm (reject);
+    /// `Some(None)` = no proof of work to check (proof of stake).
+    pub fn algo(self, version: i32, height: u32) -> Option<Option<PowAlgo>> {
+        match self {
+            PowRule::Single(a) => Some(Some(a)),
+            PowRule::PowThenStake { algo, last_pow_height } => {
+                Some((height <= last_pow_height).then_some(algo))
+            }
+            PowRule::DigiByte => match version & DGB_ALGO_MASK {
+                0x0000 => Some(Some(PowAlgo::Scrypt)),
+                0x0200 => Some(Some(PowAlgo::Sha256d)),
+                0x0400 => Some(Some(PowAlgo::Groestl)),
+                0x0600 => Some(Some(PowAlgo::Skein)),
+                0x0800 => Some(Some(PowAlgo::Qubit)),
+                0x0E00 => Some(Some(PowAlgo::Odocrypt)),
+                _ => None,
+            },
+        }
+    }
+}
+
+/// The PoW hash of an 80-byte header, or None if the algorithm is not implemented yet.
+pub fn try_pow_hash(algo: PowAlgo, header80: &[u8; 80]) -> Option<Hash256> {
     match algo {
-        PowAlgo::Sha256d => sha256d(header80),
+        PowAlgo::Sha256d => Some(sha256d(header80)),
         PowAlgo::Scrypt => {
             // Litecoin/Dogecoin scrypt: N=1024, r=1, p=1, password = salt = header.
             let params = scrypt::Params::new(10, 1, 1).expect("valid scrypt params");
             let mut out = [0u8; 32];
             scrypt::scrypt(header80, header80, &params, &mut out).expect("32-byte output");
-            Hash256(out)
+            Some(Hash256(out))
         }
+        PowAlgo::Skein => {
+            // DigiByte HashSkein: SHA-256 of Skein-512-512.
+            use skein::digest::Digest as _;
+            let h512 = skein::Skein512::<skein::consts::U64>::digest(header80);
+            Some(Hash256(crate::hash::sha256(&h512)))
+        }
+        _ => None,
     }
+}
+
+/// The PoW hash for an implemented algorithm (panics otherwise).
+pub fn pow_hash(algo: PowAlgo, header80: &[u8; 80]) -> Hash256 {
+    try_pow_hash(algo, header80).expect("PoW algorithm not implemented")
 }
 
 /// 256-bit unsigned integer as 4 little-endian u64 limbs; just enough for targets and work.

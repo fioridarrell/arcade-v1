@@ -60,6 +60,8 @@ fn params_for(genesis: &Block) -> &'static ChainParams {
     Box::leak(Box::new(p))
 }
 
+static LOGGED: &[&str] = &[HEADERS, HEIGHT, TXS, OUTPUTS, SPENDS, BY_SCRIPT, SCRIPT_HIST, STATE];
+
 fn dump(db: &ChainDb) -> Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
     LOGGED
         .iter()
@@ -233,4 +235,50 @@ fn mempool_add_conflict_and_settle() {
     let cb3 = tx(&[], &[(1, p2pkh(4))], 3);
     assert!(f.db.mempool_add(f.p, &cb3, 10).unwrap());
     assert_eq!(f.db.mempool_expire(f.p, 10 + 3601, 3600).unwrap(), 1);
+}
+
+/// A toy indexer: counts transactions per block height in an add-on table.
+struct CountTx;
+impl crate::Indexer for CountTx {
+    fn name(&self) -> &'static str { "count" }
+    fn tables(&self) -> Vec<arcade_store::TableDef> { vec![arcade_store::TableDef::plain("addon.v1.count")] }
+    fn start_height(&self, _p: &ChainParams) -> u32 { 1 }
+    fn connect(&self, ctx: &crate::BlockCtx) -> arcade_store::Result<()> {
+        let spent: u64 = ctx.prevouts.iter().flatten().map(|p| p.value).sum();
+        let mut v = (ctx.block.txs.len() as u32).to_be_bytes().to_vec();
+        v.extend_from_slice(&spent.to_be_bytes());
+        ctx.l.put("addon.v1.count", &ctx.height.to_be_bytes(), &v)
+    }
+}
+
+#[test]
+fn indexer_in_commit_undo_and_backfill_agree() {
+    // A: indexer present from the start.
+    let a = fixture();
+    a.db.add_indexer(std::sync::Arc::new(CountTx)).unwrap();
+    let cb1 = tx(&[], &[(5000, p2pkh(1))], 1);
+    let b1 = block(a.g.hash(), vec![cb1.clone()], 2);
+    let spend = tx(&[(cb1.txid, 0)], &[(4000, p2pkh(2))], 0);
+    let b2 = block(b1.hash(), vec![tx(&[], &[(1, p2pkh(9))], 2), spend], 3);
+    a.db.connect_blocks(a.p, &[b1.clone(), b2.clone()]).unwrap();
+    let rows_a = a.db.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap();
+    assert_eq!(rows_a.len(), 2);
+    assert_eq!(&rows_a[1].1[4..], &5000u64.to_be_bytes(), "prevout values reach the indexer");
+    assert_eq!(a.db.indexed_to(a.p.chain_no, "count").unwrap(), Some(2));
+    // Reorg undoes the index row with the block.
+    a.db.disconnect_tip(a.p.chain_no).unwrap();
+    assert_eq!(a.db.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap().len(), 1);
+    assert_eq!(a.db.indexed_to(a.p.chain_no, "count").unwrap(), Some(1));
+    a.db.connect_blocks(a.p, &[b2.clone()]).unwrap();
+
+    // B: same chain, indexer added afterwards and backfilled.
+    let dir = tempfile::tempdir().unwrap();
+    let bdb = ChainDb::open(dir.path().join("c.mdbx")).unwrap();
+    bdb.connect_blocks(a.p, &[a.g.clone(), b1, b2]).unwrap();
+    bdb.add_indexer(std::sync::Arc::new(CountTx)).unwrap();
+    while bdb.backfill(a.p, "count", 1).unwrap() > 0 {}
+    assert_eq!(bdb.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap(), a.db.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap());
+    // Backfilled rows inside the undo window are undone by a reorg too.
+    bdb.disconnect_tip(a.p.chain_no).unwrap();
+    assert_eq!(bdb.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap().len(), 1);
 }

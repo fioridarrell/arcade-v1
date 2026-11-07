@@ -83,69 +83,102 @@ pub struct TagRow {
     pub position: u32,
 }
 
-/// The tag table: tag PRIMARY KEY, address UNIQUE.
+/// Storage for the tag table: tag PRIMARY KEY, address UNIQUE.
+pub trait TagStore {
+    type E;
+    fn tag(&self, tag: &str) -> Result<Option<TagRow>, Self::E>;
+    fn tag_of(&self, address: &str) -> Result<Option<String>, Self::E>;
+    fn set(&mut self, tag: &str, row: TagRow) -> Result<(), Self::E>;
+    fn remove(&mut self, tag: &str, address: &str) -> Result<(), Self::E>;
+}
+
+/// Apply one op from `sender` (with `reference`). Ok(Err) = invalid, nothing changed.
+pub fn apply<S: TagStore>(
+    s: &mut S,
+    op: &TagOp,
+    sender: &str,
+    reference: Option<&str>,
+    txid: &str,
+    height: u32,
+    position: u32,
+) -> Result<Result<(), &'static str>, S::E> {
+    let row = |address: &str| TagRow { address: address.into(), claimed_txid: txid.into(), block_height: height, position };
+    match op {
+        TagOp::Claim(t) => {
+            if let Some(r) = s.tag(t)? {
+                return Ok(Err(if r.address == sender { "already yours" } else { "taken" }));
+            }
+            if let Some(old) = s.tag_of(sender)? {
+                s.remove(&old, sender)?;
+            }
+            s.set(t, row(sender))?;
+            Ok(Ok(()))
+        }
+        TagOp::Transfer(t) => {
+            match s.tag(t)? {
+                Some(r) if r.address == sender => {}
+                _ => return Ok(Err("not yours")),
+            }
+            let Some(to) = reference else { return Ok(Err("no recipient")) };
+            if to == sender {
+                return Ok(Err("to yourself"));
+            }
+            if s.tag_of(to)?.is_some() {
+                return Ok(Err("recipient already has a tag"));
+            }
+            s.remove(t, sender)?;
+            s.set(t, row(to))?;
+            Ok(Ok(()))
+        }
+    }
+}
+
+/// names_digest over rows in tag order: sha256 of "{tag}|{address}|{block_height}\n".
+pub fn digest<'a>(rows: impl Iterator<Item = (&'a str, &'a TagRow)>) -> String {
+    let mut h = Sha256::new();
+    for (t, r) in rows {
+        h.update(format!("{t}|{}|{}\n", r.address, r.block_height).as_bytes());
+    }
+    hex::encode(h.finalize())
+}
+
+/// In-memory tag table (replays, tests).
 #[derive(Debug, Default, Clone)]
 pub struct Tags {
     pub by_tag: BTreeMap<String, TagRow>,
     pub by_addr: BTreeMap<String, String>,
 }
 
+impl TagStore for Tags {
+    type E = std::convert::Infallible;
+    fn tag(&self, t: &str) -> Result<Option<TagRow>, Self::E> {
+        Ok(self.by_tag.get(t).cloned())
+    }
+    fn tag_of(&self, a: &str) -> Result<Option<String>, Self::E> {
+        Ok(self.by_addr.get(a).cloned())
+    }
+    fn set(&mut self, t: &str, row: TagRow) -> Result<(), Self::E> {
+        self.by_addr.insert(row.address.clone(), t.into());
+        self.by_tag.insert(t.into(), row);
+        Ok(())
+    }
+    fn remove(&mut self, t: &str, a: &str) -> Result<(), Self::E> {
+        self.by_tag.remove(t);
+        self.by_addr.remove(a);
+        Ok(())
+    }
+}
+
 impl Tags {
-    /// Apply one op from `sender` (with `reference`). Err = invalid, nothing changed.
-    pub fn apply(
-        &mut self,
-        op: &TagOp,
-        sender: &str,
-        reference: Option<&str>,
-        txid: &str,
-        height: u32,
-        position: u32,
-    ) -> Result<(), &'static str> {
-        match op {
-            TagOp::Claim(t) => {
-                if let Some(row) = self.by_tag.get(t) {
-                    return Err(if row.address == sender { "already yours" } else { "taken" });
-                }
-                if let Some(old) = self.by_addr.remove(sender) {
-                    self.by_tag.remove(&old);
-                }
-                self.by_tag.insert(
-                    t.clone(),
-                    TagRow { address: sender.into(), claimed_txid: txid.into(), block_height: height, position },
-                );
-                self.by_addr.insert(sender.into(), t.clone());
-                Ok(())
-            }
-            TagOp::Transfer(t) => {
-                match self.by_tag.get(t) {
-                    Some(row) if row.address == sender => {}
-                    _ => return Err("not yours"),
-                }
-                let to = reference.ok_or("no recipient")?;
-                if to == sender {
-                    return Err("to yourself");
-                }
-                if self.by_addr.contains_key(to) {
-                    return Err("recipient already has a tag");
-                }
-                self.by_addr.remove(sender);
-                self.by_addr.insert(to.into(), t.clone());
-                self.by_tag.insert(
-                    t.clone(),
-                    TagRow { address: to.into(), claimed_txid: txid.into(), block_height: height, position },
-                );
-                Ok(())
-            }
+    pub fn apply(&mut self, op: &TagOp, sender: &str, reference: Option<&str>, txid: &str, height: u32, position: u32) -> Result<(), &'static str> {
+        match apply(self, op, sender, reference, txid, height, position) {
+            Ok(r) => r,
+            Err(never) => match never {},
         }
     }
 
-    /// names_digest: sha256 over "{tag}|{address}|{block_height}\n" ORDER BY tag.
     pub fn digest(&self) -> String {
-        let mut h = Sha256::new();
-        for (t, r) in &self.by_tag {
-            h.update(format!("{t}|{}|{}\n", r.address, r.block_height).as_bytes());
-        }
-        hex::encode(h.finalize())
+        digest(self.by_tag.iter().map(|(t, r)| (t.as_str(), r)))
     }
 }
 

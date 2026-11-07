@@ -3,11 +3,13 @@
 //! as the block. See docs/PLAN.md §4-5.
 
 pub mod db;
+pub mod indexer;
 pub mod schema;
 pub mod sync;
 pub mod undo;
 
 pub use db::{ChainDb, Coin, HeaderRec, Tip};
+pub use indexer::{BlockCtx, Indexer, Prevout};
 
 #[cfg(test)]
 mod tests;

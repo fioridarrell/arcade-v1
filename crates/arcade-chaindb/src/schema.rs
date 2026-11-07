@@ -27,14 +27,6 @@ pub const STATE: &str = "core.v1.state"; // C|name -> value
 pub const MEMPOOL: &str = "core.v1.mempool"; // C|T12 -> first_seen u64 LE | raw tx
 pub const MEMPOOL_SPENDS: &str = "core.v1.mempool_spends"; // C|T12|vout -> spending txid (32)
 
-/// Undo log refers to tables by index into this list. Never reorder: append only.
-pub static LOGGED: &[&str] =
-    &[HEADERS, HEIGHT, TXS, OUTPUTS, SPENDS, BY_SCRIPT, SCRIPT_HIST, STATE];
-
-pub fn logged_index(table: &str) -> u8 {
-    LOGGED.iter().position(|t| *t == table).expect("table is undo-logged") as u8
-}
-
 static TABLES: &[TableDef] = &[
     TableDef::plain(HEADERS),
     TableDef::plain(HDR),

@@ -1,6 +1,8 @@
 //! ChainDb: blocks stored once, indexes updated in the same commit, reorgs by undo.
 
+use crate::indexer::{BlockCtx, Indexer, Prevout};
 use crate::schema::*;
+use std::sync::Arc;
 use crate::undo::{self, Logged};
 use arcade_chain::params::ChainParams;
 use arcade_chain::pow::{work_from_bits, U256};
@@ -262,11 +264,84 @@ fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Res
 
 pub struct ChainDb {
     pub store: Store,
+    indexers: std::sync::RwLock<Vec<Arc<dyn Indexer>>>,
+}
+
+fn ix_key(c: u16, name: &str) -> Vec<u8> {
+    k_state(c, &format!("ix:{name}"))
 }
 
 impl ChainDb {
     pub fn open(path: impl AsRef<Path>) -> Result<ChainDb> {
-        Ok(ChainDb { store: Store::open(path, &CHAIN_SCHEMA)? })
+        Ok(ChainDb { store: Store::open(path, &CHAIN_SCHEMA)?, indexers: Default::default() })
+    }
+
+    /// Register an indexer: creates its tables. If the chain is already past the
+    /// indexer's start, call [`ChainDb::backfill`] until it returns 0.
+    pub fn add_indexer(&self, ix: Arc<dyn Indexer>) -> Result<()> {
+        for t in ix.tables() {
+            self.store.add_table(t)?;
+        }
+        self.indexers.write().unwrap().push(ix);
+        Ok(())
+    }
+
+    /// Height an indexer has folded in on a chain (None = nothing yet).
+    pub fn indexed_to(&self, c: u16, name: &str) -> Result<Option<u32>> {
+        self.store.read(|r| Ok(r.get(STATE, &ix_key(c, name))?.map(|v| be_u32(&v, 0))))
+    }
+
+    /// Replay up to `max` stored blocks into a lagging indexer. Returns blocks processed
+    /// (0 = caught up). Blocks inside the undo window get the index changes appended to
+    /// their undo record, so a later reorg undoes them too.
+    pub fn backfill(&self, params: &ChainParams, name: &str, max: u32) -> Result<u32> {
+        let c = params.chain_no;
+        let ix = self.indexers.read().unwrap().iter().find(|i| i.name() == name).cloned()
+            .ok_or_else(|| other(format!("no indexer {name}")))?;
+        let Some(tip) = self.tip(c)? else { return Ok(0) };
+        let start = match self.indexed_to(c, name)? {
+            Some(h) => h + 1,
+            None => ix.start_height(params),
+        };
+        if start > tip.height {
+            return Ok(0);
+        }
+        let end = tip.height.min(start + max - 1);
+        self.store.write(|w| {
+            for h in start..=end {
+                let hv = w.get(HEIGHT, &k_height(c, h))?.ok_or(StoreError::Corrupt { table: HEIGHT, why: "gap" })?;
+                let b = be_u32(&hv, 32);
+                let raw = block_raw_at(w, c, b)?;
+                let blk = Block::parse_with(&raw, &params.format).map_err(other)?;
+                let mut prevouts = Vec::with_capacity(blk.txs.len());
+                for tx in &blk.txs {
+                    let mut pv = Vec::new();
+                    if !tx.is_coinbase() {
+                        for i in &tx.inputs {
+                            let (pb, pp) = locate(w, params, &i.prevout.txid)?.ok_or_else(|| other("prevout tx not stored"))?;
+                            let praw = w.get(BLOCK_TX, &k_block_tx(c, pb, pp))?.ok_or_else(|| other("prevout tx missing"))?;
+                            let ptx = Tx::parse_with(&praw, &params.format).map_err(other)?;
+                            let o = ptx.outputs.get(i.prevout.vout as usize).ok_or_else(|| other("bad prevout"))?;
+                            pv.push(Prevout { value: o.value, script: o.script_pubkey.clone() });
+                        }
+                    }
+                    prevouts.push(pv);
+                }
+                let l = Logged::new(w);
+                ix.connect(&BlockCtx { l: &l, params, block: &blk, height: h, prevouts: &prevouts })?;
+                l.put(STATE, &ix_key(c, name), &h.to_be_bytes())?;
+                let ops = l.into_ops();
+                if h + UNDO_DEPTH > tip.height && h > 0 {
+                    let mut all = match w.get(UNDO, &k_block(c, b))? {
+                        Some(v) => undo::decode(&v)?,
+                        None => Vec::new(),
+                    };
+                    all.extend(ops);
+                    w.put(UNDO, &k_block(c, b), &undo::encode(&all))?;
+                }
+            }
+            Ok(end - start + 1)
+        })
     }
 
     // ---------- reads ----------
@@ -557,10 +632,11 @@ impl ChainDb {
     /// The first block's parent must be the current tip (or there is no tip: genesis).
     pub fn connect_blocks(&self, params: &ChainParams, blocks: &[Block]) -> Result<Tip> {
         let c = params.chain_no;
+        let ixs = self.indexers.read().unwrap().clone();
         self.store.write(|w| {
             let mut tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v));
             for b in blocks {
-                tip = Some(connect_one(w, params, b, tip)?);
+                tip = Some(connect_one(w, params, b, tip, &ixs)?);
             }
             tip.ok_or_else(|| other("nothing connected"))
         })
@@ -602,7 +678,23 @@ fn next_b(w: &WriteTxn, c: u16) -> Result<u32> {
     Ok(n)
 }
 
-fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>) -> Result<Tip> {
+fn block_raw_at<R: Rd>(r: &R, c: u16, b: u32) -> Result<Vec<u8>> {
+    let m = parse_meta(&r.get(BLOCK_META, &k_block(c, b))?.ok_or(StoreError::Corrupt { table: BLOCK_META, why: "missing block" })?)?;
+    let mut o = m.header80.to_vec();
+    o.extend_from_slice(&m.auxpow);
+    arcade_chain::encode::write_varint(&mut o, m.tx_count as u64);
+    for (_, tx) in r.scan(BLOCK_TX, &k_block(c, b))? {
+        o.extend_from_slice(&tx);
+    }
+    if let Some(s) = m.sig {
+        arcade_chain::encode::write_varint(&mut o, s.len() as u64);
+        o.extend_from_slice(&s);
+    }
+    o.extend_from_slice(&m.extra);
+    Ok(o)
+}
+
+fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>, ixs: &[Arc<dyn Indexer>]) -> Result<Tip> {
     let c = params.chain_no;
     let hash = blk.hash();
     let height = match tip {
@@ -647,7 +739,9 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
 
     // Index changes, undo-logged.
     let l = Logged::new(w);
+    let mut prevouts: Vec<Vec<Prevout>> = Vec::with_capacity(blk.txs.len());
     for (p, tx) in blk.txs.iter().enumerate() {
+        let mut pv = Vec::new();
         let p = p as u32;
         let t12 = tx.txid.t12();
         settle_mempool(w, params, tx)?;
@@ -666,6 +760,7 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
                 let (pb, pp) = locate(w, params, &inp.prevout.txid)?.ok_or_else(missing)?;
                 let coin = coin_at(w, params, pb, pp, inp.prevout.vout)?.ok_or_else(missing)?;
                 let sid = script_id(&coin.script);
+                pv.push(Prevout { value: coin.value, script: coin.script.clone() });
                 let ok = k_pos(c, pb, pp, inp.prevout.vout);
                 l.del(OUTPUTS, &ok)?;
                 l.del(BY_SCRIPT, &k_by_script(c, &sid, pb, pp, inp.prevout.vout))?;
@@ -675,6 +770,7 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
                 add_hist(&l, c, &sid, height, &t12, 0, coin.value)?;
             }
         }
+        prevouts.push(pv);
         // Block 0's outputs are never coins (Bitcoin-family rule).
         if height == 0 {
             continue;
@@ -691,6 +787,21 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
             v.extend_from_slice(&height.to_le_bytes());
             l.put(BY_SCRIPT, &k_by_script(c, &sid, b, p, vout), &v)?;
             add_hist(&l, c, &sid, height, &t12, out.value, 0)?;
+        }
+    }
+
+    // Protocol indexes, in the same commit; only those exactly caught up to the parent.
+    for ix in ixs {
+        let k = ix_key(c, ix.name());
+        let at = l.get(STATE, &k)?.map(|v| be_u32(&v, 0));
+        let start = ix.start_height(params);
+        let due = match at {
+            Some(h) => h + 1 == height,
+            None => height == start,
+        };
+        if due {
+            ix.connect(&BlockCtx { l: &l, params, block: blk, height, prevouts: &prevouts })?;
+            l.put(STATE, &k, &height.to_be_bytes())?;
         }
     }
 

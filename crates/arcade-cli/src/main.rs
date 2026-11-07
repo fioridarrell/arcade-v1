@@ -19,6 +19,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade faucet                  ask the mesh for test coins
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
+  arcade profile <@tag|address>  a handle's address, balance, published profile and linked wallets
   arcade mine start [threads]    mine Pepecoin testnet on this PC (pays your wallet)
   arcade mine stop | status
 
@@ -216,6 +217,7 @@ fn main() {
         ["faucet"] => json!({"cmd": "faucet.ask"}),
         ["events"] => json!({"cmd": "events"}),
         ["mempool"] => json!({"cmd": "mempool"}),
+        ["profile", who] => json!({"cmd": "profile", "who": who}),
         ["mine", "start"] => json!({"cmd": "mine.start"}),
         ["mine", "start", n] => json!({"cmd": "mine.start", "threads": n}),
         ["mine", "stop"] => json!({"cmd": "mine.stop"}),

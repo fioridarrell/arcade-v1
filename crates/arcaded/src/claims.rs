@@ -22,11 +22,9 @@ pub fn check(node: &Node, tag: &str) -> Check {
     if let Some(p) = tags::tag_problem(&tag) {
         return Check { tag, available: false, reason: Some(p.into()) };
     }
-    let idx = node.tags.lock().unwrap();
-    if let Some(row) = idx.tags.by_tag.get(&tag) {
+    if let Ok(Some(row)) = arcade_ledger::index::tag_row(&node.chain, node.params.chain_no, &tag) {
         return Check { tag, available: false, reason: Some(format!("taken by {} at block {}", row.address, row.block_height)) };
     }
-    drop(idx);
     let pending = node.app.claims().unwrap_or_default().into_iter().any(|c| {
         c.tag == tag && matches!(c.status, ClaimStatus::Sent | ClaimStatus::Funding | ClaimStatus::Checking)
     });
@@ -142,7 +140,7 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
     match c.status {
         ClaimStatus::Checking | ClaimStatus::Funding => {
             // Someone else may have taken it meanwhile.
-            if let Some(row) = node.tags.lock().unwrap().tags.by_tag.get(&c.tag) {
+            if let Ok(Some(row)) = arcade_ledger::index::tag_row(&node.chain, p.chain_no, &c.tag) {
                 if row.address != key.address {
                     set(&mut c, ClaimStatus::Failed, "taken by someone else first");
                     node.app.put_claim(&c).ok();
@@ -170,7 +168,7 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
             }
         }
         ClaimStatus::Sent => {
-            let confirmed = node.tags.lock().unwrap().tags.by_tag.get(&c.tag).map(|r| r.address == key.address);
+            let confirmed = arcade_ledger::index::tag_row(&node.chain, p.chain_no, &c.tag).ok().flatten().map(|r| r.address == key.address);
             match confirmed {
                 Some(true) => {
                     set(&mut c, ClaimStatus::Confirmed, "confirmed on chain");
@@ -215,7 +213,7 @@ pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
         ps.insert(i.prevout);
     }
     // Forget coins the chain has since seen spent.
-    let c = node.params.chain_no;
+    let _c = node.params.chain_no;
     ps.retain(|op| node.chain.coin(node.params, op).ok().flatten().is_some());
     for i in &tx.inputs {
         ps.insert(i.prevout);

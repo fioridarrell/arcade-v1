@@ -4,5 +4,6 @@
 pub mod address;
 pub mod digidollar;
 pub mod extract;
+pub mod index;
 pub mod script;
 pub mod tags;

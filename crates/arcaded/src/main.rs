@@ -56,6 +56,8 @@ fn main() {
 
     let app = arcade_app::AppDb::open(&home).expect("open arcade.mdbx");
     let chain = arcade_chaindb::ChainDb::open(home.join("chain.mdbx")).expect("open chain.mdbx");
+    chain.add_indexer(Arc::new(arcade_ledger::index::TagIndexer)).expect("tag index");
+    chain.add_indexer(Arc::new(arcade_ledger::index::ProfileIndexer)).expect("profile index");
     let identity = app.node_identity().expect("node identity");
     let node = Arc::new(Node {
         home: home.clone(),
@@ -63,7 +65,6 @@ fn main() {
         chain,
         params: &arcade_chain::params::PEPECOIN_TEST,
         identity,
-        tags: Mutex::new(Default::default()),
         tx_outbox: Mutex::new(Vec::new()),
         mesh_outbox: Mutex::new(Vec::new()),
         links: Mutex::new(Default::default()),

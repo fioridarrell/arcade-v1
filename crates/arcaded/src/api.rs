@@ -41,7 +41,10 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     match req["cmd"].as_str().unwrap_or("") {
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
-            let idx = node.tags.lock().unwrap();
+            use arcade_ledger::index;
+            let tag_count = index::read_tags(&node.chain, c).map(|t| t.len()).unwrap_or(0);
+            let digest = index::names_digest(&node.chain, c).unwrap_or_default();
+            let indexed_to = node.chain.indexed_to(c, "tags.v1").ok().flatten();
             let tips = node.mesh_tips.lock().unwrap();
             let mesh: Vec<Value> = tips
                 .iter()
@@ -51,7 +54,8 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 "chain": p.name,
                 "sync": *node.sync_state.lock().unwrap(),
                 "tip": tip.map(|t| json!({"height": t.height, "hash": t.hash.to_hex()})),
-                "tags": {"indexed_to": idx.height, "count": idx.tags.by_tag.len(), "names_digest": idx.tags.digest()},
+                "tags": {"indexed_to": indexed_to, "count": tag_count, "names_digest": digest},
+                "profiles": index::profile_count(&node.chain, c).unwrap_or(0),
                 "mesh": {"links": node.links.lock().unwrap().len(), "tips": mesh},
                 "node_id": hex::encode(node.identity.verifying_key().to_bytes()),
                 "wallet": node.app.has_wallet().unwrap_or(false),
@@ -117,6 +121,34 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 "hash_rate": if secs > 0.0 { (h as f64 / secs).round() } else { 0.0 },
                 "found": node.miner.found.load(Ordering::Relaxed),
             }))
+        }
+        "profile" => {
+            use arcade_ledger::index;
+            let q = s("who").ok_or("give an @tag or an address")?;
+            let address = match q.strip_prefix('@') {
+                Some(t) => index::tag_row(&node.chain, c, &t.to_lowercase()).map_err(|e| e.to_string())?
+                    .ok_or_else(|| format!("@{t} is not claimed on {}", p.name))?.address,
+                None => q.clone(),
+            };
+            let tag = index::tag_of(&node.chain, c, &address).map_err(|e| e.to_string())?;
+            let prof = index::profile(&node.chain, c, &address).map_err(|e| e.to_string())?;
+            let script = arcade_ledger::address::decode_base58check(&address)
+                .and_then(|(v, h)| <[u8; 20]>::try_from(h).ok().map(|h| (v, h)))
+                .map(|(v, h)| if v == p.p2sh_version { [&[0xa9u8, 0x14][..], &h, &[0x87]].concat() } else { arcade_ledger::address::p2pkh_script(&h) });
+            let (balance, history) = match &script {
+                Some(sc) => (node.chain.balance_for_script(c, sc).unwrap_or(0), node.chain.history_for_script(c, sc).map(|h| h.len()).unwrap_or(0)),
+                None => (0, 0),
+            };
+            // Does someone else's profile state this address as theirs?
+            let linked_by = index::owner_of_linked(&node.chain, c, p.key, &address).unwrap_or(None);
+            // The tag in a profile is only a claim; verified when the tag table agrees.
+            let tag_verified = match (prof.as_ref().and_then(|v| v["tag"].as_str()), &tag) {
+                (Some(t), Some(real)) => Some(t == real),
+                (Some(_), None) => Some(false),
+                _ => None,
+            };
+            Ok(json!({"address": address, "tag": tag, "balance": balance, "history_rows": history,
+                      "profile": prof, "profile_tag_verified": tag_verified, "stated_by": linked_by}))
         }
         "events" => Ok(json!(node.app.recent_events(30).map_err(|e| e.to_string())?)),
         other => Err(format!("unknown command {other:?}")),

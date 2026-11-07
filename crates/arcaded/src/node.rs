@@ -3,7 +3,6 @@
 use arcade_app::AppDb;
 use arcade_chain::params::ChainParams;
 use arcade_chaindb::ChainDb;
-use arcade_ledger::tags::Tags;
 use ed25519_dalek::SigningKey;
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -32,8 +31,6 @@ pub struct Node {
     pub chain: ChainDb,
     pub params: &'static ChainParams,
     pub identity: SigningKey,
-    /// The @tag table, rebuilt from stored blocks and kept current.
-    pub tags: Mutex<TagIndex>,
     /// Raw transactions waiting to be sent to coin peers.
     pub tx_outbox: Mutex<Vec<Vec<u8>>>,
     /// Frames waiting to be sent to every mesh link.
@@ -60,13 +57,6 @@ pub struct Node {
     pub asks_done: Mutex<std::collections::BTreeSet<String>>,
 }
 
-#[derive(Default)]
-pub struct TagIndex {
-    pub tags: Tags,
-    /// Last block folded in (index never runs ahead of the stored chain).
-    pub height: u32,
-    pub hash: Option<arcade_chain::Hash256>,
-}
 
 impl Node {
     pub fn self_arc(&self) -> std::sync::Arc<Node> {

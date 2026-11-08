@@ -521,6 +521,25 @@ impl ChainDb {
         })
     }
 
+    /// A stored transaction by block number and position.
+    pub fn tx_at(&self, params: &ChainParams, b: u32, p: u32) -> Result<Option<Tx>> {
+        let c = params.chain_no;
+        self.store.read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
+            Some(raw) => Ok(Some(Tx::parse_with(&raw, &params.format).map_err(other)?)),
+            None => Ok(None),
+        })
+    }
+
+    /// Header, height and transaction count of a stored block by its block number.
+    pub fn block_at(&self, params: &ChainParams, b: u32) -> Result<Option<(Header, u32, u32)>> {
+        let c = params.chain_no;
+        let Some(m) = self.store.read(|r| r.get(BLOCK_META, &k_block(c, b)))? else { return Ok(None) };
+        let m = parse_meta(&m)?;
+        let h = Header::parse(&m.header80);
+        let height = self.header(c, &params.block_id(&h))?.map(|r| r.height).unwrap_or(0);
+        Ok(Some((h, height, m.tx_count)))
+    }
+
     /// Full txids of stored transactions whose id starts with `t12` (normally one).
     pub fn txids_by_t12(&self, params: &ChainParams, t12: &[u8; 12]) -> Result<Vec<Hash256>> {
         let c = params.chain_no;

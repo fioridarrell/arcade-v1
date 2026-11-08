@@ -7,7 +7,7 @@
     if (!r.ok) throw new Error(r.error || "failed");
     return r.result;
   };
-  const COLORS = { test: "#2e8b44", main: "#3f9c55", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8" };
+  const COLORS = { test: "#2e8b44", main: "#3f9c55", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a" };
   const MODES = [
     ["full", "Full", "Blocks, every address, and your chosen indexes. Serves the mesh.", true],
     ["chain", "Blockchain only", "Blocks and every address and balance. No protocol indexes.", true],
@@ -22,8 +22,8 @@
     ["names", "Names", ".pepe / .doge names and \"p\":\"dns\" claims (needs ord)", true, "ord"],
     ["maps", "Maps", "block maps: <block>.pepemap, .dogemap, .bitmap (needs ord)", true, "ord"],
     ["tokens", "Tokens", "PRC-20 / DRC-20 deploys, mints, transfers, balances (needs ord)", true, "ord"],
-    ["runes", "Runes", "coming", false],
-    ["dunes", "Dunes", "coming", false],
+    ["runes", "Runes", "coming: Bitcoin's fungible tokens", false, "runes"],
+    ["dunes", "Dunes", "coming: Dogecoin's runes-style tokens", false, "dunes"],
   ];
   const RIDERS = ["names", "maps", "tokens"];
   let chains = [], open = null, mode = "full", watching = null, poll = null;
@@ -74,7 +74,8 @@
       return l;
     }));
     const noIdx = mode === "chain";
-    $("c-idx").replaceChildren(...INDEXES.map(([k, t, d, ok, needs]) => {
+    // Runes only on Bitcoin, dunes only on Dogecoin: other chains don't list them.
+    $("c-idx").replaceChildren(...INDEXES.filter(([, , , , needs]) => (needs !== "runes" || c.runes) && (needs !== "dunes" || c.dunes)).map(([k, t, d, ok, needs]) => {
       const can = ok && !noIdx && (needs !== "ord" || c.ord);
       const l = document.createElement("label");
       l.className = can ? "" : "off";

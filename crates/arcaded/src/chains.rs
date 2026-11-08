@@ -66,6 +66,13 @@ fn normalize(p: &ChainParams, indexes: &[String]) -> Result<Vec<String>, String>
         if !INDEXES.contains(&ix.as_str()) {
             return Err(format!("unknown index {ix}; indexes: {}", INDEXES.join(", ")));
         }
+        // Runes live on Bitcoin and dunes on Dogecoin only.
+        if ix == "runes" && p.key != "btc" {
+            return Err("runes are a Bitcoin protocol; they aren't on ".to_string() + p.name);
+        }
+        if ix == "dunes" && p.key != "doge" {
+            return Err("dunes are a Dogecoin protocol; they aren't on ".to_string() + p.name);
+        }
         if COMING.contains(&ix.as_str()) {
             return Err(format!("the {ix} index is coming; it is not available yet"));
         }
@@ -400,7 +407,8 @@ pub fn list(node: &Node) -> Value {
             let st = status(node, p.key).unwrap_or(json!({}));
             json!({"key": p.key, "name": p.name, "installed": st["installed"], "home": st["home"], "mode": st["mode"],
                    "indexes": st["indexes"], "overall": st["overall"], "state": st["state"],
-                   "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).0.to_uppercase()})
+                   "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).0.to_uppercase(),
+                   "dunes": p.key == "doge", "runes": p.key == "btc"})
         })
         .collect::<Vec<_>>())
 }

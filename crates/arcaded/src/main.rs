@@ -9,6 +9,7 @@ mod chainsvc;
 mod chains;
 mod claims;
 mod coreshare;
+mod explorer;
 mod faucet;
 mod http;
 mod ledger;

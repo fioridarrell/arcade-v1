@@ -455,6 +455,38 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
     index_start: 6_415_000,
 };
 
+/// Bitcoin: sha256d, SegWit, Taproot; difficulty retargets every 2016 blocks (at most 4x).
+pub static BITCOIN_MAIN: ChainParams = ChainParams {
+    key: "btc",
+    chain_no: 10,
+    name: "Bitcoin",
+    magic: [0xf9, 0xbe, 0xb4, 0xd9],
+    p2p_port: 8333,
+    genesis: "000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f",
+    genesis_header: "0100000000000000000000000000000000000000000000000000000000000000000000003ba3edfd7a7b12b27ac72c3e67768f617fc81bc3888a51323a9fb8aa4b1e5e4a29ab5f49ffff001d1dac2b7c",
+    format: Format::BITCOIN,
+    pow: PowRule::Single(PowAlgo::Sha256d),
+    max_easier: true,
+    pow_limit_bits: 0x1d00ffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: None,
+    auxpow_strict_chain_id: false,
+    bech32_hrp: Some("bc"),
+    p2pkh_version: 0,
+    p2sh_version: 5,
+    wif_version: 128,
+    bip44_coin_type: 0,
+    protocol_version: 70016,
+    dns_seeds: &[
+        "seed.bitcoin.sipa.be", "dnsseed.bluematt.me", "seed.bitcoin.jonasschnelli.ch", "seed.btc.petertodd.net",
+        "seed.bitcoin.sprovoost.nl", "dnsseed.emzy.de", "seed.bitcoin.wiz.biz",
+    ],
+    fixed_peers: &[],
+    checkpoints: &[],
+    coinbase_maturity: 100,
+    index_start: 970_000,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
     &[
         &PEPECOIN_TEST,
@@ -466,6 +498,7 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &FLOPCOIN_MAIN,
         &LITECOIN_MAIN,
         &LITECOIN_TEST,
+        &BITCOIN_MAIN,
     ];
 
 pub fn by_key(key: &str) -> Option<&'static ChainParams> {

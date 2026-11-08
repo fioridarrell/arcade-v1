@@ -245,6 +245,7 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 }
             }
         }
+        c if c.starts_with("explorer.") => crate::explorer::handle(node, c, &req),
         "chains.list" => Ok(crate::chains::list(node)),
         "chains.status" => crate::chains::status(node, &s("key").ok_or("key required")?),
         "chains.add" => {

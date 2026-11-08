@@ -182,6 +182,7 @@ dependencies = [
  "arcade-mesh",
  "arcade-store",
  "arcade-wallet",
+ "base64 0.23.1",
  "ed25519-dalek",
  "flate2",
  "hex",

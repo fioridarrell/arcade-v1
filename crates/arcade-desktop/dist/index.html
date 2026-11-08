@@ -9,6 +9,14 @@
 <body>
 <header>
   <div class="brand"><span class="dot"></span> Arcade <small>V1.0</small></div>
+  <div class="chainsel">
+    <button id="cs-btn" aria-haspopup="true" aria-expanded="false" title="Choose a chain">
+      <span class="coin" id="cs-coin">P</span>
+      <span><span class="nm" id="cs-name">Pepecoin testnet</span> <span class="sub" id="cs-sub">· home</span></span>
+      <span class="caret"></span>
+    </button>
+    <div class="menu" id="cs-menu" hidden></div>
+  </div>
   <div id="conn" class="pill">connecting…</div>
 </header>
 
@@ -16,6 +24,7 @@
   <button data-tab="home" class="on">Home</button>
   <button data-tab="wallet">Wallet</button>
   <button data-tab="handle">Handle</button>
+  <button data-tab="explorer">Explorer</button>
   <button data-tab="chains">Chains &amp; Coins</button>
   <button data-tab="mine">Mine</button>
   <button data-tab="activity">Activity</button>
@@ -72,6 +81,18 @@
     <table><thead><tr><th>Tag</th><th>Status</th><th>Note</th></tr></thead><tbody id="t-rows"></tbody></table>
   </section>
 
+  <!-- Explorer: the chain chosen at the top, read from this arcade's own database -->
+  <section id="explorer" class="tab wide">
+    <div class="x-bar">
+      <div class="x-nav" id="x-nav"></div>
+      <label class="x-search" for="x-q">
+        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg>
+        <input id="x-q" placeholder="block height or hash, txid, address, @tag…" autocomplete="off" spellcheck="false">
+      </label>
+    </div>
+    <div id="x-view"></div>
+  </section>
+
   <!-- Chains & Coins (MOCKUP: simulated data and progress) -->
   <section id="chains" class="tab">
     <h1>Chains &amp; Coins</h1>
@@ -121,5 +142,6 @@
 </main>
 <script src="app.js"></script>
 <script src="chains.js"></script>
+<script src="explorer.js"></script>
 </body>
 </html>

@@ -17,7 +17,7 @@ use chacha20poly1305::aead::{Aead, KeyInit};
 use chacha20poly1305::{XChaCha20Poly1305, XNonce};
 use ed25519_dalek::{Signer, SigningKey, Verifier, VerifyingKey};
 use serde_json::{json, Value};
-use std::io::{Read, Write};
+
 use std::net::TcpStream;
 use std::time::Duration;
 
@@ -147,31 +147,10 @@ pub fn decode_plain(p: &[u8]) -> Result<Frame> {
     Ok(Frame { head, blob: p[2 + n..].to_vec() })
 }
 
-fn write_raw(s: &mut impl Write, body: &[u8]) -> Result<()> {
-    if body.len() > MAX_FRAME {
-        return Err(LinkError::TooLarge(body.len()));
-    }
-    let mut b = Vec::with_capacity(4 + body.len());
-    b.extend_from_slice(&(body.len() as u32).to_be_bytes());
-    b.extend_from_slice(body);
-    s.write_all(&b)?;
-    Ok(())
-}
 
-fn read_raw(s: &mut impl Read) -> Result<Vec<u8>> {
-    let mut l = [0u8; 4];
-    s.read_exact(&mut l)?;
-    let n = u32::from_be_bytes(l) as usize;
-    if n > MAX_FRAME {
-        return Err(LinkError::TooLarge(n));
-    }
-    let mut b = vec![0u8; n];
-    s.read_exact(&mut b)?;
-    Ok(b)
-}
 
 pub struct Link {
-    stream: TcpStream,
+    t: Box<dyn crate::transport::Transport>,
     send: XChaCha20Poly1305,
     recv: XChaCha20Poly1305,
     n_send: u64,
@@ -182,27 +161,32 @@ pub struct Link {
 }
 
 impl Link {
-    /// Run the handshake over an established stream.
-    pub fn handshake(
-        mut stream: TcpStream,
+    /// Run the handshake over an established TCP stream.
+    pub fn handshake(stream: TcpStream, net: &str, identity: &SigningKey, dialer: bool, listen: Option<u16>) -> Result<Link> {
+        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        Self::handshake_over(Box::new(crate::transport::Tcp { stream }), net, identity, dialer, listen)
+    }
+
+    /// Run the handshake over any transport (TCP, WebSocket).
+    pub fn handshake_over(
+        mut t: Box<dyn crate::transport::Transport>,
         net: &str,
         identity: &SigningKey,
         dialer: bool,
         listen: Option<u16>,
     ) -> Result<Link> {
-        stream.set_read_timeout(Some(Duration::from_secs(10)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(10)))?;
+        t.set_read_timeout(Duration::from_secs(10))?;
         let eph_sk = x25519_dalek::StaticSecret::random_from_rng(rand::rngs::OsRng);
         let eph_pk = x25519_dalek::PublicKey::from(&eph_sk).to_bytes();
         let my_hello = hello_body(net, &eph_pk);
-        write_raw(&mut stream, &my_hello)?;
-        let their_hello = read_raw(&mut stream)?;
+        t.send(&my_hello)?;
+        let their_hello = t.recv()?;
         let their_eph = parse_hello(&their_hello, net)?;
         let shared = eph_sk.diffie_hellman(&x25519_dalek::PublicKey::from(their_eph)).to_bytes();
         let keys = derive_keys(&shared, &my_hello, &their_hello, dialer);
 
         let mut link = Link {
-            stream,
+            t,
             send: XChaCha20Poly1305::new_from_slice(&keys.send).unwrap(),
             recv: XChaCha20Poly1305::new_from_slice(&keys.recv).unwrap(),
             n_send: 0,
@@ -249,12 +233,16 @@ impl Link {
             .map_err(|_| LinkError::Handshake("peer auth signature does not verify".into()))?;
         link.peer_id = key_hex.to_string();
         link.peer_listen = auth.head["listen"].as_u64().filter(|p| *p > 0 && *p < 65536).map(|p| p as u16);
-        link.stream.set_read_timeout(Some(Duration::from_secs(45)))?; // DEAD_AFTER
-        link.stream.set_write_timeout(Some(Duration::from_secs(30)))?; // SEND_TIMEOUT
+        link.t.set_read_timeout(Duration::from_secs(45))?; // DEAD_AFTER
         Ok(link)
     }
 
+    /// Dial `host:port` (TCP) or `wss://host/mesh` (WebSocket over TLS).
     pub fn dial(addr: &str, net: &str, identity: &SigningKey, listen: Option<u16>) -> Result<Link> {
+        if addr.starts_with("wss://") {
+            let t = crate::transport::Wss::connect(addr, Duration::from_secs(15))?;
+            return Self::handshake_over(Box::new(t), net, identity, true, listen);
+        }
         use std::net::ToSocketAddrs;
         let sa = addr
             .to_socket_addrs()?
@@ -268,23 +256,25 @@ impl Link {
     pub fn send(&mut self, f: &Frame) -> Result<()> {
         let ct = self.send.encrypt(&nonce(self.n_send), encode_plain(f).as_slice()).map_err(|_| LinkError::Decrypt)?;
         self.n_send += 1;
-        write_raw(&mut self.stream, &ct)
+        self.t.send(&ct)?;
+        Ok(())
     }
 
     pub fn recv(&mut self) -> Result<Frame> {
-        let ct = read_raw(&mut self.stream)?;
+        let ct = self.t.recv()?;
         let pt = self.recv.decrypt(&nonce(self.n_recv), ct.as_slice()).map_err(|_| LinkError::Decrypt)?;
         self.n_recv += 1;
         decode_plain(&pt)
     }
 
     /// How long `recv` waits before returning a timeout error (WouldBlock / TimedOut).
-    pub fn set_read_timeout(&self, d: Duration) -> std::io::Result<()> {
-        self.stream.set_read_timeout(Some(d))
+    pub fn set_read_timeout(&mut self, d: Duration) -> std::io::Result<()> {
+        self.t.set_read_timeout(d)
     }
 
-    pub fn try_clone_stream(&self) -> std::io::Result<TcpStream> {
-        self.stream.try_clone()
+    /// Where this link goes (address or URL).
+    pub fn describe(&self) -> String {
+        self.t.describe()
     }
 }
 

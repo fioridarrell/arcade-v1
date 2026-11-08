@@ -32,7 +32,7 @@ fn main() {
     let mut lo: u32 = a.get(3).and_then(|s| s.parse().ok()).unwrap_or(1_496_133);
     let mut hi: u32 = a.get(4).and_then(|s| s.parse().ok()).unwrap_or(1_561_500);
     let id = ed25519_dalek::SigningKey::from_bytes(&[77; 32]);
-    let link = Link::dial(&peer, "arcade-main", &id, None).expect("link");
+    let mut link = Link::dial(&peer, "arcade-main", &id, None).expect("link");
     link.set_read_timeout(Duration::from_secs(40)).unwrap();
     let mut ix = Ix { link, id: 0 };
     let c = 1u16;

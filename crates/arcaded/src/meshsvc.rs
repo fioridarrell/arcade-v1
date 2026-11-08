@@ -10,6 +10,8 @@ use std::time::Duration;
 pub const NET: &str = "arcade-main"; // one mesh for every chain (verified live)
 
 pub const SEEDS: &[&str] = &[
+    "wss://app.dogecoinarcade.com/mesh",
+    "wss://pepecoinarcade.com/mesh",
     "156.67.28.112:8421",
     "207.244.232.43:8421",
     "147.124.204.26:8421",
@@ -61,11 +63,18 @@ fn on_addrs(node: &Node, h: &Value) {
     let me = hex::encode(node.identity.verifying_key().to_bytes());
     for a in list.iter().take(50) {
         let (Some(host), Some(port), id) = (a["h"].as_str(), a["p"].as_u64(), a["id"].as_str().unwrap_or("")) else { continue };
-        // Plain TCP addresses only (wss:// needs the WebSocket transport, coming).
-        if host.contains('/') || id == me || port == 0 || port > 65535 || host.len() > 255 {
+        if id == me || port == 0 || port > 65535 || host.len() > 255 {
             continue;
         }
-        let addr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+        let addr = if host.starts_with("wss://") {
+            host.to_string()
+        } else if host.contains('/') {
+            continue;
+        } else if host.contains(':') {
+            format!("[{host}]:{port}")
+        } else {
+            format!("{host}:{port}")
+        };
         let known = node.app.peers().unwrap_or_default().iter().any(|p| p.id == id && !id.is_empty());
         if !known {
             let _ = node.app.put_peer(&arcade_app::Peer {
@@ -115,8 +124,8 @@ pub fn run(node: Arc<Node>, addr: String) {
                 node.links.lock().unwrap().insert(addr.clone(), LinkInfo { addr: addr.clone(), node_id: id.clone(), since: now() });
                 let _ = node.app.put_peer(&arcade_app::Peer {
                     id: id.clone(),
-                    host: addr.rsplit_once(':').map(|x| x.0).unwrap_or(&addr).into(),
-                    port: addr.rsplit_once(':').and_then(|x| x.1.parse().ok()).unwrap_or(8421),
+                    host: if addr.starts_with("wss://") { addr.clone() } else { addr.rsplit_once(':').map(|x| x.0.trim_matches(|c| c == '[' || c == ']')).unwrap_or(&addr).into() },
+                    port: if addr.starts_with("wss://") { 443 } else { addr.rsplit_once(':').and_then(|x| x.1.parse().ok()).unwrap_or(8421) },
                     source: "seed".into(),
                     last_seen: now(),
                     failures: 0,

@@ -121,7 +121,7 @@ fn main() {
         // Every arcade we learned of before is a seed too.
         if !no_seeds {
             for p in node.app.peers().unwrap_or_default() {
-                let a = format!("{}:{}", p.host, p.port);
+                let a = if p.host.starts_with("wss://") { p.host.clone() } else if p.host.contains(':') { format!("[{}]:{}", p.host, p.port) } else { format!("{}:{}", p.host, p.port) };
                 if !seeds.contains(&a) {
                     seeds.push(a);
                 }

@@ -18,7 +18,7 @@ pub struct MeshSource {
 
 impl MeshSource {
     pub fn dial(node: &crate::node::Node, addr: &str) -> Result<MeshSource, String> {
-        let link = Link::dial(addr, crate::meshsvc::NET, &node.identity, node.mesh_port).map_err(|e| e.to_string())?;
+        let mut link = Link::dial(addr, crate::meshsvc::NET, &node.identity, node.mesh_port).map_err(|e| e.to_string())?;
         link.set_read_timeout(Duration::from_secs(60)).map_err(|e| e.to_string())?;
         Ok(MeshSource { link, addr: addr.into(), net: node.params.key, format: node.params.format, next_id: 1 })
     }

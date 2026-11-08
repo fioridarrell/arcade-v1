@@ -7,7 +7,7 @@
   "app": {
     "withGlobalTauri": true,
     "windows": [
-      { "title": "Arcade V1.0", "width": 1000, "height": 760, "minWidth": 420, "minHeight": 500 }
+      { "label": "main", "title": "Arcade V1.0", "width": 1000, "height": 760, "minWidth": 420, "minHeight": 500 }
     ],
     "security": { "csp": "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'" }
   },

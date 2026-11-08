@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Arcade
+Comment=Arcade V1.0 — Pepecoin testnet, mesh and @handles
+Exec=arcade-desktop
+Icon=arcade
+Terminal=false
+Categories=Network;Finance;

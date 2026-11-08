@@ -63,6 +63,11 @@ drops only that chain's keys. Add-ons the P2P core must support (requested 2026-
 | More Bitcoin-family coins | A chain is a `ChainParams` entry (wire `Format` + `PowRule` + address versions); new coins are data, plus code only where a coin genuinely differs |
 
 
+**Nothing is added automatically** (2026-11-07): every chain and every index is installed by hand, from the desktop
+app's **Chains & Coins** tab or with `arcade chain list | add <key> [--mode light|chain|index|full] [--with ledger,ord,names,profiles]
+[--snapshot] | status <key> | index add <key> <index> | remove <key>`. Both show staged progress: headers, blocks,
+coins and addresses, each chosen index (ord included), fingerprints vs. the mesh. Mockup: https://claude.ai/artifact/G3T8viMzu3u4NfJAvQhJ9c
+
 **Storage mode per chain** (chosen when adding a chain; can be changed later):
 
 | Mode | Stores | Borrows from the mesh (verified by headers + hashes) | Good for |

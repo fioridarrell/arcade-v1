@@ -37,6 +37,24 @@ fn api(req: Value) -> Value {
 
 fn main() {
     tauri::Builder::default()
+        .setup(|app| {
+            // ARCADE_DEMO=chains: open the Chains & Coins mockup and run a sample install
+            // (for screenshots).
+            if std::env::var("ARCADE_DEMO").ok().as_deref() == Some("chains") {
+                use tauri::Manager;
+                if let Some(w) = app.get_webview_window("main") {
+                    std::thread::spawn(move || {
+                        std::thread::sleep(std::time::Duration::from_secs(2));
+                        let _ = w.eval(r#"
+                          document.querySelector('nav button[data-tab="chains"]').click();
+                          setTimeout(() => { [...document.querySelectorAll('.chain')].find(c => c.textContent.includes('Dogecoin')).querySelector('button').click(); }, 400);
+                          setTimeout(() => { document.getElementById('c-go').click(); }, 1800);
+                        "#);
+                    });
+                }
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![api])
         .run(tauri::generate_context!())
         .expect("error while running the Arcade app");

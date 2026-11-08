@@ -16,4 +16,9 @@ if [ "$1" = "configure" ]; then
     echo
     echo "    arcade setup"
     echo
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        echo "($SUDO_USER was added to the 'arcade' group so the CLI and the Arcade app can reach"
+        echo " the service: log out and back in once, or run  newgrp arcade  in this terminal.)"
+        echo
+    fi
 fi

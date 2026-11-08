@@ -28,9 +28,13 @@ extended-description = "Arcade V1.0: Pepecoin testnet node with the arcade mesh 
 section = "net"
 priority = "optional"
 maintainer-scripts = "../../packaging/"
+depends = "libc6, libwebkit2gtk-4.1-0, libgtk-3-0, adduser, systemd"
 assets = [
     ["target/release/arcaded", "usr/bin/", "755"],
     ["target/release/arcade", "usr/bin/", "755"],
+    ["target/release/arcade-desktop", "usr/bin/", "755"],
+    ["../../packaging/arcade.desktop", "usr/share/applications/", "644"],
+    ["../arcade-desktop/icons/icon.png", "usr/share/icons/hicolor/256x256/apps/arcade.png", "644"],
     ["../../packaging/arcaded.service", "lib/systemd/system/", "644"],
     ["../../docs/PLAN.md", "usr/share/doc/arcade/", "644"],
 ]

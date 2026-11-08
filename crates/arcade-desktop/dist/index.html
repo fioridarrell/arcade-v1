@@ -16,6 +16,7 @@
   <button data-tab="home" class="on">Home</button>
   <button data-tab="wallet">Wallet</button>
   <button data-tab="handle">Handle</button>
+  <button data-tab="chains">Chains &amp; Coins</button>
   <button data-tab="mine">Mine</button>
   <button data-tab="activity">Activity</button>
 </nav>
@@ -71,6 +72,35 @@
     <table><thead><tr><th>Tag</th><th>Status</th><th>Note</th></tr></thead><tbody id="t-rows"></tbody></table>
   </section>
 
+  <!-- Chains & Coins (MOCKUP: simulated data and progress) -->
+  <section id="chains" class="tab">
+    <h1>Chains &amp; Coins <span class="mock">mockup</span></h1>
+    <p>Install another blockchain on this arcade. Nothing is added unless you install it here.</p>
+    <div class="chains" id="c-list"></div>
+
+    <div class="installer" id="c-installer" hidden>
+      <div class="inst-head">
+        <h2 id="c-title">Install</h2>
+        <button id="c-close" aria-label="Close">✕</button>
+      </div>
+      <div id="c-choose">
+        <h3>Storage</h3>
+        <div class="modes" id="c-modes"></div>
+        <h3>Indexes</h3>
+        <div class="idx" id="c-idx"></div>
+        <h3>Get it from</h3>
+        <label class="opt"><input type="checkbox" checked disabled> Other arcades on the mesh first, the coin's own P2P network as fallback</label>
+        <label class="opt"><input type="checkbox" id="c-snap" checked> Use a verified index snapshot from the mesh (much faster; re-checked in the background)</label>
+        <div class="est" id="c-est"></div>
+        <div class="row"><button class="primary" id="c-go">Install</button><button id="c-cancel">Cancel</button></div>
+      </div>
+      <div id="c-progress" hidden>
+        <ol class="stages" id="c-stages"></ol>
+        <div class="row"><button id="c-pause">Pause</button><button id="c-stop">Stop and remove</button></div>
+      </div>
+    </div>
+  </section>
+
   <!-- Mine -->
   <section id="mine" class="tab">
     <h1>Mine testnet</h1>
@@ -90,5 +120,6 @@
   </section>
 </main>
 <script src="app.js"></script>
+<script src="chains-mock.js"></script>
 </body>
 </html>

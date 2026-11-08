@@ -671,6 +671,14 @@ fn tag_page(x: &Ctx, t: &str) -> R {
             }
         }
     }
+    // Wallets linked with proof (V1.0): signed by the wallet's key and the @tag's key.
+    for r in crate::links::for_tag(x.node, &t, x.p.net) {
+        let a = r["a"].as_str().unwrap_or("").to_string();
+        if let Some(i) = addrs.iter().position(|(b, _)| *b == a) {
+            addrs.remove(i);
+        }
+        addrs.push((a, "verified (signed by the wallet and @tag)"));
+    }
     // Imported wallets: only old arcades know them (sealed records, per-arcade lists), so
     // they come with that arcade's word, not a proof.
     let mut imported: Vec<(String, String)> = Vec::new();

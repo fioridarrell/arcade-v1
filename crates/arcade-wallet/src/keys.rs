@@ -149,9 +149,53 @@ pub fn wif(key: &SecretKey, version: u8) -> String {
     arcade_ledger::address::base58check(version, &v)
 }
 
+/// Read a WIF key: (version byte, key, compressed).
+pub fn from_wif(s: &str) -> Option<(u8, SecretKey, bool)> {
+    let (version, payload) = arcade_ledger::address::decode_base58check(s.trim())?;
+    let (bytes, compressed) = match payload.len() {
+        33 if payload[32] == 1 => (&payload[..32], true),
+        32 => (&payload[..], false),
+        _ => return None,
+    };
+    Some((version, SecretKey::from_slice(bytes).ok()?, compressed))
+}
+
+fn sha256d(m: &[u8]) -> [u8; 32] {
+    use sha2::{Digest, Sha256};
+    Sha256::digest(Sha256::digest(m)).into()
+}
+
+/// ECDSA over sha256d(message), low-S, DER, hex (as the existing arcades sign wallet imports).
+pub fn sign_message(key: &SecretKey, message: &[u8]) -> String {
+    let mut sig = secp256k1::SECP256K1.sign_ecdsa(&secp256k1::Message::from_digest(sha256d(message)), key);
+    sig.normalize_s();
+    hex::encode(sig.serialize_der())
+}
+
+/// Check a sign_message signature against a public key (hex, compressed or not).
+pub fn verify_message(pubkey_hex: &str, message: &[u8], sig_hex: &str) -> bool {
+    let Some(pk) = hex::decode(pubkey_hex).ok().and_then(|b| PublicKey::from_slice(&b).ok()) else { return false };
+    let Some(mut sig) = hex::decode(sig_hex).ok().and_then(|b| secp256k1::ecdsa::Signature::from_der(&b).ok()) else { return false };
+    sig.normalize_s();
+    secp256k1::SECP256K1.verify_ecdsa(&secp256k1::Message::from_digest(sha256d(message)), &sig, &pk).is_ok()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn wif_and_messages() {
+        let k = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let w = wif(&k, 0xf1);
+        let (v, k2, c) = from_wif(&w).unwrap();
+        assert_eq!((v, c), (0xf1, true));
+        assert_eq!(k2, k);
+        let pk = hex::encode(PublicKey::from_secret_key(secp256k1::SECP256K1, &k).serialize());
+        let sig = sign_message(&k, b"hello");
+        assert!(verify_message(&pk, b"hello", &sig));
+        assert!(!verify_message(&pk, b"hellO", &sig));
+    }
 
     /// BIP32 test vector 1.
     #[test]

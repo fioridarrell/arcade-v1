@@ -190,6 +190,10 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     if let Some(sz) = crate::sizes::frame(node) {
         link.send(&Frame::new(sz))?;
     }
+    // V1.0: wallets linked to @tags, with their signatures.
+    if let Some(lk) = crate::links::frame(node) {
+        link.send(&Frame::new(lk))?;
+    }
     let mut cr_reqs = crate::coreshare::Requests::default();
     let mut last_ping = std::time::Instant::now();
     let mut sent_outbox = 0usize;
@@ -240,6 +244,7 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
                 }
             }
             "wl" => crate::faucet::on_welcome(node, &f.head),
+            "lk" => crate::links::on_lk(node, &f.head),
             "addrs" => on_addrs(node, &f.head),
             "pp" => on_coin_peers(node, &f.head),
             "sz" => crate::sizes::on_sz(node, &link.peer_id, &f.head),

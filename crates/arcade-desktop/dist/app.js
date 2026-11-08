@@ -81,6 +81,25 @@ async function refreshWallet() {
   rows($("w-rows"), state.keys, (k) => [[String(k.index)], [k.address], [k.tag ? "@" + k.tag : "—"], [k.balance == null ? "not installed" : coins(k.balance), "num"]]);
   // Test coins from the mesh are Pepecoin testnet coins.
   $("w-faucet").hidden = !ch.home;
+  if (!$("w-ltag").value) {
+    const home = await api("wallet.keys", { chain: "peptest" }).catch(() => []);
+    const t = home.find((k) => k.tag);
+    if (t) $("w-ltag").value = t.tag;
+  }
+  const links = await api("wallet.links", { chain: ch.key }).catch(() => []);
+  $("w-links").replaceChildren(...(links.length ? links : [null]).map((l) => {
+    const tr = document.createElement("tr");
+    if (!l) { const td = document.createElement("td"); td.colSpan = 4; td.className = "note"; td.textContent = "None on this chain yet."; tr.append(td); return tr; }
+    for (const [text, cls] of [[l.address], ["@" + l.tag], [l.balance == null ? "not installed" : coins(l.balance), "num"]]) {
+      const td = document.createElement("td"); td.textContent = text; if (cls) td.className = cls; tr.append(td);
+    }
+    const td = document.createElement("td"); const b = document.createElement("button"); b.textContent = "Remove";
+    b.addEventListener("click", async () => {
+      try { await api("wallet.unlink", { chain: ch.key, address: l.address, tag: l.tag }); msg($("w-msg"), `Removed ${l.address}; other arcades are told too.`, "ok"); refreshWallet(); }
+      catch (e) { msg($("w-msg"), e.message, "bad"); }
+    });
+    td.append(b); tr.append(td); return tr;
+  }));
 }
 
 async function refreshHandle() {
@@ -150,6 +169,14 @@ $("w-done").addEventListener("click", () => { $("w-phrase-words").textContent = 
 $("w-restore").addEventListener("click", async () => {
   try { await api("wallet.create", { phrase: $("w-words").value }); $("w-words").value = ""; msg($("w-msg"), "Wallet restored.", "ok"); refresh(); }
   catch (e) { msg($("w-msg"), e.message, "bad"); }
+});
+$("w-link").addEventListener("click", async () => {
+  try {
+    const r = await api("wallet.link", { chain: picked().key, wif: $("w-wif").value, tag: $("w-ltag").value });
+    $("w-wif").value = "";
+    msg($("w-msg"), `Linked ${r.a} to @${r.tag}, signed by both keys and sent to the mesh.`, "ok");
+    refreshWallet();
+  } catch (e) { msg($("w-msg"), e.message, "bad"); }
 });
 $("w-faucet").addEventListener("click", async () => {
   try { await api("faucet.ask"); msg($("w-msg"), "Asked the mesh for test coins; any arcade with spare coins can send them.", "ok"); }

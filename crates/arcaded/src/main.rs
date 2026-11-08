@@ -14,6 +14,7 @@ mod explorer;
 mod faucet;
 mod http;
 mod ledger;
+mod links;
 mod meshsource;
 mod miner;
 mod meshsvc;

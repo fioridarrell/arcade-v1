@@ -191,6 +191,21 @@ impl AppDb {
         self.cipher.decrypt(&XNonce::from(nonce), &v[24..]).map(Some).map_err(|_| AppError::BadSecret)
     }
 
+    /// An imported wallet's key, kept encrypted like the phrase.
+    pub fn put_imported_key(&self, name: &str, plain: &[u8]) -> Result<()> {
+        self.put_secret(&format!("import/{name}"), plain)
+    }
+
+    pub fn imported_key(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        self.secret(&format!("import/{name}"))
+    }
+
+    pub fn drop_imported_key(&self, name: &str) -> Result<()> {
+        let k = format!("import/{name}");
+        self.store.write(|w| w.del(SECRETS, k.as_bytes()).map(|_| ()))?;
+        Ok(())
+    }
+
     /// This arcade's mesh identity (Ed25519), created on first use.
     pub fn node_identity(&self) -> Result<SigningKey> {
         if let Some(s) = self.secret("node_key")? {

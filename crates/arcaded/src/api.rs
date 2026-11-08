@@ -85,6 +85,9 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                        "balance": if installed { node.chain.balance_for_script(cp.chain_no, &script).ok() } else { None }})
             }).collect::<Vec<_>>()))
         }
+        "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
+        "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
+        "wallet.links" => Ok(json!(crate::links::mine(node, &s("chain").ok_or("chain required")?)?)),
         "tag.check" => Ok(json!(crate::claims::check(node, &s("tag").ok_or("tag required")?))),
         "tag.claim" => Ok(json!(crate::claims::start(node, &s("tag").ok_or("tag required")?)?)),
         "tag.list" => Ok(json!(node.app.claims().map_err(|e| e.to_string())?)),

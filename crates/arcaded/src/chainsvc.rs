@@ -70,7 +70,7 @@ pub fn run(node: Arc<Node>) {
             std::thread::sleep(Duration::from_secs(15));
             continue;
         };
-        node.note_coin_peer(p.key, &peer.addr.to_string());
+        node.note_coin_peer(p.net, &peer.addr.to_string());
         let _ = node.app.event("chain", &format!("connected to {} ({})", peer.addr, peer.version.user_agent));
         if let Err(e) = syncer.ensure_genesis(&mut peer) {
             set_state(&node, format!("genesis: {e}"));

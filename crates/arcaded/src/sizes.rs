@@ -54,7 +54,7 @@ pub fn measure(node: &Node) -> Result<BTreeMap<String, Value>, String> {
                 }
                 std::thread::sleep(Duration::from_millis(5)); // stay out of the sync's way
             }
-            logical.entry(table.clone()).or_default().insert(p.key, total);
+            logical.entry(table.clone()).or_default().insert(p.net, total);
         }
     }
     let mut out = BTreeMap::new();
@@ -62,7 +62,7 @@ pub fn measure(node: &Node) -> Result<BTreeMap<String, Value>, String> {
         let mut groups: BTreeMap<&str, u64> = BTreeMap::new();
         for (table, per) in &logical {
             let all: u64 = per.values().sum();
-            let mine = per.get(p.key).copied().unwrap_or(0);
+            let mine = per.get(p.net).copied().unwrap_or(0);
             if all == 0 || mine == 0 {
                 continue;
             }
@@ -70,7 +70,7 @@ pub fn measure(node: &Node) -> Result<BTreeMap<String, Value>, String> {
             *groups.entry(group_of(table).unwrap()).or_default() += share;
         }
         let h = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
-        out.insert(p.key.to_string(), json!({"h": h, "at": arcade_app::now(), "groups": groups}));
+        out.insert(p.net.to_string(), json!({"h": h, "at": arcade_app::now(), "groups": groups}));
     }
     Ok(out)
 }
@@ -103,7 +103,7 @@ pub fn on_sz(node: &Node, from: &str, h: &Value) {
     let Some(chains) = h["chains"].as_object() else { return };
     let mut clean = Map::new();
     for (k, v) in chains.iter().take(32) {
-        if arcade_chain::params::by_key(k).is_none() {
+        if arcade_chain::params::by_net(k).is_none() {
             continue;
         }
         let groups: Map<String, Value> = v["groups"]
@@ -150,6 +150,8 @@ fn median(mut v: Vec<u64>) -> Option<u64> {
 /// What arcades report for one chain: per-mode bases and per-index sizes (median of
 /// reports no older than 30 days; each arcade counted once, ours included).
 pub fn for_chain(node: &Node, key: &str) -> Value {
+    // Sizes travel under the mesh name.
+    let key = arcade_chain::params::by_key(key).map(|p| p.net).unwrap_or(key);
     let cutoff = arcade_app::now().saturating_sub(30 * 86400);
     let mut reports: Vec<(String, Value)> = Vec::new();
     if let Some(v) = node.my_sizes.lock().unwrap().get(key) {

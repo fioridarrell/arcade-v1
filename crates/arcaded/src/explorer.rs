@@ -28,15 +28,15 @@ fn e(x: impl std::fmt::Display) -> String {
 
 pub fn unit(p: &ChainParams) -> &'static str {
     match p.key {
-        "test" => "tPEP",
-        "main" => "PEP",
+        "peptest" => "PEPtest",
+        "pep" => "PEP",
         "doge" => "DOGE",
         "dgb" => "DGB",
-        "dgbtest" => "tDGB",
+        "dgbtest" => "DGBtest",
         "kot" => "KOT",
         "flop" => "FLOP",
         "ltc" => "LTC",
-        "ltctest" => "tLTC",
+        "ltctest" => "LTCtest",
         "btc" => "BTC",
         _ => "",
     }
@@ -129,7 +129,7 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
         "explorer.tokens" => {
             x.need("tokens")?;
             let rows = scan_after(&x, tokens::TICK, KeyBuf::new().u16(x.c()).done(), s("after"), n(50, 200) as usize);
-            Ok(json!({"protocol": tokens::protocol(x.p).0, "items": rows.into_iter().filter_map(|(k, v)| {
+            Ok(json!({"protocol": tokens::protocol(x.p).map(|t| t.0).unwrap_or("tokens"), "items": rows.into_iter().filter_map(|(k, v)| {
                 let mut v: Value = serde_json::from_slice(&v).ok()?;
                 v["tick"] = json!(String::from_utf8_lossy(&k[2..]));
                 Some(v)
@@ -281,15 +281,26 @@ fn content_of(x: &Ctx, id: &str, meta: Option<&Value>, cap: usize) -> Value {
 }
 
 fn latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
-    let c = x.c();
     (before.saturating_sub(n)..before)
         .rev()
         .filter_map(|num| {
-            let mut v = ord::inscription(&x.node.chain, x.p, &num.to_string())?;
-            let id = v["id"].as_str().unwrap_or("").to_string();
-            v["content"] = content(x, &id, 96 << 10);
+            let mut v = match ord::inscription(&x.node.chain, x.p, &num.to_string()) {
+                Some(v) => {
+                    let mut v = v;
+                    let id = v["id"].as_str().unwrap_or("").to_string();
+                    v["content"] = content(x, &id, 96 << 10);
+                    v
+                }
+                // Shared storage: records of other groups come from the arcades holding them.
+                None => {
+                    let (mut v, from) = crate::shares::ask_holders(x.node, x.p, "ord", num % ord::GROUPS, "insc", &num.to_string()).ok()?;
+                    let id = v["id"].as_str().unwrap_or("").to_string();
+                    v["content"] = content_of(x, &id, Some(&v.clone()), 96 << 10);
+                    v["from_arcade"] = json!(from);
+                    v
+                }
+            };
             v.as_object_mut()?.remove("txs");
-            let _ = c;
             Some(v)
         })
         .collect()
@@ -313,7 +324,7 @@ fn summary(x: &Ctx) -> R {
     }
     if x.has("tokens") {
         v["ticks"] = json!(tokens::tick_count(&x.node.chain, c));
-        v["protocol"] = json!(tokens::protocol(x.p).0);
+        v["protocol"] = json!(tokens::protocol(x.p).map(|t| t.0));
         let rows = scan_after(x, tokens::TICK, KeyBuf::new().u16(c).done(), None, 6);
         v["tokens"] = json!(rows.into_iter().filter_map(|(k, b)| {
             let mut t: Value = serde_json::from_slice(&b).ok()?;

@@ -97,6 +97,17 @@ pub fn places(node: &Node, chain: &str) -> Vec<Place> {
         let _ = node.app.event("shares", &format!("{chain}: joined lane {} at {:.1}% of the history line", ["A", "B", "C", "D", "E"].get(p.0).unwrap_or(&"?"), p.1 * 100.0));
         p
     });
+    // Two arcades that joined at the same moment can pick the same spot: the lower node id
+    // keeps it and the other joins again, knowing about it now.
+    let clash = v.iter().any(|o| o.1 == ours.0 && circ(o.2, ours.1) < 0.002 && o.0 < mine);
+    let ours = if clash {
+        let p = choose_place(&v);
+        let _ = node.app.store.write(|w| w.put(arcade_app::META, key.as_bytes(), &serde_json::to_vec(&p).unwrap()));
+        let _ = node.app.event("shares", &format!("{chain}: another arcade joined at the same spot; moved to lane {} at {:.1}%", ["A", "B", "C", "D", "E"].get(p.0).unwrap_or(&"?"), p.1 * 100.0));
+        p
+    } else {
+        ours
+    };
     v.push((mine, ours.0, ours.1));
     v
 }
@@ -255,16 +266,16 @@ pub fn hold_frame(node: &Node) -> Frame {
         let h = tip(p);
         let mode = node.mode_of(p.key).unwrap_or_default();
         let v = if mode == "shared" {
-            let gone = pruned(node, p.key);
+            let gone = pruned(node, p.net);
             let held = runs((0..=h / RANGE).filter(|x| !gone.contains(x)));
             let share = node.share_of(p.key);
             let g = |k: &str| if share[k].is_array() { share[k].clone() } else { json!("all") };
-            let (lane, pos) = match my_place(node, p.key) { Some((l, x)) => (json!(l), json!(x)), None => (Value::Null, Value::Null) };
+            let (lane, pos) = match my_place(node, p.net) { Some((l, x)) => (json!(l), json!(x)), None => (Value::Null, Value::Null) };
             json!({"mode": "shared", "h": h, "blocks": held, "ord": g("ord"), "tok": g("tok"), "lane": lane, "pos": pos})
         } else {
             json!({"mode": mode, "h": h, "blocks": "all", "ord": "all", "tok": "all"})
         };
-        chains.insert(p.key.into(), v);
+        chains.insert(p.net.into(), v);
     }
     Frame::new(json!({"t": "sh", "op": "hold", "chains": chains}))
 }
@@ -316,10 +327,10 @@ pub fn fetch_blocks(node: &Node, p: &'static ChainParams, hashes: &[Hash256]) ->
     };
     use arcade_chaindb::sync::BlockSource;
     let mut last_err = String::from("no source");
-    for (id, addr, kind, _) in node.offers_for(p.key) {
+    for (id, addr, kind, _) in node.offers_for(p.net) {
         // Only arcades that announce holding these blocks (any arcade not sharing holds all).
         let h0 = node.chain.header(p.chain_no, &hashes[0]).ok().flatten().map(|r| r.height).unwrap_or(0);
-        let hold = node.holds.lock().unwrap().get(&id).map(|(_, c)| holds_unit(&c[p.key], "blocks", (h0 / RANGE) as u64) || c[p.key].is_null()).unwrap_or(true);
+        let hold = node.holds.lock().unwrap().get(&id).map(|(_, c)| holds_unit(&c[p.net], "blocks", (h0 / RANGE) as u64) || c[p.net].is_null()).unwrap_or(true);
         if !hold {
             continue;
         }
@@ -349,12 +360,12 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
     let c = p.chain_no;
     let Some(tip) = node.chain.tip(c).map_err(|e| e.to_string())? else { return Ok(String::new()) };
     // Hear from the others first, so a newcomer's place is chosen knowing the lanes.
-    if my_place(node, p.key).is_none() && node.holds.lock().unwrap().is_empty() {
+    if my_place(node, p.net).is_none() && node.holds.lock().unwrap().is_empty() {
         return Ok("waiting to hear which arcades share this chain".into());
     }
-    let pl = places(node, p.key);
+    let pl = places(node, p.net);
     let m: Vec<String> = pl.iter().map(|x| x.0.clone()).collect();
-    let mut gone = pruned(node, p.key);
+    let mut gone = pruned(node, p.net);
     let mut work = 0;
     let last_full = history_ranges(tip.height); // ranges before this are shared out; the rest everyone keeps
     let mine_id = me(node);
@@ -367,7 +378,7 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
         .min()
         .unwrap_or(tip.height);
     // Work outward from our position: a newcomer fills from the middle of its stretch.
-    let my_pos = my_place(node, p.key).map(|x| x.1).unwrap_or(0.0);
+    let my_pos = my_place(node, p.net).map(|x| x.1).unwrap_or(0.0);
     let mut order: Vec<u32> = (0..last_full).collect();
     order.sort_by(|a, b| {
         let d = |r: &u32| circ((*r as f64 + 0.5) / last_full.max(1) as f64, my_pos);
@@ -377,8 +388,14 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
         if work >= std::env::var("ARCADE_SHARE_WORK").ok().and_then(|v| v.parse().ok()).unwrap_or(2) {
             break;
         }
-        let mine = lane_holders(&pl, r, last_full).contains(&mine_id);
-        let others = holders(node, p.key, "blocks", r as u64).len();
+        let owners = lane_holders(&pl, r, last_full);
+        let mine = owners.contains(&mine_id);
+        // Count only holders that own the range in the lanes (their own copy is never dropped)
+        // or keep everything (Full); a stale announcement from another sharer doesn't count.
+        let full_or_owner = |id: &String| {
+            owners.contains(id) || node.holds.lock().unwrap().get(id).is_some_and(|(_, c)| c[p.net]["mode"] != "shared")
+        };
+        let others = holders(node, p.net, "blocks", r as u64).into_iter().filter(|id| full_or_owner(id)).count();
         let (from, to) = (r * RANGE, (r + 1) * RANGE - 1);
         if !mine && !gone.contains(&r) && others >= copies() && to <= walked {
             let mut bs = Vec::with_capacity(RANGE as usize);
@@ -394,7 +411,7 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
                 freed += node.chain.prune_blocks(p, chunk).map_err(|e| e.to_string())?;
             }
             gone.insert(r);
-            set_pruned(node, p.key, &gone);
+            set_pruned(node, p.net, &gone);
             let _ = node.app.event("shares", &format!("{}: blocks {from}-{to} are held by {others} other arcades; dropped them here ({:.1} MB)", p.name, freed as f64 / 1e6));
             work += 1;
         } else if mine && gone.contains(&r) {
@@ -420,13 +437,13 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
                 }
             }
             gone.remove(&r);
-            set_pruned(node, p.key, &gone);
+            set_pruned(node, p.net, &gone);
             let _ = node.app.event("shares", &format!("{}: blocks {from}-{to} are ours to hold; fetched them back", p.name));
             work += 1;
         }
     }
     // Blocks fetched back for an index walk: drop them again once every index is past them.
-    let mut back = restored(node, p.key);
+    let mut back = restored(node, p.net);
     let before = back.len();
     let (again, keep): (Vec<u32>, Vec<u32>) = back.iter().partition(|b| {
         node.chain.block_at(p, **b).ok().flatten().is_some_and(|(_, h, _)| h <= walked && gone.contains(&(h / RANGE)))
@@ -434,13 +451,13 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
     if !again.is_empty() {
         node.chain.prune_blocks(p, &again).map_err(|e| e.to_string())?;
         back = keep.into_iter().collect();
-        set_restored(node, p.key, &back);
+        set_restored(node, p.net, &back);
     }
     if before != back.len() {
         let _ = node.app.event("shares", &format!("{}: dropped {} blocks again that an index walk had fetched", p.name, before - back.len()));
     }
     let total = tip.height / RANGE + 1;
-    let lane = my_place(node, p.key).map(|(l, x)| format!(" · lane {} at {:.0}%", ["A", "B", "C", "D", "E"].get(l).unwrap_or(&"?"), x * 100.0)).unwrap_or_default();
+    let lane = my_place(node, p.net).map(|(l, x)| format!(" · lane {} at {:.0}%", ["A", "B", "C", "D", "E"].get(l).unwrap_or(&"?"), x * 100.0)).unwrap_or_default();
     Ok(format!("holding {} of {} block ranges{lane} · {} arcade{} sharing", total as usize - gone.len(), total, m.len(), if m.len() == 1 { "" } else { "s" }))
 }
 
@@ -456,6 +473,10 @@ fn set_restored(node: &Node, chain: &str, s: &BTreeSet<u32>) {
 /// Before an index walks `max` more blocks on a chain: fetch back any block it needs that
 /// this arcade dropped (from the arcades holding it; checked against our headers).
 pub fn prepare_backfill(node: &Node, p: &'static ChainParams, name: &str, max: u32) -> Result<(), String> {
+    // Nothing dropped here yet: every block is local, nothing to check.
+    if pruned(node, p.net).is_empty() {
+        return Ok(());
+    }
     for _ in 0..50 {
         let need = node.chain.backfill_missing(p, name, max).map_err(|e| e.to_string())?;
         if need.is_empty() {
@@ -466,7 +487,7 @@ pub fn prepare_backfill(node: &Node, p: &'static ChainParams, name: &str, max: u
             let (h, _, _) = node.chain.block_at(p, *b).map_err(|e| e.to_string())?.ok_or("block missing")?;
             hashes.push(p.block_id(&h));
         }
-        let mut back = restored(node, p.key);
+        let mut back = restored(node, p.net);
         let t = std::time::Instant::now();
         // One link per block range (each range has its own holders).
         let mut by_range: std::collections::BTreeMap<u32, (Vec<u32>, Vec<Hash256>)> = Default::default();
@@ -483,7 +504,7 @@ pub fn prepare_backfill(node: &Node, p: &'static ChainParams, name: &str, max: u
                 back.insert(*b);
             }
         }
-        set_restored(node, p.key, &back);
+        set_restored(node, p.net, &back);
         let _ = node.app.event("shares", &format!("{}: fetched {} blocks other arcades hold for the {name} walk ({:.1}s)", p.name, need.len(), t.elapsed().as_secs_f64()));
     }
     Ok(())
@@ -522,9 +543,9 @@ fn addr_of(node: &Node, id: &str) -> Option<String> {
 /// Ask the arcades holding `unit` of `kind` until one answers.
 pub fn ask_holders(node: &Node, p: &ChainParams, kind: &str, unit: u64, what: &str, arg: &str) -> Result<(Value, String), String> {
     let mut last = format!("no arcade on the mesh holds that part of {} right now", p.name);
-    for id in holders(node, p.key, kind, unit) {
+    for id in holders(node, p.net, kind, unit) {
         let Some(addr) = addr_of(node, &id) else { continue };
-        match ask(node, &addr, json!({"net": p.key, "what": what, "arg": arg})) {
+        match ask(node, &addr, json!({"net": p.net, "what": what, "arg": arg})) {
             Ok((v, _)) => return Ok((v, id)),
             Err(e) => last = e,
         }
@@ -536,7 +557,7 @@ pub fn ask_holders(node: &Node, p: &ChainParams, kind: &str, unit: u64, what: &s
 pub fn answer(node: &Node, link: &mut Link, h: &Value) -> Result<(), LinkError> {
     let id = h["id"].clone();
     let res: Result<Value, String> = (|| {
-        let p = node.chain_params(h["net"].as_str().unwrap_or("")).ok_or("chain not here")?;
+        let p = arcade_chain::params::by_net(h["net"].as_str().unwrap_or("")).and_then(|q| node.chain_params(q.key)).ok_or("chain not here")?;
         let arg = h["arg"].as_str().unwrap_or("");
         match h["what"].as_str().unwrap_or("") {
             "insc" => {
@@ -558,7 +579,7 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
     let Some(c) = h["chains"].as_object() else { return };
     let mut clean = Map::new();
     for (k, v) in c.iter().take(32) {
-        if arcade_chain::params::by_key(k).is_some() {
+        if arcade_chain::params::by_net(k).is_some() {
             clean.insert(k.clone(), json!({"mode": v["mode"], "h": v["h"], "blocks": v["blocks"], "ord": v["ord"], "tok": v["tok"], "lane": v["lane"], "pos": v["pos"]}));
         }
     }
@@ -638,5 +659,27 @@ mod tests {
         assert_eq!(gainers.len(), 2, "both neighbours restore it: {gainers:?}");
         let lane_mates: Vec<&String> = full.iter().filter(|p| p.1 == gone.1 && p.0 != gone.0).map(|p| &p.0).collect();
         assert!(gainers.iter().all(|g| lane_mates.contains(g)));
+    }
+}
+
+#[cfg(test)]
+mod clash_tests {
+    use super::*;
+    #[test]
+    fn simultaneous_joiners_spread_out() {
+        // Three arcades that all picked lane A at 0 at once: lower ids keep, the others re-join in turn.
+        let mut v: Vec<Place> = (0..3).map(|i| (format!("{i:064x}"), 0, 0.0)).collect();
+        for _ in 0..3 {
+            for i in 0..v.len() {
+                let me = v[i].clone();
+                let others: Vec<Place> = v.iter().filter(|o| o.0 != me.0).cloned().collect();
+                if others.iter().any(|o| o.1 == me.1 && circ(o.2, me.2) < 0.002 && o.0 < me.0) {
+                    let (l, x) = choose_place(&others);
+                    v[i] = (me.0, l, x);
+                }
+            }
+        }
+        let distinct: BTreeSet<(usize, u64)> = v.iter().map(|p| (p.1, (p.2 * 1000.0) as u64)).collect();
+        assert_eq!(distinct.len(), 3, "{v:?}");
     }
 }

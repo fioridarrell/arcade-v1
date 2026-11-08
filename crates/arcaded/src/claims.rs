@@ -110,7 +110,7 @@ pub fn start(node: &Node, tag: &str) -> Result<Claim, String> {
     let index = node.app.free_tag_index(node.params.chain_no).map_err(|e| e.to_string())?;
     let now = arcade_app::now();
     let claim = Claim {
-        id: format!("{}:{}:{now}", node.params.key, ck.tag),
+        id: format!("{}:{}:{now}", node.params.net, ck.tag),
         chain: node.params.chain_no,
         tag: ck.tag.clone(),
         key_index: index,

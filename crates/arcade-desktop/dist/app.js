@@ -8,7 +8,12 @@ async function api(cmd, args = {}) {
   return r.result;
 }
 
-const pep = (sats) => (sats / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 }) + " PEP";
+// The chain picked at the top (explorer.js owns the picker); every tab follows it.
+const TICKER = { peptest: "PEPtest", pep: "PEP", doge: "DOGE", dgb: "DGB", dgbtest: "DGBtest", kot: "KOT", flop: "FLOP", ltc: "LTC", ltctest: "LTCtest", btc: "BTC", wjk: "WJK" };
+const picked = () => (window.arcadeChain && window.arcadeChain()) || { key: "peptest", name: "Pepecoin testnet", home: true };
+const coins = (sats, key) => (sats / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 }) + " " + (TICKER[key || picked().key] || "");
+const pep = (sats) => coins(sats, "peptest");
+window.addEventListener("arcade:chain", () => refresh());
 const short = (s, n = 12) => (s && s.length > n ? s.slice(0, n) + "…" : s || "");
 function msg(el, text, kind = "") { el.textContent = text; el.className = "msg " + kind; }
 function rows(tbody, items, cells) {
@@ -30,41 +35,68 @@ let state = { wallet: false, keys: [], claims: [] };
 
 async function refreshHome() {
   const s = await api("status");
+  const ch = picked();
   state.wallet = s.wallet;
   $("conn").textContent = "connected"; $("conn").className = "pill ok";
-  $("h-sync").textContent = s.sync;
-  $("h-tip").textContent = s.tip ? `block ${s.tip.height.toLocaleString()} · ${short(s.tip.hash, 16)}` : "";
+  $("h-title").textContent = ch.name;
+  if (ch.home) {
+    $("h-sync").textContent = s.sync;
+    $("h-tip").textContent = s.tip ? `block ${s.tip.height.toLocaleString()} · ${short(s.tip.hash, 16)}` : "";
+  } else {
+    const st = await api("chains.status", { key: ch.key });
+    $("h-sync").textContent = st.installed ? st.state : "not installed";
+    const src = (st.stages || []).find((x) => x.name === "Source");
+    $("h-tip").textContent = st.installed ? `block ${(st.tip || 0).toLocaleString()}${src ? " · " + src.detail : ""}` : "Install it in Chains & Coins";
+  }
   $("h-mesh").textContent = `${s.mesh.links} arcade${s.mesh.links === 1 ? "" : "s"} linked`;
   $("h-node").textContent = "node " + short(s.node_id, 16);
-  $("h-tags").textContent = `${s.tags.count} tags`;
-  const same = s.mesh.tips.filter((t) => t.names_digest === s.tags.names_digest).length;
-  const told = s.mesh.tips.filter((t) => t.names_digest).length;
-  $("h-match").textContent = told ? `matches ${same} of ${told} arcades` : "no arcade has reported yet";
+  if (ch.home) {
+    $("h-tags-k").textContent = "Tags";
+    $("h-tags").textContent = `${s.tags.count} tags`;
+    const same = s.mesh.tips.filter((t) => t.names_digest === s.tags.names_digest).length;
+    const told = s.mesh.tips.filter((t) => t.names_digest).length;
+    $("h-match").textContent = told ? `matches ${same} of ${told} arcades` : "no arcade has reported yet";
+  } else {
+    const st = await api("chains.status", { key: ch.key });
+    $("h-tags-k").textContent = "Indexes";
+    $("h-tags").textContent = st.installed ? `${(st.indexes || []).length} on` : "—";
+    $("h-match").textContent = st.installed ? (st.indexes || []).join(", ") || "blocks and addresses only" : "";
+  }
   $("h-wallet").textContent = s.wallet ? "ready" : "not created";
-
-  let bal = 0, tag = null;
   if (s.wallet) {
-    state.keys = await api("wallet.keys");
-    bal = state.keys.reduce((a, k) => a + k.balance, 0);
-    tag = state.keys.find((k) => k.tag)?.tag;
-    $("h-bal").textContent = pep(bal) + (tag ? ` · @${tag}` : "");
+    state.keys = await api("wallet.keys", { chain: ch.key });
+    const bal = state.keys.reduce((a, k) => a + (k.balance || 0), 0);
+    const tag = state.keys.find((k) => k.tag)?.tag;
+    $("h-bal").textContent = (state.keys.some((k) => k.balance != null) ? coins(bal) : "chain not installed") + (tag ? ` · @${tag}` : "");
   } else { $("h-bal").textContent = ""; }
   state.claims = await api("tag.list");
-
 }
 
 async function refreshWallet() {
+  const ch = picked();
+  $("w-title").textContent = `Wallet · ${ch.name}`;
   $("w-none").hidden = state.wallet; $("w-keys").hidden = !state.wallet;
   if (!state.wallet) return;
-  if (!state.keys.length) state.keys = await api("wallet.keys");
-  rows($("w-rows"), state.keys, (k) => [[String(k.index)], [k.address], [k.tag ? "@" + k.tag : "—"], [pep(k.balance), "num"]]);
+  state.keys = await api("wallet.keys", { chain: ch.key });
+  rows($("w-rows"), state.keys, (k) => [[String(k.index)], [k.address], [k.tag ? "@" + k.tag : "—"], [k.balance == null ? "not installed" : coins(k.balance), "num"]]);
+  // Test coins from the mesh are Pepecoin testnet coins.
+  $("w-faucet").hidden = !ch.home;
 }
 
 async function refreshHandle() {
+  const ch = picked();
+  // @tags are claimed on Pepecoin testnet, whichever chain is picked.
+  $("t-note").hidden = ch.home; $("t-body").hidden = !ch.home;
+  $("t-note").textContent = ch.home ? "" : `@handles live on Pepecoin testnet, so they're the same on every chain. Pick Pepecoin testnet at the top to claim or check one.`;
+  if (!ch.home) return;
   rows($("t-rows"), state.claims.slice().reverse(), (c) => [["@" + c.tag], [c.status], [c.note]]);
 }
 
 async function refreshMine() {
+  const ch = picked();
+  $("m-note").hidden = ch.home; $("m-body").hidden = !ch.home;
+  $("m-note").textContent = ch.home ? "" : `Mining here is for Pepecoin testnet only. ${ch.name} is mined by its own miners and pools.`;
+  if (!ch.home) return;
   const m = await api("mine.status");
   $("m-state").textContent = m.running ? `mining (${m.threads} threads)` : "stopped";
   $("m-rate").textContent = m.hash_rate ? Math.round(m.hash_rate).toLocaleString() + " H/s" : "—";
@@ -72,7 +104,17 @@ async function refreshMine() {
 }
 
 async function refreshActivity() {
-  const ev = await api("events");
+  const ch = picked();
+  const all = await api("events", { n: 300 });
+  // This chain's events: those naming it; on the home chain also the wallet, tags, faucet, mining and mesh.
+  const names = ["Pepecoin testnet", "Pepecoin", "Dogecoin", "DigiByte", "Kotia", "Flopcoin", "Litecoin", "Bitcoin", "Wojak"];
+  const mentions = (t) => names.filter((n) => t.includes(n));
+  const ev = all.filter((e) => {
+    const m = mentions(e.text);
+    if (ch.home) return m.length === 0 || m.includes("Pepecoin testnet");
+    return m.some((n) => n === ch.name || (ch.name.startsWith(n) && !m.includes("Pepecoin testnet")));
+  }).slice(0, 60);
+  if (!ev.length) { $("a-list").replaceChildren(Object.assign(document.createElement("li"), { textContent: `Nothing about ${ch.name} yet.` })); return; }
   $("a-list").replaceChildren(...ev.map((e) => {
     const li = document.createElement("li");
     const t = document.createElement("time"); t.textContent = new Date(e.at * 1000).toLocaleTimeString();

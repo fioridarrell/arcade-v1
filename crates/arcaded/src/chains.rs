@@ -34,6 +34,8 @@ pub struct ChainRun {
     pub share: Value,
     /// Shared storage: what we hold now (from the last balancing pass).
     pub share_note: Mutex<String>,
+    /// Where the chain is coming from right now (arcade mesh, an arcade's Core node, P2P).
+    pub source: Mutex<String>,
 }
 
 pub fn indexer_name(index: &str) -> &'static str {
@@ -79,6 +81,9 @@ fn normalize(p: &ChainParams, indexes: &[String]) -> Result<Vec<String>, String>
         }
         if COMING.contains(&ix.as_str()) {
             return Err(format!("the {ix} index is coming; it is not available yet"));
+        }
+        if ix == "tokens" && arcade_ledger::tokens::protocol(p).is_none() {
+            return Err(format!("no token protocol is known on {} yet (PRC-20 is Pepecoin's, DRC-20 is Dogecoin's)", p.name));
         }
         if (ix == "ord" || is_rider(ix)) && ord_start(p).is_none() {
             return Err(format!("the {ix} index is not available on {} yet", p.name));
@@ -177,6 +182,7 @@ fn launch(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>, added: 
         added,
         share,
         share_note: Mutex::new(String::new()),
+        source: Mutex::new(String::new()),
     });
     node.extra.lock().unwrap().insert(key.into(), run.clone());
     let n = node.clone();
@@ -186,6 +192,8 @@ fn launch(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>, added: 
 
 /// Install a chain (by hand only), with the indexes the user opted into.
 pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Result<Value, String> {
+    // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
     if p.chain_no == node.params.chain_no {
         return Err(format!("{} is this arcade's home chain and is always installed", p.name));
@@ -205,7 +213,7 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     }
     // Shared storage: pick the ord and token groups this arcade keeps (least-held first).
     let share = if mode == "shared" {
-        json!({"ord": crate::shares::choose_groups(node, key, "ord"), "tok": crate::shares::choose_groups(node, key, "tok")})
+        json!({"ord": crate::shares::choose_groups(node, p.net, "ord"), "tok": crate::shares::choose_groups(node, p.net, "tok")})
     } else {
         Value::Null
     };
@@ -216,6 +224,8 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
 }
 
 pub fn set_paused(node: &Node, key: &str, paused: bool) -> Result<Value, String> {
+    // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let r = node.extra.lock().unwrap().get(key).cloned().ok_or_else(|| format!("{key} is not installed"))?;
     r.paused.store(paused, Ordering::Relaxed);
     save(node);
@@ -237,7 +247,8 @@ fn apply_set(node: &Arc<Node>, key: &str, home: bool, run: Option<Arc<ChainRun>>
     if home {
         // Shared home chain (test setups): pick the ord/token groups when ord first arrives.
         if node.home_mode == "shared" && set.iter().any(|i| i == "ord") && node.share_of(key).is_null() {
-            let share = json!({"ord": crate::shares::choose_groups(node, key, "ord"), "tok": crate::shares::choose_groups(node, key, "tok")});
+            let net = by_key(key).map(|p| p.net).unwrap_or(key);
+        let share = json!({"ord": crate::shares::choose_groups(node, net, "ord"), "tok": crate::shares::choose_groups(node, net, "tok")});
             let _ = node.app.store.write(|w| w.put(arcade_app::META, b"home_share", share.to_string().as_bytes()));
         }
         register_shared(node, p, &set, &node.share_of(key))?;
@@ -253,6 +264,8 @@ fn apply_set(node: &Arc<Node>, key: &str, home: bool, run: Option<Arc<ChainRun>>
 }
 
 pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, String> {
+    // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let (home, cur, run) = current(node, key)?;
     if run.as_ref().is_some_and(|r| r.mode == "chain") {
@@ -266,7 +279,7 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
     let set = normalize(p, &want)?;
     // Shared storage keeps only part of the blocks, and an index needs every block from its
     // start: fetch the chain again with the new index built in (our share is dropped again after).
-    if let Some(r) = run.as_ref().filter(|r| r.mode == "shared" && !crate::shares::pruned(node, key).is_empty()) {
+    if let Some(r) = run.as_ref().filter(|r| r.mode == "shared" && !crate::shares::pruned(node, p.net).is_empty()) {
         r.stop.store(true, Ordering::Relaxed);
         node.extra.lock().unwrap().remove(key);
         for ix in node.chain.indexers_for(p.chain_no) {
@@ -276,8 +289,8 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
         let (n, key, r) = (node.clone(), key.to_string(), r.clone());
         std::thread::spawn(move || {
             while n.chain.remove_chain_batch(p.chain_no, 20_000).map(|x| x > 0).unwrap_or(false) {}
-            let _ = n.app.store.write(|w| w.del(arcade_app::META, format!("pruned:{key}").as_bytes()).map(|_| ()));
-            let share = json!({"ord": crate::shares::choose_groups(&n, &key, "ord"), "tok": crate::shares::choose_groups(&n, &key, "tok")});
+            let _ = n.app.store.write(|w| w.del(arcade_app::META, format!("pruned:{}", p.net).as_bytes()).map(|_| ()));
+            let share = json!({"ord": crate::shares::choose_groups(&n, p.net, "ord"), "tok": crate::shares::choose_groups(&n, p.net, "tok")});
             match launch(&n, &key, "shared", set, r.added, false, share) {
                 Ok(()) => { save(&n); let _ = n.app.event("chains", &format!("{}: syncing again from the mesh with the new index built in", p.name)); }
                 Err(e) => { let _ = n.app.event("chains", &format!("{}: {e}", p.name)); }
@@ -316,6 +329,8 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
 /// Remove one index from a chain: stop it and delete its rows (in the background). Removing
 /// ord removes its riders too.
 pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, String> {
+    // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let (home, cur, run) = current(node, key)?;
     if home && index == "ledger" {
@@ -356,6 +371,8 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
 
 /// Stop following a chain and delete its data (in the background).
 pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
+    // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let r = node.extra.lock().unwrap().remove(key).ok_or_else(|| format!("{key} is not installed"))?;
     r.stop.store(true, Ordering::Relaxed);
     for ix in node.chain.indexers_for(r.params.chain_no) {
@@ -383,13 +400,15 @@ fn label(p: &ChainParams, ix: &str) -> String {
         "ord" => "Ord index".into(),
         "names" => "Names".into(),
         "maps" => "Maps".into(),
-        "tokens" => format!("{} tokens", arcade_ledger::tokens::protocol(p).0.to_uppercase()),
+        "tokens" => format!("{} tokens", arcade_ledger::tokens::protocol(p).map(|x| x.0).unwrap_or("Token").to_uppercase()),
         _ => ix.into(),
     }
 }
 
 /// Staged progress, as the Chains & Coins tab and `arcade chain status` show it.
 pub fn status(node: &Node, key: &str) -> Result<Value, String> {
+    // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let c = p.chain_no;
     let home = c == node.params.chain_no;
@@ -400,7 +419,10 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     let tip = node.chain.tip(c).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
     let best = node.chain.best_header(c).ok().flatten().and_then(|h| node.chain.header(c, &h).ok().flatten()).map(|r| r.height as u64).unwrap_or(0);
     let peer = run.as_ref().map(|r| r.peer_tip.load(Ordering::Relaxed) as u64).unwrap_or(best).max(best);
+    let src = run.as_ref().map(|r| r.source.lock().unwrap().clone()).unwrap_or_default();
     let mut stages = vec![
+        json!({"name": "Source", "detail": if src.is_empty() { "this arcade's own chain".to_string() } else { src.clone() },
+               "pct": if src.starts_with("asking") { 0.0 } else { 100.0 }, "info": true}),
         json!({"name": "Headers", "detail": "checked by proof of work", "pct": pct(best, peer), "at": best, "of": peer}),
         json!({"name": "Blocks", "detail": "stored once, from the mesh or P2P", "pct": pct(tip, peer.max(1)), "at": tip, "of": peer}),
         json!({"name": "Coins and addresses", "detail": "every address and balance", "pct": pct(tip, peer.max(1)), "at": tip, "of": peer}),
@@ -436,6 +458,10 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         }
         stages.push(json!({"name": "Your share", "detail": d, "pct": 100.0, "at": 0, "of": 0, "info": true}));
     }
+    // The step being worked on: the first one not done.
+    if let Some(cur) = stages.iter_mut().find(|s| s["pct"].as_f64().unwrap_or(0.0) < 100.0) {
+        cur["current"] = json!(true);
+    }
     let overall = stages.iter().filter(|s| s["info"] != true).map(|s| s["pct"].as_f64().unwrap_or(0.0)).sum::<f64>() / stages.iter().filter(|s| s["info"] != true).count().max(1) as f64;
     let state = match &run {
         Some(r) => {
@@ -458,8 +484,9 @@ pub fn list(node: &Node) -> Value {
             let st = status(node, p.key).unwrap_or(json!({}));
             json!({"key": p.key, "name": p.name, "installed": st["installed"], "home": st["home"], "mode": st["mode"],
                    "indexes": st["indexes"], "overall": st["overall"], "state": st["state"],
-                   "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).0.to_uppercase(),
-                   "dunes": p.key == "doge", "runes": p.key == "btc", "sizes": crate::sizes::for_chain(node, p.key)})
+                   "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()),
+                   "dunes": p.key == "doge", "runes": p.key == "btc", "sizes": crate::sizes::for_chain(node, p.key),
+                   "offers": node.offers_for(p.key).len()})
         })
         .collect::<Vec<_>>())
 }
@@ -495,10 +522,12 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             break;
         }
         set(format!("asking the arcade mesh for {} ({}s, {} offer{} so far)…", p.name, t0.elapsed().as_secs(), n, if n == 1 { "" } else { "s" }));
+        *run.source.lock().unwrap() = format!("asking the arcade mesh ({}s, {} offer{} so far)", t0.elapsed().as_secs(), n, if n == 1 { "" } else { "s" });
         std::thread::sleep(Duration::from_secs(2));
     }
     let offers = node.offers_for(p.key);
     if offers.is_empty() {
+        *run.source.lock().unwrap() = format!("{} P2P network (no arcade on the mesh offers it)", p.name);
         let _ = node.app.event("chains", &format!("no arcade on the mesh offers {}; using its P2P network", p.name));
         return;
     }
@@ -519,6 +548,7 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
         };
         let how = if kind == "bk" { "blocks" } else { "Core node" };
         let _ = node.app.event("chains", &format!("bootstrapping {} from arcade {short} at {addr} ({how}, its tip {their})", p.name));
+        *run.source.lock().unwrap() = format!("bootstrap from arcade {short} ({how}, its tip {their})");
         if let Err(e) = syncer.ensure_genesis(src.as_mut()) {
             let _ = node.app.event("chains", &format!("{}: arcade {addr}: {e}", p.name));
             continue;
@@ -527,12 +557,13 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             if run.stop.load(Ordering::Relaxed) || run.paused.load(Ordering::Relaxed) {
                 return;
             }
+            set(format!("bootstrapping from arcade {short} ({how}): block {} of {their}", ours()));
+            run.peer_tip.fetch_max(their as u32, Ordering::Relaxed);
             let h = syncer.sync_headers_once(src.as_mut());
-            let b = syncer.sync_blocks(src.as_mut(), 2000, 250);
+            let b = syncer.sync_blocks(src.as_mut(), 500, 500);
             match (h, b) {
                 (Ok(hn), Ok(pr)) => {
-                    run.peer_tip.fetch_max(their as u32, Ordering::Relaxed);
-                    set(format!("bootstrapping from arcade {short} ({how}): {} of {their}", ours()));
+                    set(format!("bootstrapping from arcade {short} ({how}): block {} of {their}", ours()));
                     if hn == 0 && pr.blocks == 0 {
                         break;
                     }
@@ -567,8 +598,9 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
             std::thread::sleep(Duration::from_secs(20));
             continue;
         };
-        run.peer_tip.store(peer.version.start_height.max(0) as u32, Ordering::Relaxed);
-        node.note_coin_peer(p.key, &peer.addr.to_string());
+        run.peer_tip.fetch_max(peer.version.start_height.max(0) as u32, Ordering::Relaxed);
+        *run.source.lock().unwrap() = format!("{} P2P peer {} ({})", p.name, peer.addr, peer.version.user_agent.trim_matches('/'));
+        node.note_coin_peer(p.net, &peer.addr.to_string());
         if let Err(e) = syncer.ensure_genesis(&mut peer) {
             set(format!("genesis: {e}"));
             std::thread::sleep(Duration::from_secs(10));

@@ -8,7 +8,18 @@
     if (!r.ok) throw new Error(r.error || "failed");
     return r.result;
   };
-  const COLORS = { test: "#2e8b44", main: "#3f9c55", doge: "#c2a633", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a" };
+  const COLORS = { peptest: "#2e8b44", pep: "#3f9c55", doge: "#c2a633", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a" };
+  // What people call each coin (the keys underneath stay as the mesh knows them).
+  const TICKERS = { peptest: "PEPtest", pep: "PEP", doge: "DOGE", dgb: "DGB", dgbtest: "DGBtest", kot: "KOT", flop: "FLOP", ltc: "LTC", ltctest: "LTCtest", btc: "BTC", wjk: "WJK" };
+  const COIN_ICONS = ["peptest", "pep", "doge", "dgb", "dgbtest", "kot", "flop", "ltc", "ltctest", "btc", "wjk"];
+  const ICON_FILE = (k) => `coins/${k}.${k === "btc" ? "svg" : "png"}`;
+  // A chain's coin: the original arcade's icon, or a letter on the chain's colour.
+  function coinEl(c) {
+    const e = document.createElement("span"); e.className = "coin";
+    if (COIN_ICONS.includes(c.key)) { const i = document.createElement("img"); i.src = ICON_FILE(c.key); i.alt = ""; e.append(i); e.classList.add("img"); }
+    else { e.style.background = COLORS[c.key] || "#777"; e.textContent = c.name[0]; }
+    return e;
+  }
   const SECTIONS = [
     ["home", "Overview"], ["blocks", "Blocks"], ["mempool", "Mempool"], ["inscriptions", "Inscriptions", "ord"],
     ["tokens", "Tokens", "tokens"], ["names", "Names", "names"], ["maps", "Maps", "maps"], ["ledger", "Arcade ledger", "ledger"],
@@ -53,8 +64,14 @@
   async function loadChains() {
     try { chains = await api("chains.list"); } catch { return; }
     const inst = chains.filter((c) => c.installed);
-    if (!chain || !inst.find((c) => c.key === chain.key)) chain = inst.find((c) => c.home) || inst[0];
+    const first = !chain;
+    // ?chain=<key> picks the starting chain (links, shortcuts).
+    const want = first ? new URLSearchParams(location.search).get("chain") : null;
+    if (want && inst.find((c) => c.key === want.toLowerCase())) chain = inst.find((c) => c.key === want.toLowerCase());
+    else if (!chain || !inst.find((c) => c.key === chain.key)) chain = inst.find((c) => c.home) || inst[0];
+    else chain = inst.find((c) => c.key === chain.key);
     paintSelector();
+    if (first) announce();
   }
   function sub(c) {
     if (c.home) return "home";
@@ -63,19 +80,21 @@
   }
   function paintSelector() {
     if (!chain) return;
-    $("cs-coin").style.background = COLORS[chain.key] || "#777"; $("cs-coin").textContent = chain.name[0];
+    $("cs-coin").replaceWith(Object.assign(coinEl(chain), { id: "cs-coin" }));
     $("cs-name").textContent = chain.name; $("cs-sub").textContent = "· " + sub(chain);
   }
   function menu() {
     const m = $("cs-menu");
     const row = (c, on) => h("button", { class: c.key === chain?.key ? "on" : "", disabled: !on, onclick: on ? () => pick(c) : null },
-      h("span", { class: "coin", style: `background:${COLORS[c.key] || "#777"}` }, c.name[0]), h("span", {}, c.name), h("span", { class: "meta" }, on ? sub(c) : "—"));
+      coinEl(c), h("span", {}, c.name), h("span", { class: "meta" }, on ? sub(c) : "—"));
     const inst = chains.filter((c) => c.installed), rest = chains.filter((c) => !c.installed);
     m.replaceChildren(h("div", { class: "hd" }, "Installed on this arcade"), ...inst.map((c) => row(c, true)),
       rest.length ? h("div", { class: "hd" }, "Not installed") : "", ...rest.map((c) => row(c, false)),
       h("div", { class: "foot" }, h("span", { class: "link", onclick: () => { close(); document.querySelector('nav button[data-tab="chains"]').click(); } }, "Install a chain in Chains & Coins →")));
   }
-  function pick(c) { chain = c; close(); paintSelector(); sum = null; go("home"); }
+  function pick(c) { chain = c; close(); paintSelector(); sum = null; go("home"); announce(); }
+  // Every tab follows the picked chain.
+  function announce() { window.dispatchEvent(new CustomEvent("arcade:chain", { detail: chain })); }
   function close() { $("cs-menu").hidden = true; $("cs-btn").setAttribute("aria-expanded", "false"); }
   $("cs-btn").onclick = async (ev) => {
     ev.stopPropagation();
@@ -324,4 +343,5 @@
   const hp = (location.hash || "").slice(1).split("/");
   if (hp[0] === "explorer") { if (hp[1]) { page = hp[1]; arg = hp.slice(2).join("/") || null; } render(); }
   window.arcadeExplorer = { go, chain: () => chain };
+  window.arcadeChain = () => chain;
 })();

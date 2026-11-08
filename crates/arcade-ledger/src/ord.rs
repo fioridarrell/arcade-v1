@@ -43,7 +43,7 @@ pub enum Dialect {
 
 /// First block the ord index reads on a chain, or None where scriptSig ord does not apply.
 pub fn ord_start(p: &ChainParams) -> Option<u32> {
-    Some(match p.key {
+    Some(match p.net {
         "main" => 186_920,
         "test" => 34_237,
         "doge" => 4_600_000,
@@ -54,7 +54,7 @@ pub fn ord_start(p: &ChainParams) -> Option<u32> {
 }
 
 pub fn dialect(p: &ChainParams) -> Dialect {
-    if p.key == "main" || p.key == "test" { Dialect::Pepecoin } else { Dialect::Dogecoin }
+    if p.net == "main" || p.net == "test" { Dialect::Pepecoin } else { Dialect::Dogecoin }
 }
 
 // ---------------- envelope ----------------

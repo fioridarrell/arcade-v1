@@ -69,10 +69,20 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "wallet.phrase" => Ok(json!({"phrase": node.app.phrase().map_err(|e| e.to_string())?})),
         "wallet.keys" => {
-            let keys = node.app.tag_keys(c).map_err(|e| e.to_string())?;
+            // Any chain: the same 12 words derive each chain's own addresses (its BIP44 coin type).
+            let cp = match s("chain") {
+                Some(k) => arcade_chain::params::by_key(&k).ok_or_else(|| format!("unknown chain {k}"))?,
+                None => p,
+            };
+            let mut keys = node.app.tag_keys(cp.chain_no).map_err(|e| e.to_string())?;
+            if keys.is_empty() && node.app.has_wallet().map_err(|e| e.to_string())? {
+                keys.push(node.app.tag_key(cp, 0).map_err(|e| e.to_string())?.0);
+            }
+            let installed = cp.chain_no == p.chain_no || node.extra.lock().unwrap().contains_key(cp.key);
             Ok(json!(keys.iter().map(|k| {
                 let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
-                json!({"index": k.index, "address": k.address, "tag": k.tag, "balance": node.chain.balance_for_script(c, &script).unwrap_or(0)})
+                json!({"index": k.index, "address": k.address, "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else { None },
+                       "balance": if installed { node.chain.balance_for_script(cp.chain_no, &script).ok() } else { None }})
             }).collect::<Vec<_>>()))
         }
         "tag.check" => Ok(json!(crate::claims::check(node, &s("tag").ok_or("tag required")?))),
@@ -264,7 +274,12 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "chains.index_add" => crate::chains::add_index(&node.self_arc(), &s("key").ok_or("key required")?, &s("index").ok_or("index required")?),
         "chains.index_remove" => crate::chains::remove_index(&node.self_arc(), &s("key").ok_or("key required")?, &s("index").ok_or("index required")?),
         "chains.remove" => crate::chains::remove(&node.self_arc(), &s("key").ok_or("key required")?),
-        "events" => Ok(json!(node.app.recent_events(30).map_err(|e| e.to_string())?)),
+        "events" => {
+            let n = req["n"].as_u64().unwrap_or(30).min(2000) as usize;
+            let kind = s("kind");
+            let ev = node.app.recent_events(if kind.is_some() { 2000 } else { n }).map_err(|e| e.to_string())?;
+            Ok(json!(ev.into_iter().filter(|e| kind.as_deref().is_none_or(|k| e.kind == k)).take(n).collect::<Vec<_>>()))
+        }
         other => Err(format!("unknown command {other:?}")),
     }
 }

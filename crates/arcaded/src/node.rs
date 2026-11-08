@@ -120,6 +120,8 @@ impl Node {
 
     /// Arcades offering a chain, best tip first: (node id, addr, "bk"|"cr", tip).
     pub fn offers_for(&self, key: &str) -> Vec<(String, String, &'static str, u64)> {
+        // Offers are kept under the mesh name.
+        let key = arcade_chain::params::by_key(key).map(|p| p.net).unwrap_or(key);
         let cutoff = arcade_app::now().saturating_sub(3 * 3600);
         let mut v: Vec<_> = self
             .offers
@@ -152,7 +154,7 @@ impl Node {
     /// Coin peers for a chain: shared and learned ones first, then fixed peers, then DNS seeds.
     pub fn coin_candidates(&self, p: &arcade_chain::params::ChainParams) -> Vec<String> {
         use std::net::ToSocketAddrs;
-        let mut v: Vec<String> = self.coin_peers.lock().unwrap().get(p.key).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        let mut v: Vec<String> = self.coin_peers.lock().unwrap().get(p.net).map(|s| s.iter().cloned().collect()).unwrap_or_default();
         for f in p.fixed_peers {
             if !v.iter().any(|x| x == f) {
                 v.push(f.to_string());

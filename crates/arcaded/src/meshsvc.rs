@@ -170,10 +170,10 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
     // Tell V1.0 peers what we can serve (existing arcades ignore this kind).
     let mut nets = serde_json::Map::new();
-    nets.insert(node.params.key.into(), json!({"h": our_tip(node)}));
+    nets.insert(node.params.net.into(), json!({"h": our_tip(node)}));
     for r in node.extra.lock().unwrap().values() {
         if let Ok(Some(t)) = node.chain.tip(r.params.chain_no) {
-            nets.insert(r.params.key.into(), json!({"h": t.height}));
+            nets.insert(r.params.net.into(), json!({"h": t.height}));
         }
     }
     link.send(&arcade_mesh::bk::hi(Value::Object(nets), node.mesh_port))?;
@@ -225,7 +225,7 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
                 link.send(&Frame::new(json!({"t": "pong", "n": n})))?;
             }
             "ix" if f.head["op"] == "tip" => {
-                if let Some(t) = f.head["nets"].get(node.params.key) {
+                if let Some(t) = f.head["nets"].get(node.params.net) {
                     node.mesh_tips.lock().unwrap().insert(
                         addr.to_string(),
                         MeshTip {
@@ -268,7 +268,7 @@ fn note_offer(node: &Node, id: &str, addr: &str, kind: &str, nets: &Value) {
     }
     let m = if kind == "bk" { &mut o.bk } else { &mut o.cr };
     for (k, v) in nets.iter().take(64) {
-        if arcade_chain::params::by_key(k).is_some() {
+        if arcade_chain::params::by_net(k).is_some() {
             if let Some(h) = v["h"].as_u64() {
                 m.insert(k.clone(), h);
             }
@@ -280,7 +280,7 @@ fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), L
     use arcade_chain::Hash256;
     use arcade_mesh::bk;
     // Any chain this arcade has: the home chain or an installed one.
-    let p = match h["net"].as_str().and_then(|k| node.chain_params(k)) {
+    let p = match h["net"].as_str().and_then(arcade_chain::params::by_net).and_then(|q| node.chain_params(q.key)) {
         Some(p) => p,
         None => node.params,
     };
@@ -293,17 +293,17 @@ fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), L
             if let Some(port) = h["port"].as_u64() {
                 let host = addr.rsplit_once(':').map(|x| x.0).unwrap_or(addr);
                 let dial = if addr.starts_with("wss://") { addr.to_string() } else { format!("{host}:{port}") };
-                if let Some(t) = h["nets"][node.params.key]["h"].as_u64() {
+                if let Some(t) = h["nets"][node.params.net]["h"].as_u64() {
                     node.bk_peers.lock().unwrap().insert(dial.clone(), t);
                 }
                 note_offer(node, &link.peer_id, &dial, "bk", &h["nets"]);
             }
         }
-        "hq" if h["net"] == p.key => {
+        "hq" if h["net"] == p.net => {
             let r = node.chain.headers_payload(p, &hashes("loc"), 2000).map_err(|e| e.to_string());
             bk::send_answer(link, id, r)?;
         }
-        "bq" if h["net"] == p.key => {
+        "bq" if h["net"] == p.net => {
             let want = hashes("h");
             let r = if want.len() > bk::MAX_BLOCKS {
                 Err("too many blocks asked".to_string())

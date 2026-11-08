@@ -33,18 +33,18 @@
 <main>
   <!-- Home: the arcade at a glance -->
   <section id="home" class="tab on">
-    <h1>Pepecoin testnet</h1>
+    <h1 id="h-title">Pepecoin testnet</h1>
     <div class="grid">
       <div class="card"><div class="k">Chain</div><div class="v" id="h-sync">—</div><div class="s" id="h-tip"></div></div>
       <div class="card"><div class="k">Mesh</div><div class="v" id="h-mesh">—</div><div class="s" id="h-node"></div></div>
-      <div class="card"><div class="k">Tags</div><div class="v" id="h-tags">—</div><div class="s" id="h-match"></div></div>
+      <div class="card"><div class="k" id="h-tags-k">Tags</div><div class="v" id="h-tags">—</div><div class="s" id="h-match"></div></div>
       <div class="card"><div class="k">Wallet</div><div class="v" id="h-wallet">—</div><div class="s" id="h-bal"></div></div>
     </div>
   </section>
 
   <!-- Wallet -->
   <section id="wallet" class="tab">
-    <h1>Wallet</h1>
+    <h1 id="w-title">Wallet</h1>
     <div id="w-none" hidden>
       <p>Your wallet is a 12-word recovery phrase. It lives on this PC with no password; the phrase is the only backup.</p>
       <div class="row">
@@ -70,6 +70,8 @@
   <!-- Handle -->
   <section id="handle" class="tab">
     <h1>Your handle</h1>
+    <p class="note" id="t-note" hidden></p>
+    <div id="t-body">
     <p>Pick an @tag: 2–24 characters, a–z, 0–9 and _. It is claimed on the Pepecoin testnet and every arcade sees it.</p>
     <div class="row">
       <span class="at">@</span><input id="t-tag" placeholder="yourname" maxlength="24" autocomplete="off">
@@ -79,6 +81,7 @@
     <p class="msg" id="t-msg"></p>
     <h2>Claims</h2>
     <table><thead><tr><th>Tag</th><th>Status</th><th>Note</th></tr></thead><tbody id="t-rows"></tbody></table>
+    </div>
   </section>
 
   <!-- Explorer: the chain chosen at the top, read from this arcade's own database -->
@@ -110,7 +113,7 @@
         <h3>Indexes</h3>
         <div class="idx" id="c-idx"></div>
         <h3>Get it from</h3>
-        <label class="opt"><input type="checkbox" checked disabled> The coin's own P2P network (mesh sources for added chains are coming)</label>
+        <p class="opt" id="c-from">Arcades on the mesh first: other V1.0 arcades' blocks, or an existing arcade's Core node. This waits up to a minute and a half for their answers, then uses the coin's own P2P network for anything left.</p>
         <div class="est" id="c-est"></div>
         <div class="est total" id="c-total"></div>
         <div class="row"><button class="primary" id="c-go">Install</button><button id="c-cancel">Cancel</button></div>
@@ -126,6 +129,8 @@
   <!-- Mine -->
   <section id="mine" class="tab">
     <h1>Mine testnet</h1>
+    <p class="note" id="m-note" hidden></p>
+    <div id="m-body">
     <p>Mines Pepecoin testnet blocks on this PC and pays your wallet. Mined coins can be spent after 240 blocks (about 4 hours).</p>
     <div class="grid">
       <div class="card"><div class="k">State</div><div class="v" id="m-state">—</div></div>
@@ -133,6 +138,7 @@
       <div class="card"><div class="k">Blocks found</div><div class="v" id="m-found">—</div></div>
     </div>
     <div class="row"><button class="primary" id="m-start">Start</button><button id="m-stop">Stop</button></div>
+    </div>
   </section>
 
   <!-- Activity -->

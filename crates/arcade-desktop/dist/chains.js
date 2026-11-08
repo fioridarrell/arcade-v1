@@ -7,7 +7,12 @@
     if (!r.ok) throw new Error(r.error || "failed");
     return r.result;
   };
-  const COLORS = { test: "#2e8b44", main: "#3f9c55", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a" };
+  // The original Dogecoin Arcade's coin icons (coins/<key>.png); others get a letter.
+  // What people call each coin (the keys underneath stay as the mesh knows them).
+  const TICKERS = { peptest: "PEPtest", pep: "PEP", doge: "DOGE", dgb: "DGB", dgbtest: "DGBtest", kot: "KOT", flop: "FLOP", ltc: "LTC", ltctest: "LTCtest", btc: "BTC", wjk: "WJK" };
+  const COIN_ICONS = ["peptest", "pep", "doge", "dgb", "dgbtest", "kot", "flop", "ltc", "ltctest", "btc", "wjk"];
+  const ICON_FILE = (k) => `coins/${k}.${k === "btc" ? "svg" : "png"}`;
+  const COLORS = { peptest: "#2e8b44", pep: "#3f9c55", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a" };
   const MODES = [
     ["full", "Full", "Blocks, every address, and your chosen indexes. Serves the mesh.", true],
     ["shared", "Shared", "Every address and balance, plus your share of the blocks, ord records and token ticks; the rest is held by other arcades and fetched when needed.", true],
@@ -22,7 +27,7 @@
     ["ord", "Ord index", "inscriptions (Pepinals, Doginals, ...), content served from the chain", true, "ord"],
     ["names", "Names", ".pepe / .doge names and \"p\":\"dns\" claims (needs ord)", true, "ord"],
     ["maps", "Maps", "block maps: <block>.pepemap, .dogemap, .bitmap (needs ord)", true, "ord"],
-    ["tokens", "Tokens", "PRC-20 / DRC-20 deploys, mints, transfers, balances (needs ord)", true, "ord"],
+    ["tokens", "Tokens", "PRC-20 on Pepecoin, DRC-20 on Dogecoin: deploys, mints, transfers, balances (needs ord)", true, "ord"],
     ["runes", "Runes", "coming: Bitcoin's fungible tokens", false, "runes"],
     ["dunes", "Dunes", "coming: Dogecoin's runes-style tokens", false, "dunes"],
   ];
@@ -36,20 +41,22 @@
     el.className = "chain";
     el.innerHTML = `<div class="top"><div class="logo"></div><div><div class="nm"></div><div class="net"></div></div></div>
       <div class="bar" hidden><i></i></div><div class="state"></div>`;
-    el.querySelector(".logo").style.background = COLORS[c.key] || "#777";
-    el.querySelector(".logo").textContent = c.name[0];
+    const logo = el.querySelector(".logo");
+    if (COIN_ICONS.includes(c.key)) {
+      const img = document.createElement("img"); img.src = ICON_FILE(c.key); img.alt = ""; logo.append(img); logo.classList.add("img");
+    } else { logo.style.background = COLORS[c.key] || "#777"; logo.textContent = c.name[0]; }
     el.querySelector(".nm").textContent = c.name;
-    el.querySelector(".net").textContent = c.key;
+    el.querySelector(".net").textContent = TICKERS[c.key] || c.key;
     const st = el.querySelector(".state");
     if (c.installed) {
       st.className = "state on";
       const pct = Math.floor(c.overall || 0);
       st.textContent = c.home ? `Home chain · ${c.mode} · ${(c.indexes || []).join(", ")}` : `${pct}% · ${c.state} · ${c.mode}`;
       if (!c.home && pct < 100) { const b = el.querySelector(".bar"); b.hidden = false; b.querySelector("i").style.width = pct + "%"; }
-      const b = document.createElement("button"); b.textContent = "Manage…"; b.onclick = () => manage(c.key); el.append(b);
+      const b = document.createElement("button"); b.textContent = "Manage…"; b.onclick = () => { manage(c.key); reveal(); }; el.append(b);
     } else {
       st.textContent = "Not installed";
-      const b = document.createElement("button"); b.textContent = "Install…"; b.onclick = () => choose(c); el.append(b);
+      const b = document.createElement("button"); b.textContent = "Install…"; b.onclick = () => { choose(c); reveal(); }; el.append(b);
     }
     return el;
   }
@@ -106,24 +113,36 @@
     const noIdx = mode === "chain";
     // Runes only on Bitcoin, dunes only on Dogecoin: other chains don't list them.
     $("c-idx").replaceChildren(...INDEXES.filter(([, , , , needs]) => (needs !== "runes" || c.runes) && (needs !== "dunes" || c.dunes)).map(([k, t, d, ok, needs]) => {
-      const can = ok && !noIdx && (needs !== "ord" || c.ord);
+      const can = ok && !noIdx && (needs !== "ord" || c.ord) && (k !== "tokens" || c.tokens);
       const l = document.createElement("label");
       l.className = can ? "" : "off";
       l.innerHTML = `<input type="checkbox" data-k="${k}" ${can ? "" : "disabled"}> <b></b> <small></small> <small class="sz"></small>`;
       if (can) l.querySelector(".sz").textContent = ixSize(c, k);
       l.querySelector("b").textContent = k === "tokens" && c.tokens ? `${c.tokens} tokens` : t;
-      l.querySelector("small").textContent = can || !ok ? d : "not available on this chain yet";
+      l.querySelector("small").textContent = can || !ok ? d : k === "tokens" && c.ord ? "no token protocol known on this chain yet" : "not available on this chain yet";
       const box = l.querySelector("input");
       box.onchange = () => {
         const all = $("c-idx");
         if (box.checked && RIDERS.includes(k)) all.querySelector('input[data-k="ord"]').checked = true;
         if (!box.checked && k === "ord") RIDERS.forEach((r) => { const x = all.querySelector(`input[data-k="${r}"]`); if (x) x.checked = false; });
         $("c-total").textContent = total(c);
+        $("c-total").hidden = !$("c-total").textContent;
       };
       return l;
     }));
     $("c-est").textContent = noIdx ? "Blocks and every address; no indexes." : "Nothing is ticked for you: choose the indexes you want. Each is built in the same commit as each block and can be removed later.";
     $("c-total").textContent = total(c);
+    $("c-total").hidden = !$("c-total").textContent;
+    const offers = c.offers || 0;
+    $("c-from").textContent = offers
+      ? `From the arcade mesh first: ${offers} arcade${offers === 1 ? "" : "s"} offer ${c.name} right now. Then the coin's own P2P network for anything left.`
+      : `Arcades on the mesh are asked first (this waits up to a minute and a half for their answers), then the coin's own P2P network.`;
+  }
+
+  // Bring the install card into view (it sits below the list of coins).
+  function reveal() {
+    const el = $("c-installer");
+    requestAnimationFrame(() => el.scrollIntoView({ behavior: matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth", block: "start" }));
   }
 
   async function install() {
@@ -145,10 +164,11 @@
     $("c-stages").replaceChildren(...st.stages.map((s) => {
       const li = document.createElement("li");
       const p = s.pct || 0;
-      li.className = p >= 100 ? "done" : p > 0 ? "run" : "wait";
+      li.className = (p >= 100 ? "done" : p > 0 ? "run" : "wait") + (s.current ? " now" : "") + (s.info ? " info" : "");
       li.innerHTML = `<div class="sh"><span class="sn"></span><span class="sd"></span></div><div class="bar"><i></i></div>`;
       li.querySelector(".sn").textContent = s.name;
-      li.querySelector(".sd").textContent = p >= 100 ? "done" : `${p.toFixed(1)}% · ${(s.at ?? 0).toLocaleString()} of ${(s.of ?? 0).toLocaleString()} · ${s.detail}`;
+      li.querySelector(".sd").textContent = s.info ? s.detail : p >= 100 ? `done · ${s.detail}` : `${p.toFixed(1)}% · ${(s.at ?? 0).toLocaleString()} of ${(s.of ?? 0).toLocaleString()} · ${s.detail}`;
+      if (s.current) li.querySelector(".sn").textContent = `${s.name} (now)`;
       li.querySelector(".bar > i").style.width = p + "%";
       // Remove-index buttons on index stages.
       const ix = s.index;
@@ -164,7 +184,7 @@
     if (!add) { add = document.createElement("div"); add.id = "c-addix"; add.className = "addix"; $("c-stages").after(add); }
     const info = chains.find((x) => x.key === st.key) || {};
     const have = st.indexes || [];
-    const can = st.mode === "full" ? INDEXES.filter(([k, , , ok, needs]) => ok && !have.includes(k) && (needs !== "ord" || info.ord)) : [];
+    const can = st.mode === "full" || st.mode === "shared" ? INDEXES.filter(([k, , , ok, needs]) => ok && !have.includes(k) && (needs !== "ord" || info.ord) && (k !== "tokens" || info.tokens)) : [];
     add.replaceChildren(...(can.length ? [Object.assign(document.createElement("span"), { textContent: "Add an index: " })] : []),
       ...can.map(([k, t]) => {
         const b = document.createElement("button"); b.className = "small";
@@ -199,5 +219,13 @@
   };
   document.querySelector('nav button[data-tab="chains"]').addEventListener("click", refresh);
   clearInterval(poll); poll = setInterval(() => { if (!document.getElementById("chains").hidden && document.getElementById("chains").classList.contains("on")) refresh(); }, 2500);
+  // #chains/install/<key> opens that coin's install card.
+  (async () => {
+    const h = (location.hash || "").slice(1).split("/");
+    if (h[0] !== "chains" || h[1] !== "install" || !h[2]) return;
+    await refresh();
+    const c = chains.find((x) => x.key === h[2]);
+    if (c && !c.installed) { choose(c); reveal(); }
+  })();
   refresh();
 })();

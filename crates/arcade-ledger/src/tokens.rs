@@ -24,13 +24,13 @@ pub const XFER: &str = "tok.v1.xfer";
 
 const MAX_SUPPLY: u128 = u64::MAX as u128;
 
-/// The token protocol of a chain and whether it is BRC-20 style (no 40-character minimum).
-pub fn protocol(p: &ChainParams) -> (&'static str, bool) {
-    match p.key {
-        "main" | "test" => ("prc-20", false),
-        "dgb" | "dgbtest" => ("dgb-20", true),
-        "ltc" | "ltctest" => ("ltc-20", true),
-        _ => ("drc-20", false),
+/// The token protocol of a chain: PRC-20 on Pepecoin, DRC-20 on Dogecoin. Other chains have
+/// their own, found as their ord indexes run; until one is added here a chain has none.
+pub fn protocol(p: &ChainParams) -> Option<(&'static str, bool)> {
+    match p.net {
+        "main" | "test" => Some(("prc-20", false)),
+        "doge" => Some(("drc-20", false)),
+        _ => None,
     }
 }
 
@@ -246,10 +246,10 @@ impl OrdHook for TokensHook {
     }
     fn born(&self, l: &Logged, c: u16, b: &Born) -> Result<()> {
         let Some(owner) = &b.landed else { return Ok(()) };
-        if b.pieces != 1 || (b.params.key == "doge" && b.reinscription) {
+        if b.pieces != 1 || (b.params.net == "doge" && b.reinscription) {
             return Ok(());
         }
-        let (proto, brc) = protocol(b.params);
+        let Some((proto, brc)) = protocol(b.params) else { return Ok(()) };
         match token_op(proto, brc, b.ctype, b.body) {
             Some(op) if self.groups.as_ref().is_none_or(|g| g.contains(&tick_group(op_tick(&op)))) => self.apply(l, c, b, owner, op),
             _ => Ok(()),

@@ -12,8 +12,12 @@ use crate::pow::{meets_target, target_from_bits, try_pow_hash, PowAlgo, PowRule,
 
 #[derive(Clone, Debug)]
 pub struct ChainParams {
-    /// Short key, as the arcade names it ("test", "main", "dgb", "kot", ...).
+    /// Short key, as Arcade V1.0 names the coin everywhere people see it and in its own
+    /// settings: the ticker in lowercase ("pep", "peptest", "doge", "dgb", "dgbtest", ...).
     pub key: &'static str,
+    /// The chain's name on the arcade mesh and in protocol data (what the existing arcades
+    /// call it: "test", "main", "doge", ...). Used only on the wire and for protocol rules.
+    pub net: &'static str,
     /// Store chain number (2 bytes in every key). Assigned once, never reused.
     pub chain_no: u16,
     pub name: &'static str,
@@ -175,7 +179,8 @@ pub fn check_block_work(params: &ChainParams, b: &crate::block::Block, height: u
 }
 
 pub static PEPECOIN_TEST: ChainParams = ChainParams {
-    key: "test",
+    key: "peptest",
+    net: "test",
     chain_no: 1,
     name: "Pepecoin testnet",
     magic: [0xfe, 0xc1, 0xdb, 0xcc],
@@ -212,7 +217,8 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
 };
 
 pub static PEPECOIN_MAIN: ChainParams = ChainParams {
-    key: "main",
+    key: "pep",
+    net: "main",
     chain_no: 2,
     name: "Pepecoin",
     magic: [0xc0, 0xa0, 0xf0, 0xe0],
@@ -241,6 +247,7 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
 
 pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
     key: "dgb",
+    net: "dgb",
     chain_no: 3,
     name: "DigiByte",
     magic: [0xfa, 0xc3, 0xb6, 0xda],
@@ -276,6 +283,7 @@ pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
 /// DigiByte testnet26 ("DigiDollar Reset"): DigiDollar active from height 600.
 pub static DIGIBYTE_TEST: ChainParams = ChainParams {
     key: "dgbtest",
+    net: "dgbtest",
     chain_no: 4,
     name: "DigiByte testnet26",
     magic: [0xfe, 0xc6, 0xb9, 0xe7],
@@ -309,6 +317,7 @@ pub static DIGIBYTE_TEST: ChainParams = ChainParams {
 /// Kotia: Blackcoin-style PoS on Bitcoin 0.14. Scrypt PoW to block 1,000,000, then PoS.
 pub static KOTIA_MAIN: ChainParams = ChainParams {
     key: "kot",
+    net: "kot",
     chain_no: 5,
     name: "Kotia",
     magic: [0x3d, 0xb5, 0x80, 0x00],
@@ -338,6 +347,7 @@ pub static KOTIA_MAIN: ChainParams = ChainParams {
 /// Flopcoin: a Dogecoin 1.14 fork. AuxPoW required from 110,000 (chain id 0xA3, strict).
 pub static FLOPCOIN_MAIN: ChainParams = ChainParams {
     key: "flop",
+    net: "flop",
     chain_no: 6,
     name: "Flopcoin",
     magic: [0xfa, 0xbf, 0xb5, 0xda], // since the v2.0.0.0 fork at 125,000 (was c0c0c0c0)
@@ -367,6 +377,7 @@ pub static FLOPCOIN_MAIN: ChainParams = ChainParams {
 /// Litecoin: scrypt, SegWit, Taproot, MWEB (extension block after the HogEx tx).
 pub static LITECOIN_MAIN: ChainParams = ChainParams {
     key: "ltc",
+    net: "ltc",
     chain_no: 7,
     name: "Litecoin",
     magic: [0xfb, 0xc0, 0xb6, 0xdb],
@@ -395,6 +406,7 @@ pub static LITECOIN_MAIN: ChainParams = ChainParams {
 
 pub static LITECOIN_TEST: ChainParams = ChainParams {
     key: "ltctest",
+    net: "ltctest",
     chain_no: 8,
     name: "Litecoin testnet4",
     magic: [0xfd, 0xd2, 0xc8, 0xf1],
@@ -424,6 +436,7 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
 /// Dogecoin: scrypt, merge-mined (AuxPoW chain id 0x62) from 371,337.
 pub static DOGECOIN_MAIN: ChainParams = ChainParams {
     key: "doge",
+    net: "doge",
     chain_no: 9,
     name: "Dogecoin",
     magic: [0xc0, 0xc0, 0xc0, 0xc0],
@@ -458,6 +471,7 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
 /// Bitcoin: sha256d, SegWit, Taproot; difficulty retargets every 2016 blocks (at most 4x).
 pub static BITCOIN_MAIN: ChainParams = ChainParams {
     key: "btc",
+    net: "btc",
     chain_no: 10,
     name: "Bitcoin",
     magic: [0xf9, 0xbe, 0xb4, 0xd9],
@@ -501,7 +515,23 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &BITCOIN_MAIN,
     ];
 
+/// A chain by its mesh name (what the existing arcades call it).
+pub fn by_net(net: &str) -> Option<&'static ChainParams> {
+    ALL_CHAINS.iter().copied().find(|p| p.net == net)
+}
+
+/// A chain by its key, any capitalisation ("DOGE", "PEPtest"); the old mesh names
+/// ("test", "main") are accepted too, for settings saved before the rename.
 pub fn by_key(key: &str) -> Option<&'static ChainParams> {
+    let k = key.to_ascii_lowercase();
+    if let Some(p) = ALL_CHAINS.iter().copied().find(|p| p.key == k) {
+        return Some(p);
+    }
+    by_net(&k)
+}
+
+#[allow(dead_code)]
+fn by_key_exact(key: &str) -> Option<&'static ChainParams> {
     ALL_CHAINS.iter().copied().find(|p| p.key == key)
 }
 

@@ -10,7 +10,7 @@ pub fn ask(node: &Node, addr: &str, tag: &str) -> Result<FaucetRequest, String> 
     let id = hex::encode(node.identity.verifying_key().to_bytes());
     node.mesh_outbox.lock().unwrap().push(serde_json::json!({"t": "wl", "recs": [rec]}));
     let req = FaucetRequest {
-        id: format!("{}:{addr}", node.params.key),
+        id: format!("{}:{addr}", node.params.net),
         chain: node.params.chain_no,
         address: addr.into(),
         status: FaucetStatus::Asked,
@@ -80,7 +80,7 @@ pub const AMOUNT: u64 = arcade_mesh::welcome::AMOUNT_COINS * 100_000_000;
 /// (V1.0 policy: test coins come from any available arcade, no operator step).
 pub fn pay_asks(node: &Node) {
     let p = node.params;
-    if p.key != "test" || !node.app.has_wallet().unwrap_or(false) {
+    if p.net != "test" || !node.app.has_wallet().unwrap_or(false) {
         return; // test coins only
     }
     let me = hex::encode(node.identity.verifying_key().to_bytes());

@@ -53,7 +53,7 @@ pub struct Gates {
 }
 
 pub fn gates(p: &ChainParams) -> Gates {
-    match p.key {
+    match p.net {
         "test" => {
             let a = 1_496_133;
             Gates {
@@ -1260,7 +1260,7 @@ impl Indexer for LedgerIndexer {
     }
     fn connect(&self, ctx: &BlockCtx) -> Result<()> {
         let p = ctx.params;
-        if p.format.tx_time || p.key.starts_with("ltc") {
+        if p.format.tx_time || p.net.starts_with("ltc") {
             return Ok(()); // no arcade transactions on Kotia / Litecoin (class_b off)
         }
         let e = Engine {

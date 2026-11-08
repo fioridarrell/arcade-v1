@@ -187,7 +187,7 @@ pub fn call(node: &Node, method: &str, params: &[Value]) -> RpcResult {
         "getblockchaininfo" => {
             let best = db.best_header(c).map_err(e)?.and_then(|h| db.header(c, &h).ok().flatten());
             Ok(json!({
-                "chain": if p.key == "test" || p.key.ends_with("test") { "test" } else { "main" },
+                "chain": if p.net.ends_with("test") { "test" } else { "main" },
                 "blocks": tip.height,
                 "headers": best.as_ref().map(|b| b.height).unwrap_or(tip.height),
                 "bestblockhash": tip.hash.to_hex(),

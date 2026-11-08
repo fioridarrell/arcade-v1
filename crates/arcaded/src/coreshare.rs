@@ -22,7 +22,7 @@ pub fn offer(node: &Node) -> Option<Frame> {
     let tip = node.chain.tip(node.params.chain_no).ok()??;
     Some(Frame::new(json!({
         "t": "cr", "op": "offer",
-        "nets": { node.params.key: {"h": tip.height, "b": tip.hash.to_hex(), "l": 1} }
+        "nets": { node.params.net: {"h": tip.height, "b": tip.hash.to_hex(), "l": 1} }
     })))
 }
 
@@ -64,7 +64,7 @@ pub fn answer(node: &Node, calls: &[Value]) -> Vec<Value> {
 pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> Result<(), LinkError> {
     let h = &f.head;
     match h["op"].as_str().unwrap_or("") {
-        "q" if h["net"] == node.params.key => {
+        "q" if h["net"] == node.params.net => {
             let id = h["id"].as_u64().unwrap_or(0);
             let buf = reqs.parts.entry(id).or_default();
             buf.extend_from_slice(&f.blob);
@@ -87,7 +87,7 @@ pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> R
             });
             send(link, id, res, z)
         }
-        "tx" if h["net"] == node.params.key => {
+        "tx" if h["net"] == node.params.net => {
             if let Ok(tx) = arcade_chain::Tx::parse_with(&f.blob, &node.params.format) {
                 let _ = node.chain.mempool_add(node.params, &tx, arcade_app::now());
                 node.tx_outbox.lock().unwrap().push(f.blob.clone());

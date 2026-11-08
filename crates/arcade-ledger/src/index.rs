@@ -240,7 +240,7 @@ pub fn fingerprint(pubkey: &[u8; 32]) -> String {
 
 /// The "other" Pepecoin network's key-hash version (test <-> main).
 fn other_version(p: &ChainParams) -> Option<u8> {
-    match p.key {
+    match p.net {
         "test" => Some(56),
         "main" => Some(113),
         _ => None,
@@ -270,7 +270,7 @@ impl Indexer for ProfileIndexer {
             };
             let mut linked: Vec<(String, String)> = Vec::new();
             if let (Some(h), Some(v)) = (a.other_h160, other_version(p)) {
-                linked.push((if p.key == "test" { "main" } else { "test" }.into(), crate::address::base58check(v, &h)));
+                linked.push((if p.net == "test" { "main" } else { "test" }.into(), crate::address::base58check(v, &h)));
             }
             if let Some(h) = a.doge_h160 {
                 linked.push(("doge".into(), crate::address::base58check(30, &h)));

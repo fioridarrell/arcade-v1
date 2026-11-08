@@ -440,10 +440,12 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         };
         let running = node.chain.indexers_for(c).contains(&name);
         let at = node.chain.indexed_to(c, name).ok().flatten().map(|h| h as u64).unwrap_or(start.saturating_sub(1));
-        let span = tip.saturating_sub(start) + 1;
+        // Measured against the chain's real tip (as far as anyone has told us), not just our blocks.
+        let top = tip.max(peer);
+        let span = top.saturating_sub(start) + 1;
         let detail = if !running { "waiting to start (rebuilding)".to_string() } else if is_rider(ix) { format!("from block {start}, with the ord index") } else { format!("from block {start}") };
         stages.push(json!({"name": label(p, ix), "index": ix, "detail": detail,
-                           "pct": if tip < start || !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) }, "at": at, "of": tip}));
+                           "pct": if at + 1 < start || !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) }, "at": at, "of": top}));
     }
     if mode == "shared" {
         let note = match &run { Some(r) => r.share_note.lock().unwrap().clone(), None => node.home_share_note.lock().unwrap().clone() };
@@ -586,12 +588,22 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     let syncer = Syncer::new(&node.chain, p);
     let set = |s: String| *run.state.lock().unwrap() = s;
     mesh_first(&node, &run, &syncer);
+    let mut last_mesh = std::time::Instant::now();
     // The first balancing pass waits until the mesh has told us who holds what.
     let mut last_balance = std::time::Instant::now() - Duration::from_secs(crate::shares::every() * 4 / 5);
     'outer: while !run.stop.load(Ordering::Relaxed) {
         if run.paused.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(2));
             continue;
+        }
+        // Still far behind what an arcade on the mesh offers: go back to the mesh first
+        // (another arcade may answer where the last one stopped), P2P only after.
+        {
+            let ours = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
+            if node.offers_for(p.key).iter().any(|o| o.3 > ours + 1000) && last_mesh.elapsed() > Duration::from_secs(60) {
+                mesh_first(&node, &run, &syncer);
+                last_mesh = std::time::Instant::now();
+            }
         }
         let Some(mut peer) = node.coin_candidates(p).iter().find_map(|a| Peer::connect(p, a, Duration::from_secs(20)).ok()) else {
             set(format!("no {} peer reachable; retrying", p.name));
@@ -629,11 +641,13 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
             for name in names {
                 while {
                     if run.mode == "shared" {
-                        if let Err(e) = crate::shares::prepare_backfill(&node, p, name, 2000) {
+                        if let Err(e) = crate::shares::prepare_backfill(&node, p, name, 500) {
                             set(format!("{name}: waiting for blocks held by other arcades: {e}"));
                         }
                     }
-                    node.chain.backfill(p, name, 2000).map(|x| x > 0).unwrap_or(false)
+                    let more = node.chain.backfill(p, name, 500).map(|x| x > 0).unwrap_or(false);
+                    std::thread::sleep(Duration::from_millis(30));
+                    more
                 } {
                     if run.stop.load(Ordering::Relaxed) {
                         continue 'outer;

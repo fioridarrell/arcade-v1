@@ -34,7 +34,7 @@ impl<'a> CoreShareSource<'a> {
         let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| std::io::Read::read_exact(&mut f, &mut seed));
         let key = ed25519_dalek::SigningKey::from_bytes(&seed);
         let mut link = Link::dial(addr, crate::meshsvc::NET, &key, None).map_err(|e| e.to_string())?;
-        link.set_read_timeout(Duration::from_secs(90)).map_err(|e| e.to_string())?;
+        link.set_read_timeout(Duration::from_secs(30)).map_err(|e| e.to_string())?;
         let batch = 200;
         Ok(CoreShareSource { link, addr: addr.into(), db: &node.chain, p, next_id: 1, cache: HashMap::new(), batch })
     }
@@ -50,7 +50,7 @@ impl<'a> CoreShareSource<'a> {
                 .send(&Frame { head: json!({"t": "cr", "op": "q", "id": id, "net": self.p.net, "seq": i, "end": i + 1 == parts.len(), "z": 0}), blob: part.to_vec() })
                 .map_err(|e| e.to_string())?;
         }
-        let deadline = std::time::Instant::now() + Duration::from_secs(180);
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
         let mut buf = Vec::new();
         #[allow(unused_assignments)]
         let mut z = true;

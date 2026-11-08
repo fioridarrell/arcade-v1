@@ -13,9 +13,12 @@ pub fn catch_up(node: &Node) -> Result<u32, String> {
     for name in INDEXES.iter().filter(|i| running.contains(i)) {
         loop {
             if node.home_mode == "shared" {
-                crate::shares::prepare_backfill(node, node.params, name, 2000)?;
+                crate::shares::prepare_backfill(node, node.params, name, 500)?;
             }
-            let done = node.chain.backfill(node.params, name, 2000).map_err(|e| e.to_string())?;
+            // Short write transactions with a pause between them, so chains syncing at the same
+            // time get the database's single write lock too (no starving them).
+            let done = node.chain.backfill(node.params, name, 500).map_err(|e| e.to_string())?;
+            std::thread::sleep(std::time::Duration::from_millis(30));
             n += done;
             if done == 0 {
                 break;

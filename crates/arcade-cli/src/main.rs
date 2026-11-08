@@ -19,6 +19,11 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade faucet                  ask the mesh for test coins
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
+  arcade chain list                         chains you can install, and their state
+  arcade chain add <key> [--mode full|chain] [--with ledger,profiles]
+  arcade chain status <key>                 staged progress (headers, blocks, coins, indexes)
+  arcade chain pause|resume|remove <key>
+  arcade chain index add|remove <key> <index>
   arcade ledger [height]         ledger fingerprints vs. other arcades; a block's digest rows
   arcade profile <@tag|address>  a handle's address, balance, published profile and linked wallets
   arcade mine start [threads]    mine Pepecoin testnet on this PC (pays your wallet)
@@ -219,6 +224,27 @@ fn main() {
         ["events"] => json!({"cmd": "events"}),
         ["mempool"] => json!({"cmd": "mempool"}),
         ["profile", who] => json!({"cmd": "profile", "who": who}),
+        ["chain", "list"] | ["chains"] => json!({"cmd": "chains.list"}),
+        ["chain", "status", k] => json!({"cmd": "chains.status", "key": k}),
+        ["chain", "pause", k] => json!({"cmd": "chains.pause", "key": k}),
+        ["chain", "resume", k] => json!({"cmd": "chains.resume", "key": k}),
+        ["chain", "remove", k] => json!({"cmd": "chains.remove", "key": k}),
+        ["chain", "index", "add", k, ix] => json!({"cmd": "chains.index_add", "key": k, "index": ix}),
+        ["chain", "index", "remove", k, ix] => json!({"cmd": "chains.index_remove", "key": k, "index": ix}),
+        ["chain", "add", k, rest @ ..] => {
+            let mut mode = "full".to_string();
+            let mut with: Vec<String> = vec![];
+            let mut i = 0;
+            while i < rest.len() {
+                match rest[i] {
+                    "--mode" if i + 1 < rest.len() => { mode = rest[i + 1].to_string(); i += 1; }
+                    "--with" if i + 1 < rest.len() => { with = rest[i + 1].split(',').map(String::from).collect(); i += 1; }
+                    _ => {}
+                }
+                i += 1;
+            }
+            json!({"cmd": "chains.add", "key": k, "mode": mode, "with": with})
+        }
         ["ledger"] => json!({"cmd": "ledger"}),
         ["ledger", h] => json!({"cmd": "ledger", "height": h}),
         ["mine", "start"] => json!({"cmd": "mine.start"}),
@@ -247,6 +273,25 @@ fn main() {
                 println!("Your recovery phrase (write it down, it is shown only now):\n\n  {p}\n");
                 return;
             }
+        }
+        if (a.first() == Some(&"chain") && matches!(a.get(1).copied(), Some("status") | Some("add") | Some("pause") | Some("resume"))) && v["result"]["stages"].is_array() {
+            let r = &v["result"];
+            println!("{} — {} · {} · {}", r["name"].as_str().unwrap_or(""), r["mode"].as_str().unwrap_or(""), r["state"].as_str().unwrap_or(""), r["indexes"].as_array().map(|x| x.iter().filter_map(|i| i.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default());
+            for st in r["stages"].as_array().unwrap() {
+                let p = st["pct"].as_f64().unwrap_or(0.0);
+                let bar: String = "█".repeat((p / 5.0).round() as usize);
+                println!("  {:<22} {:<20} {:>5.1}%  {}", st["name"].as_str().unwrap_or(""), format!("{bar:░<20}"), p, st["detail"].as_str().unwrap_or(""));
+            }
+            println!("  overall {:.1}%", r["overall"].as_f64().unwrap_or(0.0));
+            return;
+        }
+        if a.first() == Some(&"chain") && a.get(1) == Some(&"list") || a.first() == Some(&"chains") {
+            println!("{:<9} {:<20} {:<14} {:<6} INDEXES", "KEY", "CHAIN", "STATE", "MODE");
+            for c in v["result"].as_array().unwrap() {
+                let st = if c["installed"] == true { if c["home"] == true { "home".to_string() } else { format!("{:.0}% {}", c["overall"].as_f64().unwrap_or(0.0), c["state"].as_str().unwrap_or("")) } } else { "available".into() };
+                println!("{:<9} {:<20} {:<14} {:<6} {}", c["key"].as_str().unwrap_or(""), c["name"].as_str().unwrap_or(""), st.chars().take(14).collect::<String>(), c["mode"].as_str().unwrap_or(""), c["indexes"].as_array().map(|x| x.iter().filter_map(|i| i.as_str()).collect::<Vec<_>>().join(", ")).unwrap_or_default());
+            }
+            return;
         }
         println!("{}", serde_json::to_string_pretty(&v["result"]).unwrap());
     } else {

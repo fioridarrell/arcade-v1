@@ -91,3 +91,6 @@ h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); }
 .stages .bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .3s; }
 .stages li.wait .sn { color: var(--muted); }
 .stages li.done .sn::after { content: " ✓"; color: var(--accent); }
+
+.mode.off { opacity: .55; cursor: default; }
+button.small { padding: 2px 8px; font-size: 12px; margin-left: 8px; }

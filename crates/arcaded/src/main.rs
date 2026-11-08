@@ -6,6 +6,7 @@
 
 mod api;
 mod chainsvc;
+mod chains;
 mod claims;
 mod coreshare;
 mod faucet;
@@ -57,8 +58,9 @@ fn main() {
 
     let app = arcade_app::AppDb::open(&home).expect("open arcade.mdbx");
     let chain = arcade_chaindb::ChainDb::open(home.join("chain.mdbx")).expect("open chain.mdbx");
-    chain.add_indexer(Arc::new(arcade_ledger::engine::LedgerIndexer)).expect("ledger index");
-    chain.add_indexer(Arc::new(arcade_ledger::index::ProfileIndexer)).expect("profile index");
+    let home_chain = &arcade_chain::params::PEPECOIN_TEST;
+    chain.add_indexer(home_chain.chain_no, Arc::new(arcade_ledger::engine::LedgerIndexer)).expect("ledger index");
+    chain.add_indexer(home_chain.chain_no, Arc::new(arcade_ledger::index::ProfileIndexer)).expect("profile index");
     let identity = app.node_identity().expect("node identity");
     let node = Arc::new(Node {
         home: home.clone(),
@@ -80,8 +82,10 @@ fn main() {
         block_outbox: Mutex::new(Vec::new()),
         miner: Default::default(),
         me: Default::default(),
+        extra: Mutex::new(Default::default()),
     });
     let _ = node.me.set(Arc::downgrade(&node));
+    chains::start_saved(&node);
     let _ = node.app.event("service", "arcaded started");
     eprintln!(
         "arcaded: home {}, node {}, chain {}",

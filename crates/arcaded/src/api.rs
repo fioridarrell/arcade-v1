@@ -183,6 +183,17 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!({"address": address, "tag": tag, "balance": balance, "history_rows": history,
                       "profile": prof, "profile_tag_verified": tag_verified, "stated_by": linked_by}))
         }
+        "chains.list" => Ok(crate::chains::list(node)),
+        "chains.status" => crate::chains::status(node, &s("key").ok_or("key required")?),
+        "chains.add" => {
+            let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::chains::add(&node.self_arc(), &s("key").ok_or("key required")?, &s("mode").unwrap_or_else(|| "full".into()), with)
+        }
+        "chains.pause" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, true),
+        "chains.resume" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, false),
+        "chains.index_add" => crate::chains::add_index(&node.self_arc(), &s("key").ok_or("key required")?, &s("index").ok_or("index required")?),
+        "chains.index_remove" => crate::chains::remove_index(&node.self_arc(), &s("key").ok_or("key required")?, &s("index").ok_or("index required")?),
+        "chains.remove" => crate::chains::remove(&node.self_arc(), &s("key").ok_or("key required")?),
         "events" => Ok(json!(node.app.recent_events(30).map_err(|e| e.to_string())?)),
         other => Err(format!("unknown command {other:?}")),
     }

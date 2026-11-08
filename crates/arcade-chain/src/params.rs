@@ -421,10 +421,40 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
     index_start: 4_926_300,
 };
 
+/// Dogecoin: scrypt, merge-mined (AuxPoW chain id 0x62) from 371,337.
+pub static DOGECOIN_MAIN: ChainParams = ChainParams {
+    key: "doge",
+    chain_no: 9,
+    name: "Dogecoin",
+    magic: [0xc0, 0xc0, 0xc0, 0xc0],
+    p2p_port: 22556,
+    genesis: "1a91e3dace36e2be3bf030a65679fe821aa1d6ef92e7c9902eb318182c355691",
+    genesis_header: "",
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: Some(0x62),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: None,
+    p2pkh_version: 30,
+    p2sh_version: 22,
+    wif_version: 158,
+    bip44_coin_type: 3,
+    protocol_version: 70015,
+    dns_seeds: &["seed.multidoge.org", "seed2.multidoge.org"],
+    fixed_peers: &[],
+    checkpoints: &[],
+    coinbase_maturity: 240,
+    index_start: 6_415_000,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
     &[
         &PEPECOIN_TEST,
         &PEPECOIN_MAIN,
+        &DOGECOIN_MAIN,
         &DIGIBYTE_MAIN,
         &DIGIBYTE_TEST,
         &KOTIA_MAIN,

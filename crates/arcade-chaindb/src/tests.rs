@@ -255,7 +255,7 @@ impl crate::Indexer for CountTx {
 fn indexer_in_commit_undo_and_backfill_agree() {
     // A: indexer present from the start.
     let a = fixture();
-    a.db.add_indexer(std::sync::Arc::new(CountTx)).unwrap();
+    a.db.add_indexer(a.p.chain_no, std::sync::Arc::new(CountTx)).unwrap();
     let cb1 = tx(&[], &[(5000, p2pkh(1))], 1);
     let b1 = block(a.g.hash(), vec![cb1.clone()], 2);
     let spend = tx(&[(cb1.txid, 0)], &[(4000, p2pkh(2))], 0);
@@ -275,10 +275,28 @@ fn indexer_in_commit_undo_and_backfill_agree() {
     let dir = tempfile::tempdir().unwrap();
     let bdb = ChainDb::open(dir.path().join("c.mdbx")).unwrap();
     bdb.connect_blocks(a.p, &[a.g.clone(), b1, b2]).unwrap();
-    bdb.add_indexer(std::sync::Arc::new(CountTx)).unwrap();
+    bdb.add_indexer(a.p.chain_no, std::sync::Arc::new(CountTx)).unwrap();
     while bdb.backfill(a.p, "count", 1).unwrap() > 0 {}
     assert_eq!(bdb.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap(), a.db.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap());
     // Backfilled rows inside the undo window are undone by a reorg too.
     bdb.disconnect_tip(a.p.chain_no).unwrap();
     assert_eq!(bdb.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap().len(), 1);
+}
+
+#[test]
+fn remove_chain_deletes_only_that_chain() {
+    let f = fixture();
+    let b1 = block(f.g.hash(), vec![tx(&[], &[(10, p2pkh(1))], 1)], 2);
+    f.db.connect_blocks(f.p, &[b1]).unwrap();
+    // A second chain number with its own genesis.
+    let mut p2 = f.p.clone();
+    p2.chain_no = 9;
+    let g2 = block(Hash256::ZERO, vec![tx(&[], &[(5, p2pkh(7))], 99)], 1);
+    p2.genesis = Box::leak(g2.hash().to_hex().into_boxed_str());
+    let p2: &'static ChainParams = Box::leak(Box::new(p2));
+    f.db.connect_blocks(p2, &[g2.clone(), block(g2.hash(), vec![tx(&[], &[(5, p2pkh(7))], 98)], 2)]).unwrap();
+    while f.db.remove_chain_batch(9, 3).unwrap() > 0 {}
+    assert!(f.db.tip(9).unwrap().is_none());
+    assert_eq!(f.db.tip(f.p.chain_no).unwrap().unwrap().height, 1, "the other chain is untouched");
+    assert_eq!(f.db.balance_for_script(f.p.chain_no, &p2pkh(1)).unwrap(), 10);
 }

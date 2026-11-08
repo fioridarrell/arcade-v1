@@ -1239,6 +1239,12 @@ impl TagStore for EngineTags<'_, '_, '_, '_> {
 /// The ledger indexer: tags, tokens, MetaDEx, INSC — the arcade ledger, block by block.
 pub struct LedgerIndexer;
 
+impl LedgerIndexer {
+    pub fn tables_named(&self) -> Vec<String> {
+        self.tables().into_iter().map(|t| t.name.to_string()).collect()
+    }
+}
+
 impl Indexer for LedgerIndexer {
     fn name(&self) -> &'static str {
         "ledger.v1"

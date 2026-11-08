@@ -53,6 +53,8 @@ pub struct Node {
     /// Blocks we mined, waiting to be sent to coin peers.
     pub block_outbox: Mutex<Vec<Vec<u8>>>,
     pub miner: crate::miner::MinerState,
+    /// Chains installed by hand (Chains & Coins), by key.
+    pub extra: Mutex<BTreeMap<String, std::sync::Arc<crate::chains::ChainRun>>>,
     /// Weak self-reference so API handlers can start threads that own the node.
     pub me: std::sync::OnceLock<std::sync::Weak<Node>>,
     /// Coins spent by our own transactions that are not in a block yet.

@@ -47,8 +47,7 @@ fn main() {
                         std::thread::sleep(std::time::Duration::from_secs(2));
                         let _ = w.eval(r#"
                           document.querySelector('nav button[data-tab="chains"]').click();
-                          setTimeout(() => { [...document.querySelectorAll('.chain')].find(c => c.textContent.includes('Dogecoin')).querySelector('button').click(); }, 400);
-                          setTimeout(() => { document.getElementById('c-go').click(); }, 1800);
+
                         "#);
                     });
                 }

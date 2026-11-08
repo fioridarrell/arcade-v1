@@ -74,7 +74,7 @@
 
   <!-- Chains & Coins (MOCKUP: simulated data and progress) -->
   <section id="chains" class="tab">
-    <h1>Chains &amp; Coins <span class="mock">mockup</span></h1>
+    <h1>Chains &amp; Coins</h1>
     <p>Install another blockchain on this arcade. Nothing is added unless you install it here.</p>
     <div class="chains" id="c-list"></div>
 
@@ -89,11 +89,11 @@
         <h3>Indexes</h3>
         <div class="idx" id="c-idx"></div>
         <h3>Get it from</h3>
-        <label class="opt"><input type="checkbox" checked disabled> Other arcades on the mesh first, the coin's own P2P network as fallback</label>
-        <label class="opt"><input type="checkbox" id="c-snap" checked> Use a verified index snapshot from the mesh (much faster; re-checked in the background)</label>
+        <label class="opt"><input type="checkbox" checked disabled> The coin's own P2P network (mesh sources for added chains are coming)</label>
         <div class="est" id="c-est"></div>
         <div class="row"><button class="primary" id="c-go">Install</button><button id="c-cancel">Cancel</button></div>
       </div>
+      <p class="msg" id="c-msg"></p>
       <div id="c-progress" hidden>
         <ol class="stages" id="c-stages"></ol>
         <div class="row"><button id="c-pause">Pause</button><button id="c-stop">Stop and remove</button></div>
@@ -120,6 +120,6 @@
   </section>
 </main>
 <script src="app.js"></script>
-<script src="chains-mock.js"></script>
+<script src="chains.js"></script>
 </body>
 </html>

@@ -264,7 +264,8 @@ fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Res
 
 pub struct ChainDb {
     pub store: Store,
-    indexers: std::sync::RwLock<Vec<Arc<dyn Indexer>>>,
+    /// Indexers and the chains they run on.
+    indexers: std::sync::RwLock<Vec<(u16, Arc<dyn Indexer>)>>,
 }
 
 fn ix_key(c: u16, name: &str) -> Vec<u8> {
@@ -276,14 +277,71 @@ impl ChainDb {
         Ok(ChainDb { store: Store::open(path, &CHAIN_SCHEMA)?, indexers: Default::default() })
     }
 
-    /// Register an indexer: creates its tables. If the chain is already past the
+    /// Run an indexer on one chain: creates its tables. If the chain is already past the
     /// indexer's start, call [`ChainDb::backfill`] until it returns 0.
-    pub fn add_indexer(&self, ix: Arc<dyn Indexer>) -> Result<()> {
+    pub fn add_indexer(&self, chain_no: u16, ix: Arc<dyn Indexer>) -> Result<()> {
         for t in ix.tables() {
             self.store.add_table(t)?;
         }
-        self.indexers.write().unwrap().push(ix);
+        let mut v = self.indexers.write().unwrap();
+        if !v.iter().any(|(c, i)| *c == chain_no && i.name() == ix.name()) {
+            v.push((chain_no, ix));
+        }
         Ok(())
+    }
+
+    /// Indexers running on a chain.
+    pub fn indexers_for(&self, chain_no: u16) -> Vec<&'static str> {
+        self.indexers.read().unwrap().iter().filter(|(c, _)| *c == chain_no).map(|(_, i)| i.name()).collect()
+    }
+
+    /// Stop running an indexer on a chain (its rows stay until the chain is removed).
+    pub fn remove_indexer(&self, chain_no: u16, name: &str) {
+        self.indexers.write().unwrap().retain(|(c, i)| !(*c == chain_no && i.name() == name));
+    }
+
+    /// Stop an indexer on a chain and delete its rows for that chain (a batch at a time:
+    /// call until it returns 0). Its progress is reset, so adding it again rebuilds it.
+    pub fn remove_index_batch(&self, chain_no: u16, name: &str, tables: &[String], max: usize) -> Result<usize> {
+        self.remove_indexer(chain_no, name);
+        let pre = k_chain(chain_no);
+        self.store.write(|w| {
+            let mut n = 0;
+            for t in tables {
+                if n >= max {
+                    break;
+                }
+                for (k, _) in w.scan_prefix_limit(t, &pre, max - n)? {
+                    w.del(t, &k)?;
+                    n += 1;
+                }
+            }
+            if n == 0 {
+                w.del(STATE, &ix_key(chain_no, name))?;
+            }
+            Ok(n)
+        })
+    }
+
+    /// Delete everything stored for a chain, a batch at a time. Returns rows deleted in this
+    /// call (0 = done). Every table's keys start with the 2-byte chain number.
+    pub fn remove_chain_batch(&self, chain_no: u16, max: usize) -> Result<usize> {
+        let pre = k_chain(chain_no);
+        let mut tables: Vec<String> = CHAIN_SCHEMA.tables.iter().map(|t| t.name.to_string()).collect();
+        tables.extend(self.store.addon_tables()?);
+        self.store.write(|w| {
+            let mut n = 0;
+            for t in &tables {
+                if n >= max {
+                    break;
+                }
+                for (k, _) in w.scan_prefix_limit(t, &pre, max - n)? {
+                    w.del(t, &k)?;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })
     }
 
     /// Height an indexer has folded in on a chain (None = nothing yet).
@@ -296,7 +354,7 @@ impl ChainDb {
     /// their undo record, so a later reorg undoes them too.
     pub fn backfill(&self, params: &ChainParams, name: &str, max: u32) -> Result<u32> {
         let c = params.chain_no;
-        let ix = self.indexers.read().unwrap().iter().find(|i| i.name() == name).cloned()
+        let ix = self.indexers.read().unwrap().iter().find(|(ch, i)| *ch == c && i.name() == name).map(|(_, i)| i.clone())
             .ok_or_else(|| other(format!("no indexer {name}")))?;
         let Some(tip) = self.tip(c)? else { return Ok(0) };
         let start = match self.indexed_to(c, name)? {
@@ -632,7 +690,7 @@ impl ChainDb {
     /// The first block's parent must be the current tip (or there is no tip: genesis).
     pub fn connect_blocks(&self, params: &ChainParams, blocks: &[Block]) -> Result<Tip> {
         let c = params.chain_no;
-        let ixs = self.indexers.read().unwrap().clone();
+        let ixs: Vec<Arc<dyn Indexer>> = self.indexers.read().unwrap().iter().filter(|(ch, _)| *ch == c).map(|(_, i)| i.clone()).collect();
         self.store.write(|w| {
             let mut tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v));
             for b in blocks {

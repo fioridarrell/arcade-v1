@@ -99,6 +99,14 @@ impl<'a> CoreShareSource<'a> {
         v.get("r").ok_or_else(|| "no result".to_string())
     }
 
+    /// Block hashes for heights start..start+n (n at most 500).
+    pub fn hashes(&mut self, start: u32, n: u32) -> Result<Vec<Hash256>, String> {
+        let n = n.min(crate::coreshare::MAX_CALLS as u32);
+        let calls: Vec<Value> = (start..start + n).map(|h| json!(["getblockhash", [h]])).collect();
+        let a = self.call(json!(calls))?;
+        a.iter().map(|x| Hash256::from_hex(Self::r(x)?.as_str().ok_or("bad hash")?).map_err(|e| e.to_string())).collect()
+    }
+
     /// Their tip height.
     pub fn height(&mut self) -> Result<u64, String> {
         let a = self.call(json!([["getblockcount", []]]))?;

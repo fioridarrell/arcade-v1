@@ -538,6 +538,30 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
         let _ = node.app.event("chains", &format!("no arcade on the mesh offers {}; using its P2P network", p.name));
         return;
     }
+    // Far behind: every source at once (all arcades offering it, plus P2P peers).
+    let top = offers.iter().map(|o| o.3).max().unwrap_or(0);
+    if top > ours() + 2000 && offers.iter().any(|o| o.2 == "cr") {
+        if node.chain.tip(p.chain_no).ok().flatten().is_none() {
+            // Genesis first, from the first arcade that answers.
+            for o in offers.iter().filter(|o| o.2 == "cr") {
+                if let Ok(mut src) = crate::crsource::CoreShareSource::dial(node, &o.1, p) {
+                    if syncer.ensure_genesis(&mut src).is_ok() {
+                        break;
+                    }
+                }
+            }
+        }
+        let _ = node.app.event("chains", &format!("{}: downloading from every source at once ({} arcade offer{} + P2P)", p.name, offers.len(), if offers.len() == 1 { "" } else { "s" }));
+        run.peer_tip.fetch_max(top as u32, Ordering::Relaxed);
+        let progress = |s: String| {
+            *run.source.lock().unwrap() = format!("parallel: {}", s.split(" · ").skip(1).collect::<Vec<_>>().join(" · "));
+            set(format!("downloading in parallel: {s}"));
+        };
+        match crate::psync::run(node, p, syncer, top as u32, &progress, &run.stop) {
+            Ok(n) => { let _ = node.app.event("chains", &format!("{}: parallel download connected {n} blocks", p.name)); }
+            Err(e) => { let _ = node.app.event("chains", &format!("{}: parallel download stopped: {e}", p.name)); }
+        }
+    }
     for (id, addr, kind, their) in offers {
         if run.stop.load(Ordering::Relaxed) || their <= ours() + 10 {
             continue;

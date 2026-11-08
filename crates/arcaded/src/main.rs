@@ -18,6 +18,7 @@ mod meshsource;
 mod miner;
 mod meshsvc;
 mod node;
+mod psync;
 mod rpc;
 mod sizes;
 mod shares;

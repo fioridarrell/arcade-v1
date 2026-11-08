@@ -143,6 +143,11 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `group.read` | `/api/v1/group/read` | message | id | Mark a group read. |
 | `group.say` | `/api/v1/group/say` | message | id, text?, file? | Write to a group. |
 | `group.leave` | `/api/v1/group/leave` | message | id | Leave a group. |
+| `group.app_list` | `/api/v1/group/app_list` | read | — | Your groups as apps see them: id, name, live room, members. |
+| `group.app_read` | `/api/v1/group/app_read` | read | id, after?, limit? | A group's lines for an app (oldest first). |
+| `group.seal` | `/api/v1/group/seal` | read | id, text | Seal text for a group's live room (the original's group live key). |
+| `group.open` | `/api/v1/group/open` | read | id, sealed | Open text sealed for a group's live room (null if not this group's). |
+| `group.add` | `/api/v1/group/add` | message | id, members | Add members to a group (they get its key). |
 | `group.update` | `/api/v1/group/update` | message | id, changes | Admins: change admins, description, picture or pinned message. |
 | `group.remove` | `/api/v1/group/remove` | message | id, members | Admins: remove members (gives everyone else a new group key). |
 
@@ -224,6 +229,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `apps.perms` | `/api/v1/apps/perms` | admin | id, set? | An app's permission switches (wallet, contacts, groups, media, pictures, notify). |
 | `apps.review` | `/api/v1/apps/review` | admin | chain, txid, verdict | Clear or confirm an app flagged as a lookalike. |
 | `apps.trust` | `/api/v1/apps/trust` | admin | address, on? | Trust a publisher (never flagged as a lookalike). |
+| `apps.storage` | `/api/v1/apps/storage` | local | page, op, key?, value? | An app page's saves (load, set, remove, clear, history), as arcade.storage. |
 | `apps.launch` | `/api/v1/apps/launch` | read | chain, txid | What an app window opens: the sandboxed page URL and the card. |
 
 ### API keys

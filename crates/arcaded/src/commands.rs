@@ -100,6 +100,11 @@ cmds! {
     "group.read" Message "id" "Mark a group read.";
     "group.say" Message "id, text?, file?" "Write to a group.";
     "group.leave" Message "id" "Leave a group.";
+    "group.app_list" Read "" "Your groups as apps see them: id, name, live room, members.";
+    "group.app_read" Read "id, after?, limit?" "A group's lines for an app (oldest first).";
+    "group.seal" Read "id, text" "Seal text for a group's live room (the original's group live key).";
+    "group.open" Read "id, sealed" "Open text sealed for a group's live room (null if not this group's).";
+    "group.add" Message "id, members" "Add members to a group (they get its key).";
     "group.update" Message "id, changes" "Admins: change admins, description, picture or pinned message.";
     "group.remove" Message "id, members" "Admins: remove members (gives everyone else a new group key).";
     // Feed
@@ -165,6 +170,7 @@ cmds! {
     "apps.perms" Admin "id, set?" "An app's permission switches (wallet, contacts, groups, media, pictures, notify).";
     "apps.review" Admin "chain, txid, verdict" "Clear or confirm an app flagged as a lookalike.";
     "apps.trust" Admin "address, on?" "Trust a publisher (never flagged as a lookalike).";
+    "apps.storage" Local "page, op, key?, value?" "An app page's saves (load, set, remove, clear, history), as arcade.storage.";
     "apps.launch" Read "chain, txid" "What an app window opens: the sandboxed page URL and the card.";
     // API keys (managed from this computer only)
     "apikey.list" Local "" "API keys (not their secrets).";

@@ -153,6 +153,14 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             };
             crate::grpsvc::say(node, &s("id").ok_or("id required")?, &s("text").unwrap_or_default(), file)
         }
+        "group.app_list" => crate::grpsvc::app_list(node),
+        "group.app_read" => crate::grpsvc::app_read(node, &s("id").ok_or("id required")?, req["after"].as_u64().unwrap_or(0), req["limit"].as_u64().unwrap_or(200) as usize),
+        "group.seal" => crate::grpsvc::seal_live(node, &s("id").ok_or("id required")?, &s("text").unwrap_or_default()),
+        "group.open" => crate::grpsvc::open_live(node, &s("id").ok_or("id required")?, &s("sealed").unwrap_or_default()),
+        "group.add" => {
+            let names: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::grpsvc::add(node, &s("id").ok_or("id required")?, &names)
+        }
         "group.leave" => crate::grpsvc::leave(node, &s("id").ok_or("id required")?),
         "group.update" => crate::grpsvc::update(node, &s("id").ok_or("id required")?, &req["changes"]),
         "group.remove" => {
@@ -171,6 +179,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "apps.review" => crate::appsvc::review(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?, &s("verdict").ok_or("verdict required (clear or confirm)")?),
         "apps.trust" => crate::appsvc::trust(node, &s("address").ok_or("address required")?, req["on"] != false),
+        "apps.storage" => crate::appsvc::storage(node, &s("page").ok_or("page required")?, &s("op").ok_or("op required")?, req["key"].as_str(), req["value"].as_str()),
         "apps.launch" => crate::appsvc::launch(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
         "rpc.help" => Ok(crate::commands::help()),
         "apikey.list" => Ok(crate::apikeys::list(node)),

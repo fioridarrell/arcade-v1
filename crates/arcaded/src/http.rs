@@ -225,6 +225,25 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         };
     }
+    // The arcade's scripts for app pages (the original's /r/*.js API), and the page API reads.
+    if let Some(name) = path.strip_prefix("/r/").and_then(|n| n.strip_suffix(".js")) {
+        let body: Option<&str> = match name {
+            "storage" => Some(include_str!("shims/storage.js")),
+            "app" => Some(include_str!("shims/app.js")),
+            "realtime" => Some(include_str!("shims/realtime.js")),
+            "groups" => Some(include_str!("shims/groups.js")),
+            _ => None,
+        };
+        return match body {
+            Some(b) => respond(&mut s, "200 OK", "application/javascript", &[("Access-Control-Allow-Origin", "*".into()), ("Cache-Control", "public, max-age=3600".into())], b.as_bytes()),
+            None => respond(&mut s, "404 Not Found", "application/javascript", &[("Access-Control-Allow-Origin", "*".into())], b"/* not in this arcade yet */\n"),
+        };
+    }
+    if path == "/r/inscriptions" {
+        let q = query_fields(&r.query);
+        let v = crate::appsvc::page_inscriptions(node, q.get("creator").and_then(|v| v.as_str()), q.get("limit").and_then(|v| v.as_u64()).unwrap_or(100));
+        return respond(&mut s, "200 OK", "application/json", &[("Access-Control-Allow-Origin", "*".into()), ("Cache-Control", "no-store".into())], v.to_string().as_bytes());
+    }
     let seg: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
     match seg.as_slice() {
         ["content", id] => match arcade_ledger::content::content(&node.chain, p, id) {
@@ -236,6 +255,8 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
                     ("ETag", format!("\"{}\"", c.sha256)),
                     ("Cache-Control", "public, max-age=31536000, immutable".into()),
                     ("Content-Security-Policy", "sandbox allow-scripts; default-src 'self' data: blob:; connect-src 'none'".into()),
+                    // Apps (opaque origin) read their parts from here, as on the original.
+                    ("Access-Control-Allow-Origin", "*".into()),
                 ],
                 if r.method == "HEAD" { &[] } else { &c.bytes },
             ),
@@ -244,7 +265,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         ["inscription", id] => match arcade_ledger::content::inscription(&node.chain, p.chain_no, id) {
             Some(mut v) => {
                 v["content"] = json!(format!("/content/{}", v["txid"].as_str().unwrap_or("")));
-                respond(&mut s, "200 OK", "application/json", &[], v.to_string().as_bytes())
+                respond(&mut s, "200 OK", "application/json", &[("Access-Control-Allow-Origin", "*".into())], v.to_string().as_bytes())
             }
             None => respond(&mut s, "404 Not Found", "text/plain", &[], b"no such inscription\n"),
         },

@@ -311,3 +311,104 @@ pub fn mark_read(node: &Node, id: &str) -> Result<Value, String> {
     }
     Ok(json!({"read": n}))
 }
+
+// ---------------- groups for apps (arcade.groups, docs/compat/APP_API.md B3) ----------------
+
+fn secret_of(g: &Value) -> Option<Vec<u8>> {
+    hex::decode(g["secret"].as_str()?).ok().filter(|s| s.len() == 32)
+}
+
+/// The original's live room and key for a group: room = hex(sha512("arcade-group-room/1\n" || secret)[:16]),
+/// key = sha512("arcade-group-live/1\n" || secret)[:32].
+fn live(secret: &[u8], label: &str, n: usize) -> Vec<u8> {
+    use sha2::Digest;
+    let mut h = sha2::Sha512::new();
+    h.update(label.as_bytes());
+    h.update(secret);
+    h.finalize()[..n].to_vec()
+}
+
+pub fn app_list(node: &Node) -> Result<Value, String> {
+    let (me, _, _) = crate::msgsvc::sender_key(node)?;
+    let gs: Vec<Value> = all(node)
+        .into_iter()
+        .filter(|g| g["current"] == true)
+        .filter_map(|g| {
+            let s = secret_of(&g)?;
+            Some(json!({"id": g["id"], "name": g["name"], "room": hex::encode(live(&s, "arcade-group-room/1\n", 16)),
+                        "members": g["members"].as_array().cloned().unwrap_or_default().iter().map(|m| json!({"tag": m["tag"], "address": m["address"]})).collect::<Vec<_>>()}))
+        })
+        .collect();
+    Ok(json!({"me": me, "groups": gs}))
+}
+
+pub fn app_read(node: &Node, id: &str, after: u64, limit: usize) -> Result<Value, String> {
+    let t = thread(node, id).map_err(|_| "not a group of yours".to_string())?;
+    let lines: Vec<Value> = t["lines"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|l| l["at"].as_u64().unwrap_or(0) > after)
+        .take(limit.clamp(1, 1000))
+        .map(|l| json!({"txid": l["id"], "when": l["at"], "height": l["height"], "mine": l["dir"] != "in", "from": l["peer_address"], "text": l["text"]}))
+        .collect();
+    Ok(json!({"lines": lines}))
+}
+
+/// Seal text for the group's live room (secretbox under the group's live key, base64(nonce || box)).
+pub fn seal_live(node: &Node, id: &str, text: &str) -> Result<Value, String> {
+    use crypto_secretbox::aead::{Aead, AeadCore, KeyInit};
+    use base64::Engine;
+    let g = get(node, id).ok_or("not a group of yours")?;
+    let key = live(&secret_of(&g).ok_or("bad group key")?, "arcade-group-live/1\n", 32);
+    let c = crypto_secretbox::XSalsa20Poly1305::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let nonce = crypto_secretbox::XSalsa20Poly1305::generate_nonce(&mut rand_core::OsRng);
+    let ct = c.encrypt(&nonce, text.as_bytes()).map_err(|e| e.to_string())?;
+    let mut b = nonce.to_vec();
+    b.extend_from_slice(&ct);
+    Ok(json!({"sealed": base64::engine::general_purpose::STANDARD.encode(b)}))
+}
+
+pub fn open_live(node: &Node, id: &str, sealed: &str) -> Result<Value, String> {
+    use crypto_secretbox::aead::{Aead, KeyInit};
+    use base64::Engine;
+    let g = get(node, id).ok_or("not a group of yours")?;
+    let key = live(&secret_of(&g).ok_or("bad group key")?, "arcade-group-live/1\n", 32);
+    let c = crypto_secretbox::XSalsa20Poly1305::new_from_slice(&key).map_err(|e| e.to_string())?;
+    let b = base64::engine::general_purpose::STANDARD.decode(sealed.trim()).unwrap_or_default();
+    if b.len() < 24 + 16 {
+        return Ok(json!({"text": Value::Null}));
+    }
+    let text = c.decrypt(crypto_secretbox::Nonce::from_slice(&b[..24]), &b[24..]).ok().and_then(|p| String::from_utf8(p).ok());
+    Ok(json!({"text": text}))
+}
+
+/// Add members to a group (they get the group's key; everyone's member list is updated).
+pub fn add(node: &Node, id: &str, names: &[String]) -> Result<Value, String> {
+    let mut g = get(node, id).ok_or("not a group of yours")?;
+    if names.len() > 50 {
+        return Err("at most 50 members at a time".into());
+    }
+    let mut members = g["members"].as_array().cloned().unwrap_or_default();
+    for m in members_of(node, names)? {
+        if !members.iter().any(|x| x["key"] == m["key"]) {
+            members.push(m);
+        }
+    }
+    g["members"] = json!(members);
+    g["invited"] = json!(arcade_app::now());
+    let mut sent = g.clone();
+    if let Some(o) = sent.as_object_mut() {
+        o.remove("current");
+        o.remove("left");
+        o.remove("mine_left");
+    }
+    let (txids, fee) = send_invites(node, &sent)?;
+    put(node, &g)?;
+    let mut info = g.clone();
+    if let Some(o) = info.as_object_mut() {
+        o.remove("secret");
+    }
+    Ok(json!({"group": info, "txids": txids, "fee": fee}))
+}

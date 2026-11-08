@@ -354,3 +354,105 @@ pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
         "card": e["card"], "permissions": e["permissions"], "creator": e["creator"], "chain": chain,
     }))
 }
+
+/// GET /r/inscriptions?creator=: the home chain's arcade inscriptions as pages see them
+/// (the original's contentlib.describe), newest first.
+pub fn page_inscriptions(node: &Node, creator: Option<&str>, limit: u64) -> Value {
+    let c = node.params.chain_no;
+    let rows = node.chain.store.read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &KeyBuf::new().u16(c).done())).unwrap_or_default();
+    let mut out: Vec<Value> = rows
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice::<Value>(&v).ok())
+        .filter(|v| creator.is_none_or(|cr| v["creator"] == cr))
+        .collect();
+    out.sort_by(|a, b| (b["block_height"].as_u64(), b["position"].as_u64()).cmp(&(a["block_height"].as_u64(), a["position"].as_u64())));
+    json!(out
+        .into_iter()
+        .take(limit.clamp(1, 1000) as usize)
+        .map(|v| {
+            let raw = v["json"].as_str().unwrap_or("").to_string();
+            let tag = |a: &Value| a.as_str().and_then(|a| arcade_ledger::index::tag_of(&node.chain, c, a).ok().flatten());
+            json!({"id": v["txid"], "number": v["number"], "creator": v["creator"], "owner": v["owner"],
+                   "creatortag": tag(&v["creator"]), "ownertag": tag(&v["owner"]), "block": v["block_height"],
+                   "contenttype": v["content_type"], "length": v["content_len"], "sha256": v["sha256"],
+                   "transactions": v["chunks"], "held": false,
+                   "json": serde_json::from_str::<Value>(&raw).ok(), "rawjson": raw, "collection": Value::Null, "edition": Value::Null})
+        })
+        .collect::<Vec<_>>())
+}
+
+// ---------------- arcade.storage: saves per app page (the original's pagestore limits) ----------------
+
+const MAX_KEY: usize = 256;
+const MAX_VALUE: usize = 65_536;
+const MAX_TOTAL: usize = 1_048_576;
+const MAX_KEYS: usize = 1000;
+const HISTORY: usize = 10;
+
+fn shelf(node: &Node, page: &str) -> (serde_json::Map<String, Value>, serde_json::Map<String, Value>) {
+    let items = meta_get(node, &format!("pagestore:{page}")).as_object().cloned().unwrap_or_default();
+    let hist = meta_get(node, &format!("pagehist:{page}")).as_object().cloned().unwrap_or_default();
+    (items, hist)
+}
+
+/// One storage op from an app page (load, set, remove, clear, history).
+pub fn storage(node: &Node, page: &str, op: &str, key: Option<&str>, value: Option<&str>) -> Result<Value, String> {
+    if page.len() != 64 || !page.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err("no such inscription".into());
+    }
+    let (mut items, mut hist) = shelf(node, page);
+    let now = arcade_app::now() as f64;
+    let file = |hist: &mut serde_json::Map<String, Value>, k: &str, old: &Value| {
+        let mut l = hist.get(k).and_then(|x| x.as_array().cloned()).unwrap_or_default();
+        l.insert(0, json!({"value": old, "updated": Value::Null, "replaced": now}));
+        l.truncate(HISTORY);
+        hist.insert(k.to_string(), json!(l));
+    };
+    match op {
+        "load" => return Ok(json!({"items": items})),
+        "history" => {
+            return Ok(json!({"history": match key.filter(|k| !k.is_empty()) {
+                Some(k) => hist.get(k).map(|h| json!({k: h})).unwrap_or(json!({})),
+                None => Value::Object(hist),
+            }}))
+        }
+        "set" => {
+            let k = key.unwrap_or("");
+            let v = value.unwrap_or("");
+            if k.is_empty() || k.chars().count() > MAX_KEY {
+                return Err("a key is 1 to 256 characters".into());
+            }
+            if v.chars().count() > MAX_VALUE {
+                return Err("a value is at most 65,536 characters".into());
+            }
+            if !items.contains_key(k) && items.len() >= MAX_KEYS {
+                return Err("a page may keep at most 1000 keys".into());
+            }
+            let others: usize = items.iter().filter(|(x, _)| x.as_str() != k).map(|(x, y)| x.chars().count() + y.as_str().unwrap_or("").chars().count()).sum();
+            if others + k.chars().count() + v.chars().count() > MAX_TOTAL {
+                return Err("a page may keep at most 1,048,576 characters in all".into());
+            }
+            if let Some(old) = items.get(k).cloned() {
+                if old != v {
+                    file(&mut hist, k, &old);
+                }
+            }
+            items.insert(k.to_string(), json!(v));
+        }
+        "remove" => {
+            let k = key.unwrap_or("");
+            if let Some(old) = items.remove(k) {
+                file(&mut hist, k, &old);
+            }
+        }
+        "clear" => {
+            for (k, old) in std::mem::take(&mut items) {
+                file(&mut hist, &k, &old);
+            }
+        }
+        _ => return Err("op must be set, remove, clear or history".into()),
+    }
+    meta_put(node, &format!("pagestore:{page}"), &Value::Object(items))?;
+    meta_put(node, &format!("pagehist:{page}"), &Value::Object(hist))?;
+    Ok(json!({}))
+}

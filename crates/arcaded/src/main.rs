@@ -58,9 +58,6 @@ fn main() {
 
     let app = arcade_app::AppDb::open(&home).expect("open arcade.mdbx");
     let chain = arcade_chaindb::ChainDb::open(home.join("chain.mdbx")).expect("open chain.mdbx");
-    let home_chain = &arcade_chain::params::PEPECOIN_TEST;
-    chain.add_indexer(home_chain.chain_no, Arc::new(arcade_ledger::engine::LedgerIndexer)).expect("ledger index");
-    chain.add_indexer(home_chain.chain_no, Arc::new(arcade_ledger::index::ProfileIndexer)).expect("profile index");
     let identity = app.node_identity().expect("node identity");
     let node = Arc::new(Node {
         home: home.clone(),
@@ -87,6 +84,7 @@ fn main() {
         dialing: Mutex::new(Default::default()),
     });
     let _ = node.me.set(Arc::downgrade(&node));
+    chains::start_home(&node).expect("home indexes");
     chains::start_saved(&node);
     let _ = node.app.event("service", "arcaded started");
     eprintln!(

@@ -14,12 +14,18 @@
     ["index", "Index only", "Coming: chosen indexes, blocks borrowed from the mesh.", false],
     ["light", "Light", "Coming: headers only; everything else borrowed.", false],
   ];
+  // Every index is opt-in. Names, maps and tokens ride on the ord index (ticking one ticks ord).
   const INDEXES = [
-    ["ledger", "Arcade ledger", "tokens, exchange, arcade NFTs, @tags", true],
+    ["ledger", "Arcade ledger", "arcade tokens, exchange, arcade NFTs, @tags", true],
     ["profiles", "Profiles", "published keys, names and linked wallets", true],
-    ["ord", "Ord index", "coming: inscriptions (Pepinals, Doginals, ...)", false],
-    ["names", "Names", "coming: \"p\":\"dns\" names", false],
+    ["ord", "Ord index", "inscriptions (Pepinals, Doginals, ...), content served from the chain", true, "ord"],
+    ["names", "Names", ".pepe / .doge names and \"p\":\"dns\" claims (needs ord)", true, "ord"],
+    ["maps", "Maps", "block maps: <block>.pepemap, .dogemap, .bitmap (needs ord)", true, "ord"],
+    ["tokens", "Tokens", "PRC-20 / DRC-20 deploys, mints, transfers, balances (needs ord)", true, "ord"],
+    ["runes", "Runes", "coming", false],
+    ["dunes", "Dunes", "coming", false],
   ];
+  const RIDERS = ["names", "maps", "tokens"];
   let chains = [], open = null, mode = "full", watching = null, poll = null;
 
   function msg(text, bad) { const m = $("c-msg"); m.textContent = text; m.className = "msg " + (bad ? "bad" : "ok"); }
@@ -68,15 +74,22 @@
       return l;
     }));
     const noIdx = mode === "chain";
-    $("c-idx").replaceChildren(...INDEXES.map(([k, t, d, ok]) => {
-      const can = ok && !noIdx && (k !== "ord" || c.ord);
+    $("c-idx").replaceChildren(...INDEXES.map(([k, t, d, ok, needs]) => {
+      const can = ok && !noIdx && (needs !== "ord" || c.ord);
       const l = document.createElement("label");
       l.className = can ? "" : "off";
-      l.innerHTML = `<input type="checkbox" data-k="${k}" ${can && k === "ledger" ? "checked" : ""} ${can ? "" : "disabled"}> <b></b> <small></small>`;
-      l.querySelector("b").textContent = t; l.querySelector("small").textContent = d;
+      l.innerHTML = `<input type="checkbox" data-k="${k}" ${can ? "" : "disabled"}> <b></b> <small></small>`;
+      l.querySelector("b").textContent = k === "tokens" && c.tokens ? `${c.tokens} tokens` : t;
+      l.querySelector("small").textContent = can || !ok ? d : "not available on this chain yet";
+      const box = l.querySelector("input");
+      box.onchange = () => {
+        const all = $("c-idx");
+        if (box.checked && RIDERS.includes(k)) all.querySelector('input[data-k="ord"]').checked = true;
+        if (!box.checked && k === "ord") RIDERS.forEach((r) => { const x = all.querySelector(`input[data-k="${r}"]`); if (x) x.checked = false; });
+      };
       return l;
     }));
-    $("c-est").textContent = noIdx ? "Blocks and every address; no indexes." : "Indexes are built in the same commit as each block.";
+    $("c-est").textContent = noIdx ? "Blocks and every address; no indexes." : "Nothing is ticked for you: choose the indexes you want. Each is built in the same commit as each block and can be removed later.";
   }
 
   async function install() {
@@ -104,7 +117,7 @@
       li.querySelector(".sd").textContent = p >= 100 ? "done" : `${p.toFixed(1)}% · ${(s.at ?? 0).toLocaleString()} of ${(s.of ?? 0).toLocaleString()} · ${s.detail}`;
       li.querySelector(".bar > i").style.width = p + "%";
       // Remove-index buttons on index stages.
-      const ix = { "Arcade ledger": "ledger", "Profiles": "profiles" }[s.name];
+      const ix = s.index;
       if (ix && !(st.home && ix === "ledger")) {
         const b = document.createElement("button"); b.textContent = "Remove index"; b.className = "small";
         b.onclick = async () => { try { await api("chains.index_remove", { key: st.key, index: ix }); msg(`Removing the ${s.name} index…`); refresh(); } catch (e) { msg(e.message, true); } };
@@ -112,6 +125,25 @@
       }
       return li;
     }));
+    // Add an index the chain doesn't have yet (opt-in, one at a time).
+    let add = document.getElementById("c-addix");
+    if (!add) { add = document.createElement("div"); add.id = "c-addix"; add.className = "addix"; $("c-stages").after(add); }
+    const info = chains.find((x) => x.key === st.key) || {};
+    const have = st.indexes || [];
+    const can = st.mode === "full" ? INDEXES.filter(([k, , , ok, needs]) => ok && !have.includes(k) && (needs !== "ord" || info.ord)) : [];
+    add.replaceChildren(...(can.length ? [Object.assign(document.createElement("span"), { textContent: "Add an index: " })] : []),
+      ...can.map(([k, t]) => {
+        const b = document.createElement("button"); b.className = "small";
+        b.textContent = k === "tokens" && info.tokens ? `${info.tokens} tokens` : t;
+        b.onclick = async () => {
+          try {
+            const r = await api("chains.index_add", { key: st.key, index: k });
+            msg(r.rebuilding ? `Adding ${t}: the ord index is rebuilt from its start with it.` : `Adding ${t}…`);
+            refresh();
+          } catch (e) { msg(e.message, true); }
+        };
+        return b;
+      }));
     $("c-pause").hidden = !!st.home; $("c-stop").hidden = !!st.home;
     $("c-pause").textContent = st.state === "paused" ? "Resume" : "Pause";
   }

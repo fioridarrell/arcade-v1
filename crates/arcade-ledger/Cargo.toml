@@ -10,10 +10,13 @@ arcade-chaindb = { version = "0.1.0", path = "../arcade-chaindb" }
 arcade-store = { version = "0.1.0", path = "../arcade-store" }
 bs58 = { version = "0.5.1", features = ["check"] }
 hex = "0.4.3"
+regex = "1.13.1"
 ripemd = "0.2.0"
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 thiserror = "1"
+unicode-general-category = "1.1.0"
+unicode_names2 = "4.0.0"
 
 [dev-dependencies]
 arcade-chaindb = { path = "../arcade-chaindb" }

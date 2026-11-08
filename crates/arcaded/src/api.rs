@@ -183,6 +183,68 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!({"address": address, "tag": tag, "balance": balance, "history_rows": history,
                       "profile": prof, "profile_tag_verified": tag_verified, "stated_by": linked_by}))
         }
+        "ord" | "ord.chunks" | "name" | "map" | "token" | "tokens" => {
+            let cp = match s("chain") {
+                Some(k) => arcade_chain::params::by_key(&k).ok_or_else(|| format!("unknown chain {k}"))?,
+                None => p,
+            };
+            let cc = cp.chain_no;
+            let need = |ix: &str| -> Result<(), String> {
+                let on = if cp.chain_no == p.chain_no { crate::chains::home_indexes(node) } else {
+                    node.extra.lock().unwrap().get(cp.key).map(|r| r.indexes.clone()).unwrap_or_default()
+                };
+                if on.iter().any(|i| i == ix) { Ok(()) } else {
+                    Err(format!("the {ix} index is not on {}; add it with  arcade chain index add {} {ix}", cp.name, cp.key))
+                }
+            };
+            use arcade_ledger::{maps, names, ord, tokens};
+            match req["cmd"].as_str().unwrap() {
+                "ord" => {
+                    need("ord")?;
+                    match s("id") {
+                        Some(id) => ord::inscription(&node.chain, cp, &id).ok_or_else(|| format!("no inscription {id} on {}", cp.name)),
+                        None => Ok(json!({"chain": cp.key, "inscriptions": ord::count(&node.chain, cc),
+                                          "indexed_to": node.chain.indexed_to(cc, "ord.v1").ok().flatten(), "start": ord::ord_start(cp)})),
+                    }
+                }
+                "ord.chunks" => {
+                    need("ord")?;
+                    let from = req["from"].as_u64().unwrap_or(0) as u32;
+                    let n = req["n"].as_u64().unwrap_or(10).min(500) as u32;
+                    Ok(json!((from..from + n).filter_map(|i| ord::chunk(&node.chain, cp, i).map(|(h, b)| json!([i, h, b]))).collect::<Vec<_>>()))
+                }
+                "name" => {
+                    need("names")?;
+                    let q = s("name").ok_or("give a name")?;
+                    let wins = names::lookup(&node.chain, cc, &q);
+                    Ok(json!({"name": q, "readings": wins.iter().map(|(rule, n, id)| json!({"rule": rule, "number": n, "id": id,
+                        "owner": ord::inscription(&node.chain, cp, id).and_then(|v| v.get("owner").cloned())})).collect::<Vec<_>>(),
+                        "counts": names::counts(&node.chain, cc)}))
+                }
+                "map" => {
+                    need("maps")?;
+                    match s("claim") {
+                        Some(q) => {
+                            let (n, id) = maps::lookup(&node.chain, cc, &q).ok_or_else(|| format!("{q} is not claimed"))?;
+                            Ok(json!({"claim": q, "number": n, "id": id, "owner": ord::inscription(&node.chain, cp, &id).and_then(|v| v.get("owner").cloned())}))
+                        }
+                        None => Ok(json!(maps::counts(&node.chain, cc))),
+                    }
+                }
+                "token" => {
+                    need("tokens")?;
+                    match s("tick") {
+                        Some(t) => tokens::tick(&node.chain, cc, &t).ok_or_else(|| format!("no token {t}")),
+                        None => Ok(json!({"ticks": tokens::tick_count(&node.chain, cc)})),
+                    }
+                }
+                _ => {
+                    need("tokens")?;
+                    let a = s("owner").ok_or("give an address")?;
+                    Ok(json!(tokens::balances(&node.chain, cc, &a).into_iter().map(|(t, o, tr)| json!({"tick": t, "overall": o, "transferable": tr})).collect::<Vec<_>>()))
+                }
+            }
+        }
         "chains.list" => Ok(crate::chains::list(node)),
         "chains.status" => crate::chains::status(node, &s("key").ok_or("key required")?),
         "chains.add" => {

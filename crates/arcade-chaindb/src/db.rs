@@ -323,6 +323,25 @@ impl ChainDb {
         })
     }
 
+    /// Delete a chain's rows in some tables, a batch at a time, without touching any
+    /// indexer's progress (for an index riding on another). Call until it returns 0.
+    pub fn clear_rows_batch(&self, chain_no: u16, tables: &[String], max: usize) -> Result<usize> {
+        let pre = k_chain(chain_no);
+        self.store.write(|w| {
+            let mut n = 0;
+            for t in tables {
+                if n >= max {
+                    break;
+                }
+                for (k, _) in w.scan_prefix_limit(t, &pre, max - n)? {
+                    w.del(t, &k)?;
+                    n += 1;
+                }
+            }
+            Ok(n)
+        })
+    }
+
     /// Delete everything stored for a chain, a batch at a time. Returns rows deleted in this
     /// call (0 = done). Every table's keys start with the 2-byte chain number.
     pub fn remove_chain_batch(&self, chain_no: u16, max: usize) -> Result<usize> {

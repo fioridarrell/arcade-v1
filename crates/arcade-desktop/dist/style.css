@@ -94,3 +94,5 @@ h3 { font-size: 13px; margin: 16px 0 6px; color: var(--muted); }
 
 .mode.off { opacity: .55; cursor: default; }
 button.small { padding: 2px 8px; font-size: 12px; margin-left: 8px; }
+.addix { margin: 10px 0; display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 13px; }
+.addix button.small { margin-left: 0; }

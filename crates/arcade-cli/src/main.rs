@@ -20,12 +20,19 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
   arcade chain list                         chains you can install, and their state
-  arcade chain add <key> [--mode full|chain] [--with ledger,profiles]
+  arcade chain add <key> [--mode full|chain] [--with ledger,profiles,ord,names,maps,tokens]
+                     every index is opt-in; names, maps and tokens ride on ord
   arcade chain status <key>                 staged progress (headers, blocks, coins, indexes)
   arcade chain pause|resume|remove <key>
   arcade chain index add|remove <key> <index>
   arcade ledger [height]         ledger fingerprints vs. other arcades; a block's digest rows
   arcade profile <@tag|address>  a handle's address, balance, published profile and linked wallets
+  arcade ord [id|number] [--chain k]       an inscription (or the ord index's state)
+  arcade ord chunks [from] [n] [--chain k] dx chunk hashes, as other arcades compare
+  arcade name <name> [--chain k]           who holds a name (spec, json, doge2023 readings)
+  arcade map [<n>.<namespace>] [--chain k] a block map claim (or claims per namespace)
+  arcade token [tick] [--chain k]          a PRC-20/DRC-20 token
+  arcade tokens <address> [--chain k]      token balances of an address
   arcade mine start [threads]    mine Pepecoin testnet on this PC (pays your wallet)
   arcade mine stop | status
 
@@ -205,6 +212,11 @@ fn main() {
     if let Some(i) = args.iter().position(|a| a == "--home") {
         args.drain(i..i + 2);
     }
+    let mut chain: Option<String> = None;
+    if let Some(i) = args.iter().position(|a| a == "--chain") {
+        chain = args.get(i + 1).cloned();
+        args.drain(i..(i + 2).min(args.len()));
+    }
     let a: Vec<&str> = args.iter().map(String::as_str).collect();
     if a.as_slice() == ["setup"] {
         setup(&sock);
@@ -224,6 +236,17 @@ fn main() {
         ["events"] => json!({"cmd": "events"}),
         ["mempool"] => json!({"cmd": "mempool"}),
         ["profile", who] => json!({"cmd": "profile", "who": who}),
+        ["ord"] => json!({"cmd": "ord"}),
+        ["ord", "chunks"] => json!({"cmd": "ord.chunks"}),
+        ["ord", "chunks", f] => json!({"cmd": "ord.chunks", "from": f.parse::<u64>().unwrap_or(0)}),
+        ["ord", "chunks", f, n] => json!({"cmd": "ord.chunks", "from": f.parse::<u64>().unwrap_or(0), "n": n.parse::<u64>().unwrap_or(10)}),
+        ["ord", id] => json!({"cmd": "ord", "id": id}),
+        ["name", n] => json!({"cmd": "name", "name": n}),
+        ["map"] => json!({"cmd": "map"}),
+        ["map", m] => json!({"cmd": "map", "claim": m}),
+        ["token"] => json!({"cmd": "token"}),
+        ["token", t] => json!({"cmd": "token", "tick": t}),
+        ["tokens", a] => json!({"cmd": "tokens", "owner": a}),
         ["chain", "list"] | ["chains"] => json!({"cmd": "chains.list"}),
         ["chain", "status", k] => json!({"cmd": "chains.status", "key": k}),
         ["chain", "pause", k] => json!({"cmd": "chains.pause", "key": k}),
@@ -256,6 +279,10 @@ fn main() {
             return;
         }
     };
+    let mut req = req;
+    if let Some(k) = &chain {
+        req["chain"] = json!(k);
+    }
     let mut s = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(e) => {

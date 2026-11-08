@@ -109,6 +109,30 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             };
             crate::msgsvc::send(node, &s("to").ok_or("to required (@tag, address or messaging key)")?, &s("text").unwrap_or_default(), file)
         }
+        "group.list" => Ok(crate::grpsvc::list(node)),
+        "group.create" => {
+            let names: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::grpsvc::create(node, &s("name").ok_or("name required")?, &names, &s("description").unwrap_or_default())
+        }
+        "group.thread" => crate::grpsvc::thread(node, &s("id").ok_or("id required")?),
+        "group.read" => crate::grpsvc::mark_read(node, &s("id").ok_or("id required")?),
+        "group.say" => {
+            let file = match req["file"].as_object() {
+                Some(f) => {
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(f.get("data").and_then(|d| d.as_str()).unwrap_or("")).map_err(|e| format!("file data: {e}"))?;
+                    Some(arcade_msg::content::File { name: f.get("name").and_then(|x| x.as_str()).unwrap_or("file").into(), mime: f.get("type").and_then(|x| x.as_str()).unwrap_or("application/octet-stream").into(), bytes })
+                }
+                None => None,
+            };
+            crate::grpsvc::say(node, &s("id").ok_or("id required")?, &s("text").unwrap_or_default(), file)
+        }
+        "group.leave" => crate::grpsvc::leave(node, &s("id").ok_or("id required")?),
+        "group.update" => crate::grpsvc::update(node, &s("id").ok_or("id required")?, &req["changes"]),
+        "group.remove" => {
+            let keys: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::grpsvc::remove(node, &s("id").ok_or("id required")?, &keys)
+        }
         "msg.delete" => crate::msgsvc::delete(node, &s("id").ok_or("id required")?),
         "msg.announce" => Ok(json!({"txid": crate::msgsvc::announce_if_needed(node)?})),
         "contacts.list" => Ok(crate::msgsvc::contacts_list(node)),

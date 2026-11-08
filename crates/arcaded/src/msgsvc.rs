@@ -112,6 +112,76 @@ fn row_of(me: &[u8; 32], opened: &env::Opened, cand: &Value, height: u32, at: u6
     (row, file)
 }
 
+/// Try our key, then every group's: what opened and which group's key did it.
+fn open_any(me: &crypto_box::SecretKey, groups: &[(crypto_box::SecretKey, String)], open: impl Fn(&crypto_box::SecretKey) -> Result<env::Opened, env::Error>) -> Option<(env::Opened, Option<String>)> {
+    if let Ok(o) = open(me) {
+        return Some((o, None));
+    }
+    groups.iter().find_map(|(s, id)| open(s).ok().map(|o| (o, Some(id.clone()))))
+}
+
+/// Keep what opened (a message, an invite, or a group line). True when it was new.
+fn take(node: &Node, me: &[u8; 32], o: &env::Opened, group: Option<String>, cand: &Value, height: u32, at: u64) -> Result<bool, String> {
+    let (mut row, file) = row_of(me, o, cand, height, at);
+    if let Some(t) = cand.get("txids") {
+        row["txids"] = t.clone();
+    }
+    match group {
+        Some(gid) => {
+            let from = cand["from"].as_str().unwrap_or("");
+            let sender = hex::encode(o.sender);
+            let mine_addr = sender_key(node).map(|(a, _, _)| a).unwrap_or_default();
+            let text = row["text"].as_str().unwrap_or("").to_string();
+            row["kind"] = json!(crate::grpsvc::line_kind(node, &gid, from, &sender, &text));
+            row["group"] = json!(gid);
+            row["peer"] = json!(gid);
+            row["sender"] = json!(sender);
+            row["peer_address"] = json!(from);
+            let mine = from == mine_addr || o.sender == *me;
+            row["dir"] = json!(if mine { "out" } else { "in" });
+            row["unread"] = json!(!mine && row["kind"] == "group");
+        }
+        None if row["kind"] == "group_invite" => {
+            let before = crate::grpsvc::secrets(node).len();
+            if let Some(gid) = crate::grpsvc::on_invite(node, &hex::encode(o.sender), row["text"].as_str().unwrap_or("")) {
+                if crate::grpsvc::secrets(node).len() > before {
+                    rescan_group(node, &gid)?;
+                }
+            }
+        }
+        None => {}
+    }
+    keep(node, &row, file.as_deref())
+}
+
+/// A group we just joined: look for its earlier lines among every candidate.
+fn rescan_group(node: &Node, gid: &str) -> Result<(), String> {
+    let Some((secret, _)) = crate::grpsvc::secrets(node).into_iter().find(|(_, id)| id == gid) else { return Ok(()) };
+    let me = keys(node)?.public_bytes();
+    let c = node.params.chain_no;
+    let mut cursor = None;
+    loop {
+        let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
+        if batch.is_empty() {
+            return Ok(());
+        }
+        for (h, p, cand) in &batch {
+            if cand["kind"] == env::SINGLE as u64 {
+                let payload = hex::decode(cand["payload"].as_str().unwrap_or("")).unwrap_or_default();
+                if let Ok(o) = env::open_single(&secret, &payload) {
+                    take(node, &me, &o, Some(gid.to_string()), cand, *h, block_time(node, *h))?;
+                }
+            }
+            cursor = Some((*h, *p));
+        }
+    }
+}
+
+/// Rewrite a kept message row (read marks).
+pub fn rewrite(node: &Node, m: &Value) -> Result<(), String> {
+    node.app.put_sealed(arcade_app::MAIL, &mail_key(m["id"].as_str().unwrap_or("")), m.to_string().as_bytes()).map_err(|e| e.to_string())
+}
+
 /// One scanning pass over new candidates. Returns how many messages were opened.
 pub fn scan(node: &Node) -> Result<usize, String> {
     if !node.app.has_wallet().map_err(|e| e.to_string())? {
@@ -130,6 +200,7 @@ pub fn scan(node: &Node) -> Result<usize, String> {
         .filter(|v| v.len() == 8)
         .map(|v| (u32::from_be_bytes(v[..4].try_into().unwrap()), u32::from_be_bytes(v[4..].try_into().unwrap())));
     let mut opened = 0;
+    let groups = crate::grpsvc::secrets(node);
     loop {
         let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
         if batch.is_empty() {
@@ -140,9 +211,8 @@ pub fn scan(node: &Node) -> Result<usize, String> {
             let at = block_time(node, *h);
             match cand["kind"].as_u64().unwrap_or(0) as u8 {
                 env::SINGLE | env::API => {
-                    if let Ok(o) = env::open_single(&k.secret, &payload) {
-                        let (row, file) = row_of(&me, &o, cand, *h, at);
-                        if keep(node, &row, file.as_deref())? {
+                    if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_single(s, &payload)) {
+                        if take(node, &me, &o, g, cand, *h, at)? {
                             opened += 1;
                         }
                     }
@@ -159,16 +229,15 @@ pub fn scan(node: &Node) -> Result<usize, String> {
                         let cds: Vec<u16> = rows.iter().map(|(k, _)| u16::from_be_bytes([k[k.len() - 2], k[k.len() - 1]])).collect();
                         if cds.len() == cds.iter().copied().max().unwrap_or(0) as usize + 1 {
                             let vals: Vec<Value> = rows.iter().filter_map(|(_, v)| serde_json::from_slice(v).ok()).collect();
-                            let mut parts: Vec<(u16, Vec<u8>)> = cds.iter().zip(&vals).map(|(cd, v)| (*cd, hex::decode(v["piece"].as_str().unwrap_or("")).unwrap_or_default())).collect();
-                            if let Ok(o) = env::open_chunks(&k.secret, id, &mut parts) {
+                            let parts: Vec<(u16, Vec<u8>)> = cds.iter().zip(&vals).map(|(cd, v)| (*cd, hex::decode(v["piece"].as_str().unwrap_or("")).unwrap_or_default())).collect();
+                            if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_chunks(s, id, &mut parts.clone())) {
                                 // Known by the first chunk's txid (countdown highest).
                                 let mut order: Vec<(u16, String)> = cds.iter().zip(&vals).map(|(cd, v)| (*cd, v["txid"].as_str().unwrap_or("").to_string())).collect();
                                 order.sort_by(|a, b| b.0.cmp(&a.0));
                                 let mut first = cand.clone();
                                 first["txid"] = json!(order[0].1);
-                                let (mut row, file) = row_of(&me, &o, &first, *h, at);
-                                row["txids"] = json!(order.iter().map(|x| x.1.clone()).collect::<Vec<_>>());
-                                if keep(node, &row, file.as_deref())? {
+                                first["txids"] = json!(order.iter().map(|x| x.1.clone()).collect::<Vec<_>>());
+                                if take(node, &me, &o, g, &first, *h, at)? {
                                     opened += 1;
                                 }
                             }
@@ -196,10 +265,9 @@ pub fn scan(node: &Node) -> Result<usize, String> {
         if !matches!(a.get(5), Some(&env::SINGLE) | Some(&env::API)) {
             continue;
         }
-        if let Ok(o) = env::open_single(&k.secret, a) {
+        if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_single(s, a)) {
             let cand = json!({"txid": tx.txid.to_hex(), "from": atx.sender});
-            let (row, file) = row_of(&me, &o, &cand, 0, arcade_app::now());
-            if keep(node, &row, file.as_deref())? {
+            if take(node, &me, &o, g, &cand, 0, arcade_app::now())? {
                 opened += 1;
             }
         }
@@ -370,7 +438,8 @@ pub fn unread(node: &Node) -> Value {
             req += 1;
         }
     }
-    json!({"unread": n, "requests": req})
+    let groups = ms.iter().filter(|m| m["unread"] == true && m["kind"] == "group").count();
+    json!({"unread": n + groups, "requests": req, "groups": groups})
 }
 
 /// Forget a message here (the chain keeps it; this arcade stops showing it).
@@ -432,7 +501,7 @@ pub fn mute(node: &Node, address: &str, on: bool) -> Result<Value, String> {
 // ---------------- sending ----------------
 
 /// The key we send from: the one holding our @tag on the home chain (else slot 0).
-fn sender_key(node: &Node) -> Result<(String, Option<String>, arcade_wallet::SecretKey), String> {
+pub fn sender_key(node: &Node) -> Result<(String, Option<String>, arcade_wallet::SecretKey), String> {
     let p = node.params;
     let keys = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?;
     for k in &keys {
@@ -446,7 +515,7 @@ fn sender_key(node: &Node) -> Result<(String, Option<String>, arcade_wallet::Sec
 }
 
 /// Send arcm payloads as transactions, each spending the change of the one before.
-fn send_payloads(node: &Node, payloads: &[Vec<u8>]) -> Result<(Vec<String>, u64), String> {
+pub fn send_payloads(node: &Node, payloads: &[Vec<u8>]) -> Result<(Vec<String>, u64), String> {
     let p = node.params;
     let (_, _, sk) = sender_key(node)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);

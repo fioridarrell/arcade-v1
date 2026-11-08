@@ -20,6 +20,7 @@ mod meshsource;
 mod miner;
 mod meshsvc;
 mod msgsvc;
+mod grpsvc;
 mod node;
 mod psync;
 mod rpc;

@@ -628,7 +628,14 @@ fn tag_page(x: &Ctx, t: &str) -> R {
     }
     for l in prof.as_ref().and_then(|v| v["linked"].as_array().cloned()).unwrap_or_default() {
         if l["chain"] == x.p.net {
-            if let Some(a) = l["address"].as_str().filter(|a| !a.starts_with("h160:")) {
+            // Addresses stored as a bare key hash (a chain not known when indexed) get this
+            // chain's address form now.
+            let raw = l["address"].as_str().unwrap_or("");
+            let shown = match raw.strip_prefix("h160:").and_then(|h| hex::decode(h).ok()).and_then(|h| <[u8; 20]>::try_from(h).ok()) {
+                Some(h) => address::base58check(x.p.p2pkh_version, &h),
+                None => raw.to_string(),
+            };
+            if let Some(a) = Some(shown.as_str()).filter(|a| !a.is_empty()) {
                 if !addrs.iter().any(|(b, _)| b == a) {
                     addrs.push((a.to_string(), "listed in their profile"));
                 }

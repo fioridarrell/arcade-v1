@@ -223,7 +223,9 @@ pub enum HashSource<'a> {
 }
 
 /// Feed the queue with block hashes ahead of the connector.
-fn feeder(pool: &Pool, mut hs: HashSource, mut last: Hash256) {
+fn feeder(node: &Node, pool: &Pool, mut hs: HashSource, mut last: Hash256) {
+    let mut bad = 0;
+    let mut tried: Vec<String> = Vec::new();
     while !pool.stop.load(Ordering::Relaxed) {
         let (next, want) = {
             let st = pool.s.lock().unwrap();
@@ -237,14 +239,25 @@ fn feeder(pool: &Pool, mut hs: HashSource, mut last: Hash256) {
             continue;
         }
         let got: Result<Vec<Hash256>, String> = match &mut hs {
-            HashSource::P2p(peer, p) => peer
-                .get_headers(&[last])
-                .map(|es| es.iter().map(|e| p.block_id(&e.header)).collect())
-                .map_err(|e| e.to_string()),
+            HashSource::P2p(peer, p) => peer.get_headers(&[last]).map_err(|e| e.to_string()).and_then(|es| {
+                // The headers must follow our last hash, each building on the one before:
+                // a peer answering from somewhere else would put blocks at the wrong heights.
+                let mut prev = last;
+                let mut out = Vec::with_capacity(es.len());
+                for e in &es {
+                    if e.header.prev != prev {
+                        return Err("headers from this peer don't follow ours".into());
+                    }
+                    prev = p.block_id(&e.header);
+                    out.push(prev);
+                }
+                Ok(out)
+            }),
             HashSource::Core(c) => c.hashes(next, (pool.top - next + 1).min(500)),
         };
         match got {
             Ok(hashes) if !hashes.is_empty() => {
+                bad = 0;
                 let hashes: Vec<Hash256> = hashes.into_iter().take((pool.top - next + 1) as usize).collect();
                 let mut st = pool.s.lock().unwrap();
                 for (i, chunk) in hashes.chunks(JOB as usize).enumerate() {
@@ -254,9 +267,32 @@ fn feeder(pool: &Pool, mut hs: HashSource, mut last: Hash256) {
                 last = *hashes.last().unwrap();
                 pool.cv.notify_all();
             }
-            _ => std::thread::sleep(Duration::from_secs(3)),
+            _ => {
+                // Try another source for the hashes ahead.
+                bad += 1;
+                if bad >= 2 {
+                    if let Some(np) = recruit_peer(node, p_of(&hs), &tried) {
+                        tried.push(np.addr.to_string());
+                        hs = HashSource::P2p(np, p_of(&hs));
+                        bad = 0;
+                    }
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
     }
+}
+
+fn p_of(hs: &HashSource) -> &'static ChainParams {
+    match hs {
+        HashSource::P2p(_, p) => p,
+        HashSource::Core(c) => c.params(),
+    }
+}
+
+/// A P2P peer not tried yet, for the hash feeder.
+fn recruit_peer(node: &Node, p: &'static ChainParams, tried: &[String]) -> Option<arcade_chain::p2p::Peer> {
+    node.coin_candidates(p).iter().filter(|a| !tried.contains(a)).take(6).find_map(|a| arcade_chain::p2p::Peer::connect(p, a, Duration::from_secs(6)).ok())
 }
 
 /// Bring a chain up to `top` from every source at once. Returns blocks connected.
@@ -281,7 +317,7 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
     let pool = Pool { s: Mutex::new(State { next: tip + 1, want: tip + 1, ..Default::default() }), cv: Condvar::new(), stop: AtomicBool::new(false), top };
     let short = |id: &str| id[..id.len().min(8)].to_string();
     std::thread::scope(|sc| -> Result<(), String> {
-        sc.spawn(|| feeder(&pool, feeder_src, tip_hash));
+        sc.spawn(|| feeder(node, &pool, feeder_src, tip_hash));
         // Every arcade offering the chain, then a few P2P peers.
         for (id, addr, kind, their) in offers.iter() {
             if (*their as u32) < tip + 10 {

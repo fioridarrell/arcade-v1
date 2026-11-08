@@ -99,6 +99,10 @@ impl<'a> CoreShareSource<'a> {
         v.get("r").ok_or_else(|| "no result".to_string())
     }
 
+    pub fn params(&self) -> &'static ChainParams {
+        self.p
+    }
+
     /// Block hashes for heights start..start+n (n at most 500).
     pub fn hashes(&mut self, start: u32, n: u32) -> Result<Vec<Hash256>, String> {
         let n = n.min(crate::coreshare::MAX_CALLS as u32);

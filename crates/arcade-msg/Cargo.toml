@@ -1,0 +1,15 @@
+[package]
+name = "arcade-msg"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+crypto_box = { version = "0.9", features = ["seal", "salsa20", "std"] }
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4.3"
+serde_json = "1"
+thiserror = "1"
+bip39 = "2"
+rand_core = { version = "0.6", features = ["getrandom"] }

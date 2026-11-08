@@ -251,7 +251,7 @@ fn header_rec<R: Rd>(r: &R, c: u16, hash: &Hash256) -> Result<Option<HeaderRec>>
 
 /// Where a transaction is stored: (B, P). Several candidates only on a T12 collision or a
 /// duplicate txid; then each is checked by full hash.
-fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
+pub(crate) fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
     let c = params.chain_no;
     let cands = r.scan(TXS, &k_txs(c, &txid.t12()))?;
     if cands.len() == 1 {
@@ -270,7 +270,7 @@ fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Result<Option<(
     Ok(found)
 }
 
-fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Result<Option<Coin>> {
+pub(crate) fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Result<Option<Coin>> {
     let c = params.chain_no;
     let Some(v) = r.get(OUTPUTS, &k_pos(c, b, p, vout))? else { return Ok(None) };
     let script = expand_script(&v[13..], || {
@@ -918,20 +918,22 @@ impl ChainDb {
     /// Connect blocks on top of the tip, in one transaction (all or none).
     /// The first block's parent must be the current tip (or there is no tip: genesis).
     pub fn connect_blocks(&self, params: &ChainParams, blocks: &[Block]) -> Result<Tip> {
-        self.connect_blocks_with(params, blocks, true)
+        self.connect_blocks_with(params, blocks, true, false)
     }
 
     /// As connect_blocks, for blocks whose `check()` the caller already ran (the syncer does
-    /// it on several cores before connecting).
-    pub fn connect_blocks_checked(&self, params: &ChainParams, blocks: &[Block]) -> Result<Tip> {
-        self.connect_blocks_with(params, blocks, false)
+    /// it on several cores before connecting). With `defer`, the address rows (history,
+    /// address coins, spends) go to a log instead, to be built later in key order
+    /// (addrbuild): far behind the tip, writing them in place is what limits the sync.
+    pub fn connect_blocks_checked(&self, params: &ChainParams, blocks: &[Block], defer: bool) -> Result<Tip> {
+        self.connect_blocks_with(params, blocks, false, defer)
     }
 
     /// Touch, read-only, every database page connecting `blk` at `height` will read or write
     /// (its coins being spent, the address rows and the txid slots). Run from several threads
     /// before the write, so a database bigger than memory faults pages in parallel instead of
     /// one at a time inside the single writer. Misses (coins made in the same batch) are fine.
-    pub fn warm(&self, params: &ChainParams, blk: &Block, height: u32) {
+    pub fn warm(&self, params: &ChainParams, blk: &Block, height: u32, addresses: bool) {
         let c = params.chain_no;
         let _ = self.store.read(|r| {
             for tx in &blk.txs {
@@ -943,9 +945,14 @@ impl ChainDb {
                         let Ok(Some(coin)) = coin_at(r, params, pb, pp, inp.prevout.vout) else { continue };
                         let sid = script_id(&coin.script);
                         let _ = r.get(BY_SCRIPT, &k_by_script(c, &sid, pb, pp, inp.prevout.vout));
-                        let _ = r.get(SPENDS, &k_pos(c, pb, pp, inp.prevout.vout));
-                        let _ = r.get(SCRIPT_HIST, &k_hist(c, &sid, height, &t12));
+                        if addresses {
+                            let _ = r.get(SPENDS, &k_pos(c, pb, pp, inp.prevout.vout));
+                            let _ = r.get(SCRIPT_HIST, &k_hist(c, &sid, height, &t12));
+                        }
                     }
+                }
+                if !addresses {
+                    continue;
                 }
                 for out in &tx.outputs {
                     let sid = script_id(&out.script_pubkey);
@@ -957,13 +964,24 @@ impl ChainDb {
         });
     }
 
-    fn connect_blocks_with(&self, params: &ChainParams, blocks: &[Block], check: bool) -> Result<Tip> {
+    pub(crate) fn connect_blocks_with(&self, params: &ChainParams, blocks: &[Block], check: bool, defer: bool) -> Result<Tip> {
         let c = params.chain_no;
         let ixs: Vec<Arc<dyn Indexer>> = self.indexers.read().unwrap().iter().filter(|(ch, _)| *ch == c).map(|(_, i)| i.clone()).collect();
         self.store.write(|w| {
             let mut tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v));
+            // The Addresses index is a choice per chain (on unless turned off).
+            let addr = if w.get(STATE, &k_state(c, crate::addrbuild::OFF))?.is_some() {
+                Addr::Off
+            } else if defer {
+                Addr::Log
+            } else {
+                Addr::Live
+            };
+            if addr == Addr::Log && !blocks.is_empty() {
+                w.put(STATE, &k_state(c, crate::addrbuild::PENDING), b"1")?;
+            }
             for b in blocks {
-                tip = Some(connect_one(w, params, b, tip, &ixs, check)?);
+                tip = Some(connect_one(w, params, b, tip, &ixs, check, addr)?);
             }
             tip.ok_or_else(|| other("nothing connected"))
         })
@@ -1024,7 +1042,16 @@ fn block_raw_at<R: Rd>(r: &R, c: u16, b: u32) -> Result<Vec<u8>> {
     Ok(o)
 }
 
-fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>, ixs: &[Arc<dyn Indexer>], check: bool) -> Result<Tip> {
+/// Where a block's address rows go: nowhere (index off), the log (built later), or in place.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Addr {
+    Off,
+    Log,
+    Live,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>, ixs: &[Arc<dyn Indexer>], check: bool, addr: Addr) -> Result<Tip> {
     let c = params.chain_no;
     let hash = blk.hash();
     let height = match tip {
@@ -1071,6 +1098,20 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
 
     // Index changes, undo-logged.
     let l = Logged::new(w);
+    // Deferred address rows: one log row each, keyed by height so they append.
+    let seq = std::cell::Cell::new(0u32);
+    let log = |tag: u8, key: &[u8], val: &[u8]| -> Result<()> {
+        let mut k = k_chain(c);
+        k.extend_from_slice(&height.to_be_bytes());
+        k.extend_from_slice(&seq.get().to_be_bytes());
+        seq.set(seq.get() + 1);
+        let mut v = Vec::with_capacity(3 + key.len() + val.len());
+        v.push(tag);
+        v.extend_from_slice(&(key.len() as u16).to_be_bytes());
+        v.extend_from_slice(key);
+        v.extend_from_slice(val);
+        l.put(ADDR_LOG, &k, &v)
+    };
     let mut prevouts: Vec<Vec<Prevout>> = Vec::with_capacity(blk.txs.len());
     for (p, tx) in blk.txs.iter().enumerate() {
         let mut pv = Vec::new();
@@ -1095,11 +1136,23 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
                 pv.push(Prevout { value: coin.value, script: coin.script.clone() });
                 let ok = k_pos(c, pb, pp, inp.prevout.vout);
                 l.del(OUTPUTS, &ok)?;
-                l.del(BY_SCRIPT, &k_by_script(c, &sid, pb, pp, inp.prevout.vout))?;
                 let mut sp = bp.clone();
                 sp.extend_from_slice(&(vin as u32).to_be_bytes());
-                l.put(SPENDS, &ok, &sp)?;
-                add_hist(&l, c, &sid, height, &t12, 0, coin.value)?;
+                match addr {
+                    Addr::Off => {}
+                    Addr::Log => {
+                        // A coin from before the log began has its address row in place
+                        // already (a missing row costs a read, no write).
+                        l.del(BY_SCRIPT, &k_by_script(c, &sid, pb, pp, inp.prevout.vout))?;
+                        log(crate::addrbuild::SPEND, &ok, &sp)?;
+                        log(crate::addrbuild::HIST, &k_hist(c, &sid, height, &t12), &crate::addrbuild::hist_val(0, coin.value))?;
+                    }
+                    Addr::Live => {
+                        l.del(BY_SCRIPT, &k_by_script(c, &sid, pb, pp, inp.prevout.vout))?;
+                        l.put(SPENDS, &ok, &sp)?;
+                        add_hist(&l, c, &sid, height, &t12, 0, coin.value)?;
+                    }
+                }
             }
         }
         prevouts.push(pv);
@@ -1117,8 +1170,17 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
             l.put(OUTPUTS, &k_pos(c, b, p, vout), &encode_coin(out.value, height, coinbase, &out.script_pubkey))?;
             let mut v = out.value.to_le_bytes().to_vec();
             v.extend_from_slice(&height.to_le_bytes());
-            l.put(BY_SCRIPT, &k_by_script(c, &sid, b, p, vout), &v)?;
-            add_hist(&l, c, &sid, height, &t12, out.value, 0)?;
+            match addr {
+                Addr::Off => {}
+                Addr::Log => {
+                    log(crate::addrbuild::COIN, &k_by_script(c, &sid, b, p, vout), &v)?;
+                    log(crate::addrbuild::HIST, &k_hist(c, &sid, height, &t12), &crate::addrbuild::hist_val(out.value, 0))?;
+                }
+                Addr::Live => {
+                    l.put(BY_SCRIPT, &k_by_script(c, &sid, b, p, vout), &v)?;
+                    add_hist(&l, c, &sid, height, &t12, out.value, 0)?;
+                }
+            }
         }
     }
 

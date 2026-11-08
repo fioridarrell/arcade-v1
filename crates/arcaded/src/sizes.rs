@@ -18,7 +18,8 @@ pub fn group_of(table: &str) -> Option<&'static str> {
     Some(match table {
         "core.v2.headers" | "core.v2.hdr" | "core.v1.height" => "headers",
         "core.v1.block_meta" | "core.v1.block_tx" | "core.v1.txs" | "core.v1.undo" => "blocks",
-        "core.v2.outputs" | "core.v2.spends" | "core.v2.by_script" | "core.v2.script_hist" => "coins",
+        "core.v2.outputs" => "coins",
+        "core.v2.spends" | "core.v2.by_script" | "core.v2.script_hist" | "core.v1.addr_log" => "addresses",
         t if t.starts_with("ledger.") => "ledger",
         t if t.starts_with("msg.") => "profiles",
         t if t.starts_with("ord.") => "ord",
@@ -118,7 +119,7 @@ pub fn on_sz(node: &Node, from: &str, h: &Value) {
 }
 
 fn group_of_name(n: &str) -> bool {
-    matches!(n, "headers" | "blocks" | "coins" | "ledger" | "profiles" | "ord" | "names" | "maps" | "tokens")
+    matches!(n, "headers" | "blocks" | "coins" | "addresses" | "ledger" | "profiles" | "ord" | "names" | "maps" | "tokens")
 }
 
 fn save(node: &Node) {
@@ -175,7 +176,7 @@ pub fn for_chain(node: &Node, key: &str) -> Value {
     let frac = (crate::shares::copies() as f64 / sharing as f64).min(1.0);
     let part = |b: u64, f: f64| (b as f64 * f) as u64;
     let mut ix = Map::new();
-    for name in ["ledger", "profiles", "ord", "names", "maps", "tokens"] {
+    for name in ["addresses", "ledger", "profiles", "ord", "names", "maps", "tokens"] {
         if let Some(b) = g(name) {
             // Ord keeps its whole location map (about 40% of it); token ticks split fully.
             let shared = match name {

@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const MODES: &[&str] = &["light", "chain", "index", "full", "shared"];
-pub const INDEXES: &[&str] = &["ledger", "profiles", "ord", "names", "maps", "tokens", "runes", "dunes"];
+pub const INDEXES: &[&str] = &["addresses", "ledger", "profiles", "ord", "names", "maps", "tokens", "runes", "dunes"];
 pub const COMING: &[&str] = &["runes", "dunes"];
 const HOME_DEFAULT: &[&str] = &["ledger", "profiles"];
 
@@ -144,8 +144,15 @@ pub fn home_indexes(node: &Node) -> Vec<String> {
         .read(|r| r.get(arcade_app::META, b"home_indexes"))
         .ok()
         .flatten()
-        .and_then(|v| serde_json::from_slice(&v).ok())
-        .unwrap_or_else(|| HOME_DEFAULT.iter().map(|s| s.to_string()).collect())
+        .and_then(|v| serde_json::from_slice::<Vec<String>>(&v).ok())
+        .map(|mut v| {
+            // The home chain always keeps addresses (the wallet and faucet need its coins).
+            if !v.iter().any(|i| i == "addresses") {
+                v.insert(0, "addresses".into());
+            }
+            v
+        })
+        .unwrap_or_else(|| std::iter::once("addresses").chain(HOME_DEFAULT.iter().copied()).map(String::from).collect())
 }
 
 fn save_home(node: &Node, ix: &[String]) {
@@ -168,8 +175,16 @@ pub fn start_saved(node: &Arc<Node>) {
     }
 }
 
-fn launch(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>, added: u64, paused: bool, share: Value) -> Result<(), String> {
+fn launch(node: &Arc<Node>, key: &str, mode: &str, mut indexes: Vec<String>, added: u64, paused: bool, share: Value) -> Result<(), String> {
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
+    // The chain store's own switch is what counts for Addresses: chains installed before it
+    // was an index have their address rows, so they show it on (and can remove it).
+    let on = node.chain.addresses_on(p.chain_no).map_err(|e| e.to_string())?;
+    if on && !indexes.iter().any(|i| i == "addresses") {
+        indexes.insert(0, "addresses".into());
+    } else if !on {
+        indexes.retain(|i| i != "addresses");
+    }
     register_shared(node, p, &indexes, &share)?;
     let run = Arc::new(ChainRun {
         params: p,
@@ -208,8 +223,8 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
         return Err("Light and Index-only storage (borrowing blocks from the mesh) are coming; use full or chain for now".into());
     }
     let indexes = normalize(p, &indexes)?;
-    if mode == "chain" && !indexes.is_empty() {
-        return Err("Blockchain-only storage keeps no protocol indexes; choose full to add indexes".into());
+    if mode == "chain" && indexes.iter().any(|i| i != "addresses") {
+        return Err("Blockchain-only storage keeps no protocol indexes (Addresses is fine); choose full to add indexes".into());
     }
     // Shared storage: pick the ord and token groups this arcade keeps (least-held first).
     let share = if mode == "shared" {
@@ -217,6 +232,11 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     } else {
         Value::Null
     };
+    if crate::addrsvc::clearing(p.chain_no) {
+        return Err(format!("{}'s old address rows are still being deleted; try again in a minute", p.name));
+    }
+    let r = if indexes.iter().any(|i| i == "addresses") { node.chain.set_addresses_on(p.chain_no) } else { node.chain.set_addresses_off(p.chain_no) };
+    r.map_err(|e| e.to_string())?;
     launch(node, key, mode, indexes, arcade_app::now(), false, share)?;
     save(node);
     let _ = node.app.event("chains", &format!("installing {} ({mode})", p.name));
@@ -268,7 +288,7 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let (home, cur, run) = current(node, key)?;
-    if run.as_ref().is_some_and(|r| r.mode == "chain") {
+    if index != "addresses" && run.as_ref().is_some_and(|r| r.mode == "chain") {
         return Err("Blockchain-only storage keeps no protocol indexes".into());
     }
     if cur.iter().any(|i| i == index) {
@@ -277,6 +297,16 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
     let mut want = cur.clone();
     want.push(index.into());
     let set = normalize(p, &want)?;
+    if index == "addresses" && run.as_ref().is_none_or(|r| r.mode != "shared" || crate::shares::pruned(node, p.net).is_empty()) {
+        // Rows for the blocks already stored are built from them, in the background.
+        if crate::addrsvc::clearing(p.chain_no) {
+            return Err(format!("{}'s old address rows are still being deleted; try again in a minute", p.name));
+        }
+        node.chain.set_addresses_on(p.chain_no).map_err(|e| e.to_string())?;
+        apply_set(node, key, home, run, set)?;
+        let _ = node.app.event("chains", &format!("adding the Addresses index on {}: building it from the stored blocks", p.name));
+        return status(node, key);
+    }
     // Shared storage keeps only part of the blocks, and an index needs every block from its
     // start: fetch the chain again with the new index built in (our share is dropped again after).
     if let Some(r) = run.as_ref().filter(|r| r.mode == "shared" && !crate::shares::pruned(node, p.net).is_empty()) {
@@ -336,6 +366,21 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
     if home && index == "ledger" {
         return Err("the home chain's ledger holds your @handle and claims, so it stays".into());
     }
+    if index == "addresses" {
+        if home {
+            return Err("the home chain keeps its addresses: the wallet and faucet need its coins".into());
+        }
+        if !cur.iter().any(|i| i == "addresses") {
+            return Err(format!("addresses is not on {key}"));
+        }
+        let c = p.chain_no;
+        crate::addrsvc::stop(c);
+        node.chain.set_addresses_off(c).map_err(|e| e.to_string())?;
+        let set: Vec<String> = cur.iter().filter(|i| *i != "addresses").cloned().collect();
+        apply_set(node, key, home, run, set)?;
+        crate::addrsvc::clear_in_background(node.clone(), p);
+        return Ok(json!({"removed": index, "chain": key}));
+    }
     if indexer_name(index).is_empty() {
         return Err(format!("unknown index {index}"));
     }
@@ -375,6 +420,7 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let r = node.extra.lock().unwrap().remove(key).ok_or_else(|| format!("{key} is not installed"))?;
     r.stop.store(true, Ordering::Relaxed);
+    crate::addrsvc::stop(r.params.chain_no);
     for ix in node.chain.indexers_for(r.params.chain_no) {
         node.chain.remove_indexer(r.params.chain_no, ix);
     }
@@ -395,6 +441,7 @@ fn pct(done: u64, total: u64) -> f64 {
 
 fn label(p: &ChainParams, ix: &str) -> String {
     match ix {
+        "addresses" => "Addresses".into(),
         "ledger" => "Arcade ledger".into(),
         "profiles" => "Profiles".into(),
         "ord" => "Ord index".into(),
@@ -425,13 +472,30 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
                "pct": if src.starts_with("asking") { 0.0 } else { 100.0 }, "info": true}),
         json!({"name": "Headers", "detail": "checked by proof of work", "pct": pct(best, peer), "at": best, "of": peer}),
         json!({"name": "Blocks", "detail": "stored once, from the mesh or P2P", "pct": pct(tip, peer.max(1)), "at": tip, "of": peer}),
-        json!({"name": "Coins and addresses", "detail": "every address and balance", "pct": pct(tip, peer.max(1)), "at": tip, "of": peer}),
+        json!({"name": "Coins", "detail": "every unspent coin", "pct": pct(tip, peer.max(1)), "at": tip, "of": peer}),
     ];
     let (mode, indexes): (String, Vec<String>) = match &run {
         Some(r) => (r.mode.clone(), r.indexes.clone()),
         None => (node.home_mode.clone(), home_indexes(node)),
     };
     for ix in &indexes {
+        if ix == "addresses" {
+            let blocks_pct = pct(tip, peer.max(1));
+            let pending = node.chain.addresses_pending(c).unwrap_or(false);
+            let note = crate::addrsvc::note(c);
+            let (detail, p_) = if !pending {
+                ("every address's history and balance, and where each coin went".to_string(), blocks_pct)
+            } else if !note.is_empty() {
+                (note, 0.0)
+            } else if peer.saturating_sub(tip) > arcade_chaindb::sync::DEFER_BEHIND as u64 {
+                ("kept aside while catching up, then built in one sorted pass (much faster)".to_string(), 0.0)
+            } else {
+                ("waiting to be built".to_string(), 0.0)
+            };
+            stages.push(json!({"name": "Addresses", "index": ix, "detail": detail, "overall_pct": if pending { blocks_pct * 0.9 } else { blocks_pct },
+                               "pct": p_, "at": tip, "of": peer}));
+            continue;
+        }
         let name = indexer_name(ix);
         let start = match ix.as_str() {
             "ledger" => arcade_ledger::engine::gates(p).activation as u64,
@@ -540,6 +604,7 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
     }
     // Far behind: every source at once (all arcades offering it, plus P2P peers).
     let top = offers.iter().map(|o| o.3).max().unwrap_or(0);
+    run.peer_tip.fetch_max(top as u32, Ordering::Relaxed);
     if top > ours() + 2000 && offers.iter().any(|o| o.2 == "cr") {
         if node.chain.tip(p.chain_no).ok().flatten().is_none() {
             // Genesis first, from the first arcade that answers.
@@ -603,6 +668,7 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             }
             set(format!("bootstrapping from arcade {short} ({how}): block {} of {their}", ours()));
             run.peer_tip.fetch_max(their as u32, Ordering::Relaxed);
+            syncer.known_top.set(syncer.known_top.get().max(their as u32));
             let h = syncer.sync_headers_once(src.as_mut());
             let b = syncer.sync_blocks(src.as_mut(), 500, 500);
             match (h, b) {

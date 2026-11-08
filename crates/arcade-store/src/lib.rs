@@ -368,6 +368,35 @@ macro_rules! read_methods {
             Ok((rows, bytes, last))
         }
 
+        /// Up to `limit` entries under `prefix`, starting after `after` (exclusive) when given:
+        /// for walking a big range in short transactions.
+        pub fn scan_after(
+            &self,
+            table: &str,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+            check(self.schema, table)?;
+            let t = self.txn.open_table(Some(table))?;
+            let mut c = self.txn.cursor(&t)?;
+            let mut cur: Option<(Vec<u8>, Vec<u8>)> = c.set_range(after.unwrap_or(prefix))?;
+            if let (Some(a), Some((k, _))) = (after, &cur) {
+                if k.as_slice() == a {
+                    cur = c.next()?;
+                }
+            }
+            let mut out = Vec::new();
+            while let Some((k, v)) = cur {
+                if !k.starts_with(prefix) || out.len() >= limit {
+                    break;
+                }
+                out.push((k, v));
+                cur = c.next()?;
+            }
+            Ok(out)
+        }
+
         /// Last (greatest) entry whose key starts with `prefix`.
         pub fn last_with_prefix(&self, table: &str, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
             check(self.schema, table)?;

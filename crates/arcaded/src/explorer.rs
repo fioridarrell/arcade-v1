@@ -576,13 +576,22 @@ fn addr(x: &Ctx, a: &str) -> R {
     let c = x.c();
     let a = a.trim();
     let script = script_for(x, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
-    let hist = x.node.chain.history_for_script(c, &script).map_err(e)?;
-    let rows: Vec<Value> = hist.iter().rev().take(50).map(|(h, t12, recv, sent)| {
-        let txid = x.node.chain.txids_by_t12(x.p, t12).ok().and_then(|v| v.first().copied());
-        json!({"height": h, "txid": txid.map(|t| t.to_hex()), "received": recv, "sent": sent})
-    }).collect();
-    let mut v = json!({"address": a, "balance": x.node.chain.balance_for_script(c, &script).map_err(e)?, "tx_count": hist.len(),
-                       "history": rows, "tag": tag_of(x, a), "unit": unit(x.p)});
+    let mut v = json!({"address": a, "tag": tag_of(x, a), "unit": unit(x.p)});
+    if x.has("addresses") {
+        let hist = x.node.chain.history_for_script(c, &script).map_err(e)?;
+        let rows: Vec<Value> = hist.iter().rev().take(50).map(|(h, t12, recv, sent)| {
+            let txid = x.node.chain.txids_by_t12(x.p, t12).ok().and_then(|v| v.first().copied());
+            json!({"height": h, "txid": txid.map(|t| t.to_hex()), "received": recv, "sent": sent})
+        }).collect();
+        v["balance"] = json!(x.node.chain.balance_for_script(c, &script).map_err(e)?);
+        v["tx_count"] = json!(hist.len());
+        v["history"] = json!(rows);
+        if x.node.chain.addresses_pending(c).unwrap_or(false) {
+            v["note"] = json!(format!("The Addresses index for {} is still being built, so this history and balance may be incomplete.", x.p.name));
+        }
+    } else {
+        v["note"] = json!(format!("Balance and history need the Addresses index for {}; add it in Chains & Coins.", x.p.name));
+    }
     if x.has("ord") {
         let held = ord::held_by(&x.node.chain, x.p, &script).map_err(e)?;
         v["inscriptions"] = json!(held.iter().take(60).filter_map(|id| {
@@ -694,7 +703,7 @@ fn tag_page(x: &Ctx, t: &str) -> R {
     let mut addrs: Vec<(String, String)> = addrs.into_iter().map(|(a, w)| (a, w.to_string())).collect();
     addrs.extend(imported);
     let list: Vec<Value> = addrs.iter().map(|(a, why)| {
-        let bal = script_for(x, a).and_then(|sc| x.node.chain.balance_for_script(x.c(), &sc).ok());
+        let bal = if x.has("addresses") { script_for(x, a).and_then(|sc| x.node.chain.balance_for_script(x.c(), &sc).ok()) } else { None };
         json!({"address": a, "why": why, "balance": bal})
     }).collect();
     Ok(json!({"tag": t, "home_address": row.address, "claimed_at": row.block_height, "addresses": list,

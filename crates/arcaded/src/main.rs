@@ -4,6 +4,7 @@
 //!
 //!   arcaded [--home DIR] [--no-mesh] [--no-seeds] [--mesh-port N|0] [--mesh-peer HOST:PORT]... [--p2p-only] [--http-port N|0]
 
+mod addrsvc;
 mod api;
 mod chainsvc;
 mod chains;
@@ -110,6 +111,10 @@ fn main() {
             let note = shares::balance(&n, n.params).unwrap_or_else(|e| format!("balancing paused: {e}"));
             *n.home_share_note.lock().unwrap() = note;
         }).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("addresses".into()).spawn(move || addrsvc::run(n)).unwrap();
     }
     {
         let n = node.clone();

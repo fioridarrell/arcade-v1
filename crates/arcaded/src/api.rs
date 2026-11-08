@@ -78,7 +78,7 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             if keys.is_empty() && node.app.has_wallet().map_err(|e| e.to_string())? {
                 keys.push(node.app.tag_key(cp, 0).map_err(|e| e.to_string())?.0);
             }
-            let installed = cp.chain_no == p.chain_no || node.extra.lock().unwrap().contains_key(cp.key);
+            let installed = (cp.chain_no == p.chain_no || node.extra.lock().unwrap().contains_key(cp.key)) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
             Ok(json!(keys.iter().map(|k| {
                 let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
                 json!({"index": k.index, "address": k.address, "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else { None },

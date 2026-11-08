@@ -332,6 +332,7 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
         .map(|pr| HashSource::P2p(pr, p))
         .or_else(|| cr.iter().find_map(|o| crate::crsource::CoreShareSource::dial(node, &o.1, p).ok()).map(HashSource::Core))
         .ok_or("no source for block hashes")?;
+    syncer.known_top.set(syncer.known_top.get().max(top));
     let pool = Pool { s: Mutex::new(State { next: tip + 1, want: tip + 1, ..Default::default() }), cv: Condvar::new(), stop: AtomicBool::new(false), top };
     let short = |id: &str| id[..id.len().min(8)].to_string();
     std::thread::scope(|sc| -> Result<(), String> {

@@ -57,7 +57,15 @@ pub struct Syncer<'a> {
     /// Remaining path to the best header, cached between rounds (walking 1.5M headers
     /// back every round would be quadratic). Valid while its first entry extends the tip.
     path: std::cell::RefCell<(Hash256, Vec<Hash256>)>,
+    /// Put address rows off while far behind (on by default).
+    pub defer_addresses: bool,
+    /// The chain's height as a source told us, when our headers only run a little ahead of
+    /// the blocks (sources that send headers with the blocks).
+    pub known_top: std::cell::Cell<u32>,
 }
+
+/// Blocks behind the best header from which address rows are logged and built later.
+pub const DEFER_BEHIND: u32 = 20_000;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct Progress {
@@ -68,7 +76,7 @@ pub struct Progress {
 
 impl<'a> Syncer<'a> {
     pub fn new(db: &'a ChainDb, params: &'static ChainParams) -> Self {
-        Syncer { db, params, path: Default::default() }
+        Syncer { db, params, path: Default::default(), defer_addresses: true, known_top: Default::default() }
     }
 
     fn c(&self) -> u16 {
@@ -232,6 +240,11 @@ impl<'a> Syncer<'a> {
                 prog.disconnected += 1;
             }
         }
+        // Far behind the best header, address rows go to a log and are built afterwards in key
+        // order (addrbuild): written in place they are what limits a long catch-up.
+        let best_h = (fork + path.len() as u32).max(self.known_top.get());
+        let defer = self.defer_addresses && best_h.saturating_sub(tip.height) > DEFER_BEHIND;
+        let addresses_live = !defer && self.db.addresses_on(c)?;
         let path: Vec<_> = path.into_iter().take(max as usize).collect();
         let mut height = fork;
         for chunk in path.chunks(batch.max(1)) {
@@ -247,7 +260,7 @@ impl<'a> Syncer<'a> {
                     return Err(SyncError::BadBlock { hash: b.hash(), why: "does not rebuild byte-identically".into() });
                 }
                 b.check().map_err(|e| SyncError::BadBlock { hash: b.hash(), why: e.to_string() })?;
-                db.warm(params, &b, first_height + i as u32);
+                db.warm(params, &b, first_height + i as u32, addresses_live);
                 Ok(b)
             };
             let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
@@ -280,7 +293,7 @@ impl<'a> Syncer<'a> {
                 }
                 blocks.push(b);
             }
-            self.db.connect_blocks_checked(self.params, &blocks)?;
+            self.db.connect_blocks_checked(self.params, &blocks, defer)?;
             prog.blocks += blocks.len() as u32;
             // Drop what we connected from the cached path.
             let mut cached = self.path.borrow_mut();

@@ -26,6 +26,8 @@ pub const UNDO: &str = "core.v1.undo"; // C|B -> undo record
 pub const STATE: &str = "core.v1.state"; // C|name -> value
 pub const MEMPOOL: &str = "core.v1.mempool"; // C|T12 -> first_seen u64 LE | raw tx
 pub const MEMPOOL_SPENDS: &str = "core.v1.mempool_spends"; // C|T12|vout -> spending txid (32)
+/// Address rows put off while catching up (see addrbuild): C|height|seq -> tag u8 | klen u16 BE | key | value.
+pub const ADDR_LOG: &str = "core.v1.addr_log";
 
 static TABLES: &[TableDef] = &[
     TableDef::plain(HEADERS),
@@ -42,7 +44,12 @@ static TABLES: &[TableDef] = &[
     TableDef::plain(STATE),
     TableDef::plain(MEMPOOL),
     TableDef::plain(MEMPOOL_SPENDS),
+    TableDef::plain(ADDR_LOG),
 ];
+
+fn add_addr_log(_w: &arcade_store::WriteTxn) -> arcade_store::Result<()> {
+    Ok(()) // the table is created before migrations run
+}
 
 fn add_mempool(_w: &arcade_store::WriteTxn) -> arcade_store::Result<()> {
     Ok(())
@@ -59,11 +66,12 @@ fn relayout(_w: &arcade_store::WriteTxn) -> arcade_store::Result<()> {
 static MIGRATIONS: &[arcade_store::Migration] = &[
     arcade_store::Migration { to: 2, run: add_mempool },
     arcade_store::Migration { to: 3, run: relayout },
+    arcade_store::Migration { to: 4, run: add_addr_log },
 ];
 
 pub static CHAIN_SCHEMA: Schema = Schema {
     name: "chain",
-    version: 3,
+    version: 4,
     tables: TABLES,
     migrations: MIGRATIONS,
     max_size: 4 << 40, // 4 TiB ceiling; the file grows as needed

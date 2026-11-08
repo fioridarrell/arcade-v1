@@ -2,6 +2,7 @@
 //! (txid, coins, spends, address coins and history, undo) updated in the same commit
 //! as the block. See docs/PLAN.md §4-5.
 
+pub mod addrbuild;
 pub mod db;
 pub mod indexer;
 pub mod schema;

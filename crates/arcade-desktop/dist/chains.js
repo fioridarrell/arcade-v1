@@ -14,14 +14,15 @@
   const ICON_FILE = (k) => `coins/${k}.${k === "btc" ? "svg" : "png"}`;
   const COLORS = { peptest: "#2e8b44", pep: "#3f9c55", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a" };
   const MODES = [
-    ["full", "Full", "Blocks, every address, and your chosen indexes. Serves the mesh.", true],
-    ["shared", "Shared", "Every address and balance, plus your share of the blocks, ord records and token ticks; the rest is held by other arcades and fetched when needed.", true],
-    ["chain", "Blockchain only", "Blocks and every address and balance. No protocol indexes.", true],
+    ["full", "Full", "Blocks, coins, and your chosen indexes. Serves the mesh.", true],
+    ["shared", "Shared", "Coins, plus your share of the blocks, ord records and token ticks; the rest is held by other arcades and fetched when needed.", true],
+    ["chain", "Blockchain only", "Blocks and coins (and Addresses, if you tick it). No protocol indexes.", true],
     ["index", "Index only", "Coming: chosen indexes, blocks borrowed from the mesh.", false],
     ["light", "Light", "Coming: headers only; everything else borrowed.", false],
   ];
   // Every index is opt-in. Names, maps and tokens ride on the ord index (ticking one ticks ord).
   const INDEXES = [
+    ["addresses", "Addresses", "every address's history and balance, and where each coin went (address pages, balances); built after catching up", true],
     ["ledger", "Arcade ledger", "arcade tokens, exchange, arcade NFTs, @tags", true],
     ["profiles", "Profiles", "published keys, names and linked wallets", true],
     ["ord", "Ord index", "inscriptions (Pepinals, Doginals, ...), content served from the chain", true, "ord"],
@@ -113,7 +114,7 @@
     const noIdx = mode === "chain";
     // Runes only on Bitcoin, dunes only on Dogecoin: other chains don't list them.
     $("c-idx").replaceChildren(...INDEXES.filter(([, , , , needs]) => (needs !== "runes" || c.runes) && (needs !== "dunes" || c.dunes)).map(([k, t, d, ok, needs]) => {
-      const can = ok && !noIdx && (needs !== "ord" || c.ord) && (k !== "tokens" || c.tokens);
+      const can = ok && (!noIdx || k === "addresses") && (needs !== "ord" || c.ord) && (k !== "tokens" || c.tokens);
       const l = document.createElement("label");
       l.className = can ? "" : "off";
       l.innerHTML = `<input type="checkbox" data-k="${k}" ${can ? "" : "disabled"}> <b></b> <small></small> <small class="sz"></small>`;
@@ -130,7 +131,7 @@
       };
       return l;
     }));
-    $("c-est").textContent = noIdx ? "Blocks and every address; no indexes." : "Nothing is ticked for you: choose the indexes you want. Each is built in the same commit as each block and can be removed later.";
+    $("c-est").textContent = noIdx ? "Blocks and coins; Addresses if you tick it, no protocol indexes." : "Nothing is ticked for you: choose the indexes you want. Each can be removed later. Addresses are built in one sorted pass after the chain catches up, which is much faster.";
     $("c-total").textContent = total(c);
     $("c-total").hidden = !$("c-total").textContent;
     const offers = c.offers || 0;
@@ -172,7 +173,7 @@
       li.querySelector(".bar > i").style.width = p + "%";
       // Remove-index buttons on index stages.
       const ix = s.index;
-      if (ix && !(st.home && ix === "ledger")) {
+      if (ix && !(st.home && (ix === "ledger" || ix === "addresses"))) {
         const b = document.createElement("button"); b.textContent = "Remove index"; b.className = "small";
         b.onclick = async () => { try { await api("chains.index_remove", { key: st.key, index: ix }); msg(`Removing the ${s.name} index…`); refresh(); } catch (e) { msg(e.message, true); } };
         li.querySelector(".sh").append(b);
@@ -184,7 +185,8 @@
     if (!add) { add = document.createElement("div"); add.id = "c-addix"; add.className = "addix"; $("c-stages").before(add); }
     const info = chains.find((x) => x.key === st.key) || {};
     const have = st.indexes || [];
-    const can = st.mode === "full" || st.mode === "shared"
+    const can = st.mode === "chain" ? INDEXES.filter(([k]) => k === "addresses" && !have.includes(k))
+      : st.mode === "full" || st.mode === "shared"
       ? INDEXES.filter(([k, , , ok, needs]) => ok && !have.includes(k) && (needs !== "ord" || info.ord) && (k !== "tokens" || info.tokens)
           && (needs !== "runes" || info.runes) && (needs !== "dunes" || info.dunes)) : [];
     add.replaceChildren(...(can.length ? [Object.assign(document.createElement("h3"), { textContent: `Indexes you can add to ${st.name}` })] : []),

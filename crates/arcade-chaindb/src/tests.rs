@@ -338,3 +338,104 @@ fn prune_and_restore_a_block_body() {
     assert!(!f.db.is_block_pruned(c, b).unwrap());
     assert_eq!(f.db.block_raw(c, &b1.hash()).unwrap().unwrap(), b1.encode());
 }
+
+/// A chain with spends across blocks, scripts paid twice in one tx, and paying-and-spending
+/// the same script in one tx.
+fn busy_chain(g: &Block, n: u32) -> Vec<Block> {
+    let mut coins: Vec<(Hash256, u32, u64, u8)> = Vec::new();
+    let mut prev = g.hash();
+    let mut out = Vec::new();
+    let mut seed = 7u32;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        seed >> 8
+    };
+    for h in 1..=n {
+        let cb = tx(&[], &[(1000 + h as u64, p2pkh((h % 5) as u8))], h);
+        let mut txs = vec![cb.clone()];
+        let mut fresh = vec![(cb.txid, 0, 1000 + h as u64, (h % 5) as u8)];
+        for k in 0..2 {
+            if coins.len() < 2 {
+                break;
+            }
+            let a = coins.remove((rnd() as usize) % coins.len());
+            let b = coins.remove((rnd() as usize) % coins.len());
+            let total = a.2 + b.2;
+            let t1 = (rnd() % 5) as u8;
+            // Sometimes pay the spent script back, sometimes the same script twice.
+            let t2 = if k == 0 { a.3 } else { t1 };
+            let s = tx(&[(a.0, a.1), (b.0, b.1)], &[(total / 2, p2pkh(t1)), (total - total / 2, p2pkh(t2))], 0);
+            fresh.push((s.txid, 0, total / 2, t1));
+            fresh.push((s.txid, 1, total - total / 2, t2));
+            txs.push(s);
+        }
+        coins.extend(fresh);
+        let blk = block(prev, txs, 10 + h);
+        prev = blk.hash();
+        out.push(blk);
+    }
+    out
+}
+
+fn address_tables(db: &ChainDb) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
+    [SCRIPT_HIST, BY_SCRIPT, SPENDS, OUTPUTS, ADDR_LOG].iter().map(|t| db.store.read(|r| r.scan_prefix(t, b"")).unwrap()).collect()
+}
+
+fn build(f: &Fixture) {
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    let tmp = f._dir.path().join("tmp");
+    while f.db.addresses_pending(f.p.chain_no).unwrap() {
+        assert!(f.db.build_addresses(f.p, &tmp, &stop, &mut |_| {}).unwrap());
+    }
+}
+
+#[test]
+fn addresses_built_later_match_live() {
+    let live = fixture();
+    let blocks = busy_chain(&live.g, 40);
+    live.db.connect_blocks(live.p, &blocks).unwrap();
+    let want = address_tables(&live.db);
+    assert!(want[0].len() > 100 && want[2].len() > 50, "the test chain has history and spends");
+    let c = live.p.chain_no;
+
+    // All of it logged, then built.
+    let f = fixture();
+    f.db.connect_blocks_with(f.p, &blocks, true, true).unwrap();
+    assert!(f.db.addresses_pending(c).unwrap());
+    assert!(f.db.store.read(|r| r.scan_prefix(SCRIPT_HIST, b"")).unwrap().is_empty());
+    build(&f);
+    assert_eq!(address_tables(&f.db), want, "logged then built");
+
+    // Off while stored, then turned on: built from the blocks.
+    let f = fixture();
+    f.db.set_addresses_off(c).unwrap();
+    f.db.connect_blocks(f.p, &blocks).unwrap();
+    assert!(f.db.store.read(|r| r.scan_prefix(BY_SCRIPT, b"")).unwrap().is_empty());
+    f.db.set_addresses_on(c).unwrap();
+    build(&f);
+    assert_eq!(address_tables(&f.db), want, "built from stored blocks");
+
+    // Logged for a while, then live (spending logged coins), then built.
+    let f = fixture();
+    f.db.connect_blocks_with(f.p, &blocks[..20], true, true).unwrap();
+    f.db.connect_blocks(f.p, &blocks[20..]).unwrap();
+    build(&f);
+    assert_eq!(address_tables(&f.db), want, "logged then live");
+
+    // Off, on part way (backfill), logged after, then built.
+    let f = fixture();
+    f.db.set_addresses_off(c).unwrap();
+    f.db.connect_blocks(f.p, &blocks[..15]).unwrap();
+    f.db.set_addresses_on(c).unwrap();
+    f.db.connect_blocks_with(f.p, &blocks[15..30], true, true).unwrap();
+    f.db.connect_blocks(f.p, &blocks[30..]).unwrap();
+    build(&f);
+    assert_eq!(address_tables(&f.db), want, "off, backfilled, logged, live");
+
+    // Turning it off and clearing leaves no address rows.
+    f.db.set_addresses_off(c).unwrap();
+    while f.db.clear_address_rows_batch(c, 1000).unwrap() > 0 {}
+    let t = address_tables(&f.db);
+    assert!(t[0].is_empty() && t[1].is_empty() && t[2].is_empty() && t[4].is_empty());
+    assert_eq!(t[3], want[3], "coins stay");
+}

@@ -317,13 +317,14 @@
     const a = await api("explorer.address", { chain: chain.key, address: arg });
     return h("div", {}, crumbs("Address"),
       head(short(a.address, 14, 8), a.tag ? h("span", { class: "chip arc" }, "@" + a.tag) : ""),
-      kv([["Address", h("span", { class: "mono" }, a.address)], ["Balance", coins(a.balance)], ["Transactions", fmt(a.tx_count)],
+      a.note ? h("p", { class: "note" }, a.note) : "",
+      kv([["Address", h("span", { class: "mono" }, a.address)], a.balance != null && ["Balance", coins(a.balance)], a.tx_count != null && ["Transactions", fmt(a.tx_count)],
         a.inscription_count != null && ["Inscriptions held", fmt(a.inscription_count)]]),
       a.tokens && a.tokens.length ? h("div", {}, h("h2", { class: "x-h2" }, "Tokens"), table([["Tick"], ["Balance", 1], ["Transferable", 1]],
         a.tokens.map((t) => ({ go: () => go("token", t.tick), cells: [[h("b", {}, t.tick)], [units(t.overall, t.dec), 1], [units(t.transferable, t.dec), 1]] })))) : "",
       a.inscriptions && a.inscriptions.length ? h("div", {}, h("h2", { class: "x-h2" }, "Inscriptions"), insGrid(a.inscriptions)) : "",
-      h("h2", { class: "x-h2" }, "History"),
-      a.history.length ? table([["Block"], ["Txid"], ["Received", 1], ["Sent", 1]], a.history.map((r) => ({ go: r.txid ? () => go("tx", r.txid) : null,
+      a.history ? h("h2", { class: "x-h2" }, "History") : "",
+      !a.history ? "" : a.history.length ? table([["Block"], ["Txid"], ["Received", 1], ["Sent", 1]], a.history.map((r) => ({ go: r.txid ? () => go("tx", r.txid) : null,
         cells: [[fmt(r.height)], [h("span", { class: "mono" }, short(r.txid || "", 16, 8))], [r.received ? coins(r.received) : "", 1], [r.sent ? coins(r.sent) : "", 1]] })))
         : h("div", { class: "x-empty" }, "No transactions."));
   }

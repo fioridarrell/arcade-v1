@@ -186,7 +186,7 @@ pub fn unlink(node: &Node, chain: &str, address: &str, tag: &str) -> Result<Valu
 /// Our links (with a note whether we hold the key) for the Wallet tab.
 pub fn mine(node: &Node, chain: &str) -> Result<Vec<Value>, String> {
     let p = by_key(chain).ok_or_else(|| format!("unknown chain {chain}"))?;
-    let installed = p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key);
+    let installed = (p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key)) && node.chain.addresses_on(p.chain_no).unwrap_or(false);
     Ok(all(node)
         .into_iter()
         .filter(|r| r["on"] == true && r["net"] == p.net && owner_key(node, s(r, "tag")).is_ok())

@@ -447,7 +447,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         // An index that starts further along the chain than we are can't move yet; for the
         // overall figure it counts at the pace of the blocks (it finishes with them).
         let blocks_pct = pct(tip, peer.max(1));
-        let overall_pct = if at + 1 < start { blocks_pct } else if !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) };
+        let overall_pct = if tip < start { blocks_pct } else if !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) };
         stages.push(json!({"name": label(p, ix), "index": ix, "detail": detail, "overall_pct": overall_pct,
                            "pct": if at + 1 < start || !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) }, "at": at, "of": top}));
     }

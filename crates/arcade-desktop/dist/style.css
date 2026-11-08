@@ -218,3 +218,12 @@ main:has(#explorer.on) { max-width: 1240px; }
 .addrow b { display: block; }
 .addrow small { color: var(--muted); }
 .addrow button { flex: none; }
+.x-pager { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 8px 16px; margin: 10px 0; }
+.pg-nums { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+.pg { padding: 5px 10px; font-size: 13px; border-radius: 8px; }
+.pg.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; opacity: 1; }
+.pg:disabled:not(.on) { opacity: .4; }
+.pg-gap { color: var(--muted); padding: 0 2px; }
+.pg-info { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+.pg-go { display: inline-flex; gap: 6px; }
+.pg-go input { width: 120px; padding: 5px 8px; font-size: 13px; }

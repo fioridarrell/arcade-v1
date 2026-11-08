@@ -130,6 +130,29 @@
     return h("div", { class: "x-tbl" }, h("table", {}, h("thead", {}, h("tr", {}, head.map(([t, num]) => h("th", { class: num ? "num" : "" }, t)))),
       h("tbody", {}, rows.map((r) => h("tr", { class: r.go ? "click" : "", onclick: r.go || null }, r.cells.map(([v, num]) => h("td", { class: num ? "num" : "" }, v)))))));
   }
+  // Pages: the page number lives in the address arg as "p<N>" (1 = newest).
+  const pageOf = () => (arg && /^p\d+$/.test(arg) ? Math.max(1, Number(arg.slice(1))) : 1);
+  function pager(total, size, page, where, gotoLabel, gotoPage) {
+    const pages = Math.max(1, Math.ceil(total / size));
+    page = Math.min(page, pages);
+    const btn = (label, p, on) => h("button", { class: "pg" + (on ? " on" : ""), disabled: p < 1 || p > pages || (on && true), onclick: () => go(where, `p${p}`) }, label);
+    const nums = [];
+    const lo = Math.max(1, page - 2), hi = Math.min(pages, page + 2);
+    if (lo > 1) { nums.push(btn("1", 1)); if (lo > 2) nums.push(h("span", { class: "pg-gap" }, "…")); }
+    for (let i = lo; i <= hi; i++) nums.push(btn(fmt(i), i, i === page));
+    if (hi < pages) { if (hi < pages - 1) nums.push(h("span", { class: "pg-gap" }, "…")); nums.push(btn(fmt(pages), pages)); }
+    const box = h("input", { type: "text", inputmode: "numeric", placeholder: gotoLabel || "page", "aria-label": gotoLabel || "Go to page" });
+    const jump = () => {
+      const v = Number(String(box.value).replace(/[,#\s]/g, ""));
+      if (!Number.isFinite(v) || box.value === "") return;
+      const p = gotoPage ? gotoPage(v) : v;
+      go(where, `p${Math.min(pages, Math.max(1, p))}`);
+    };
+    box.onkeydown = (e) => { if (e.key === "Enter") jump(); };
+    return h("div", { class: "x-pager" },
+      h("div", { class: "pg-nums" }, btn("« First", 1, false), btn("‹ Prev", page - 1, false), ...nums, btn("Next ›", page + 1, false), btn("Last »", pages, false)),
+      h("div", { class: "pg-info" }, `Page ${fmt(page)} of ${fmt(pages)} · ${fmt(total)} in all`, h("span", { class: "pg-go" }, box, h("button", { class: "pg", onclick: jump }, "Go"))));
+  }
   const sect = (title, more, body) => h("section", { class: "x-sect" }, h("header", {}, h("h2", {}, title), more ? link("View all →", more) : ""), body);
   const kv = (rows) => h("div", { class: "x-kv" }, rows.filter(Boolean).flatMap(([k, v]) => [h("div", { class: "k" }, k), h("div", {}, v)]));
   const crumbs = (...parts) => h("div", { class: "x-crumbs" }, parts.flatMap((p, i) => (i ? [" / ", p] : [p])));
@@ -168,10 +191,12 @@
     }));
   }
   async function vBlocks() {
-    const before = arg ? Number(arg) : undefined;
-    const list = await api("explorer.blocks", { chain: chain.key, before, n: 25 });
-    const last = list[list.length - 1];
-    return sect("Blocks", null, h("div", {}, blockRows(list), last && last.height > 0 ? h("div", { class: "row" }, h("button", { onclick: () => go("blocks", String(last.height)) }, "Older blocks")) : ""));
+    const size = 25, total = (sum?.tip ?? 0) + 1, page = pageOf();
+    const before = Math.max(0, total - (page - 1) * size);
+    const list = await api("explorer.blocks", { chain: chain.key, before, n: size });
+    // Jump to a height: the page that holds it (page 1 = newest).
+    const toPage = (height) => Math.floor((total - 1 - height) / size) + 1;
+    return sect("Blocks", null, h("div", {}, pager(total, size, page, "blocks", "block height", toPage), blockRows(list), pager(total, size, page, "blocks", "block height", toPage)));
   }
   async function vMempool() {
     const m = await api("explorer.mempool", { chain: chain.key });
@@ -183,14 +208,17 @@
       h("p", { class: "x-note" }, "Read from this arcade's mempool. Spending with zero confirmations is fine on chains without RBF."));
   }
   async function vInscriptions() {
-    const r = await api("explorer.inscriptions", { chain: chain.key, before: arg ? Number(arg) : undefined, n: 36 });
-    const last = r.items[r.items.length - 1];
-    return sect(`Inscriptions · ${fmt(r.total)}`, null, h("div", {}, insGrid(r.items), last && last.n > 0 ? h("div", { class: "row" }, h("button", { onclick: () => go("inscriptions", String(last.n)) }, "Older inscriptions")) : ""));
+    const size = 36, page = pageOf();
+    const first = await api("explorer.inscriptions", { chain: chain.key, n: 1 });
+    const total = first.total;
+    const r = await api("explorer.inscriptions", { chain: chain.key, before: Math.max(0, total - (page - 1) * size), n: size });
+    const toPage = (num) => Math.floor((total - 1 - num) / size) + 1;
+    return sect(`Inscriptions · ${fmt(total)}`, null, h("div", {}, pager(total, size, page, "inscriptions", "inscription #", toPage), insGrid(r.items), pager(total, size, page, "inscriptions", "inscription #", toPage)));
   }
   async function vTokens() {
-    const r = await api("explorer.tokens", { chain: chain.key, after: arg || undefined, n: 50 });
-    const last = r.items[r.items.length - 1];
-    return sect(`${r.protocol.toUpperCase()} tokens`, null, h("div", {}, tokTable(r.items), r.items.length === 50 && last ? h("div", { class: "row" }, h("button", { onclick: () => go("tokens", last.tick) }, "More")) : ""));
+    const size = 50, page = pageOf();
+    const r = await api("explorer.tokens", { chain: chain.key, offset: (page - 1) * size, n: size });
+    return sect(`${r.protocol.toUpperCase()} tokens · ${fmt(r.total)}`, null, h("div", {}, pager(r.total, size, page, "tokens"), tokTable(r.items), pager(r.total, size, page, "tokens")));
   }
   async function vNames() {
     const r = await api("explorer.names", { chain: chain.key, after: arg || undefined, n: 50 });
@@ -227,13 +255,17 @@
       h("p", { class: "x-note" }, `Indexed to block ${fmt(L.indexed_to)}. Arcade tokens, NFTs and inscriptions are the arcade's own protocol (class B/C payloads), separate from ord.`));
   }
   async function vLTokens() {
-    const list = await api("explorer.ledger_tokens", { chain: chain.key, n: 300 });
-    return sect(`Arcade tokens · ${fmt(list.length)}`, null, ledgerTokens(list));
+    const size = 50, page = pageOf();
+    const r = await api("explorer.ledger_tokens", { chain: chain.key, offset: (page - 1) * size, n: size });
+    return sect(`Arcade tokens · ${fmt(r.total)}`, null, h("div", {}, pager(r.total, size, page, "ltokens"), ledgerTokens(r.items), pager(r.total, size, page, "ltokens")));
   }
   async function vLInscs() {
-    const r = await api("explorer.ledger_inscriptions", { chain: chain.key, before: arg ? Number(arg) : undefined, n: 36 });
-    const last = r.items[r.items.length - 1];
-    return sect(`Arcade inscriptions · ${fmt(r.total)}`, null, h("div", {}, ledgerGrid(r.items), last && last.number > 0 ? h("div", { class: "row" }, h("button", { onclick: () => go("linscs", String(last.number)) }, "Older")) : ""));
+    const size = 36, page = pageOf();
+    const first = await api("explorer.ledger_inscriptions", { chain: chain.key, n: 1 });
+    const total = first.total;
+    const r = await api("explorer.ledger_inscriptions", { chain: chain.key, before: Math.max(0, total - (page - 1) * size), n: size });
+    const toPage = (num) => Math.floor((total - 1 - num) / size) + 1;
+    return sect(`Arcade inscriptions · ${fmt(total)}`, null, h("div", {}, pager(total, size, page, "linscs", "inscription #", toPage), ledgerGrid(r.items), pager(total, size, page, "linscs", "inscription #", toPage)));
   }
   async function vLToken() {
     const t = await api("explorer.ledger_token", { chain: chain.key, id: arg });

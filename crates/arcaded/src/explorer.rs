@@ -129,8 +129,13 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
         }
         "explorer.tokens" => {
             x.need("tokens")?;
-            let rows = scan_after(&x, tokens::TICK, KeyBuf::new().u16(x.c()).done(), s("after"), n(50, 200) as usize);
-            Ok(json!({"protocol": tokens::protocol(x.p).map(|t| t.0).unwrap_or("tokens"), "items": rows.into_iter().filter_map(|(k, v)| {
+            // Offset paging (ticks in alphabetical order), with the total for the pager.
+            let off = req["offset"].as_u64().unwrap_or(0) as usize;
+            let want = n(50, 200) as usize;
+            let pre = KeyBuf::new().u16(x.c()).done();
+            let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::TICK, &pre, off + want)).map_err(e)?;
+            Ok(json!({"protocol": tokens::protocol(x.p).map(|t| t.0).unwrap_or("tokens"), "total": tokens::tick_count(&x.node.chain, x.c()),
+                "offset": off, "items": rows.into_iter().skip(off).filter_map(|(k, v)| {
                 let mut v: Value = serde_json::from_slice(&v).ok()?;
                 v["tick"] = json!(String::from_utf8_lossy(&k[2..]));
                 Some(v)
@@ -205,7 +210,12 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
         }
         "explorer.mempool" => mempool(&x),
         "explorer.ledger" => { x.need("ledger")?; ledger_summary(&x) }
-        "explorer.ledger_tokens" => { x.need("ledger")?; Ok(json!(ledger_tokens(&x, n(50, 500) as usize))) }
+        "explorer.ledger_tokens" => {
+            x.need("ledger")?;
+            let off = req["offset"].as_u64().unwrap_or(0) as usize;
+            let total = x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY, &x.c().to_be_bytes())).map(|v| v.len()).unwrap_or(0);
+            Ok(json!({"total": total, "offset": off, "items": ledger_tokens_page(&x, off, n(50, 200) as usize)}))
+        }
         "explorer.ledger_token" => { x.need("ledger")?; ledger_token(&x, req["id"].as_u64().or_else(|| s("id").and_then(|v| v.parse().ok())).ok_or("give a token id")? as u32) }
         "explorer.ledger_inscriptions" => {
             x.need("ledger")?;
@@ -273,10 +283,14 @@ fn ledger_latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
 }
 
 fn ledger_tokens(x: &Ctx, n: usize) -> Vec<Value> {
+    ledger_tokens_page(x, 0, n)
+}
+
+fn ledger_tokens_page(x: &Ctx, off: usize, n: usize) -> Vec<Value> {
     // Newest first: the creation-height index, read backwards.
     let mut rows = x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY_BY_BLOCK, &x.c().to_be_bytes())).unwrap_or_default();
     rows.reverse();
-    rows.iter().take(n).filter_map(|(k, _)| {
+    rows.iter().skip(off).take(n).filter_map(|(k, _)| {
         let pid = u32::from_be_bytes(k[k.len() - 4..].try_into().ok()?);
         let mut v: Value = serde_json::from_slice(&x.node.chain.store.read(|r| r.get(led::PROPERTY, &KeyBuf::new().u16(x.c()).u32(pid).done())).ok()??).ok()?;
         v["total_shown"] = json!(token_amount(&v, v["total"].as_u64().unwrap_or(0)));

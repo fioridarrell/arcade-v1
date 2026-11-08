@@ -24,7 +24,7 @@ use std::time::{Duration, Instant};
 
 const JOB: u32 = 250;
 /// P2P peers kept working at once (the coin's network is the other side of "mesh + P2P").
-const P2P_WANT: usize = 6;
+const P2P_WANT: usize = 12;
 /// How far ahead of the connected tip hashes are fetched: at most this many blocks, and no
 /// more than READY_BYTES of finished blocks waiting (old blocks are tiny, new ones are not).
 const AHEAD: u32 = 100_000;
@@ -82,7 +82,8 @@ impl Pool {
         }
         let mut v: Vec<(&String, &u64)> = st.stats.iter().collect();
         v.sort_by(|a, b| b.1.cmp(a.1));
-        format!("{} sources ({} P2P) [queue {} · fetching {} · done {} · hashes to {}]: {}", st.workers, st.p2p, st.queue.len(), st.inflight.len(), st.ready.len(), st.next, v.iter().take(6).map(|(k, n)| format!("{k} {}%", **n * 100 / total)).collect::<Vec<_>>().join(" · "))
+        let head = st.inflight.iter().find(|(s, _)| **s >= st.want).map(|(s, (_, since, d))| format!(" · next job +{} for {:.1}s{}", s - st.want, since.elapsed().as_secs_f32(), if *d { " (2 copies)" } else { "" })).unwrap_or_default();
+        format!("{} sources ({} P2P) [queue {} · fetching {} · done {} · {} MB ready · hashes to {}{head}]: {}", st.workers, st.p2p, st.queue.len(), st.inflight.len(), st.ready.len(), st.ready_bytes >> 20, st.next, v.iter().take(6).map(|(k, n)| format!("{k} {}%", **n * 100 / total)).collect::<Vec<_>>().join(" · "))
     }
 }
 
@@ -177,7 +178,9 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) 
                     return;
                 }
                 // Don't run too far ahead of the connector (memory).
-                let ahead_ok = st.queue.front().is_some_and(|j| j.start < st.want + AHEAD && st.ready_bytes < READY_BYTES);
+                // The memory bound never holds back the jobs the connector needs next (a job
+                // put back after a failure goes to the front): those always go out.
+                let ahead_ok = st.queue.front().is_some_and(|j| j.start < st.want + AHEAD && (st.ready_bytes < READY_BYTES || j.start < st.want + 8 * JOB));
                 // First help with the oldest jobs still in flight: the connector waits on them
                 // while later ones pile up done (first copy wins).
                 let want = st.want;
@@ -432,6 +435,9 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
                 let tot = (waited + stored).as_secs_f64().max(0.001);
                 on_progress(format!("block {} of {top} · {} · waiting {:.0}% storing {:.0}%", node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0), pool.summary(),
                     waited.as_secs_f64() * 100.0 / tot, stored.as_secs_f64() * 100.0 / tot));
+                // A rolling share (about the last 20 s), not the average since the start.
+                waited = waited.mul_f64(0.9);
+                stored = stored.mul_f64(0.9);
                 last_note = Instant::now();
             }
         };

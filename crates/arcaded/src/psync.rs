@@ -85,11 +85,14 @@ pub struct Prefetched<'p> {
     pool: &'p Pool,
     cache: HashMap<Hash256, Vec<u8>>,
     p: &'static ChainParams,
+    /// Headers of jobs pulled but not yet handed to the syncer, in order. A job pulled early
+    /// (because a block batch needed it) must still give its headers, or nothing after links.
+    heads: VecDeque<HeaderEntry>,
 }
 
 impl Prefetched<'_> {
     /// The next finished job in height order (waits up to `wait`): its headers, in order.
-    fn pull(&mut self, wait: Duration) -> Result<Vec<HeaderEntry>, String> {
+    fn pull(&mut self, wait: Duration) -> Result<usize, String> {
         let deadline = Instant::now() + wait;
         let mut st = self.pool.s.lock().unwrap();
         loop {
@@ -98,13 +101,13 @@ impl Prefetched<'_> {
                 st.want = want + raws.len() as u32;
                 self.pool.cv.notify_all();
                 drop(st);
-                let mut heads = Vec::with_capacity(raws.len());
+                let n = raws.len();
                 for raw in raws {
                     let b = Block::parse_with(&raw, &self.p.format).map_err(|e| e.to_string())?;
-                    heads.push(HeaderEntry { header: b.header, auxpow: b.auxpow.clone() });
+                    self.heads.push_back(HeaderEntry { header: b.header, auxpow: b.auxpow.clone() });
                     self.cache.insert(b.id, raw);
                 }
-                return Ok(heads);
+                return Ok(n);
             }
             if st.workers == 0 && Instant::now() + Duration::from_secs(150) > deadline {
                 // Nobody working for a while (the recruiter had 30 s to bring someone).
@@ -130,7 +133,12 @@ impl Prefetched<'_> {
 
 impl BlockSource for Prefetched<'_> {
     fn get_headers(&mut self, _locator: &[Hash256]) -> Result<Vec<HeaderEntry>, String> {
-        self.pull(Duration::from_secs(180))
+        if self.heads.is_empty() {
+            self.pull(Duration::from_secs(180))?;
+        }
+        // Everything pulled so far, in order (the syncer takes up to 2,000 per round).
+        let n = self.heads.len().min(2000);
+        Ok(self.heads.drain(..n).collect())
     }
 
     fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>, String> {
@@ -333,7 +341,7 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
             }
         });
         // The ordered side, on this thread.
-        let mut pre = Prefetched { pool: &pool, cache: HashMap::new(), p };
+        let mut pre = Prefetched { pool: &pool, cache: HashMap::new(), p, heads: VecDeque::new() };
         let mut last_note = Instant::now();
         let mut stalls = 0;
         let (mut waited, mut stored) = (Duration::ZERO, Duration::ZERO);

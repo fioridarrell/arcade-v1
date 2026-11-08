@@ -26,8 +26,8 @@
     // Runes and dunes join here (with their index keys) when those indexes exist.
   ];
   // Pages and the index each needs; a page comes online only when its index is on the chain.
-  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
-  const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
+  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
+  const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
 
   let chains = [], chain = null, sum = null, page = "home", arg = null, seq = 0;
 

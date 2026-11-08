@@ -320,5 +320,8 @@
   setInterval(() => { if ($("explorer").classList.contains("on") && page === "home" && !document.hidden) { sum = null; render(); } }, 30000);
   setInterval(loadChains, 15000);
   loadChains();
+  // #explorer/<page>/<arg> opens that page.
+  const hp = (location.hash || "").slice(1).split("/");
+  if (hp[0] === "explorer") { if (hp[1]) { page = hp[1]; arg = hp.slice(2).join("/") || null; } render(); }
   window.arcadeExplorer = { go, chain: () => chain };
 })();

@@ -77,6 +77,8 @@ fn main() {
         bk_peers: Mutex::new(Default::default()),
         mesh_port,
         mesh_bootstrap: !args.iter().any(|a| a == "--p2p-only"),
+        home_share_note: Mutex::new(String::new()),
+        home_mode: opt("--home-mode").filter(|m| m == "shared").unwrap_or_else(|| "full".into()),
         asks: Mutex::new(Default::default()),
         asks_done: Mutex::new(Default::default()),
         pending_spent: Mutex::new(Default::default()),
@@ -95,6 +97,18 @@ fn main() {
     chains::start_home(&node).expect("home indexes");
     chains::start_saved(&node);
     sizes::load(&node);
+    if node.home_mode == "shared" {
+        // Shared home chain (test setups): keep our share of its blocks right.
+        let n = node.clone();
+        // ARCADE_SHARE_START: wait this long before the first pass (test setups add indexes first).
+        let mut first = std::env::var("ARCADE_SHARE_START").ok().and_then(|v| v.parse().ok()).unwrap_or(0u64);
+        std::thread::Builder::new().name("home shares".into()).spawn(move || loop {
+            std::thread::sleep(std::time::Duration::from_secs(shares::every().max(first)));
+            first = 0;
+            let note = shares::balance(&n, n.params).unwrap_or_else(|e| format!("balancing paused: {e}"));
+            *n.home_share_note.lock().unwrap() = note;
+        }).unwrap();
+    }
     {
         let n = node.clone();
         std::thread::Builder::new().name("sizes".into()).spawn(move || sizes::run(n)).unwrap();

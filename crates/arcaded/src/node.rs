@@ -59,6 +59,10 @@ pub struct Node {
     pub mesh_port: Option<u16>,
     /// Set false to skip mesh bootstrap (P2P only).
     pub mesh_bootstrap: bool,
+    /// The home chain's storage: "full", or "shared" (for testing shared storage on the home
+    /// chain with several local arcades; --home-mode shared).
+    pub home_mode: String,
+    pub home_share_note: Mutex<String>,
     /// Welcome asks seen on the mesh: asker arcade id -> latest ask record.
     pub asks: Mutex<BTreeMap<String, Value>>,
     /// Blocks we mined, waiting to be sent to coin peers.
@@ -95,6 +99,23 @@ impl Node {
             return Some(self.params);
         }
         self.extra.lock().unwrap().get(key).map(|r| r.params)
+    }
+
+    /// Storage mode of a chain this arcade has.
+    pub fn mode_of(&self, key: &str) -> Option<String> {
+        if key == self.params.key {
+            return Some(self.home_mode.clone());
+        }
+        self.extra.lock().unwrap().get(key).map(|r| r.mode.clone())
+    }
+
+    /// Shared storage groups of a chain ({"ord", "tok"}), Null when it keeps everything.
+    pub fn share_of(&self, key: &str) -> Value {
+        if key == self.params.key {
+            return self.app.store.read(|r| r.get(arcade_app::META, b"home_share")).ok().flatten()
+                .and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or(Value::Null);
+        }
+        self.extra.lock().unwrap().get(key).map(|r| r.share.clone()).unwrap_or(Value::Null)
     }
 
     /// Arcades offering a chain, best tip first: (node id, addr, "bk"|"cr", tip).

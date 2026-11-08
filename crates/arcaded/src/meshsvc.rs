@@ -200,7 +200,7 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
             link.send(&Frame::new(f.clone()))?;
         }
         sent_outbox = pending.len();
-        if last_hold.elapsed() > Duration::from_secs(600) {
+        if last_hold.elapsed() > Duration::from_secs(crate::shares::every().clamp(20, 120)) {
             link.send(&crate::shares::hold_frame(node))?;
             last_hold = std::time::Instant::now();
         }

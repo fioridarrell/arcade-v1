@@ -616,6 +616,87 @@ impl ChainDb {
         })
     }
 
+    /// Prune many blocks in one commit (see prune_block). Returns bytes freed.
+    pub fn prune_blocks(&self, params: &ChainParams, bs: &[u32]) -> Result<u64> {
+        let c = params.chain_no;
+        self.store.write(|w| {
+            let mut freed = 0u64;
+            for &b in bs {
+                for (k, raw) in w.scan_prefix(BLOCK_TX, &k_block(c, b))? {
+                    if is_pruned(&raw) {
+                        continue;
+                    }
+                    let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
+                    let p = be_u32(&k, k.len() - 4);
+                    for (vout, out) in tx.outputs.iter().enumerate() {
+                        let ok = k_pos(c, b, p, vout as u32);
+                        if let Some(v) = w.get(OUTPUTS, &ok)? {
+                            if v.get(13) == Some(&SCRIPT_IN_TX) {
+                                let mut nv = v[..13].to_vec();
+                                nv.push(SCRIPT_INLINE);
+                                arcade_chain::encode::write_varint(&mut nv, out.script_pubkey.len() as u64);
+                                nv.extend_from_slice(&out.script_pubkey);
+                                w.put(OUTPUTS, &ok, &nv)?;
+                            }
+                        }
+                    }
+                    let mut stub = vec![PRUNED];
+                    stub.extend_from_slice(&tx.txid.0);
+                    freed += raw.len().saturating_sub(stub.len()) as u64;
+                    w.put(BLOCK_TX, &k, &stub)?;
+                }
+            }
+            Ok(freed)
+        })
+    }
+
+    /// Before a backfill batch on Shared storage: the block numbers whose bodies it needs but
+    /// this arcade dropped (the batch's own blocks, then the blocks holding their prevouts).
+    /// Fetch and restore these, then call again until it returns none.
+    pub fn backfill_missing(&self, params: &ChainParams, name: &str, max: u32) -> Result<Vec<u32>> {
+        let c = params.chain_no;
+        let ix = self.indexers.read().unwrap().iter().find(|(ch, i)| *ch == c && i.name() == name).map(|(_, i)| i.clone());
+        let Some(ix) = ix else { return Ok(vec![]) };
+        let Some(tip) = self.tip(c)? else { return Ok(vec![]) };
+        let start = match self.indexed_to(c, name)? {
+            Some(h) => h + 1,
+            None => ix.start_height(params),
+        };
+        if start > tip.height {
+            return Ok(vec![]);
+        }
+        let end = tip.height.min(start + max - 1);
+        self.store.read(|r| {
+            let mut need: Vec<u32> = Vec::new();
+            for h in start..=end {
+                let hv = r.get(HEIGHT, &k_height(c, h))?.ok_or(StoreError::Corrupt { table: HEIGHT, why: "gap" })?;
+                let b = be_u32(&hv, 32);
+                let rows = r.scan_prefix(BLOCK_TX, &k_block(c, b))?;
+                if rows.iter().any(|(_, v)| is_pruned(v)) {
+                    need.push(b);
+                    continue;
+                }
+                for (_, raw) in rows {
+                    let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
+                    if tx.is_coinbase() {
+                        continue;
+                    }
+                    for i in &tx.inputs {
+                        if let Some((pb, pp)) = locate(r, params, &i.prevout.txid)? {
+                            if r.get(BLOCK_TX, &k_block_tx(c, pb, pp))?.is_some_and(|v| is_pruned(&v)) && !need.contains(&pb) {
+                                need.push(pb);
+                            }
+                        }
+                    }
+                }
+                if need.len() >= 5000 {
+                    break;
+                }
+            }
+            Ok(need)
+        })
+    }
+
     /// Put a pruned block's body back (fetched from another arcade or a coin peer; checked
     /// against the stored header and each stub's txid).
     pub fn restore_block(&self, params: &ChainParams, b: u32, blk: &Block) -> Result<()> {

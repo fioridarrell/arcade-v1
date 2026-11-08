@@ -93,10 +93,6 @@ fn normalize(p: &ChainParams, indexes: &[String]) -> Result<Vec<String>, String>
     Ok(out)
 }
 
-fn register(node: &Node, p: &'static ChainParams, indexes: &[String]) -> Result<(), String> {
-    register_shared(node, p, indexes, &Value::Null)
-}
-
 fn register_shared(node: &Node, p: &'static ChainParams, indexes: &[String], share: &Value) -> Result<(), String> {
     let c = p.chain_no;
     for ix in indexes {
@@ -153,7 +149,7 @@ fn save_home(node: &Node, ix: &[String]) {
 
 /// Register the home chain's indexes (at start).
 pub fn start_home(node: &Node) -> Result<(), String> {
-    register(node, node.params, &home_indexes(node))
+    register_shared(node, node.params, &home_indexes(node), &node.share_of(node.params.key))
 }
 
 /// Start every chain the user installed earlier.
@@ -239,7 +235,12 @@ fn current(node: &Node, key: &str) -> Result<(bool, Vec<String>, Option<Arc<Chai
 fn apply_set(node: &Arc<Node>, key: &str, home: bool, run: Option<Arc<ChainRun>>, set: Vec<String>) -> Result<(), String> {
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     if home {
-        register(node, p, &set)?;
+        // Shared home chain (test setups): pick the ord/token groups when ord first arrives.
+        if node.home_mode == "shared" && set.iter().any(|i| i == "ord") && node.share_of(key).is_null() {
+            let share = json!({"ord": crate::shares::choose_groups(node, key, "ord"), "tok": crate::shares::choose_groups(node, key, "tok")});
+            let _ = node.app.store.write(|w| w.put(arcade_app::META, b"home_share", share.to_string().as_bytes()));
+        }
+        register_shared(node, p, &set, &node.share_of(key))?;
         save_home(node, &set);
         return Ok(());
     }
@@ -406,7 +407,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     ];
     let (mode, indexes): (String, Vec<String>) = match &run {
         Some(r) => (r.mode.clone(), r.indexes.clone()),
-        None => ("full".into(), home_indexes(node)),
+        None => (node.home_mode.clone(), home_indexes(node)),
     };
     for ix in &indexes {
         let name = indexer_name(ix);
@@ -422,15 +423,16 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         stages.push(json!({"name": label(p, ix), "index": ix, "detail": detail,
                            "pct": if tip < start || !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) }, "at": at, "of": tip}));
     }
-    if let Some(r) = run.as_ref().filter(|r| r.mode == "shared") {
-        let note = r.share_note.lock().unwrap().clone();
+    if mode == "shared" {
+        let note = match &run { Some(r) => r.share_note.lock().unwrap().clone(), None => node.home_share_note.lock().unwrap().clone() };
+        let share = node.share_of(key);
         let groups = |v: &Value| match v { Value::Array(a) => format!("{} of 64 groups", a.len()), _ => "all groups".into() };
         let mut d = if note.is_empty() { "waiting to hear what other arcades hold".to_string() } else { note };
         if indexes.iter().any(|i| i == "ord") {
-            d.push_str(&format!(" · ord records: {}", groups(&r.share["ord"])));
+            d.push_str(&format!(" · ord records: {}", groups(&share["ord"])));
         }
         if indexes.iter().any(|i| i == "tokens") {
-            d.push_str(&format!(" · token ticks: {}", groups(&r.share["tok"])));
+            d.push_str(&format!(" · token ticks: {}", groups(&share["tok"])));
         }
         stages.push(json!({"name": "Your share", "detail": d, "pct": 100.0, "at": 0, "of": 0, "info": true}));
     }
@@ -554,7 +556,7 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     let set = |s: String| *run.state.lock().unwrap() = s;
     mesh_first(&node, &run, &syncer);
     // The first balancing pass waits until the mesh has told us who holds what.
-    let mut last_balance = std::time::Instant::now() - Duration::from_secs(480);
+    let mut last_balance = std::time::Instant::now() - Duration::from_secs(crate::shares::every() * 4 / 5);
     'outer: while !run.stop.load(Ordering::Relaxed) {
         if run.paused.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(2));
@@ -593,13 +595,20 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
             let mut names: Vec<&str> = run.indexes.iter().map(|i| indexer_name(i)).collect();
             names.dedup();
             for name in names {
-                while node.chain.backfill(p, name, 2000).map(|x| x > 0).unwrap_or(false) {
+                while {
+                    if run.mode == "shared" {
+                        if let Err(e) = crate::shares::prepare_backfill(&node, p, name, 2000) {
+                            set(format!("{name}: waiting for blocks held by other arcades: {e}"));
+                        }
+                    }
+                    node.chain.backfill(p, name, 2000).map(|x| x > 0).unwrap_or(false)
+                } {
                     if run.stop.load(Ordering::Relaxed) {
                         continue 'outer;
                     }
                 }
             }
-            if run.mode == "shared" && last_balance.elapsed() > Duration::from_secs(600) {
+            if run.mode == "shared" && last_balance.elapsed() > Duration::from_secs(crate::shares::every()) {
                 match crate::shares::balance(&node, p) {
                     Ok(note) => *run.share_note.lock().unwrap() = note,
                     Err(e) => *run.share_note.lock().unwrap() = format!("balancing paused: {e}"),

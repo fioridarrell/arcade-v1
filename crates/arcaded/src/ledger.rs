@@ -12,6 +12,9 @@ pub fn catch_up(node: &Node) -> Result<u32, String> {
     let running = node.chain.indexers_for(node.params.chain_no);
     for name in INDEXES.iter().filter(|i| running.contains(i)) {
         loop {
+            if node.home_mode == "shared" {
+                crate::shares::prepare_backfill(node, node.params, name, 2000)?;
+            }
             let done = node.chain.backfill(node.params, name, 2000).map_err(|e| e.to_string())?;
             n += done;
             if done == 0 {

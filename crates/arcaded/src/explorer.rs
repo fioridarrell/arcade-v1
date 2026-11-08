@@ -139,7 +139,7 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
             x.need("tokens")?;
             let t = s("tick").ok_or("give a tick")?.to_lowercase();
             let local = tokens::tick(&x.node.chain, x.c(), &t);
-            let held = x.node.extra.lock().unwrap().get(x.p.key).and_then(|r| crate::shares::groups_of(&r.share["tok"]));
+            let held = crate::shares::groups_of(&x.node.share_of(x.p.key)["tok"]);
             if local.is_none() && held.as_ref().is_some_and(|g| !g.contains(&tokens::tick_group(&t))) {
                 let (mut v, from) = crate::shares::ask_holders(x.node, x.p, "tok", tokens::tick_group(&t) as u64, "tick", &t)?;
                 v["from_arcade"] = json!(from);

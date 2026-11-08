@@ -138,3 +138,10 @@ $("m-stop").addEventListener("click", async () => { await api("mine.stop"); refr
 
 refresh();
 setInterval(refresh, 4000);
+
+// Open a tab from the address (#explorer, #chains, ...), e.g. from a link or a shortcut.
+(() => {
+  const t = (location.hash || "").slice(1).split("/")[0];
+  const b = t && document.querySelector(`nav button[data-tab="${t}"]`);
+  if (b) b.click();
+})();

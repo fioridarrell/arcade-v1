@@ -275,3 +275,24 @@ To stay compatible with the current mesh, these specs must be pulled from the ex
 - `git` (not installed: `sudo apt install git`)
 - Rust toolchain (`rustup`), plus build tools for libmdbx (`build-essential`, `clang`)
 - Tauri dependencies (`libwebkit2gtk-4.1-dev` and friends)
+
+## Shared storage (Martin's lanes, 2026-11-07)
+
+A fifth storage mode, **Shared**, chosen per chain in Chains & Coins (`arcade chain add <key> --mode shared`).
+- Everyone keeps the last 10,000 blocks. The history before that is held exactly **3 times**, in lanes A, B, C;
+  each lane is one complete copy. Arcades that want more choose **Full** (a complete copy of their own); they count
+  as holders but take no lane place.
+- In a lane every arcade has a position on the history line (a circle, so a stretch can wrap) and holds from halfway
+  to its left neighbour to halfway to its right one. A newcomer joins the lane with the fewest arcades, in the middle
+  of that lane's longest stretch, and fetches outward until it meets its neighbours. An arcade that goes leaves an
+  orphan stretch that both neighbours restore, meeting in the middle. A lane's first arcade starts at lane/3 of the
+  line (offset markers); positions are nudged off the other lanes' edges so no two lanes break at the same block.
+  More arcades = smaller shares, never more than 3 copies.
+- Blocks are dropped only when at least 3 other arcades announce holding them, and only after every index on the chain
+  has walked past them. A dropped block keeps header, txids, coins and address history; an index added later fetches
+  the bodies it needs back from the holders and drops them again afterwards.
+- Ord records split in 64 groups by inscription number (the location map stays whole); PRC-20/DRC-20 ticks in 64
+  groups by ticker. Each arcade keeps the least-held groups at install.
+- Mesh: `sh hold` (what each arcade holds, its lane and position), `sh q/a` (records from holders); blocks over `bk`,
+  checked against our own headers; the coin's P2P network is the backstop.
+- Added chains wait for the mesh's offers (V1.0 `bk`, existing arcades' Core nodes over `cr`) before using P2P.

@@ -1,10 +1,19 @@
 //! Shared storage: a chain's blocks, its ord records and its token balances spread over the
 //! arcades that run it in "shared" mode, instead of every arcade keeping everything.
 //!
-//! * Blocks: 10,000-block ranges. Each range is held by COPIES arcades chosen by rendezvous
-//!   hashing over the sharing arcades (anyone can work out who holds what). An arcade drops a
-//!   range it isn't assigned only once at least COPIES other arcades announce holding it, and
-//!   never inside the last 1,000 blocks. A dropped block keeps its header, txids, coins and
+//! * Blocks, Martin's lanes (whiteboard, 2026-11-07): everyone keeps the last 10,000 blocks.
+//!   The history before that is held exactly COPIES (3) times, in lanes A, B, C: each lane is
+//!   one full copy. In a lane every arcade has a position on the history line (a circle, so a
+//!   stretch can wrap from the end to the start) and holds from halfway to its left neighbour
+//!   to halfway to its right one. A newcomer joins the lane with the fewest arcades, takes the
+//!   middle of that lane's longest stretch, and fetches from there outward until it meets its
+//!   neighbours (who then drop what it holds). When an arcade goes, its two neighbours each
+//!   grow into its orphaned stretch, so both restore it, meeting in the middle. A lane's first
+//!   arcade starts at lane/COPIES of the line (the offset markers), and positions are nudged
+//!   away from the other lanes' edges, so no two lanes break at the same block. Positions are
+//!   announced ("lane", "pos") and kept. The history line moves in 100,000-block steps.
+//!   Work is done in 10,000-block ranges. An arcade drops a range only once at least COPIES
+//!   other arcades announce holding it. A dropped block keeps its header, txids, coins and
 //!   address history; only the body goes (crate arcade_chaindb prune_block).
 //! * Ord: inscription records in 64 groups by number (number % 64); the location map (which
 //!   output holds each inscription) stays whole, because any transaction can move any
@@ -30,9 +39,16 @@ use std::time::Duration;
 
 pub const RANGE: u32 = 10_000;
 pub const GROUPS: u8 = 64;
-const KEEP_RECENT: u32 = 1_000;
+const KEEP_RECENT: u32 = 10_000;
+/// The shared history line moves in steps of this many blocks.
+const STEP: u32 = 100_000;
 
 /// How many arcades should hold each piece (ARCADE_SHARE_COPIES overrides, for tests).
+/// Seconds between balancing passes (ARCADE_SHARE_EVERY overrides, for tests).
+pub fn every() -> u64 {
+    std::env::var("ARCADE_SHARE_EVERY").ok().and_then(|v| v.parse().ok()).unwrap_or(600)
+}
+
 pub fn copies() -> usize {
     std::env::var("ARCADE_SHARE_COPIES").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n >= 1).unwrap_or(3)
 }
@@ -61,16 +77,118 @@ pub fn members(node: &Node, chain: &str) -> Vec<String> {
     v.into_iter().collect()
 }
 
-/// Is `unit` of `kind` assigned to us among `members`?
-pub fn assigned(node: &Node, chain: &str, kind: &str, unit: u64, members: &[String]) -> bool {
-    let n = copies();
-    if members.len() <= n {
-        return true;
-    }
+/// Places of the arcades sharing a chain (ours included, chosen on first need and kept).
+pub fn places(node: &Node, chain: &str) -> Vec<Place> {
+    let cutoff = arcade_app::now().saturating_sub(3600);
     let mine = me(node);
-    let mut s: Vec<(u64, &String)> = members.iter().map(|m| (score(m, chain, kind, unit), m)).collect();
-    s.sort_by(|a, b| b.0.cmp(&a.0));
-    s.iter().take(n).any(|(_, m)| **m == mine)
+    let mut v: Vec<Place> = node
+        .holds
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(id, (t, c))| *t >= cutoff && **id != mine && c[chain]["mode"] == "shared")
+        .filter_map(|(id, (_, c))| Some((id.clone(), c[chain]["lane"].as_u64()? as usize, c[chain]["pos"].as_f64()?)))
+        .collect();
+    let key = format!("place:{chain}");
+    let ours: Option<(usize, f64)> = node.app.store.read(|r| r.get(arcade_app::META, key.as_bytes())).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok());
+    let ours = ours.unwrap_or_else(|| {
+        let p = choose_place(&v);
+        let _ = node.app.store.write(|w| w.put(arcade_app::META, key.as_bytes(), &serde_json::to_vec(&p).unwrap()));
+        let _ = node.app.event("shares", &format!("{chain}: joined lane {} at {:.1}% of the history line", ["A", "B", "C", "D", "E"].get(p.0).unwrap_or(&"?"), p.1 * 100.0));
+        p
+    });
+    v.push((mine, ours.0, ours.1));
+    v
+}
+
+/// Our place on a shared chain, if chosen.
+pub fn my_place(node: &Node, chain: &str) -> Option<(usize, f64)> {
+    node.app.store.read(|r| r.get(arcade_app::META, format!("place:{chain}").as_bytes())).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok())
+}
+
+
+/// An arcade's place in the lanes: (node id, lane, position in [0, 1)).
+pub type Place = (String, usize, f64);
+
+fn circ(a: f64, b: f64) -> f64 {
+    let d = (a - b).rem_euclid(1.0);
+    d.min(1.0 - d)
+}
+
+/// Who holds range `r` of `total`: in each lane, the arcade whose position is nearest (on the
+/// circle) to the range's middle, i.e. whose stretch (halfway to each neighbour) contains it.
+pub fn lane_holders(places: &[Place], r: u32, total: u32) -> Vec<String> {
+    if total == 0 {
+        return places.iter().map(|p| p.0.clone()).collect();
+    }
+    let x = (r as f64 + 0.5) / total as f64;
+    let mut out = Vec::new();
+    for lane in 0..lanes() {
+        let best = places
+            .iter()
+            .filter(|p| p.1 == lane)
+            .min_by(|a, b| circ(a.2, x).partial_cmp(&circ(b.2, x)).unwrap().then(a.0.cmp(&b.0)));
+        if let Some(b) = best {
+            out.push(b.0.clone());
+        }
+    }
+    out
+}
+
+/// Edges (stretch boundaries) of one lane: halfway between neighbouring positions.
+fn edges(places: &[Place], lane: usize) -> Vec<f64> {
+    let mut ps: Vec<f64> = places.iter().filter(|p| p.1 == lane).map(|p| p.2).collect();
+    ps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if ps.len() < 2 {
+        return vec![];
+    }
+    (0..ps.len()).map(|i| {
+        let (a, b) = (ps[i], if i + 1 < ps.len() { ps[i + 1] } else { ps[0] + 1.0 });
+        ((a + b) / 2.0).rem_euclid(1.0)
+    }).collect()
+}
+
+pub fn lanes() -> usize {
+    copies()
+}
+
+/// Where a newcomer goes: the lane with the fewest arcades, in the middle of its longest
+/// stretch (an empty lane starts at lane/lanes, the offset marker), nudged off other lanes' edges.
+pub fn choose_place(others: &[Place]) -> (usize, f64) {
+    let n = lanes();
+    let lane = (0..n).min_by_key(|l| (others.iter().filter(|p| p.1 == *l).count(), *l)).unwrap();
+    let mut ps: Vec<f64> = others.iter().filter(|p| p.1 == lane).map(|p| p.2).collect();
+    ps.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    if ps.is_empty() {
+        return (lane, lane as f64 / n as f64);
+    }
+    // Longest gap between neighbouring positions (around the circle).
+    let mut best = (0.0f64, 0.0f64);
+    for i in 0..ps.len() {
+        let a = ps[i];
+        let b = if i + 1 < ps.len() { ps[i + 1] } else { ps[0] + 1.0 };
+        if b - a > best.1 {
+            best = (a, b - a);
+        }
+    }
+    let mut pos = (best.0 + best.1 / 2.0).rem_euclid(1.0);
+    // Our edges will sit halfway to our neighbours; keep them off the other lanes' edges.
+    let theirs: Vec<f64> = (0..n).filter(|l| *l != lane).flat_map(|l| edges(others, l)).collect();
+    let too_close = |p: f64| {
+        let mine = [(best.0 + p) / 2.0, (p + best.0 + best.1) / 2.0];
+        mine.iter().any(|m| theirs.iter().any(|t| circ(m.rem_euclid(1.0), *t) < 0.01))
+    };
+    let mut tries = 0;
+    while too_close(pos) && tries < 8 {
+        pos = (pos + best.1 / 12.0).rem_euclid(1.0);
+        tries += 1;
+    }
+    (lane, pos)
+}
+
+/// Ranges of shared history (before the kept recent blocks, in STEP-sized steps).
+pub fn history_ranges(tip: u32) -> u32 {
+    (tip.saturating_sub(KEEP_RECENT) / STEP * STEP) / RANGE
 }
 
 fn holds_unit(v: &Value, kind: &str, unit: u64) -> bool {
@@ -131,16 +249,20 @@ pub fn hold_frame(node: &Node) -> Frame {
     let mut chains = Map::new();
     let home = node.params;
     let tip = |p: &ChainParams| node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
-    chains.insert(home.key.into(), json!({"mode": "full", "h": tip(home), "blocks": "all", "ord": "all", "tok": "all"}));
-    for r in node.extra.lock().unwrap().values() {
-        let p = r.params;
+    let mut all: Vec<&'static ChainParams> = vec![home];
+    all.extend(node.extra.lock().unwrap().values().map(|r| r.params));
+    for p in all {
         let h = tip(p);
-        let v = if r.mode == "shared" {
+        let mode = node.mode_of(p.key).unwrap_or_default();
+        let v = if mode == "shared" {
             let gone = pruned(node, p.key);
             let held = runs((0..=h / RANGE).filter(|x| !gone.contains(x)));
-            json!({"mode": "shared", "h": h, "blocks": held, "ord": r.share["ord"], "tok": r.share["tok"]})
+            let share = node.share_of(p.key);
+            let g = |k: &str| if share[k].is_array() { share[k].clone() } else { json!("all") };
+            let (lane, pos) = match my_place(node, p.key) { Some((l, x)) => (json!(l), json!(x)), None => (Value::Null, Value::Null) };
+            json!({"mode": "shared", "h": h, "blocks": held, "ord": g("ord"), "tok": g("tok"), "lane": lane, "pos": pos})
         } else {
-            json!({"mode": r.mode, "h": h, "blocks": "all", "ord": "all", "tok": "all"})
+            json!({"mode": mode, "h": h, "blocks": "all", "ord": "all", "tok": "all"})
         };
         chains.insert(p.key.into(), v);
     }
@@ -194,7 +316,13 @@ pub fn fetch_blocks(node: &Node, p: &'static ChainParams, hashes: &[Hash256]) ->
     };
     use arcade_chaindb::sync::BlockSource;
     let mut last_err = String::from("no source");
-    for (_, addr, kind, _) in node.offers_for(p.key) {
+    for (id, addr, kind, _) in node.offers_for(p.key) {
+        // Only arcades that announce holding these blocks (any arcade not sharing holds all).
+        let h0 = node.chain.header(p.chain_no, &hashes[0]).ok().flatten().map(|r| r.height).unwrap_or(0);
+        let hold = node.holds.lock().unwrap().get(&id).map(|(_, c)| holds_unit(&c[p.key], "blocks", (h0 / RANGE) as u64) || c[p.key].is_null()).unwrap_or(true);
+        if !hold {
+            continue;
+        }
         let got = match kind {
             "bk" => crate::meshsource::MeshSource::dial_chain(node, &addr, p).and_then(|mut s| s.get_blocks(hashes)),
             _ => crate::crsource::CoreShareSource::dial(node, &addr, p).and_then(|mut s| s.get_blocks(hashes)),
@@ -220,25 +348,50 @@ pub fn fetch_blocks(node: &Node, p: &'static ChainParams, hashes: &[Hash256]) ->
 pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
     let c = p.chain_no;
     let Some(tip) = node.chain.tip(c).map_err(|e| e.to_string())? else { return Ok(String::new()) };
-    let m = members(node, p.key);
+    // Hear from the others first, so a newcomer's place is chosen knowing the lanes.
+    if my_place(node, p.key).is_none() && node.holds.lock().unwrap().is_empty() {
+        return Ok("waiting to hear which arcades share this chain".into());
+    }
+    let pl = places(node, p.key);
+    let m: Vec<String> = pl.iter().map(|x| x.0.clone()).collect();
     let mut gone = pruned(node, p.key);
     let mut work = 0;
-    let last_full = tip.height.saturating_sub(KEEP_RECENT) / RANGE; // ranges before this are settled
-    for r in 0..last_full {
-        if work >= 2 {
+    let last_full = history_ranges(tip.height); // ranges before this are shared out; the rest everyone keeps
+    let mine_id = me(node);
+    // Never drop blocks an index on this chain hasn't walked yet: indexes need every block.
+    let walked = node
+        .chain
+        .indexers_for(c)
+        .iter()
+        .map(|ix| node.chain.indexed_to(c, ix).ok().flatten().unwrap_or(0))
+        .min()
+        .unwrap_or(tip.height);
+    // Work outward from our position: a newcomer fills from the middle of its stretch.
+    let my_pos = my_place(node, p.key).map(|x| x.1).unwrap_or(0.0);
+    let mut order: Vec<u32> = (0..last_full).collect();
+    order.sort_by(|a, b| {
+        let d = |r: &u32| circ((*r as f64 + 0.5) / last_full.max(1) as f64, my_pos);
+        d(a).partial_cmp(&d(b)).unwrap()
+    });
+    for r in order {
+        if work >= std::env::var("ARCADE_SHARE_WORK").ok().and_then(|v| v.parse().ok()).unwrap_or(2) {
             break;
         }
-        let mine = assigned(node, p.key, "blocks", r as u64, &m);
+        let mine = lane_holders(&pl, r, last_full).contains(&mine_id);
         let others = holders(node, p.key, "blocks", r as u64).len();
         let (from, to) = (r * RANGE, (r + 1) * RANGE - 1);
-        if !mine && !gone.contains(&r) && others >= copies() {
-            let mut freed = 0u64;
+        if !mine && !gone.contains(&r) && others >= copies() && to <= walked {
+            let mut bs = Vec::with_capacity(RANGE as usize);
             for h in from..=to {
                 if let Some(hash) = node.chain.hash_at(c, h).map_err(|e| e.to_string())? {
                     if let Some(rec) = node.chain.header(c, &hash).map_err(|e| e.to_string())? {
-                        freed += node.chain.prune_block(p, rec.b).map_err(|e| e.to_string())?;
+                        bs.push(rec.b);
                     }
                 }
+            }
+            let mut freed = 0u64;
+            for chunk in bs.chunks(2000) {
+                freed += node.chain.prune_blocks(p, chunk).map_err(|e| e.to_string())?;
             }
             gone.insert(r);
             set_pruned(node, p.key, &gone);
@@ -272,8 +425,68 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
             work += 1;
         }
     }
+    // Blocks fetched back for an index walk: drop them again once every index is past them.
+    let mut back = restored(node, p.key);
+    let before = back.len();
+    let (again, keep): (Vec<u32>, Vec<u32>) = back.iter().partition(|b| {
+        node.chain.block_at(p, **b).ok().flatten().is_some_and(|(_, h, _)| h <= walked && gone.contains(&(h / RANGE)))
+    });
+    if !again.is_empty() {
+        node.chain.prune_blocks(p, &again).map_err(|e| e.to_string())?;
+        back = keep.into_iter().collect();
+        set_restored(node, p.key, &back);
+    }
+    if before != back.len() {
+        let _ = node.app.event("shares", &format!("{}: dropped {} blocks again that an index walk had fetched", p.name, before - back.len()));
+    }
     let total = tip.height / RANGE + 1;
-    Ok(format!("holding {} of {} block ranges · {} arcade{} sharing", total as usize - gone.len(), total, m.len(), if m.len() == 1 { "" } else { "s" }))
+    let lane = my_place(node, p.key).map(|(l, x)| format!(" · lane {} at {:.0}%", ["A", "B", "C", "D", "E"].get(l).unwrap_or(&"?"), x * 100.0)).unwrap_or_default();
+    Ok(format!("holding {} of {} block ranges{lane} · {} arcade{} sharing", total as usize - gone.len(), total, m.len(), if m.len() == 1 { "" } else { "s" }))
+}
+
+fn restored(node: &Node, chain: &str) -> BTreeSet<u32> {
+    node.app.store.read(|r| r.get(arcade_app::META, format!("restored:{chain}").as_bytes())).ok().flatten()
+        .and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+fn set_restored(node: &Node, chain: &str, s: &BTreeSet<u32>) {
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, format!("restored:{chain}").as_bytes(), &serde_json::to_vec(s).unwrap()));
+}
+
+/// Before an index walks `max` more blocks on a chain: fetch back any block it needs that
+/// this arcade dropped (from the arcades holding it; checked against our headers).
+pub fn prepare_backfill(node: &Node, p: &'static ChainParams, name: &str, max: u32) -> Result<(), String> {
+    for _ in 0..50 {
+        let need = node.chain.backfill_missing(p, name, max).map_err(|e| e.to_string())?;
+        if need.is_empty() {
+            return Ok(());
+        }
+        let mut hashes = Vec::new();
+        for b in &need {
+            let (h, _, _) = node.chain.block_at(p, *b).map_err(|e| e.to_string())?.ok_or("block missing")?;
+            hashes.push(p.block_id(&h));
+        }
+        let mut back = restored(node, p.key);
+        let t = std::time::Instant::now();
+        // One link per block range (each range has its own holders).
+        let mut by_range: std::collections::BTreeMap<u32, (Vec<u32>, Vec<Hash256>)> = Default::default();
+        for (b, h) in need.iter().zip(hashes.iter()) {
+            let ht = node.chain.header(p.chain_no, h).map_err(|e| e.to_string())?.map(|r| r.height).unwrap_or(0);
+            let e = by_range.entry(ht / RANGE).or_default();
+            e.0.push(*b);
+            e.1.push(*h);
+        }
+        for (_, (bs, hs)) in by_range {
+            let blocks = fetch_blocks(node, p, &hs)?;
+            for (b, blk) in bs.iter().zip(blocks.iter()) {
+                node.chain.restore_block(p, *b, blk).map_err(|e| e.to_string())?;
+                back.insert(*b);
+            }
+        }
+        set_restored(node, p.key, &back);
+        let _ = node.app.event("shares", &format!("{}: fetched {} blocks other arcades hold for the {name} walk ({:.1}s)", p.name, need.len(), t.elapsed().as_secs_f64()));
+    }
+    Ok(())
 }
 
 // ---------------- asking other arcades ----------------
@@ -346,8 +559,84 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
     let mut clean = Map::new();
     for (k, v) in c.iter().take(32) {
         if arcade_chain::params::by_key(k).is_some() {
-            clean.insert(k.clone(), json!({"mode": v["mode"], "h": v["h"], "blocks": v["blocks"], "ord": v["ord"], "tok": v["tok"]}));
+            clean.insert(k.clone(), json!({"mode": v["mode"], "h": v["h"], "blocks": v["blocks"], "ord": v["ord"], "tok": v["tok"], "lane": v["lane"], "pos": v["pos"]}));
         }
     }
     node.holds.lock().unwrap().insert(from.to_string(), (arcade_app::now(), Value::Object(clean)));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Arcades joining one by one, each choosing its place from those already there.
+    fn join(n: usize) -> Vec<Place> {
+        let mut v: Vec<Place> = Vec::new();
+        for i in 0..n {
+            let (l, x) = choose_place(&v);
+            v.push((format!("{i:064x}"), l, x));
+        }
+        v
+    }
+
+    fn shares(v: &[Place], total: u32) -> std::collections::BTreeMap<String, u32> {
+        let mut m = std::collections::BTreeMap::new();
+        for r in 0..total {
+            for h in lane_holders(v, r, total) {
+                *m.entry(h).or_insert(0) += 1;
+            }
+        }
+        m
+    }
+
+    #[test]
+    fn three_copies_always_and_shares_shrink() {
+        for n in [3usize, 9, 20] {
+            let v = join(n);
+            for r in 0..300 {
+                let h = lane_holders(&v, r, 300);
+                assert_eq!(h.len(), 3, "{n} arcades: three copies of range {r}");
+                assert_eq!(h.iter().collect::<BTreeSet<_>>().len(), 3);
+            }
+            let s = shares(&v, 300);
+            let max = *s.values().max().unwrap();
+            assert!(max as usize <= 300 * 2 * 3 / n.max(3) + 2, "{n}: largest share {max}");
+        }
+    }
+
+    #[test]
+    fn lanes_break_at_different_blocks() {
+        let v = join(9);
+        let edges_of = |lane: usize| -> BTreeSet<u32> {
+            (1..300u32).filter(|r| lane_holders(&v, *r, 300)[lane] != lane_holders(&v, r - 1, 300)[lane]).collect()
+        };
+        let (a, b, c) = (edges_of(0), edges_of(1), edges_of(2));
+        assert!(a.is_disjoint(&b) && b.is_disjoint(&c) && a.is_disjoint(&c), "{a:?} {b:?} {c:?}");
+    }
+
+    #[test]
+    fn a_newcomer_takes_the_middle_and_only_its_neighbours_change() {
+        let before = join(9);
+        let mut after = before.clone();
+        let (l, x) = choose_place(&before);
+        after.push(("new".into(), l, x));
+        let (s0, s1) = (shares(&before, 600), shares(&after, 600));
+        let changed: Vec<&String> = s0.keys().filter(|k| s0[*k] != s1[*k]).collect();
+        assert!(changed.len() <= 2, "only the newcomer's neighbours give up blocks: {changed:?}");
+        // The newcomer holds the range at its own position (the middle of its stretch).
+        let r = (x * 600.0) as u32;
+        assert!(lane_holders(&after, r, 600).contains(&"new".to_string()));
+    }
+
+    #[test]
+    fn an_orphan_stretch_goes_to_both_neighbours() {
+        let full = join(9);
+        let gone = full[4].clone();
+        let rest: Vec<Place> = full.iter().filter(|p| p.0 != gone.0).cloned().collect();
+        let (s0, s1) = (shares(&full, 600), shares(&rest, 600));
+        let gainers: Vec<&String> = s1.keys().filter(|k| s1[*k] > s0[*k]).collect();
+        assert_eq!(gainers.len(), 2, "both neighbours restore it: {gainers:?}");
+        let lane_mates: Vec<&String> = full.iter().filter(|p| p.1 == gone.1 && p.0 != gone.0).map(|p| &p.0).collect();
+        assert!(gainers.iter().all(|g| lane_mates.contains(g)));
+    }
 }

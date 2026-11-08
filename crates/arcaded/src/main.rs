@@ -21,6 +21,7 @@ mod miner;
 mod meshsvc;
 mod msgsvc;
 mod grpsvc;
+mod feedsvc;
 mod node;
 mod psync;
 mod rpc;

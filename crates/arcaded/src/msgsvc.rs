@@ -516,6 +516,11 @@ pub fn sender_key(node: &Node) -> Result<(String, Option<String>, arcade_wallet:
 
 /// Send arcm payloads as transactions, each spending the change of the one before.
 pub fn send_payloads(node: &Node, payloads: &[Vec<u8>]) -> Result<(Vec<String>, u64), String> {
+    send_payloads_with(node, payloads, vec![])
+}
+
+/// As send_payloads, with extra outputs on the first transaction (a tip's payment).
+pub fn send_payloads_with(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
     let p = node.params;
     let (_, _, sk) = sender_key(node)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
@@ -524,7 +529,7 @@ pub fn send_payloads(node: &Node, payloads: &[Vec<u8>]) -> Result<(Vec<String>, 
     let mut fees = 0u64;
     for pl in payloads {
         let coins = crate::claims::spendable(node, &script);
-        let tx = arcade_wallet::tx::build_arcade(p, &arcade_wallet::tx::any_data(pl), vec![], &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, arcade_app::now() as u32)
+        let tx = arcade_wallet::tx::build_arcade(p, &arcade_wallet::tx::any_data(pl), std::mem::take(&mut extra), &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, arcade_app::now() as u32)
             .map_err(|e| format!("could not build the message transaction: {e}"))?;
         let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
         let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();

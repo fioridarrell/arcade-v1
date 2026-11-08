@@ -109,6 +109,32 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             };
             crate::msgsvc::send(node, &s("to").ok_or("to required (@tag, address or messaging key)")?, &s("text").unwrap_or_default(), file)
         }
+        "feed" => crate::feedsvc::feed(node, &crate::feedsvc::View {
+            order: s("order").unwrap_or_else(|| "popular".into()),
+            txid: s("txid"),
+            channel: s("channel").filter(|c| !c.is_empty()),
+            author: match s("tag") {
+                Some(t) => Some(arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t.trim_start_matches('@').to_lowercase()).map_err(|e| e.to_string())?.ok_or_else(|| format!("@{t} is not claimed"))?.address),
+                None => s("author"),
+            },
+            limit: req["limit"].as_u64().unwrap_or(30).min(200) as usize,
+            offset: req["offset"].as_u64().unwrap_or(0) as usize,
+        }),
+        "feed.channels" => Ok(crate::feedsvc::channels(node)),
+        "feed.settings" => if req["set"].is_object() { crate::feedsvc::set_settings(node, &req["set"]) } else { Ok(crate::feedsvc::settings(node)) },
+        "feed.post" => {
+            let file = match req["file"].as_object() {
+                Some(f) => {
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(f.get("data").and_then(|d| d.as_str()).unwrap_or("")).map_err(|e| format!("file data: {e}"))?;
+                    Some(arcade_msg::content::File { name: f.get("name").and_then(|x| x.as_str()).unwrap_or("file").into(), mime: f.get("type").and_then(|x| x.as_str()).unwrap_or("application/octet-stream").into(), bytes })
+                }
+                None => None,
+            };
+            crate::feedsvc::post(node, &s("text").unwrap_or_default(), &s("channel").unwrap_or_default(), file)
+        }
+        "feed.act" => crate::feedsvc::act(node, &s("kind").ok_or("kind required")?, &s("target").ok_or("target required (txid)")?, &s("text").unwrap_or_default(), req["amount"].as_u64().unwrap_or(0)),
+        "feed.file" => crate::feedsvc::file(node, &s("txid").ok_or("txid required")?),
         "group.list" => Ok(crate::grpsvc::list(node)),
         "group.create" => {
             let names: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();

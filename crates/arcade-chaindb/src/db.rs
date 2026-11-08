@@ -76,6 +76,24 @@ fn other(e: impl std::fmt::Display) -> StoreError {
 // | FE = read the script from the stored transaction (anything else).
 
 const SCRIPT_IN_TX: u8 = 0xfe;
+/// A full script stored inline (varint length + bytes): written when a block's body is pruned
+/// (Shared storage) so its unspent coins no longer need the raw transaction.
+const SCRIPT_INLINE: u8 = 0x06;
+/// A pruned transaction: this byte + its txid, in place of the raw bytes (Shared storage).
+/// Raw transactions never start with 0xff (version 1/2 little-endian).
+pub const PRUNED: u8 = 0xff;
+
+pub fn is_pruned(raw: &[u8]) -> bool {
+    raw.len() == 33 && raw[0] == PRUNED
+}
+
+/// Txid of a stored transaction row (raw or pruned stub).
+fn row_txid(raw: &[u8], params: &ChainParams) -> Result<Hash256> {
+    if is_pruned(raw) {
+        return Ok(Hash256(raw[1..33].try_into().unwrap()));
+    }
+    Ok(Tx::parse_with(raw, &params.format).map_err(other)?.txid)
+}
 
 fn compress_script(s: &[u8]) -> Vec<u8> {
     if s.len() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac {
@@ -126,6 +144,12 @@ fn expand_script(r: &[u8], from_tx: impl FnOnce() -> Result<Vec<u8>>) -> Result<
             s
         }
         SCRIPT_IN_TX => from_tx()?,
+        SCRIPT_INLINE => {
+            let mut rd = arcade_chain::encode::Reader::new(&r[1..]);
+            let n = rd.varint().map_err(|_| bad())? as usize;
+            let at = r.len() - rd.remaining();
+            r.get(at..at + n).ok_or_else(bad)?.to_vec()
+        }
         _ => return Err(bad()),
     })
 }
@@ -238,7 +262,7 @@ fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Result<Option<(
     for (_, bp) in cands {
         let (b, p) = (be_u32(&bp, 0), be_u32(&bp, 4));
         if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
-            if Tx::parse_with(&raw, &params.format).map_err(other)?.txid == *txid {
+            if row_txid(&raw, params)? == *txid {
                 found = Some((b, p)); // the latest stored copy wins (BIP30-style duplicates)
             }
         }
@@ -251,6 +275,9 @@ fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Res
     let Some(v) = r.get(OUTPUTS, &k_pos(c, b, p, vout))? else { return Ok(None) };
     let script = expand_script(&v[13..], || {
         let raw = r.get(BLOCK_TX, &k_block_tx(c, b, p))?.ok_or(StoreError::Corrupt { table: BLOCK_TX, why: "coin's tx missing" })?;
+        if is_pruned(&raw) {
+            return Err(StoreError::Corrupt { table: OUTPUTS, why: "coin script not inlined before pruning" });
+        }
         let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
         Ok(tx.outputs.get(vout as usize).ok_or(StoreError::Corrupt { table: OUTPUTS, why: "bad vout" })?.script_pubkey.clone())
     })?;
@@ -397,6 +424,9 @@ impl ChainDb {
                         for i in &tx.inputs {
                             let (pb, pp) = locate(w, params, &i.prevout.txid)?.ok_or_else(|| other("prevout tx not stored"))?;
                             let praw = w.get(BLOCK_TX, &k_block_tx(c, pb, pp))?.ok_or_else(|| other("prevout tx missing"))?;
+                            if is_pruned(&praw) {
+                                return Err(other("an earlier block's body is held by other arcades (pruned here)"));
+                            }
                             let ptx = Tx::parse_with(&praw, &params.format).map_err(other)?;
                             let o = ptx.outputs.get(i.prevout.vout as usize).ok_or_else(|| other("bad prevout"))?;
                             pv.push(Prevout { value: o.value, script: o.script_pubkey.clone() });
@@ -455,6 +485,9 @@ impl ChainDb {
             o.extend_from_slice(&m.auxpow);
             arcade_chain::encode::write_varint(&mut o, m.tx_count as u64);
             for (_, tx) in r.scan_prefix(BLOCK_TX, &k_block(c, h.b))? {
+                if is_pruned(&tx) {
+                    return Ok(None); // body held by other arcades (Shared storage)
+                }
                 o.extend_from_slice(&tx);
             }
             if let Some(s) = m.sig {
@@ -513,8 +546,8 @@ impl ChainDb {
             for (_, bp) in r.scan_prefix(TXS, &k_txs(c, &txid.t12()))? {
                 let (b, p) = (be_u32(&bp, 0), be_u32(&bp, 4));
                 let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? else { continue };
-                if Tx::parse_with(&raw, &params.format).map_err(other)?.txid == *txid {
-                    return Ok(Some((raw, b)));
+                if row_txid(&raw, params)? == *txid {
+                    return Ok(if is_pruned(&raw) { None } else { Some((raw, b)) });
                 }
             }
             Ok(None)
@@ -525,8 +558,83 @@ impl ChainDb {
     pub fn tx_at(&self, params: &ChainParams, b: u32, p: u32) -> Result<Option<Tx>> {
         let c = params.chain_no;
         self.store.read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
-            Some(raw) => Ok(Some(Tx::parse_with(&raw, &params.format).map_err(other)?)),
+            Some(raw) if !is_pruned(&raw) => Ok(Some(Tx::parse_with(&raw, &params.format).map_err(other)?)),
+            _ => Ok(None),
+        })
+    }
+
+    /// Where a transaction is (block number, position), even when its body is pruned.
+    pub fn tx_location(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
+        self.store.read(|r| locate(r, params, txid))
+    }
+
+    /// Txid at a block number and position (pruned or not).
+    pub fn txid_at(&self, params: &ChainParams, b: u32, p: u32) -> Result<Option<Hash256>> {
+        let c = params.chain_no;
+        self.store.read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
+            Some(raw) => Ok(Some(row_txid(&raw, params)?)),
             None => Ok(None),
+        })
+    }
+
+    /// Is block number `b`'s body pruned here (Shared storage)?
+    pub fn is_block_pruned(&self, c: u16, b: u32) -> Result<bool> {
+        self.store.read(|r| Ok(r.get(BLOCK_TX, &k_block_tx(c, b, 0))?.map(|v| is_pruned(&v)).unwrap_or(false)))
+    }
+
+    /// Drop a stored block's body, keeping each transaction's txid (so lookups, coins and
+    /// history still work) and inlining the scripts of its unspent outputs first. Never
+    /// inside the undo window. Returns bytes freed (0 = already pruned).
+    pub fn prune_block(&self, params: &ChainParams, b: u32) -> Result<u64> {
+        let c = params.chain_no;
+        self.store.write(|w| {
+            let mut freed = 0u64;
+            for (k, raw) in w.scan_prefix(BLOCK_TX, &k_block(c, b))? {
+                if is_pruned(&raw) {
+                    continue;
+                }
+                let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
+                let p = be_u32(&k, k.len() - 4);
+                for (vout, out) in tx.outputs.iter().enumerate() {
+                    let ok = k_pos(c, b, p, vout as u32);
+                    if let Some(v) = w.get(OUTPUTS, &ok)? {
+                        if v.get(13) == Some(&SCRIPT_IN_TX) {
+                            let mut nv = v[..13].to_vec();
+                            nv.push(SCRIPT_INLINE);
+                            arcade_chain::encode::write_varint(&mut nv, out.script_pubkey.len() as u64);
+                            nv.extend_from_slice(&out.script_pubkey);
+                            w.put(OUTPUTS, &ok, &nv)?;
+                        }
+                    }
+                }
+                let mut stub = vec![PRUNED];
+                stub.extend_from_slice(&tx.txid.0);
+                freed += raw.len().saturating_sub(stub.len()) as u64;
+                w.put(BLOCK_TX, &k, &stub)?;
+            }
+            Ok(freed)
+        })
+    }
+
+    /// Put a pruned block's body back (fetched from another arcade or a coin peer; checked
+    /// against the stored header and each stub's txid).
+    pub fn restore_block(&self, params: &ChainParams, b: u32, blk: &Block) -> Result<()> {
+        let c = params.chain_no;
+        let (h, _, n) = self.block_at(params, b)?.ok_or_else(|| other("no such block"))?;
+        if params.block_id(&h) != params.block_id(&blk.header) || blk.txs.len() as u32 != n || blk.computed_merkle_root() != h.merkle_root {
+            return Err(other("block does not match the stored header"));
+        }
+        self.store.write(|w| {
+            for (p, tx) in blk.txs.iter().enumerate() {
+                let k = k_block_tx(c, b, p as u32);
+                if let Some(old) = w.get(BLOCK_TX, &k)? {
+                    if row_txid(&old, params)? != tx.txid {
+                        return Err(other("transaction does not match the stored txid"));
+                    }
+                }
+                w.put(BLOCK_TX, &k, &tx.raw)?;
+            }
+            Ok(())
         })
     }
 
@@ -547,9 +655,9 @@ impl ChainDb {
             let mut out = Vec::new();
             for (_, bp) in r.scan_prefix(TXS, &k_txs(c, t12))? {
                 if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, be_u32(&bp, 0), be_u32(&bp, 4)))? {
-                    let tx = Tx::parse_with(&raw, &params.format).map_err(other)?;
-                    if !out.contains(&tx.txid) {
-                        out.push(tx.txid);
+                    let txid = row_txid(&raw, params)?;
+                    if !out.contains(&txid) {
+                        out.push(txid);
                     }
                 }
             }
@@ -576,7 +684,7 @@ impl ChainDb {
                 let n = pre.len();
                 let (b, p, vout) = (be_u32(&k, n), be_u32(&k, n + 4), be_u32(&k, n + 8));
                 let raw = r.get(BLOCK_TX, &k_block_tx(c, b, p))?.ok_or(StoreError::Corrupt { table: BLOCK_TX, why: "coin's tx missing" })?;
-                let txid = Tx::parse_with(&raw, &params.format).map_err(other)?.txid;
+                let txid = row_txid(&raw, params)?;
                 out.push((
                     OutPoint { txid, vout },
                     u64::from_le_bytes(v[0..8].try_into().unwrap()),
@@ -780,6 +888,9 @@ fn block_raw_at<R: Rd>(r: &R, c: u16, b: u32) -> Result<Vec<u8>> {
     o.extend_from_slice(&m.auxpow);
     arcade_chain::encode::write_varint(&mut o, m.tx_count as u64);
     for (_, tx) in r.scan(BLOCK_TX, &k_block(c, b))? {
+        if is_pruned(&tx) {
+            return Err(other(format!("block {b}'s body is held by other arcades (pruned here)")));
+        }
         o.extend_from_slice(&tx);
     }
     if let Some(s) = m.sig {

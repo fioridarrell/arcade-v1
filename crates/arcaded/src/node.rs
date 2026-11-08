@@ -21,6 +21,17 @@ pub struct MeshTip {
     pub from: String,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct Offer {
+    pub at: u64,
+    /// Where to dial that arcade.
+    pub addr: String,
+    /// chain key -> their tip, over V1.0 bk
+    pub bk: BTreeMap<String, u64>,
+    /// chain key -> their tip, over coreshare (an existing arcade's Core node)
+    pub cr: BTreeMap<String, u64>,
+}
+
 #[derive(Debug, Clone)]
 pub struct LinkInfo {
     pub addr: String,
@@ -57,6 +68,11 @@ pub struct Node {
     pub coin_peers: Mutex<BTreeMap<String, std::collections::BTreeSet<String>>>,
     /// Mesh addresses we have a dialing thread for.
     pub dialing: Mutex<std::collections::BTreeSet<String>>,
+    /// Chains other arcades offer, by node id: V1.0 "bk" hi (blocks) and existing arcades'
+    /// "cr" offers (their Core node). Used to bootstrap an added chain from the mesh first.
+    pub offers: Mutex<BTreeMap<String, Offer>>,
+    /// What other arcades hold on shared chains: node id -> (received at, chains) (crate::shares).
+    pub holds: Mutex<BTreeMap<String, (u64, Value)>>,
     /// Our measured per-chain sizes (crate::sizes), shared on every link.
     pub my_sizes: Mutex<BTreeMap<String, serde_json::Value>>,
     /// Sizes other arcades report: node id -> (received at, chains).
@@ -73,6 +89,34 @@ pub struct Node {
 
 
 impl Node {
+    /// Params of a chain this arcade has (home or installed).
+    pub fn chain_params(&self, key: &str) -> Option<&'static ChainParams> {
+        if key == self.params.key {
+            return Some(self.params);
+        }
+        self.extra.lock().unwrap().get(key).map(|r| r.params)
+    }
+
+    /// Arcades offering a chain, best tip first: (node id, addr, "bk"|"cr", tip).
+    pub fn offers_for(&self, key: &str) -> Vec<(String, String, &'static str, u64)> {
+        let cutoff = arcade_app::now().saturating_sub(3 * 3600);
+        let mut v: Vec<_> = self
+            .offers
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, o)| o.at >= cutoff && !o.addr.is_empty())
+            .flat_map(|(id, o)| {
+                let a = o.bk.get(key).map(|h| (id.clone(), o.addr.clone(), "bk", *h));
+                let b = o.cr.get(key).map(|h| (id.clone(), o.addr.clone(), "cr", *h));
+                a.into_iter().chain(b)
+            })
+            .collect();
+        // Highest tip first; V1.0 bk before coreshare at the same tip.
+        v.sort_by(|x, y| y.3.cmp(&x.3).then((x.2 != "bk").cmp(&(y.2 != "bk"))));
+        v
+    }
+
     pub fn self_arc(&self) -> std::sync::Arc<Node> {
         self.me.get().and_then(|w| w.upgrade()).expect("node is running")
     }

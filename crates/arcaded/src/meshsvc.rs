@@ -169,7 +169,14 @@ fn our_tip(node: &Node) -> u64 {
 fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
     // Tell V1.0 peers what we can serve (existing arcades ignore this kind).
-    link.send(&arcade_mesh::bk::hi(json!({ node.params.key: {"h": our_tip(node)} }), node.mesh_port))?;
+    let mut nets = serde_json::Map::new();
+    nets.insert(node.params.key.into(), json!({"h": our_tip(node)}));
+    for r in node.extra.lock().unwrap().values() {
+        if let Ok(Some(t)) = node.chain.tip(r.params.chain_no) {
+            nets.insert(r.params.key.into(), json!({"h": t.height}));
+        }
+    }
+    link.send(&arcade_mesh::bk::hi(Value::Object(nets), node.mesh_port))?;
     // Every arcade is a seed: share the arcades and coin peers we know.
     share(node, link)?;
     // Offer our chain to arcades that borrow one (existing arcades' coreshare).
@@ -178,6 +185,8 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     }
     // V1.0: what each installed chain and index costs on disk here (existing arcades ignore it).
     let mut last_sz = std::time::Instant::now();
+    let mut last_hold = std::time::Instant::now();
+    link.send(&crate::shares::hold_frame(node))?;
     if let Some(sz) = crate::sizes::frame(node) {
         link.send(&Frame::new(sz))?;
     }
@@ -191,6 +200,10 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
             link.send(&Frame::new(f.clone()))?;
         }
         sent_outbox = pending.len();
+        if last_hold.elapsed() > Duration::from_secs(600) {
+            link.send(&crate::shares::hold_frame(node))?;
+            last_hold = std::time::Instant::now();
+        }
         if last_sz.elapsed() > Duration::from_secs(3600) {
             if let Some(sz) = crate::sizes::frame(node) {
                 link.send(&Frame::new(sz))?;
@@ -230,9 +243,35 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
             "addrs" => on_addrs(node, &f.head),
             "pp" => on_coin_peers(node, &f.head),
             "sz" => crate::sizes::on_sz(node, &link.peer_id, &f.head),
+            "sh" if f.head["op"] == "hold" => crate::shares::on_hold(node, &link.peer_id, &f.head),
+            "sh" if f.head["op"] == "q" => crate::shares::answer(node, link, &f.head)?,
             "bk" => serve_bk(node, link, addr, &f.head)?,
-            "cr" => crate::coreshare::handle(node, link, &mut cr_reqs, &f)?,
+            "cr" => {
+                if f.head["op"] == "offer" {
+                    note_offer(node, &link.peer_id, addr, "cr", &f.head["nets"]);
+                }
+                crate::coreshare::handle(node, link, &mut cr_reqs, &f)?
+            }
             _ => {} // unknown kinds are ignored, as the existing arcade does
+        }
+    }
+}
+
+/// Remember which chains an arcade offers (and where to dial it).
+fn note_offer(node: &Node, id: &str, addr: &str, kind: &str, nets: &Value) {
+    let Some(nets) = nets.as_object() else { return };
+    let mut all = node.offers.lock().unwrap();
+    let o = all.entry(id.to_string()).or_default();
+    o.at = now();
+    if !addr.ends_with(":0") {
+        o.addr = addr.to_string();
+    }
+    let m = if kind == "bk" { &mut o.bk } else { &mut o.cr };
+    for (k, v) in nets.iter().take(64) {
+        if arcade_chain::params::by_key(k).is_some() {
+            if let Some(h) = v["h"].as_u64() {
+                m.insert(k.clone(), h);
+            }
         }
     }
 }
@@ -240,16 +279,24 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
 fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), LinkError> {
     use arcade_chain::Hash256;
     use arcade_mesh::bk;
-    let p = node.params;
+    // Any chain this arcade has: the home chain or an installed one.
+    let p = match h["net"].as_str().and_then(|k| node.chain_params(k)) {
+        Some(p) => p,
+        None => node.params,
+    };
     let hashes = |k: &str| -> Vec<Hash256> {
         h[k].as_array().map(|a| a.iter().filter_map(|x| x.as_str().and_then(|s| Hash256::from_hex(s).ok())).collect()).unwrap_or_default()
     };
     let id = h["id"].as_u64().unwrap_or(0);
     match h["op"].as_str().unwrap_or("") {
         "hi" => {
-            if let (Some(t), Some(port)) = (h["nets"][p.key]["h"].as_u64(), h["port"].as_u64()) {
+            if let Some(port) = h["port"].as_u64() {
                 let host = addr.rsplit_once(':').map(|x| x.0).unwrap_or(addr);
-                node.bk_peers.lock().unwrap().insert(format!("{host}:{port}"), t);
+                let dial = if addr.starts_with("wss://") { addr.to_string() } else { format!("{host}:{port}") };
+                if let Some(t) = h["nets"][node.params.key]["h"].as_u64() {
+                    node.bk_peers.lock().unwrap().insert(dial.clone(), t);
+                }
+                note_offer(node, &link.peer_id, &dial, "bk", &h["nets"]);
             }
         }
         "hq" if h["net"] == p.key => {

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-pub const MODES: &[&str] = &["light", "chain", "index", "full"];
+pub const MODES: &[&str] = &["light", "chain", "index", "full", "shared"];
 pub const INDEXES: &[&str] = &["ledger", "profiles", "ord", "names", "maps", "tokens", "runes", "dunes"];
 pub const COMING: &[&str] = &["runes", "dunes"];
 const HOME_DEFAULT: &[&str] = &["ledger", "profiles"];
@@ -30,6 +30,10 @@ pub struct ChainRun {
     pub paused: AtomicBool,
     pub stop: AtomicBool,
     pub added: u64,
+    /// Shared storage: {"ord": groups|"all", "tok": groups|"all"} chosen at install.
+    pub share: Value,
+    /// Shared storage: what we hold now (from the last balancing pass).
+    pub share_note: Mutex<String>,
 }
 
 pub fn indexer_name(index: &str) -> &'static str {
@@ -90,6 +94,10 @@ fn normalize(p: &ChainParams, indexes: &[String]) -> Result<Vec<String>, String>
 }
 
 fn register(node: &Node, p: &'static ChainParams, indexes: &[String]) -> Result<(), String> {
+    register_shared(node, p, indexes, &Value::Null)
+}
+
+fn register_shared(node: &Node, p: &'static ChainParams, indexes: &[String], share: &Value) -> Result<(), String> {
     let c = p.chain_no;
     for ix in indexes {
         let r = match ix.as_str() {
@@ -98,7 +106,7 @@ fn register(node: &Node, p: &'static ChainParams, indexes: &[String]) -> Result<
             "ord" => {
                 let riders: Vec<&str> = indexes.iter().map(|s| s.as_str()).filter(|i| is_rider(i)).collect();
                 node.chain.remove_indexer(c, "ord.v1");
-                node.chain.add_indexer(c, Arc::new(OrdIndexer::new(&riders)))
+                node.chain.add_indexer(c, Arc::new(OrdIndexer::shared(&riders, crate::shares::groups_of(&share["ord"]), crate::shares::groups_of(&share["tok"]))))
             }
             _ => Ok(()),
         };
@@ -123,7 +131,7 @@ fn save(node: &Node) {
         .lock()
         .unwrap()
         .values()
-        .map(|r| json!({"key": r.params.key, "mode": r.mode, "indexes": r.indexes, "added": r.added, "paused": r.paused.load(Ordering::Relaxed)}))
+        .map(|r| json!({"key": r.params.key, "mode": r.mode, "indexes": r.indexes, "added": r.added, "paused": r.paused.load(Ordering::Relaxed), "share": r.share}))
         .collect();
     let _ = node.app.store.write(|w| w.put(arcade_app::META, b"chains", &serde_json::to_vec(&list).unwrap()));
 }
@@ -153,15 +161,15 @@ pub fn start_saved(node: &Arc<Node>) {
     for c in saved(node) {
         let (Some(key), Some(mode)) = (c["key"].as_str(), c["mode"].as_str()) else { continue };
         let indexes: Vec<String> = c["indexes"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-        if let Err(e) = launch(node, key, mode, indexes, c["added"].as_u64().unwrap_or(0), c["paused"] == true) {
+        if let Err(e) = launch(node, key, mode, indexes, c["added"].as_u64().unwrap_or(0), c["paused"] == true, c["share"].clone()) {
             let _ = node.app.event("chains", &format!("could not start {key}: {e}"));
         }
     }
 }
 
-fn launch(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>, added: u64, paused: bool) -> Result<(), String> {
+fn launch(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>, added: u64, paused: bool, share: Value) -> Result<(), String> {
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
-    register(node, p, &indexes)?;
+    register_shared(node, p, &indexes, &share)?;
     let run = Arc::new(ChainRun {
         params: p,
         mode: mode.into(),
@@ -171,6 +179,8 @@ fn launch(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>, added: 
         paused: AtomicBool::new(paused),
         stop: AtomicBool::new(false),
         added,
+        share,
+        share_note: Mutex::new(String::new()),
     });
     node.extra.lock().unwrap().insert(key.into(), run.clone());
     let n = node.clone();
@@ -197,7 +207,13 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     if mode == "chain" && !indexes.is_empty() {
         return Err("Blockchain-only storage keeps no protocol indexes; choose full to add indexes".into());
     }
-    launch(node, key, mode, indexes, arcade_app::now(), false)?;
+    // Shared storage: pick the ord and token groups this arcade keeps (least-held first).
+    let share = if mode == "shared" {
+        json!({"ord": crate::shares::choose_groups(node, key, "ord"), "tok": crate::shares::choose_groups(node, key, "tok")})
+    } else {
+        Value::Null
+    };
+    launch(node, key, mode, indexes, arcade_app::now(), false, share)?;
     save(node);
     let _ = node.app.event("chains", &format!("installing {} ({mode})", p.name));
     status(node, key)
@@ -230,7 +246,7 @@ fn apply_set(node: &Arc<Node>, key: &str, home: bool, run: Option<Arc<ChainRun>>
     let r = run.ok_or("not installed")?;
     r.stop.store(true, Ordering::Relaxed);
     node.extra.lock().unwrap().remove(key);
-    launch(node, key, &r.mode, set, r.added, r.paused.load(Ordering::Relaxed))?;
+    launch(node, key, &r.mode, set, r.added, r.paused.load(Ordering::Relaxed), r.share.clone())?;
     save(node);
     Ok(())
 }
@@ -247,6 +263,27 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
     let mut want = cur.clone();
     want.push(index.into());
     let set = normalize(p, &want)?;
+    // Shared storage keeps only part of the blocks, and an index needs every block from its
+    // start: fetch the chain again with the new index built in (our share is dropped again after).
+    if let Some(r) = run.as_ref().filter(|r| r.mode == "shared" && !crate::shares::pruned(node, key).is_empty()) {
+        r.stop.store(true, Ordering::Relaxed);
+        node.extra.lock().unwrap().remove(key);
+        for ix in node.chain.indexers_for(p.chain_no) {
+            node.chain.remove_indexer(p.chain_no, ix);
+        }
+        let reply = json!({"adding": index, "chain": key, "resync": true});
+        let (n, key, r) = (node.clone(), key.to_string(), r.clone());
+        std::thread::spawn(move || {
+            while n.chain.remove_chain_batch(p.chain_no, 20_000).map(|x| x > 0).unwrap_or(false) {}
+            let _ = n.app.store.write(|w| w.del(arcade_app::META, format!("pruned:{key}").as_bytes()).map(|_| ()));
+            let share = json!({"ord": crate::shares::choose_groups(&n, &key, "ord"), "tok": crate::shares::choose_groups(&n, &key, "tok")});
+            match launch(&n, &key, "shared", set, r.added, false, share) {
+                Ok(()) => { save(&n); let _ = n.app.event("chains", &format!("{}: syncing again from the mesh with the new index built in", p.name)); }
+                Err(e) => { let _ = n.app.event("chains", &format!("{}: {e}", p.name)); }
+            }
+        });
+        return Ok(reply);
+    }
     let rebuild_ord = is_rider(index) && cur.iter().any(|i| i == "ord");
     if !rebuild_ord {
         apply_set(node, key, home, run, set)?;
@@ -385,7 +422,19 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         stages.push(json!({"name": label(p, ix), "index": ix, "detail": detail,
                            "pct": if tip < start || !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) }, "at": at, "of": tip}));
     }
-    let overall = stages.iter().map(|s| s["pct"].as_f64().unwrap_or(0.0)).sum::<f64>() / stages.len() as f64;
+    if let Some(r) = run.as_ref().filter(|r| r.mode == "shared") {
+        let note = r.share_note.lock().unwrap().clone();
+        let groups = |v: &Value| match v { Value::Array(a) => format!("{} of 64 groups", a.len()), _ => "all groups".into() };
+        let mut d = if note.is_empty() { "waiting to hear what other arcades hold".to_string() } else { note };
+        if indexes.iter().any(|i| i == "ord") {
+            d.push_str(&format!(" · ord records: {}", groups(&r.share["ord"])));
+        }
+        if indexes.iter().any(|i| i == "tokens") {
+            d.push_str(&format!(" · token ticks: {}", groups(&r.share["tok"])));
+        }
+        stages.push(json!({"name": "Your share", "detail": d, "pct": 100.0, "at": 0, "of": 0, "info": true}));
+    }
+    let overall = stages.iter().filter(|s| s["info"] != true).map(|s| s["pct"].as_f64().unwrap_or(0.0)).sum::<f64>() / stages.iter().filter(|s| s["info"] != true).count().max(1) as f64;
     let state = match &run {
         Some(r) => {
             if r.paused.load(Ordering::Relaxed) {
@@ -416,10 +465,96 @@ pub fn list(node: &Node) -> Value {
 
 /// Follow one installed chain until it is stopped: headers, blocks (each batch one commit,
 /// indexes in the same commit), backfill of any lagging index, then wait for new blocks.
+/// Mesh first: every chain we support except Bitcoin is already on the arcade mesh, and the
+/// existing arcades can take a minute to send their offers. So wait for them (longest on a
+/// fresh install), then bootstrap from the arcade furthest ahead: a V1.0 arcade's blocks
+/// (bk) or an existing arcade's Core node (coreshare). P2P only takes over after that.
+fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
+    let p = run.params;
+    if !node.mesh_bootstrap {
+        return;
+    }
+    let set = |s: String| *run.state.lock().unwrap() = s;
+    let ours = || node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
+    let fresh = ours() == 0;
+    let wait_max = Duration::from_secs(if fresh { 90 } else { 20 });
+    let t0 = std::time::Instant::now();
+    let mut first: Option<std::time::Instant> = None;
+    loop {
+        if run.stop.load(Ordering::Relaxed) || run.paused.load(Ordering::Relaxed) {
+            return;
+        }
+        let n = node.offers_for(p.key).len();
+        if n > 0 && first.is_none() {
+            first = Some(std::time::Instant::now());
+        }
+        // Once an arcade offers it, give the others a little longer to answer too.
+        if first.is_some_and(|f| f.elapsed() > Duration::from_secs(15)) || t0.elapsed() > wait_max {
+            break;
+        }
+        set(format!("asking the arcade mesh for {} ({}s, {} offer{} so far)…", p.name, t0.elapsed().as_secs(), n, if n == 1 { "" } else { "s" }));
+        std::thread::sleep(Duration::from_secs(2));
+    }
+    let offers = node.offers_for(p.key);
+    if offers.is_empty() {
+        let _ = node.app.event("chains", &format!("no arcade on the mesh offers {}; using its P2P network", p.name));
+        return;
+    }
+    for (id, addr, kind, their) in offers {
+        if run.stop.load(Ordering::Relaxed) || their <= ours() + 10 {
+            continue;
+        }
+        let short = &id[..id.len().min(12)];
+        let mut src: Box<dyn arcade_chaindb::sync::BlockSource + '_> = match kind {
+            "bk" => match crate::meshsource::MeshSource::dial_chain(node, &addr, p) {
+                Ok(s) => Box::new(s),
+                Err(e) => { let _ = node.app.event("chains", &format!("{}: arcade {addr}: {e}", p.name)); continue; }
+            },
+            _ => match crate::crsource::CoreShareSource::dial(node, &addr, p) {
+                Ok(s) => Box::new(s),
+                Err(e) => { let _ = node.app.event("chains", &format!("{}: arcade {addr}: {e}", p.name)); continue; }
+            },
+        };
+        let how = if kind == "bk" { "blocks" } else { "Core node" };
+        let _ = node.app.event("chains", &format!("bootstrapping {} from arcade {short} at {addr} ({how}, its tip {their})", p.name));
+        if let Err(e) = syncer.ensure_genesis(src.as_mut()) {
+            let _ = node.app.event("chains", &format!("{}: arcade {addr}: {e}", p.name));
+            continue;
+        }
+        loop {
+            if run.stop.load(Ordering::Relaxed) || run.paused.load(Ordering::Relaxed) {
+                return;
+            }
+            let h = syncer.sync_headers_once(src.as_mut());
+            let b = syncer.sync_blocks(src.as_mut(), 2000, 250);
+            match (h, b) {
+                (Ok(hn), Ok(pr)) => {
+                    run.peer_tip.fetch_max(their as u32, Ordering::Relaxed);
+                    set(format!("bootstrapping from arcade {short} ({how}): {} of {their}", ours()));
+                    if hn == 0 && pr.blocks == 0 {
+                        break;
+                    }
+                }
+                (Err(e), _) | (_, Err(e)) => {
+                    let _ = node.app.event("chains", &format!("{}: arcade {addr} stopped: {e}", p.name));
+                    break;
+                }
+            }
+        }
+        let _ = node.app.event("chains", &format!("{} bootstrap from arcade {short} reached {}", p.name, ours()));
+        if ours() + 10 >= their {
+            break;
+        }
+    }
+}
+
 fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     let p = run.params;
     let syncer = Syncer::new(&node.chain, p);
     let set = |s: String| *run.state.lock().unwrap() = s;
+    mesh_first(&node, &run, &syncer);
+    // The first balancing pass waits until the mesh has told us who holds what.
+    let mut last_balance = std::time::Instant::now() - Duration::from_secs(480);
     'outer: while !run.stop.load(Ordering::Relaxed) {
         if run.paused.load(Ordering::Relaxed) {
             std::thread::sleep(Duration::from_secs(2));
@@ -463,6 +598,13 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
                         continue 'outer;
                     }
                 }
+            }
+            if run.mode == "shared" && last_balance.elapsed() > Duration::from_secs(600) {
+                match crate::shares::balance(&node, p) {
+                    Ok(note) => *run.share_note.lock().unwrap() = note,
+                    Err(e) => *run.share_note.lock().unwrap() = format!("balancing paused: {e}"),
+                }
+                last_balance = std::time::Instant::now();
             }
             let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
             set(if h == 0 && b == 0 { format!("synced at {tip}") } else { format!("syncing {tip}") });

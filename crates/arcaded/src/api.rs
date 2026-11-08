@@ -246,6 +246,7 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             }
         }
         c if c.starts_with("explorer.") => crate::explorer::handle(node, c, &req),
+        "chains.offers" => Ok(json!(node.offers.lock().unwrap().iter().map(|(id, o)| json!({"node": id, "addr": o.addr, "at": o.at, "bk": o.bk, "cr": o.cr})).collect::<Vec<_>>())),
         "chains.list" => Ok(crate::chains::list(node)),
         "chains.sizes" => {
             // Measure now (instead of waiting for the six-hourly pass) and show the result.

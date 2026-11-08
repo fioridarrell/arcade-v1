@@ -300,3 +300,41 @@ fn remove_chain_deletes_only_that_chain() {
     assert_eq!(f.db.tip(f.p.chain_no).unwrap().unwrap().height, 1, "the other chain is untouched");
     assert_eq!(f.db.balance_for_script(f.p.chain_no, &p2pkh(1)).unwrap(), 10);
 }
+
+#[test]
+fn prune_and_restore_a_block_body() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    // A nonstandard output script (stored only in the tx, not inlined) stays spendable.
+    let odd = vec![0x51, 0x52, 0x93, 0x53, 0x87]; // 1 2 ADD 3 EQUAL
+    let cb1 = tx(&[], &[(5000, p2pkh(1)), (700, odd.clone())], 1);
+    let b1 = block(f.g.hash(), vec![cb1.clone()], 2);
+    let cb2 = tx(&[], &[(5000, p2pkh(3))], 2);
+    let b2 = block(b1.hash(), vec![cb2.clone()], 3);
+    f.db.connect_blocks(f.p, &[b1.clone(), b2.clone()]).unwrap();
+    let b = f.db.header(c, &b1.hash()).unwrap().unwrap().b;
+
+    let freed = f.db.prune_block(f.p, b).unwrap();
+    assert!(freed > 0);
+    assert!(f.db.is_block_pruned(c, b).unwrap());
+    assert_eq!(f.db.prune_block(f.p, b).unwrap(), 0, "pruning twice frees nothing");
+    // The body is gone, but txids, coins, scripts and history still answer.
+    assert!(f.db.block_raw(c, &b1.hash()).unwrap().is_none());
+    assert!(f.db.tx_raw(f.p, &cb1.txid).unwrap().is_none());
+    assert_eq!(f.db.tx_location(f.p, &cb1.txid).unwrap(), Some((b, 0)));
+    assert_eq!(f.db.txid_at(f.p, b, 0).unwrap(), Some(cb1.txid));
+    assert_eq!(f.db.coins_for_script(f.p, &p2pkh(1)).unwrap()[0].0.txid, cb1.txid);
+    assert_eq!(f.db.coin(f.p, &OutPoint { txid: cb1.txid, vout: 1 }).unwrap().unwrap().script, odd);
+    assert_eq!(f.db.txids_by_t12(f.p, &cb1.txid.t12()).unwrap(), vec![cb1.txid]);
+    // A later block can still spend the pruned block's coins (scripts were inlined).
+    let spend = tx(&[(cb1.txid, 1), (cb1.txid, 0)], &[(5600, p2pkh(4))], 0);
+    let cb3 = tx(&[], &[(5000, p2pkh(5))], 3);
+    let b3 = block(b2.hash(), vec![cb3, spend], 4);
+    f.db.connect_blocks(f.p, &[b3]).unwrap();
+    assert_eq!(f.db.balance_for_script(c, &p2pkh(4)).unwrap(), 5600);
+    // Restoring checks the header and txids, then rebuilds byte-identically.
+    assert!(f.db.restore_block(f.p, b, &b2).is_err());
+    f.db.restore_block(f.p, b, &b1).unwrap();
+    assert!(!f.db.is_block_pruned(c, b).unwrap());
+    assert_eq!(f.db.block_raw(c, &b1.hash()).unwrap().unwrap(), b1.encode());
+}

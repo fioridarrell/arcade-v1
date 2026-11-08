@@ -166,10 +166,21 @@ pub fn for_chain(node: &Node, key: &str) -> Value {
     let count = |name: &str| reports.iter().filter(|(_, r)| r["groups"][name].as_u64().unwrap_or(0) > 0).count();
     let (headers, blocks, coins) = (g("headers"), g("blocks"), g("coins"));
     let sum = |xs: &[Option<u64>]| xs.iter().all(|x| x.is_some()).then(|| xs.iter().map(|x| x.unwrap()).sum::<u64>());
+    // Shared storage: our part of the blocks, ord records and token ticks, with this arcade
+    // joining the ones already sharing the chain.
+    let sharing = crate::shares::members(node, key).len().max(1);
+    let frac = (crate::shares::copies() as f64 / sharing as f64).min(1.0);
+    let part = |b: u64, f: f64| (b as f64 * f) as u64;
     let mut ix = Map::new();
     for name in ["ledger", "profiles", "ord", "names", "maps", "tokens"] {
         if let Some(b) = g(name) {
-            ix.insert(name.into(), json!({"bytes": b, "reports": count(name)}));
+            // Ord keeps its whole location map (about 40% of it); token ticks split fully.
+            let shared = match name {
+                "ord" => part(b, 0.4 + 0.6 * frac),
+                "tokens" => part(b, frac),
+                _ => b,
+            };
+            ix.insert(name.into(), json!({"bytes": b, "shared_bytes": shared, "reports": count(name)}));
         }
     }
     json!({
@@ -180,7 +191,10 @@ pub fn for_chain(node: &Node, key: &str) -> Value {
             "chain": sum(&[headers, blocks, coins]),
             "index": sum(&[headers, coins]),
             "full": sum(&[headers, blocks, coins]),
+            "shared": sum(&[headers, coins, blocks.map(|b| part(b, frac))]),
         },
+        "sharing": sharing,
+        "copies": crate::shares::copies(),
         "indexes": ix,
     })
 }

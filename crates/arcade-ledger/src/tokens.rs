@@ -156,7 +156,21 @@ fn set_bal(l: &Logged, c: u16, owner: &str, tick: &str, o: u128, t: u128) -> Res
     l.put(HOLDER, &k2, v.as_bytes())
 }
 
-pub struct TokensHook;
+pub struct TokensHook {
+    /// Shared storage: only ticks in these groups (sha256(tick)[0] % 64); None = all.
+    pub groups: Option<Vec<u8>>,
+}
+
+pub fn tick_group(tick: &str) -> u8 {
+    use sha2::Digest;
+    sha2::Sha256::digest(tick.to_lowercase().as_bytes())[0] % 64
+}
+
+fn op_tick(op: &Op) -> &str {
+    match op {
+        Op::Deploy { tick, .. } | Op::Mint { tick, .. } | Op::Transfer { tick, .. } => tick,
+    }
+}
 
 impl TokensHook {
     fn apply(&self, l: &Logged, c: u16, b: &Born, owner: &str, op: Op) -> Result<()> {
@@ -237,8 +251,8 @@ impl OrdHook for TokensHook {
         }
         let (proto, brc) = protocol(b.params);
         match token_op(proto, brc, b.ctype, b.body) {
-            Some(op) => self.apply(l, c, b, owner, op),
-            None => Ok(()),
+            Some(op) if self.groups.as_ref().is_none_or(|g| g.contains(&tick_group(op_tick(&op)))) => self.apply(l, c, b, owner, op),
+            _ => Ok(()),
         }
     }
     fn moved(&self, l: &Logged, c: u16, m: &Moved) -> Result<()> {

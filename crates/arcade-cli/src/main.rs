@@ -23,6 +23,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade chain add <key> [--mode full|chain] [--with ledger,profiles,ord,names,maps,tokens]
                      every index is opt-in; names, maps and tokens ride on ord
   arcade chain status <key>                 staged progress (headers, blocks, coins, indexes)
+  arcade chain offers                       which arcades on the mesh offer which chains
   arcade chain sizes                        measure this arcade's chains now; sizes other arcades report
   arcade chain pause|resume|remove <key>
   arcade chain index add|remove <key> <index>
@@ -250,6 +251,7 @@ fn main() {
         ["tokens", a] => json!({"cmd": "tokens", "owner": a}),
         ["chain", "list"] | ["chains"] => json!({"cmd": "chains.list"}),
         ["chain", "sizes"] => json!({"cmd": "chains.sizes"}),
+        ["chain", "offers"] => json!({"cmd": "chains.offers"}),
         ["chain", "status", k] => json!({"cmd": "chains.status", "key": k}),
         ["chain", "pause", k] => json!({"cmd": "chains.pause", "key": k}),
         ["chain", "resume", k] => json!({"cmd": "chains.resume", "key": k}),

@@ -100,8 +100,27 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
         "explorer.inscription" => {
             x.need("ord")?;
             let id = s("id").ok_or("give an inscription id or number")?;
-            let mut v = ord::inscription(&x.node.chain, x.p, id.trim_start_matches('#')).ok_or_else(|| format!("no inscription {id}"))?;
-            v["content"] = content(&x, v["id"].as_str().unwrap_or(""), 4 << 20);
+            let q = id.trim_start_matches('#');
+            let mut v = match ord::inscription(&x.node.chain, x.p, q) {
+                Some(v) => {
+                    let mut v = v;
+                    v["content"] = content(&x, v["id"].as_str().unwrap_or(""), 4 << 20);
+                    v
+                }
+                None => {
+                    // Shared storage: its record lives with the arcades holding its group.
+                    let number = match q.parse::<u64>() {
+                        Ok(n) => Some(n),
+                        Err(_) => ord::parse_iid(q).or_else(|| (q.len() == 64).then(|| Hash256::from_hex(q).ok().map(|h| ord::iid_bytes(&h, 0))).flatten())
+                            .and_then(|b| ord::number_of(&x.node.chain, x.c(), &b)),
+                    };
+                    let number = number.ok_or_else(|| format!("no inscription {id}"))?;
+                    let (mut v, from) = crate::shares::ask_holders(x.node, x.p, "ord", number % ord::GROUPS, "insc", q)?;
+                    v["content"] = content_of(&x, q, Some(&v), 4 << 20);
+                    v["from_arcade"] = json!(from);
+                    v
+                }
+            };
             if let Some(o) = v["owner"].as_str() {
                 v["owner_tag"] = json!(tag_of(&x, o));
             }
@@ -119,7 +138,14 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
         "explorer.token" => {
             x.need("tokens")?;
             let t = s("tick").ok_or("give a tick")?.to_lowercase();
-            let mut v = tokens::tick(&x.node.chain, x.c(), &t).ok_or_else(|| format!("no token {t}"))?;
+            let local = tokens::tick(&x.node.chain, x.c(), &t);
+            let held = x.node.extra.lock().unwrap().get(x.p.key).and_then(|r| crate::shares::groups_of(&r.share["tok"]));
+            if local.is_none() && held.as_ref().is_some_and(|g| !g.contains(&tokens::tick_group(&t))) {
+                let (mut v, from) = crate::shares::ask_holders(x.node, x.p, "tok", tokens::tick_group(&t) as u64, "tick", &t)?;
+                v["from_arcade"] = json!(from);
+                return Ok(v);
+            }
+            let mut v = local.ok_or_else(|| format!("no token {t}"))?;
             let pre = KeyBuf::new().u16(x.c()).var(t.as_bytes()).done();
             let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::HOLDER, &pre, 5000)).map_err(e)?;
             let more = rows.len() >= 5000;
@@ -224,7 +250,19 @@ fn blocks(x: &Ctx, before: u32, n: u32) -> Vec<Value> {
 
 /// Text or image preview of an inscription's content (empty for other types).
 fn content(x: &Ctx, id: &str, cap: usize) -> Value {
-    match ord::content(&x.node.chain, x.p, id) {
+    content_of(x, id, None, cap)
+}
+
+/// Content preview from a record (ours, or another arcade's on Shared storage).
+fn content_of(x: &Ctx, id: &str, meta: Option<&Value>, cap: usize) -> Value {
+    let got = match meta {
+        None => ord::content(&x.node.chain, x.p, id).or_else(|_| match ord::inscription(&x.node.chain, x.p, id) {
+            Some(m) => ord::body_of(x.p, &m, &|h| tx_any(x, h).map(|t| t.0)).map(|b| (m["ct"].as_str().unwrap_or("").to_string(), b)),
+            None => Err("no such inscription".into()),
+        }),
+        Some(m) => ord::body_of(x.p, m, &|h| tx_any(x, h).map(|t| t.0)).map(|b| (m["ct"].as_str().unwrap_or("").to_string(), b)),
+    };
+    match got {
         Ok((ct, bytes)) => {
             let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
             let text = base.starts_with("text/") || base == "application/json";
@@ -301,9 +339,24 @@ fn summary(x: &Ctx) -> R {
     Ok(v)
 }
 
+/// A block: stored here, or (Shared storage) fetched from an arcade holding it and checked
+/// against our header.
 fn parse_block(x: &Ctx, hash: &Hash256) -> Result<Block, String> {
-    let raw = x.node.chain.block_raw(x.c(), hash).map_err(e)?.ok_or("block not stored here")?;
-    Block::parse_with(&raw, &x.p.format).map_err(e)
+    match x.node.chain.block_raw(x.c(), hash).map_err(e)? {
+        Some(raw) => Block::parse_with(&raw, &x.p.format).map_err(e),
+        None => crate::shares::fetch_blocks(x.node, x.p, &[*hash])?.pop().ok_or_else(|| "block not available".into()),
+    }
+}
+
+/// A transaction: stored here, or from its (fetched) block when this arcade doesn't hold it.
+fn tx_any(x: &Ctx, txid: &Hash256) -> Option<(Tx, Option<u32>)> {
+    if let Ok(Some((raw, b))) = x.node.chain.tx_raw(x.p, txid) {
+        return Some((Tx::parse_with(&raw, &x.p.format).ok()?, x.node.chain.block_at(x.p, b).ok().flatten().map(|b| b.1)));
+    }
+    let (b, pos) = x.node.chain.tx_location(x.p, txid).ok()??;
+    let (hdr, height, _) = x.node.chain.block_at(x.p, b).ok()??;
+    let blk = crate::shares::fetch_blocks(x.node, x.p, &[x.p.block_id(&hdr)]).ok()?.pop()?;
+    Some((blk.txs.get(pos as usize)?.clone(), Some(height)))
 }
 
 fn block(x: &Ctx, id: &str) -> R {
@@ -347,8 +400,8 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
 fn tx(x: &Ctx, id: &str) -> R {
     let c = x.c();
     let txid = Hash256::from_hex(id.trim()).map_err(|_| format!("{id} is not a txid"))?;
-    let (t, height) = match x.node.chain.tx_raw(x.p, &txid).map_err(e)? {
-        Some((raw, b)) => (Tx::parse_with(&raw, &x.p.format).map_err(e)?, x.node.chain.block_at(x.p, b).ok().flatten().map(|b| b.1)),
+    let (t, height) = match tx_any(x, &txid) {
+        Some(found) => found,
         None => {
             let pool = x.node.chain.mempool(c).map_err(e)?;
             let t = pool.iter().filter_map(|(_, raw)| Tx::parse_with(raw, &x.p.format).ok()).find(|t| t.txid == txid).ok_or_else(|| format!("no transaction {id} on {}", x.p.name))?;
@@ -360,7 +413,7 @@ fn tx(x: &Ctx, id: &str) -> R {
         if t.is_coinbase() {
             return json!({"coinbase": true});
         }
-        let prev = x.node.chain.tx_raw(x.p, &i.prevout.txid).ok().flatten().and_then(|(raw, _)| Tx::parse_with(&raw, &x.p.format).ok());
+        let prev = tx_any(x, &i.prevout.txid).map(|t| t.0);
         let o = prev.as_ref().and_then(|p| p.outputs.get(i.prevout.vout as usize));
         total_in += o.map(|o| o.value).unwrap_or(0);
         let a = o.and_then(|o| address::address_of(&o.script_pubkey, x.p));

@@ -30,7 +30,10 @@ pub const AT: &str = "ord.v1.at";
 pub const LOC: &str = "ord.v1.loc";
 pub const BLOCK: &str = "ord.v1.block";
 pub const STATE: &str = "ord.v1.state";
-pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE];
+/// Every inscription id -> its number (all groups, also on Shared storage).
+pub const IDS: &str = "ord.v1.ids";
+pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE, IDS];
+pub const GROUPS: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Dialect {
@@ -312,6 +315,8 @@ pub const RIDERS: &[&str] = &["names", "maps", "tokens"];
 
 pub struct OrdIndexer {
     pub hooks: Vec<Box<dyn OrdHook>>,
+    /// Shared storage: keep full records only for numbers in these groups (number % 64).
+    pub groups: Option<Vec<u8>>,
 }
 
 impl OrdIndexer {
@@ -322,11 +327,30 @@ impl OrdIndexer {
             match *r {
                 "names" => hooks.push(Box::new(crate::names::NamesHook)),
                 "maps" => hooks.push(Box::new(crate::maps::MapsHook)),
-                "tokens" => hooks.push(Box::new(crate::tokens::TokensHook)),
+                "tokens" => hooks.push(Box::new(crate::tokens::TokensHook { groups: None })),
                 _ => {}
             }
         }
-        OrdIndexer { hooks }
+        OrdIndexer { hooks, groups: None }
+    }
+
+    /// Shared storage: ord records for `ord_groups` and token ticks in `tok_groups` only
+    /// (None = all). The location map is always whole.
+    pub fn shared(riders: &[&str], ord_groups: Option<Vec<u8>>, tok_groups: Option<Vec<u8>>) -> OrdIndexer {
+        let mut ix = OrdIndexer::new(riders);
+        ix.groups = ord_groups;
+        if let Some(g) = tok_groups {
+            for h in ix.hooks.iter_mut() {
+                if h.name() == "tokens" {
+                    *h = Box::new(crate::tokens::TokensHook { groups: Some(g.clone()) });
+                }
+            }
+        }
+        ix
+    }
+
+    fn keeps(&self, number: u64) -> bool {
+        self.groups.as_ref().is_none_or(|g| g.contains(&((number % GROUPS) as u8)))
     }
     pub fn tables_named(&self) -> Vec<String> {
         self.tables().into_iter().map(|t| t.name.to_string()).collect()
@@ -442,7 +466,7 @@ impl Indexer for OrdIndexer {
             let mut birth: Option<([u8; 36], Complete)> = None;
             if let Some(cm) = done {
                 let iid = iid_bytes(&cm.p.origin, 0);
-                if l.get(INSC, &k(c, &iid))?.is_none() {
+                if l.get(IDS, &k(c, &iid))?.is_none() {
                     birth = Some((iid, cm));
                 }
             }
@@ -481,7 +505,7 @@ impl Indexer for OrdIndexer {
                     for (key, v) in &cm.tags {
                         if key.as_slice() == b"parent" {
                             if let Some(pid) = id_from_tag(v).and_then(|s| parse_iid(&s)) {
-                                if carried.iter().any(|x| x.1 == pid) && !parents.contains(&pid) && l.get(INSC, &k(c, &pid))?.is_some() {
+                                if carried.iter().any(|x| x.1 == pid) && !parents.contains(&pid) && l.get(IDS, &k(c, &pid))?.is_some() {
                                     parents.push(pid);
                                 }
                             }
@@ -559,8 +583,11 @@ impl Indexer for OrdIndexer {
                 if !all.iter().any(|x| x.1 == iid && x.0 < e) {
                     row["burned"] = json!(ctx.height);
                 }
-                l.put(INSC, &k(c, &iid), row.to_string().as_bytes())?;
-                l.put(NUM, &KeyBuf::new().u16(c).u64(number).done(), &iid)?;
+                l.put(IDS, &k(c, &iid), &number.to_be_bytes())?;
+                if self.keeps(number) {
+                    l.put(INSC, &k(c, &iid), row.to_string().as_bytes())?;
+                    l.put(NUM, &KeyBuf::new().u16(c).u64(number).done(), &iid)?;
+                }
                 for h in &self.hooks {
                     h.born(l, c, &Born { params: p, iid: &iid, number, height: ctx.height, ctype: &ct, body: &cm.p.body,
                                          pieces: cm.p.pieces, txid: &txid, landed: landed.clone(), reinscription: row.get("re").is_some() })?;
@@ -625,24 +652,31 @@ pub fn content(db: &ChainDb, p: &ChainParams, id: &str) -> std::result::Result<(
 
 fn content_depth(db: &ChainDb, p: &ChainParams, id: &str, depth: u32) -> std::result::Result<(String, Vec<u8>), String> {
     let meta = inscription(db, p, id).ok_or("no such inscription")?;
-    let d = dialect(p);
-    let mut body = Vec::new();
-    let mut left = 0u64;
-    for (i, t) in meta["txs"].as_array().cloned().unwrap_or_default().iter().enumerate() {
-        let h = Hash256::from_hex(t.as_str().unwrap_or("")).map_err(|e| e.to_string())?;
-        let (raw, _) = db.tx_raw(p, &h).map_err(|e| e.to_string())?.ok_or("piece transaction not stored")?;
-        let tx = Tx::parse_with(&raw, &p.format).map_err(|e| e.to_string())?;
-        let s = &tx.inputs.first().ok_or("no inputs")?.script_sig;
-        let r = if i == 0 { start(s, d).map(|x| x.2) } else { more(s, left, d) }.ok_or("piece unreadable")?;
-        body.extend_from_slice(&r.body);
-        left = r.left;
-    }
+    let local = |h: &Hash256| db.tx_raw(p, h).ok().flatten().and_then(|(raw, _)| Tx::parse_with(&raw, &p.format).ok());
+    let body = body_of(p, &meta, &local)?;
     if body.is_empty() && depth < 4 {
         if let Some(dl) = meta["delegate"].as_str() {
             return content_depth(db, p, dl, depth + 1);
         }
     }
     Ok((meta["ct"].as_str().unwrap_or("").to_string(), body))
+}
+
+/// An inscription's bytes from its record's piece txids, reading each tx with `get_tx`
+/// (local, or fetched from another arcade on Shared storage).
+pub fn body_of(p: &ChainParams, meta: &Value, get_tx: &dyn Fn(&Hash256) -> Option<Tx>) -> std::result::Result<Vec<u8>, String> {
+    let d = dialect(p);
+    let mut body = Vec::new();
+    let mut left = 0u64;
+    for (i, t) in meta["txs"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+        let h = Hash256::from_hex(t.as_str().unwrap_or("")).map_err(|e| e.to_string())?;
+        let tx = get_tx(&h).ok_or("piece transaction not available")?;
+        let s = &tx.inputs.first().ok_or("no inputs")?.script_sig;
+        let r = if i == 0 { start(s, d).map(|x| x.2) } else { more(s, left, d) }.ok_or("piece unreadable")?;
+        body.extend_from_slice(&r.body);
+        left = r.left;
+    }
+    Ok(body)
 }
 
 /// dx chunk hash and births of chunk `n` (None until all 100 blocks are indexed).
@@ -656,6 +690,12 @@ pub fn chunk(db: &ChainDb, p: &ChainParams, n: u32) -> Option<(String, u32)> {
         births += u32::from_be_bytes(v[64..68].try_into().ok()?);
     }
     Some((hex::encode(Sha256::digest(cat.as_bytes())), births))
+}
+
+/// An inscription's number, whether or not its record is held here.
+pub fn number_of(db: &ChainDb, c: u16, iid: &[u8; 36]) -> Option<u64> {
+    let v = db.store.read(|r| r.get(IDS, &k(c, iid))).ok()??;
+    Some(u64::from_be_bytes(v[..8].try_into().ok()?))
 }
 
 pub fn count(db: &ChainDb, c: u16) -> u64 {

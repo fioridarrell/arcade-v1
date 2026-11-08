@@ -18,9 +18,14 @@ pub struct MeshSource {
 
 impl MeshSource {
     pub fn dial(node: &crate::node::Node, addr: &str) -> Result<MeshSource, String> {
+        Self::dial_chain(node, addr, node.params)
+    }
+
+    /// A V1.0 arcade's blocks of any chain.
+    pub fn dial_chain(node: &crate::node::Node, addr: &str, p: &'static arcade_chain::params::ChainParams) -> Result<MeshSource, String> {
         let mut link = Link::dial(addr, crate::meshsvc::NET, &node.identity, node.mesh_port).map_err(|e| e.to_string())?;
         link.set_read_timeout(Duration::from_secs(60)).map_err(|e| e.to_string())?;
-        Ok(MeshSource { link, addr: addr.into(), net: node.params.key, format: node.params.format, next_id: 1 })
+        Ok(MeshSource { link, addr: addr.into(), net: p.key, format: p.format, next_id: 1 })
     }
 
     fn ask(&mut self, mut head: serde_json::Value) -> Result<Vec<u8>, String> {

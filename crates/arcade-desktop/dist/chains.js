@@ -10,6 +10,7 @@
   const COLORS = { test: "#2e8b44", main: "#3f9c55", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a" };
   const MODES = [
     ["full", "Full", "Blocks, every address, and your chosen indexes. Serves the mesh.", true],
+    ["shared", "Shared", "Every address and balance, plus your share of the blocks, ord records and token ticks; the rest is held by other arcades and fetched when needed.", true],
     ["chain", "Blockchain only", "Blocks and every address and balance. No protocol indexes.", true],
     ["index", "Index only", "Coming: chosen indexes, blocks borrowed from the mesh.", false],
     ["light", "Light", "Coming: headers only; everything else borrowed.", false],
@@ -69,11 +70,14 @@
     const b = z.modes?.[k];
     if (b == null) return "Size: no arcade has reported this chain yet.";
     const at = z.height ? ` at block ${z.height.toLocaleString()}` : "";
-    return `About ${size(b)}${k === "full" || k === "index" ? " plus the indexes you pick" : ""} · reported by ${who(z.reports)}${at}`;
+    const shareNote = k === "shared" ? ` · ${z.sharing} arcade${z.sharing === 1 ? "" : "s"} would share it, each block range kept by ${z.copies}` : "";
+    return `About ${size(b)}${k === "full" || k === "index" || k === "shared" ? " plus the indexes you pick" : ""} · reported by ${who(z.reports)}${at}${shareNote}`;
   }
   function ixSize(c, k) {
     const x = c.sizes?.indexes?.[k];
-    return x ? `+ ${size(x.bytes)} · ${who(x.reports)}` : "size not reported yet";
+    if (!x) return "size not reported yet";
+    const b = mode === "shared" && x.shared_bytes != null ? x.shared_bytes : x.bytes;
+    return `+ ${size(b)}${mode === "shared" && b !== x.bytes ? " (your share)" : ""} · ${who(x.reports)}`;
   }
   function total(c) {
     const base = c.sizes?.modes?.[mode];
@@ -81,7 +85,7 @@
     let sum = base, unknown = [];
     for (const i of $("c-idx").querySelectorAll("input:checked")) {
       const x = c.sizes?.indexes?.[i.dataset.k];
-      if (x) sum += x.bytes; else unknown.push(i.dataset.k);
+      if (x) sum += mode === "shared" && x.shared_bytes != null ? x.shared_bytes : x.bytes; else unknown.push(i.dataset.k);
     }
     return `This install: about ${size(sum)}${unknown.length ? ` plus ${unknown.join(", ")} (not reported yet)` : ""}. Chains grow, so leave room.`;
   }

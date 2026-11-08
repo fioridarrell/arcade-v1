@@ -9,6 +9,7 @@ mod chainsvc;
 mod chains;
 mod claims;
 mod coreshare;
+mod crsource;
 mod explorer;
 mod faucet;
 mod http;
@@ -19,6 +20,7 @@ mod meshsvc;
 mod node;
 mod rpc;
 mod sizes;
+mod shares;
 
 use node::Node;
 use std::sync::{Arc, Mutex};
@@ -84,6 +86,8 @@ fn main() {
         extra: Mutex::new(Default::default()),
         coin_peers: Mutex::new(Default::default()),
         dialing: Mutex::new(Default::default()),
+        offers: Mutex::new(Default::default()),
+        holds: Mutex::new(Default::default()),
         my_sizes: Mutex::new(Default::default()),
         mesh_sizes: Mutex::new(Default::default()),
     });

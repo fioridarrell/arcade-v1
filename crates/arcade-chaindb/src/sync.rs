@@ -236,13 +236,33 @@ impl<'a> Syncer<'a> {
         let mut height = fork;
         for chunk in path.chunks(batch.max(1)) {
             let raws = peer.get_blocks(chunk).map_err(SyncError::Source)?;
-            let mut by_hash: HashMap<Hash256, Block> = HashMap::new();
-            for raw in raws {
-                let b = Block::parse_with(&raw, &self.params.format)
-                    .map_err(|e| SyncError::BadBlock { hash: Hash256::ZERO, why: e.to_string() })?;
-                if b.encode() != raw {
+            // Parsing and the per-block checks don't depend on each other: spread them over
+            // the cores (the database writes after stay in order, on this thread).
+            let format = &self.params.format;
+            let (db, params) = (self.db, self.params);
+            let first_height = height + 1;
+            let one = |(i, raw): (usize, &Vec<u8>)| -> std::result::Result<Block, SyncError> {
+                let b = Block::parse_with(raw, format).map_err(|e| SyncError::BadBlock { hash: Hash256::ZERO, why: e.to_string() })?;
+                if b.encode() != *raw {
                     return Err(SyncError::BadBlock { hash: b.hash(), why: "does not rebuild byte-identically".into() });
                 }
+                b.check().map_err(|e| SyncError::BadBlock { hash: b.hash(), why: e.to_string() })?;
+                db.warm(params, &b, first_height + i as u32);
+                Ok(b)
+            };
+            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+            let parsed: Vec<std::result::Result<Block, SyncError>> = if raws.len() < 32 || threads == 1 {
+                raws.iter().enumerate().map(one).collect()
+            } else {
+                let per = raws.len().div_ceil(threads);
+                std::thread::scope(|sc| {
+                    let hs: Vec<_> = raws.chunks(per).enumerate().map(|(n, part)| sc.spawn(move || part.iter().enumerate().map(|(i, r)| one((n * per + i, r))).collect::<Vec<_>>())).collect();
+                    hs.into_iter().flat_map(|h| h.join().expect("block check thread")).collect()
+                })
+            };
+            let mut by_hash: HashMap<Hash256, Block> = HashMap::new();
+            for b in parsed {
+                let b = b?;
                 by_hash.insert(b.hash(), b);
             }
             let mut blocks = Vec::with_capacity(chunk.len());
@@ -251,7 +271,6 @@ impl<'a> Syncer<'a> {
                 let b = by_hash
                     .remove(h)
                     .ok_or_else(|| SyncError::BadBlock { hash: *h, why: "peer did not send it".into() })?;
-                b.check().map_err(|e| SyncError::BadBlock { hash: *h, why: e.to_string() })?;
                 if let Some(rec) = self.db.header(c, h)? {
                     let parent = self.db.header(c, &rec.header.prev)?.expect("parent stored");
                     if let Ok(PowCheck::NeedsBlock) = check_header(self.params, &b.header, &parent.header, height) {
@@ -261,7 +280,7 @@ impl<'a> Syncer<'a> {
                 }
                 blocks.push(b);
             }
-            self.db.connect_blocks(self.params, &blocks)?;
+            self.db.connect_blocks_checked(self.params, &blocks)?;
             prog.blocks += blocks.len() as u32;
             // Drop what we connected from the cached path.
             let mut cached = self.path.borrow_mut();

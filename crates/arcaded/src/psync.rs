@@ -25,8 +25,12 @@ use std::time::{Duration, Instant};
 const JOB: u32 = 250;
 /// P2P peers kept working at once (the coin's network is the other side of "mesh + P2P").
 const P2P_WANT: usize = 6;
-/// How far ahead of the connected tip hashes are fetched (bounds memory).
-const AHEAD: u32 = 12_000;
+/// How far ahead of the connected tip hashes are fetched: at most this many blocks, and no
+/// more than READY_BYTES of finished blocks waiting (old blocks are tiny, new ones are not).
+const AHEAD: u32 = 100_000;
+const READY_BYTES: usize = 384 << 20;
+/// An idle source also fetches the oldest job still in flight once it is this old.
+const STEAL_AFTER: Duration = Duration::from_millis(1500);
 
 struct Job {
     start: u32,
@@ -39,6 +43,8 @@ struct State {
     queue: VecDeque<Job>,
     /// Finished jobs by start height: (raw blocks, source name).
     ready: BTreeMap<u32, (Vec<Vec<u8>>, String)>,
+    /// Bytes in `ready`.
+    ready_bytes: usize,
     /// Next height the feeder will cut a job for.
     next: u32,
     /// The connector's next expected height.
@@ -98,6 +104,7 @@ impl Prefetched<'_> {
         loop {
             let want = st.want;
             if let Some((raws, _src)) = st.ready.remove(&want) {
+                st.ready_bytes -= raws.iter().map(|r| r.len()).sum::<usize>();
                 st.want = want + raws.len() as u32;
                 self.pool.cv.notify_all();
                 drop(st);
@@ -170,7 +177,17 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) 
                     return;
                 }
                 // Don't run too far ahead of the connector (memory).
-                let ahead_ok = st.queue.front().is_some_and(|j| j.start < st.want + AHEAD);
+                let ahead_ok = st.queue.front().is_some_and(|j| j.start < st.want + AHEAD && st.ready_bytes < READY_BYTES);
+                // First help with the oldest jobs still in flight: the connector waits on them
+                // while later ones pile up done (first copy wins).
+                let want = st.want;
+                let steal = st.inflight.iter_mut().filter(|(s, _)| **s >= want).take(2).find(|(_, (_, since, doubled))| !*doubled && since.elapsed() > STEAL_AFTER).map(|(s, (h, _, d))| {
+                    *d = true;
+                    Job { start: *s, hashes: h.clone(), tries: 0 }
+                });
+                if let Some(j) = steal {
+                    break j;
+                }
                 if ahead_ok {
                     let j = st.queue.pop_front().unwrap();
                     // A doubled job that another source already delivered: skip it.
@@ -196,6 +213,7 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) 
                 // First copy wins; a late duplicate is dropped.
                 if job.start >= st.want && !st.ready.contains_key(&job.start) {
                     *st.stats.entry(name.clone()).or_insert(0) += raws.len() as u64;
+                    st.ready_bytes += raws.iter().map(|r| r.len()).sum::<usize>();
                     st.ready.insert(job.start, (raws, name.clone()));
                 }
                 pool.cv.notify_all();
@@ -227,14 +245,14 @@ fn feeder(node: &Node, pool: &Pool, mut hs: HashSource, mut last: Hash256) {
     let mut bad = 0;
     let mut tried: Vec<String> = Vec::new();
     while !pool.stop.load(Ordering::Relaxed) {
-        let (next, want) = {
+        let (next, want, full) = {
             let st = pool.s.lock().unwrap();
-            (st.next, st.want)
+            (st.next, st.want, st.ready_bytes >= READY_BYTES)
         };
         if next > pool.top {
             return;
         }
-        if next >= want + AHEAD {
+        if next >= want + AHEAD || full {
             std::thread::sleep(Duration::from_millis(200));
             continue;
         }
@@ -394,7 +412,7 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
                 break Err(e.to_string());
             }
             let t1 = Instant::now();
-            if let Err(e) = syncer.sync_blocks(&mut pre, 5000, 500) {
+            if let Err(e) = syncer.sync_blocks(&mut pre, 5000, 1000) {
                 break Err(e.to_string());
             }
             waited += t1 - t0;

@@ -918,12 +918,52 @@ impl ChainDb {
     /// Connect blocks on top of the tip, in one transaction (all or none).
     /// The first block's parent must be the current tip (or there is no tip: genesis).
     pub fn connect_blocks(&self, params: &ChainParams, blocks: &[Block]) -> Result<Tip> {
+        self.connect_blocks_with(params, blocks, true)
+    }
+
+    /// As connect_blocks, for blocks whose `check()` the caller already ran (the syncer does
+    /// it on several cores before connecting).
+    pub fn connect_blocks_checked(&self, params: &ChainParams, blocks: &[Block]) -> Result<Tip> {
+        self.connect_blocks_with(params, blocks, false)
+    }
+
+    /// Touch, read-only, every database page connecting `blk` at `height` will read or write
+    /// (its coins being spent, the address rows and the txid slots). Run from several threads
+    /// before the write, so a database bigger than memory faults pages in parallel instead of
+    /// one at a time inside the single writer. Misses (coins made in the same batch) are fine.
+    pub fn warm(&self, params: &ChainParams, blk: &Block, height: u32) {
+        let c = params.chain_no;
+        let _ = self.store.read(|r| {
+            for tx in &blk.txs {
+                let t12 = tx.txid.t12();
+                let _ = r.scan(TXS, &k_txs(c, &t12));
+                if !tx.is_coinbase() {
+                    for inp in &tx.inputs {
+                        let Ok(Some((pb, pp))) = locate(r, params, &inp.prevout.txid) else { continue };
+                        let Ok(Some(coin)) = coin_at(r, params, pb, pp, inp.prevout.vout) else { continue };
+                        let sid = script_id(&coin.script);
+                        let _ = r.get(BY_SCRIPT, &k_by_script(c, &sid, pb, pp, inp.prevout.vout));
+                        let _ = r.get(SPENDS, &k_pos(c, pb, pp, inp.prevout.vout));
+                        let _ = r.get(SCRIPT_HIST, &k_hist(c, &sid, height, &t12));
+                    }
+                }
+                for out in &tx.outputs {
+                    let sid = script_id(&out.script_pubkey);
+                    let _ = r.get(BY_SCRIPT, &k_by_script(c, &sid, 0, 0, 0));
+                    let _ = r.get(SCRIPT_HIST, &k_hist(c, &sid, height, &t12));
+                }
+            }
+            Ok(())
+        });
+    }
+
+    fn connect_blocks_with(&self, params: &ChainParams, blocks: &[Block], check: bool) -> Result<Tip> {
         let c = params.chain_no;
         let ixs: Vec<Arc<dyn Indexer>> = self.indexers.read().unwrap().iter().filter(|(ch, _)| *ch == c).map(|(_, i)| i.clone()).collect();
         self.store.write(|w| {
             let mut tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v));
             for b in blocks {
-                tip = Some(connect_one(w, params, b, tip, &ixs)?);
+                tip = Some(connect_one(w, params, b, tip, &ixs, check)?);
             }
             tip.ok_or_else(|| other("nothing connected"))
         })
@@ -984,7 +1024,7 @@ fn block_raw_at<R: Rd>(r: &R, c: u16, b: u32) -> Result<Vec<u8>> {
     Ok(o)
 }
 
-fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>, ixs: &[Arc<dyn Indexer>]) -> Result<Tip> {
+fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>, ixs: &[Arc<dyn Indexer>], check: bool) -> Result<Tip> {
     let c = params.chain_no;
     let hash = blk.hash();
     let height = match tip {
@@ -1001,7 +1041,9 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
             0
         }
     };
-    blk.check().map_err(other)?;
+    if check {
+        blk.check().map_err(other)?;
+    }
 
     // The block's bytes: stored once, kept even if later disconnected (forks included).
     let mut hrec = match header_rec(w, c, &hash)? {

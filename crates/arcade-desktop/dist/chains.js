@@ -53,7 +53,7 @@
       const pct = Math.floor(c.overall || 0);
       st.textContent = c.home ? `Home chain · ${c.mode} · ${(c.indexes || []).join(", ")}` : `${pct}% · ${c.state} · ${c.mode}`;
       if (!c.home && pct < 100) { const b = el.querySelector(".bar"); b.hidden = false; b.querySelector("i").style.width = pct + "%"; }
-      const b = document.createElement("button"); b.textContent = "Manage…"; b.onclick = () => { manage(c.key); reveal(); }; el.append(b);
+      const b = document.createElement("button"); b.textContent = c.home ? "Manage indexes…" : "Manage…"; b.onclick = () => { manage(c.key); reveal(); }; el.append(b);
     } else {
       st.textContent = "Not installed";
       const b = document.createElement("button"); b.textContent = "Install…"; b.onclick = () => { choose(c); reveal(); }; el.append(b);
@@ -179,25 +179,34 @@
       }
       return li;
     }));
-    // Add an index the chain doesn't have yet (opt-in, one at a time).
+    // Indexes the chain doesn't have yet: a clear list at the top of the panel (opt-in, one at a time).
     let add = document.getElementById("c-addix");
-    if (!add) { add = document.createElement("div"); add.id = "c-addix"; add.className = "addix"; $("c-stages").after(add); }
+    if (!add) { add = document.createElement("div"); add.id = "c-addix"; add.className = "addix"; $("c-stages").before(add); }
     const info = chains.find((x) => x.key === st.key) || {};
     const have = st.indexes || [];
-    const can = st.mode === "full" || st.mode === "shared" ? INDEXES.filter(([k, , , ok, needs]) => ok && !have.includes(k) && (needs !== "ord" || info.ord) && (k !== "tokens" || info.tokens)) : [];
-    add.replaceChildren(...(can.length ? [Object.assign(document.createElement("span"), { textContent: "Add an index: " })] : []),
-      ...can.map(([k, t]) => {
-        const b = document.createElement("button"); b.className = "small";
+    const can = st.mode === "full" || st.mode === "shared"
+      ? INDEXES.filter(([k, , , ok, needs]) => ok && !have.includes(k) && (needs !== "ord" || info.ord) && (k !== "tokens" || info.tokens)
+          && (needs !== "runes" || info.runes) && (needs !== "dunes" || info.dunes)) : [];
+    add.replaceChildren(...(can.length ? [Object.assign(document.createElement("h3"), { textContent: `Indexes you can add to ${st.name}` })] : []),
+      ...can.map(([k, t, d]) => {
+        const row = document.createElement("div"); row.className = "addrow";
         const xs = info.sizes?.indexes?.[k];
-        b.textContent = (k === "tokens" && info.tokens ? `${info.tokens} tokens` : t) + (xs ? ` (+${size(xs.bytes)})` : "");
+        const name = k === "tokens" && info.tokens ? `${info.tokens} tokens` : t;
+        const txt = document.createElement("div");
+        txt.innerHTML = "<b></b><small></small>";
+        txt.querySelector("b").textContent = name;
+        txt.querySelector("small").textContent = d + (xs ? ` · about ${size(xs.bytes)}` : "");
+        const b = document.createElement("button"); b.className = "primary"; b.textContent = "Add";
         b.onclick = async () => {
+          b.disabled = true;
           try {
             const r = await api("chains.index_add", { key: st.key, index: k });
-            msg(r.rebuilding ? `Adding ${t}: the ord index is rebuilt from its start with it.` : `Adding ${t}…`);
+            msg(r.rebuilding ? `Adding ${name}: the ord index is rebuilt from its start with it.` : r.resync ? `Adding ${name}: the chain is fetched again with it built in.` : `Adding ${name}. Its progress shows below.`);
             refresh();
-          } catch (e) { msg(e.message, true); }
+          } catch (e) { b.disabled = false; msg(e.message, true); }
         };
-        return b;
+        row.append(txt, b);
+        return row;
       }));
     $("c-pause").hidden = !!st.home; $("c-stop").hidden = !!st.home;
     $("c-pause").textContent = st.state === "paused" ? "Resume" : "Pause";
@@ -222,10 +231,11 @@
   // #chains/install/<key> opens that coin's install card.
   (async () => {
     const h = (location.hash || "").slice(1).split("/");
-    if (h[0] !== "chains" || h[1] !== "install" || !h[2]) return;
+    if (h[0] !== "chains" || !["install", "manage"].includes(h[1]) || !h[2]) return;
     await refresh();
     const c = chains.find((x) => x.key === h[2]);
     if (c && !c.installed) { choose(c); reveal(); }
+    if (c && c.installed && h[1] === "manage") { manage(c.key); reveal(); }
   })();
   refresh();
 })();

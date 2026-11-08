@@ -247,6 +247,12 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         c if c.starts_with("explorer.") => crate::explorer::handle(node, c, &req),
         "chains.list" => Ok(crate::chains::list(node)),
+        "chains.sizes" => {
+            // Measure now (instead of waiting for the six-hourly pass) and show the result.
+            let m = crate::sizes::measure(node)?;
+            *node.my_sizes.lock().unwrap() = m.clone();
+            Ok(json!({"measured": m, "chains": crate::chains::list(node)}))
+        }
         "chains.status" => crate::chains::status(node, &s("key").ok_or("key required")?),
         "chains.add" => {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();

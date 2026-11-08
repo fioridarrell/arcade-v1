@@ -18,6 +18,7 @@ mod miner;
 mod meshsvc;
 mod node;
 mod rpc;
+mod sizes;
 
 use node::Node;
 use std::sync::{Arc, Mutex};
@@ -83,10 +84,17 @@ fn main() {
         extra: Mutex::new(Default::default()),
         coin_peers: Mutex::new(Default::default()),
         dialing: Mutex::new(Default::default()),
+        my_sizes: Mutex::new(Default::default()),
+        mesh_sizes: Mutex::new(Default::default()),
     });
     let _ = node.me.set(Arc::downgrade(&node));
     chains::start_home(&node).expect("home indexes");
     chains::start_saved(&node);
+    sizes::load(&node);
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("sizes".into()).spawn(move || sizes::run(n)).unwrap();
+    }
     let _ = node.app.event("service", "arcaded started");
     eprintln!(
         "arcaded: home {}, node {}, chain {}",

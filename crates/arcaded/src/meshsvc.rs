@@ -176,6 +176,11 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     if let Some(o) = crate::coreshare::offer(node) {
         link.send(&o)?;
     }
+    // V1.0: what each installed chain and index costs on disk here (existing arcades ignore it).
+    let mut last_sz = std::time::Instant::now();
+    if let Some(sz) = crate::sizes::frame(node) {
+        link.send(&Frame::new(sz))?;
+    }
     let mut cr_reqs = crate::coreshare::Requests::default();
     let mut last_ping = std::time::Instant::now();
     let mut sent_outbox = 0usize;
@@ -186,6 +191,12 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
             link.send(&Frame::new(f.clone()))?;
         }
         sent_outbox = pending.len();
+        if last_sz.elapsed() > Duration::from_secs(3600) {
+            if let Some(sz) = crate::sizes::frame(node) {
+                link.send(&Frame::new(sz))?;
+            }
+            last_sz = std::time::Instant::now();
+        }
         if last_ping.elapsed() > Duration::from_secs(15) {
             link.send(&Frame::new(json!({"t": "ping", "n": format!("{:08x}", now() as u32)})))?;
             last_ping = std::time::Instant::now();
@@ -218,6 +229,7 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
             "wl" => crate::faucet::on_welcome(node, &f.head),
             "addrs" => on_addrs(node, &f.head),
             "pp" => on_coin_peers(node, &f.head),
+            "sz" => crate::sizes::on_sz(node, &link.peer_id, &f.head),
             "bk" => serve_bk(node, link, addr, &f.head)?,
             "cr" => crate::coreshare::handle(node, link, &mut cr_reqs, &f)?,
             _ => {} // unknown kinds are ignored, as the existing arcade does

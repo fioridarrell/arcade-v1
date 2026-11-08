@@ -203,3 +203,6 @@ main:has(#explorer.on) { max-width: 1240px; }
 .x-io .r { white-space: nowrap; display: flex; gap: 4px; align-items: center; }
 .ins-on { color: var(--gold); }
 @media (max-width: 640px) { .x-flow { grid-template-columns: minmax(0, 1fr); } .x-flow .arrow { transform: rotate(90deg); padding: 0; } }
+.mode small.sz, .idx small.sz { display: block; color: var(--accent); font-size: 12px; margin-top: 2px; }
+.idx small.sz { display: inline; margin-left: 4px; }
+.est.total { font-weight: 600; color: var(--ink); margin-top: 6px; }

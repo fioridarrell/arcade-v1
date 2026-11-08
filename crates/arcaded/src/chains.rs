@@ -408,7 +408,7 @@ pub fn list(node: &Node) -> Value {
             json!({"key": p.key, "name": p.name, "installed": st["installed"], "home": st["home"], "mode": st["mode"],
                    "indexes": st["indexes"], "overall": st["overall"], "state": st["state"],
                    "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).0.to_uppercase(),
-                   "dunes": p.key == "doge", "runes": p.key == "btc"})
+                   "dunes": p.key == "doge", "runes": p.key == "btc", "sizes": crate::sizes::for_chain(node, p.key)})
         })
         .collect::<Vec<_>>())
 }

@@ -61,6 +61,31 @@
     }
   }
 
+  // Sizes as other arcades report them (median; this arcade counts too when it has the chain).
+  const size = (b) => b == null ? null : b >= 1e12 ? (b / 1e12).toFixed(2) + " TB" : b >= 1e9 ? (b / 1e9).toFixed(1) + " GB" : b >= 1e6 ? Math.max(1, Math.round(b / 1e6)) + " MB" : "under 1 MB";
+  const who = (n) => n === 1 ? "1 arcade" : `${n} arcades`;
+  function modeSize(c, k) {
+    const z = c.sizes || {};
+    const b = z.modes?.[k];
+    if (b == null) return "Size: no arcade has reported this chain yet.";
+    const at = z.height ? ` at block ${z.height.toLocaleString()}` : "";
+    return `About ${size(b)}${k === "full" || k === "index" ? " plus the indexes you pick" : ""} · reported by ${who(z.reports)}${at}`;
+  }
+  function ixSize(c, k) {
+    const x = c.sizes?.indexes?.[k];
+    return x ? `+ ${size(x.bytes)} · ${who(x.reports)}` : "size not reported yet";
+  }
+  function total(c) {
+    const base = c.sizes?.modes?.[mode];
+    if (base == null) return "";
+    let sum = base, unknown = [];
+    for (const i of $("c-idx").querySelectorAll("input:checked")) {
+      const x = c.sizes?.indexes?.[i.dataset.k];
+      if (x) sum += x.bytes; else unknown.push(i.dataset.k);
+    }
+    return `This install: about ${size(sum)}${unknown.length ? ` plus ${unknown.join(", ")} (not reported yet)` : ""}. Chains grow, so leave room.`;
+  }
+
   function choose(c) {
     open = c; watching = null;
     $("c-installer").hidden = false; $("c-choose").hidden = false; $("c-progress").hidden = true; msg("");
@@ -68,8 +93,9 @@
     $("c-modes").replaceChildren(...MODES.map(([k, t, d, ok]) => {
       const l = document.createElement("label");
       l.className = "mode" + (k === mode ? " sel" : "") + (ok ? "" : " off");
-      l.innerHTML = `<input type="radio" name="mode" ${k === mode ? "checked" : ""} ${ok ? "" : "disabled"}><b></b><small></small>`;
+      l.innerHTML = `<input type="radio" name="mode" ${k === mode ? "checked" : ""} ${ok ? "" : "disabled"}><b></b><small></small><small class="sz"></small>`;
       l.querySelector("b").textContent = t; l.querySelector("small").textContent = d;
+      l.querySelector(".sz").textContent = modeSize(c, k);
       if (ok) l.onclick = () => { mode = k; choose(c); };
       return l;
     }));
@@ -79,7 +105,8 @@
       const can = ok && !noIdx && (needs !== "ord" || c.ord);
       const l = document.createElement("label");
       l.className = can ? "" : "off";
-      l.innerHTML = `<input type="checkbox" data-k="${k}" ${can ? "" : "disabled"}> <b></b> <small></small>`;
+      l.innerHTML = `<input type="checkbox" data-k="${k}" ${can ? "" : "disabled"}> <b></b> <small></small> <small class="sz"></small>`;
+      if (can) l.querySelector(".sz").textContent = ixSize(c, k);
       l.querySelector("b").textContent = k === "tokens" && c.tokens ? `${c.tokens} tokens` : t;
       l.querySelector("small").textContent = can || !ok ? d : "not available on this chain yet";
       const box = l.querySelector("input");
@@ -87,10 +114,12 @@
         const all = $("c-idx");
         if (box.checked && RIDERS.includes(k)) all.querySelector('input[data-k="ord"]').checked = true;
         if (!box.checked && k === "ord") RIDERS.forEach((r) => { const x = all.querySelector(`input[data-k="${r}"]`); if (x) x.checked = false; });
+        $("c-total").textContent = total(c);
       };
       return l;
     }));
     $("c-est").textContent = noIdx ? "Blocks and every address; no indexes." : "Nothing is ticked for you: choose the indexes you want. Each is built in the same commit as each block and can be removed later.";
+    $("c-total").textContent = total(c);
   }
 
   async function install() {
@@ -135,7 +164,8 @@
     add.replaceChildren(...(can.length ? [Object.assign(document.createElement("span"), { textContent: "Add an index: " })] : []),
       ...can.map(([k, t]) => {
         const b = document.createElement("button"); b.className = "small";
-        b.textContent = k === "tokens" && info.tokens ? `${info.tokens} tokens` : t;
+        const xs = info.sizes?.indexes?.[k];
+        b.textContent = (k === "tokens" && info.tokens ? `${info.tokens} tokens` : t) + (xs ? ` (+${size(xs.bytes)})` : "");
         b.onclick = async () => {
           try {
             const r = await api("chains.index_add", { key: st.key, index: k });

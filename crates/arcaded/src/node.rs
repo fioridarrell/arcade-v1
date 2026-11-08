@@ -57,6 +57,10 @@ pub struct Node {
     pub coin_peers: Mutex<BTreeMap<String, std::collections::BTreeSet<String>>>,
     /// Mesh addresses we have a dialing thread for.
     pub dialing: Mutex<std::collections::BTreeSet<String>>,
+    /// Our measured per-chain sizes (crate::sizes), shared on every link.
+    pub my_sizes: Mutex<BTreeMap<String, serde_json::Value>>,
+    /// Sizes other arcades report: node id -> (received at, chains).
+    pub mesh_sizes: Mutex<BTreeMap<String, (u64, serde_json::Value)>>,
     /// Chains installed by hand (Chains & Coins), by key.
     pub extra: Mutex<BTreeMap<String, std::sync::Arc<crate::chains::ChainRun>>>,
     /// Weak self-reference so API handlers can start threads that own the node.

@@ -326,6 +326,41 @@ macro_rules! read_methods {
             Ok(out)
         }
 
+        /// Sum key + value lengths of up to `limit` entries under `prefix`, starting after
+        /// `after` (exclusive) when given. Returns (rows, bytes, last key seen) so a caller
+        /// can walk a big table in short read transactions.
+        pub fn sum_prefix(
+            &self,
+            table: &str,
+            prefix: &[u8],
+            after: Option<&[u8]>,
+            limit: usize,
+        ) -> Result<(u64, u64, Option<Vec<u8>>)> {
+            check(self.schema, table)?;
+            let t = self.txn.open_table(Some(table))?;
+            let mut c = self.txn.cursor(&t)?;
+            let mut cur: Option<(std::borrow::Cow<[u8]>, std::borrow::Cow<[u8]>)> = c.set_range(after.unwrap_or(prefix))?;
+            if let (Some(a), Some((k, _))) = (after, &cur) {
+                if k.as_ref() == a {
+                    cur = c.next()?;
+                }
+            }
+            let (mut rows, mut bytes, mut last) = (0u64, 0u64, None);
+            while let Some((k, v)) = cur {
+                if !k.starts_with(prefix) {
+                    return Ok((rows, bytes, None));
+                }
+                rows += 1;
+                bytes += (k.len() + v.len()) as u64;
+                if rows as usize >= limit {
+                    last = Some(k.to_vec());
+                    break;
+                }
+                cur = c.next()?;
+            }
+            Ok((rows, bytes, last))
+        }
+
         /// Last (greatest) entry whose key starts with `prefix`.
         pub fn last_with_prefix(&self, table: &str, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
             check(self.schema, table)?;

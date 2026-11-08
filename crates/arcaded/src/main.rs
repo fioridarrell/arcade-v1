@@ -8,6 +8,7 @@
 mod addrsvc;
 mod api;
 mod apikeys;
+mod appsvc;
 mod commands;
 mod chainsvc;
 mod chains;

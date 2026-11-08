@@ -201,6 +201,30 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         return respond(&mut s, "405 Method Not Allowed", "text/plain", &[], b"GET only\n");
     }
     let p = node.params;
+    // An app (or its cover) from any chain's arcade ledger, sandboxed as the original serves apps:
+    // an opaque origin with scripts, fetching only from this arcade.
+    if let Some(rest) = path.strip_prefix("/app/") {
+        let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
+        let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
+        let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
+        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me}; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
+        return match arcade_ledger::content::content(&node.chain, cp, id) {
+            Ok(c) => respond(
+                &mut s,
+                "200 OK",
+                if c.content_type.is_empty() { "application/octet-stream" } else { &c.content_type },
+                &[
+                    ("ETag", format!("\"{}\"", c.sha256)),
+                    ("Cache-Control", "public, max-age=31536000, immutable".into()),
+                    ("Content-Security-Policy", csp),
+                    ("Access-Control-Allow-Origin", "*".into()),
+                    ("Referrer-Policy", "unsafe-url".into()),
+                ],
+                if r.method == "HEAD" { &[] } else { &c.bytes },
+            ),
+            Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
+        };
+    }
     let seg: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
     match seg.as_slice() {
         ["content", id] => match arcade_ledger::content::content(&node.chain, p, id) {

@@ -155,6 +155,17 @@ cmds! {
     "mine.start" Admin "threads?" "Mine the home chain.";
     "mine.stop" Admin "" "Stop mining.";
     "mine.status" Read "" "Mining state and hash rate.";
+    // Apps (app cards)
+    "apps.store" Public "sort?, q?, flagged?" "The App Store: app cards from every chain with the arcade ledger (popular or new; starred first).";
+    "apps.installed" Read "" "Apps installed on this arcade, each at its newest version.";
+    "apps.install" Admin "chain, txid" "Install an app (it follows its author's updates).";
+    "apps.uninstall" Admin "id" "Uninstall an app.";
+    "apps.star" Admin "chain, txid, on?" "Star or unstar an app (starred show first).";
+    "apps.card" Public "chain, txid" "One app: card, versions, comments, permission switches.";
+    "apps.perms" Admin "id, set?" "An app's permission switches (wallet, contacts, groups, media, pictures, notify).";
+    "apps.review" Admin "chain, txid, verdict" "Clear or confirm an app flagged as a lookalike.";
+    "apps.trust" Admin "address, on?" "Trust a publisher (never flagged as a lookalike).";
+    "apps.launch" Read "chain, txid" "What an app window opens: the sandboxed page URL and the card.";
     // API keys (managed from this computer only)
     "apikey.list" Local "" "API keys (not their secrets).";
     "apikey.create" Local "name, perms, tip_limit?" "Make an API key; the secret is shown once.";

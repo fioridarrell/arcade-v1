@@ -3,6 +3,7 @@
 
 pub mod address;
 pub mod collections;
+pub mod cards;
 pub mod content;
 pub mod digidollar;
 pub mod engine;

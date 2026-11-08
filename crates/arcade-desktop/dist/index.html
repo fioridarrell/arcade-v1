@@ -26,6 +26,7 @@
   <button data-tab="handle">Handle</button>
   <button data-tab="messages">Messages</button>
   <button data-tab="feed">Feed</button>
+  <button data-tab="apps">Apps</button>
   <button data-tab="explorer">Explorer</button>
   <button data-tab="chains">Chains &amp; Coins</button>
   <button data-tab="mine">Mine</button>
@@ -174,6 +175,20 @@
     <p class="msg" id="ap-msg"></p>
   </section>
 
+  <!-- Apps: installed apps and the App Store of published app cards -->
+  <section id="apps" class="tab wide">
+    <div class="row" style="justify-content:space-between">
+      <h1 style="margin:0">Apps</h1>
+      <div class="mx-views" id="ap2-views"><button data-v="mine" class="on">Your apps</button><button data-v="store">App Store</button><button data-v="review">Review</button></div>
+    </div>
+    <div class="row" id="ap2-storebar" hidden>
+      <div class="mx-views" id="ap2-sort"><button data-s="popular" class="on">Popular</button><button data-s="new">New</button></div>
+      <input id="ap2-q" placeholder="Search apps" style="flex:1;min-width:180px">
+    </div>
+    <p class="msg" id="ap2-msg"></p>
+    <div id="ap2-body"></div>
+  </section>
+
   <section id="explorer" class="tab wide">
     <div class="x-bar">
       <div class="x-nav" id="x-nav"></div>
@@ -242,5 +257,6 @@
 <script src="messages.js"></script>
 <script src="feed.js"></script>
 <script src="apitab.js"></script>
+<script src="apps.js"></script>
 </body>
 </html>

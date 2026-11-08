@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "The main window may call the arcade API command only.",
-  "windows": ["main"],
+  "description": "The main window and app windows (our wrapper; the app itself is a sandboxed frame inside) may call the arcade API.",
+  "windows": ["main", "app-*"],
   "permissions": ["core:default"]
 }

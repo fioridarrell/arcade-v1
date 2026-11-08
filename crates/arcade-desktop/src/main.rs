@@ -35,6 +35,36 @@ fn api(req: Value) -> Value {
     serde_json::from_str(&line).unwrap_or(json!({"ok": false, "error": "bad reply from the arcade service"}))
 }
 
+fn pct(s: &str) -> String {
+    s.bytes().map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") }).collect()
+}
+
+/// Open an app in its own window: our wrapper page with the app sandboxed in a frame inside it
+/// (one window per app; opening it again brings that window forward).
+#[tauri::command]
+fn open_app(app: tauri::AppHandle, id: String, title: String, frame: String) -> Result<(), String> {
+    use std::hash::{Hash, Hasher};
+    use tauri::Manager;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    id.hash(&mut h);
+    let label = format!("app-{:016x}", h.finish());
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.unminimize();
+        return w.set_focus().map_err(|e| e.to_string());
+    }
+    if !frame.starts_with("http://127.0.0.1:") {
+        return Err("apps run only from this arcade".into());
+    }
+    let url = format!("appwindow.html?frame={}&id={}&title={}", pct(&frame), pct(&id), pct(&title));
+    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::App(url.into()))
+        .title(&title)
+        .inner_size(1000.0, 720.0)
+        .min_inner_size(320.0, 240.0)
+        .build()
+        .map(|_| ())
+        .map_err(|e| e.to_string())
+}
+
 fn main() {
     tauri::Builder::default()
         .setup(|app| {
@@ -54,7 +84,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![api])
+        .invoke_handler(tauri::generate_handler![api, open_app])
         .run(tauri::generate_context!())
         .expect("error while running the Arcade app");
 }

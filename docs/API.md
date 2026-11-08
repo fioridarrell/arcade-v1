@@ -211,6 +211,21 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `mine.stop` | `/api/v1/mine/stop` | admin | — | Stop mining. |
 | `mine.status` | `/api/v1/mine/status` | read | — | Mining state and hash rate. |
 
+### Apps
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `apps.store` | `/api/v1/apps/store` | public | sort?, q?, flagged? | The App Store: app cards from every chain with the arcade ledger (popular or new; starred first). |
+| `apps.installed` | `/api/v1/apps/installed` | read | — | Apps installed on this arcade, each at its newest version. |
+| `apps.install` | `/api/v1/apps/install` | admin | chain, txid | Install an app (it follows its author's updates). |
+| `apps.uninstall` | `/api/v1/apps/uninstall` | admin | id | Uninstall an app. |
+| `apps.star` | `/api/v1/apps/star` | admin | chain, txid, on? | Star or unstar an app (starred show first). |
+| `apps.card` | `/api/v1/apps/card` | public | chain, txid | One app: card, versions, comments, permission switches. |
+| `apps.perms` | `/api/v1/apps/perms` | admin | id, set? | An app's permission switches (wallet, contacts, groups, media, pictures, notify). |
+| `apps.review` | `/api/v1/apps/review` | admin | chain, txid, verdict | Clear or confirm an app flagged as a lookalike. |
+| `apps.trust` | `/api/v1/apps/trust` | admin | address, on? | Trust a publisher (never flagged as a lookalike). |
+| `apps.launch` | `/api/v1/apps/launch` | read | chain, txid | What an app window opens: the sandboxed page URL and the card. |
+
 ### API keys
 
 | method | route | needs | params | what |

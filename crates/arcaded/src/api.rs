@@ -159,6 +159,19 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let keys: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::grpsvc::remove(node, &s("id").ok_or("id required")?, &keys)
         }
+        "apps.store" => Ok(crate::appsvc::store(node, &s("sort").unwrap_or_else(|| "popular".into()), &s("q").unwrap_or_default(), req["flagged"] == true)),
+        "apps.installed" => Ok(crate::appsvc::installed(node)),
+        "apps.install" => crate::appsvc::install(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
+        "apps.uninstall" => crate::appsvc::uninstall(node, &s("id").ok_or("id required")?),
+        "apps.star" => crate::appsvc::star(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?, req["on"] != false),
+        "apps.card" => crate::appsvc::card(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
+        "apps.perms" => {
+            let id = s("id").ok_or("id required")?;
+            if req["set"].is_object() { crate::appsvc::set_perms(node, &id, &req["set"]) } else { Ok(crate::appsvc::perms(node, &id)) }
+        }
+        "apps.review" => crate::appsvc::review(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?, &s("verdict").ok_or("verdict required (clear or confirm)")?),
+        "apps.trust" => crate::appsvc::trust(node, &s("address").ok_or("address required")?, req["on"] != false),
+        "apps.launch" => crate::appsvc::launch(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
         "rpc.help" => Ok(crate::commands::help()),
         "apikey.list" => Ok(crate::apikeys::list(node)),
         "apikey.create" => {

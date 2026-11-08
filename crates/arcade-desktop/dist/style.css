@@ -288,3 +288,27 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .ap-perms { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px; }
 .ap-perms label { display: flex; gap: 6px; align-items: flex-start; }
 #ap-out code { word-break: break-all; font-size: 14px; }
+
+/* Apps */
+.ap-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 14px; }
+.ap-mine { background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 12px; display: flex; flex-direction: column; align-items: center; gap: 6px; text-align: center; cursor: pointer; }
+.ap-mine:hover { border-color: var(--accent); }
+.ap-mine.gone { opacity: .6; cursor: default; }
+.ap-mine .ap-cover { width: 96px; height: 96px; }
+.ap-cover { width: 120px; height: 120px; border-radius: 18px; object-fit: cover; flex: none; background: var(--bg); }
+.ap-tile { display: flex; align-items: center; justify-content: center; font-size: 34px; font-weight: 700; color: var(--accent); border: 1px solid var(--line); }
+.ap-store { display: flex; flex-direction: column; gap: 12px; }
+.ap-card { display: flex; gap: 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 14px; padding: 14px; }
+@media (max-width: 600px) { .ap-card { flex-direction: column; } }
+.ap-body { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; }
+.ap-body h2 { margin: 0; color: var(--ink); font-size: 20px; }
+.ap-title { display: flex; justify-content: space-between; align-items: center; font-size: 16px; }
+.ap-star { border: 0; background: none; font-size: 20px; padding: 0 4px; color: var(--muted); }
+.ap-star.on { color: #e0a800; }
+.ap-pills { display: flex; gap: 4px; flex-wrap: wrap; }
+.ap-desc { overflow-wrap: anywhere; }
+.ap-row { margin: 6px 0 2px; }
+.ap-comment { padding-left: 8px; border-left: 2px solid var(--line); }
+.ap-detail { display: flex; flex-direction: column; gap: 12px; }
+.ap-perm { display: block; margin: 6px 0; }
+.ap-list { margin: 0; padding-left: 18px; }

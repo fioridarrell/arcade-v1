@@ -4,20 +4,9 @@
 use crate::node::Node;
 use arcade_chain::p2p::Peer;
 use arcade_chaindb::sync::Syncer;
-use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 
-fn candidates(node: &Node) -> Vec<String> {
-    let p = node.params;
-    p.fixed_peers
-        .iter()
-        .map(|s| s.to_string())
-        .chain(p.dns_seeds.iter().flat_map(|d| {
-            (*d, p.p2p_port).to_socket_addrs().into_iter().flatten().map(|a| a.to_string())
-        }))
-        .collect()
-}
 
 fn set_state(node: &Node, s: String) {
     *node.sync_state.lock().unwrap() = s;
@@ -75,12 +64,13 @@ pub fn run(node: Arc<Node>) {
         mesh_bootstrap(&node, &syncer);
     }
     loop {
-        let Some(mut peer) = candidates(&node).iter().find_map(|a| Peer::connect_with(p, a, Duration::from_secs(20), true).ok())
+        let Some(mut peer) = node.coin_candidates(p).iter().find_map(|a| Peer::connect_with(p, a, Duration::from_secs(20), true).ok())
         else {
             set_state(&node, "no coin peer reachable; retrying".into());
             std::thread::sleep(Duration::from_secs(15));
             continue;
         };
+        node.note_coin_peer(p.key, &peer.addr.to_string());
         let _ = node.app.event("chain", &format!("connected to {} ({})", peer.addr, peer.version.user_agent));
         if let Err(e) = syncer.ensure_genesis(&mut peer) {
             set_state(&node, format!("genesis: {e}"));

@@ -20,6 +20,85 @@ fn now() -> u64 {
     arcade_app::now()
 }
 
+/// Most mesh links we dial out to (the existing arcade links "everyone" up to 48).
+pub const MAX_OUTBOUND: usize = 24;
+
+/// Start a dialing thread for a mesh address unless one exists.
+pub fn dial(node: &Arc<Node>, addr: String) {
+    {
+        let mut d = node.dialing.lock().unwrap();
+        if d.contains(&addr) || d.len() >= MAX_OUTBOUND {
+            return;
+        }
+        d.insert(addr.clone());
+    }
+    let n = node.clone();
+    std::thread::Builder::new().name(format!("mesh {addr}")).spawn(move || run(n, addr)).unwrap();
+}
+
+/// What we share on every link: arcades we know and coin peers that work.
+fn share(node: &Node, link: &mut Link) -> Result<(), LinkError> {
+    let peers = node.app.peers().unwrap_or_default();
+    let a: Vec<Value> = peers.iter().take(50).map(|p| json!({"h": p.host, "p": p.port, "id": p.id})).collect();
+    if !a.is_empty() {
+        link.send(&Frame::new(json!({"t": "addrs", "a": a})))?;
+    }
+    let nets: serde_json::Map<String, Value> = node
+        .coin_peers
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, v)| (k.clone(), json!(v.iter().take(30).collect::<Vec<_>>())))
+        .collect();
+    if !nets.is_empty() {
+        link.send(&Frame::new(json!({"t": "pp", "nets": nets})))?;
+    }
+    Ok(())
+}
+
+fn on_addrs(node: &Node, h: &Value) {
+    let Some(list) = h["a"].as_array() else { return };
+    let me = hex::encode(node.identity.verifying_key().to_bytes());
+    for a in list.iter().take(50) {
+        let (Some(host), Some(port), id) = (a["h"].as_str(), a["p"].as_u64(), a["id"].as_str().unwrap_or("")) else { continue };
+        // Plain TCP addresses only (wss:// needs the WebSocket transport, coming).
+        if host.contains('/') || id == me || port == 0 || port > 65535 || host.len() > 255 {
+            continue;
+        }
+        let addr = if host.contains(':') { format!("[{host}]:{port}") } else { format!("{host}:{port}") };
+        let known = node.app.peers().unwrap_or_default().iter().any(|p| p.id == id && !id.is_empty());
+        if !known {
+            let _ = node.app.put_peer(&arcade_app::Peer {
+                id: if id.is_empty() { addr.clone() } else { id.to_string() },
+                host: host.into(),
+                port: port as u16,
+                source: "gossip".into(),
+                last_seen: 0,
+                failures: 0,
+            });
+        }
+        if let Some(n) = node.me.get().and_then(|w| w.upgrade()) {
+            dial(&n, addr);
+        }
+    }
+}
+
+fn on_coin_peers(node: &Node, h: &Value) {
+    let Some(nets) = h["nets"].as_object() else { return };
+    for (key, list) in nets {
+        if arcade_chain::params::by_key(key).is_none() {
+            continue;
+        }
+        for a in list.as_array().into_iter().flatten().take(30) {
+            if let Some(s) = a.as_str() {
+                if s.parse::<std::net::SocketAddr>().is_ok() {
+                    node.note_coin_peer(key, s);
+                }
+            }
+        }
+    }
+}
+
 pub fn run(node: Arc<Node>, addr: String) {
     let mut fails = 0u32;
     loop {
@@ -82,6 +161,8 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
     // Tell V1.0 peers what we can serve (existing arcades ignore this kind).
     link.send(&arcade_mesh::bk::hi(json!({ node.params.key: {"h": our_tip(node)} }), node.mesh_port))?;
+    // Every arcade is a seed: share the arcades and coin peers we know.
+    share(node, link)?;
     // Offer our chain to arcades that borrow one (existing arcades' coreshare).
     if let Some(o) = crate::coreshare::offer(node) {
         link.send(&o)?;
@@ -126,6 +207,8 @@ fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
                 }
             }
             "wl" => crate::faucet::on_welcome(node, &f.head),
+            "addrs" => on_addrs(node, &f.head),
+            "pp" => on_coin_peers(node, &f.head),
             "bk" => serve_bk(node, link, addr, &f.head)?,
             "cr" => crate::coreshare::handle(node, link, &mut cr_reqs, &f)?,
             _ => {} // unknown kinds are ignored, as the existing arcade does

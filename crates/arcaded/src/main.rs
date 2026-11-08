@@ -83,6 +83,8 @@ fn main() {
         miner: Default::default(),
         me: Default::default(),
         extra: Mutex::new(Default::default()),
+        coin_peers: Mutex::new(Default::default()),
+        dialing: Mutex::new(Default::default()),
     });
     let _ = node.me.set(Arc::downgrade(&node));
     chains::start_saved(&node);
@@ -115,10 +117,18 @@ fn main() {
             .unwrap();
     }
     if mesh {
-        let seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
+        let mut seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
+        // Every arcade we learned of before is a seed too.
+        if !no_seeds {
+            for p in node.app.peers().unwrap_or_default() {
+                let a = format!("{}:{}", p.host, p.port);
+                if !seeds.contains(&a) {
+                    seeds.push(a);
+                }
+            }
+        }
         for a in seeds.into_iter().chain(extra_peers) {
-            let n = node.clone();
-            std::thread::Builder::new().name(format!("mesh {a}")).spawn(move || meshsvc::run(n, a)).unwrap();
+            meshsvc::dial(&node, a);
         }
         if let Some(port) = mesh_port {
             let n = node.clone();

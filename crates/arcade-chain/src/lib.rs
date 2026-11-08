@@ -5,6 +5,7 @@
 
 pub mod auxpow;
 pub mod block;
+pub mod dns;
 pub mod encode;
 pub mod format;
 pub mod hash;

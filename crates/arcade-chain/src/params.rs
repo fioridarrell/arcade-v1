@@ -444,7 +444,12 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
     bip44_coin_type: 3,
     protocol_version: 70015,
     dns_seeds: &["seed.multidoge.org", "seed2.multidoge.org"],
-    fixed_peers: &[],
+    // Live Dogecoin Core 1.14.x nodes (2026-11-07), as Core ships chainparamsseeds.h.
+    fixed_peers: &[
+        "88.98.198.90:22556", "64.31.61.150:22556", "162.222.203.151:22556", "91.134.83.248:22556",
+        "74.139.78.63:22556", "217.115.120.70:22556", "144.76.234.216:22556", "80.211.154.104:22556",
+        "13.228.138.193:22556", "135.181.56.49:22556", "47.241.177.51:22556",
+    ],
     checkpoints: &[],
     coinbase_maturity: 240,
     index_start: 6_415_000,

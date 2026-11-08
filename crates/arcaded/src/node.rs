@@ -53,6 +53,10 @@ pub struct Node {
     /// Blocks we mined, waiting to be sent to coin peers.
     pub block_outbox: Mutex<Vec<Vec<u8>>>,
     pub miner: crate::miner::MinerState,
+    /// Working coin P2P peers per chain key (ours and those other arcades shared).
+    pub coin_peers: Mutex<BTreeMap<String, std::collections::BTreeSet<String>>>,
+    /// Mesh addresses we have a dialing thread for.
+    pub dialing: Mutex<std::collections::BTreeSet<String>>,
     /// Chains installed by hand (Chains & Coins), by key.
     pub extra: Mutex<BTreeMap<String, std::sync::Arc<crate::chains::ChainRun>>>,
     /// Weak self-reference so API handlers can start threads that own the node.
@@ -67,5 +71,36 @@ pub struct Node {
 impl Node {
     pub fn self_arc(&self) -> std::sync::Arc<Node> {
         self.me.get().and_then(|w| w.upgrade()).expect("node is running")
+    }
+}
+
+impl Node {
+    /// Remember a coin peer that worked (shared with the mesh on every link).
+    pub fn note_coin_peer(&self, chain_key: &str, addr: &str) {
+        self.coin_peers.lock().unwrap().entry(chain_key.to_string()).or_default().insert(addr.to_string());
+    }
+
+    /// Coin peers for a chain: shared and learned ones first, then fixed peers, then DNS seeds.
+    pub fn coin_candidates(&self, p: &arcade_chain::params::ChainParams) -> Vec<String> {
+        use std::net::ToSocketAddrs;
+        let mut v: Vec<String> = self.coin_peers.lock().unwrap().get(p.key).map(|s| s.iter().cloned().collect()).unwrap_or_default();
+        for f in p.fixed_peers {
+            if !v.iter().any(|x| x == f) {
+                v.push(f.to_string());
+            }
+        }
+        for d in p.dns_seeds {
+            let mut found: Vec<String> = (*d, p.p2p_port).to_socket_addrs().into_iter().flatten().map(|a| a.to_string()).collect();
+            if found.is_empty() {
+                // The system resolver gave nothing: ask public resolvers ourselves.
+                found = arcade_chain::dns::resolve_a(d).into_iter().map(|ip| format!("{ip}:{}", p.p2p_port)).collect();
+            }
+            for s in found {
+                if !v.contains(&s) {
+                    v.push(s);
+                }
+            }
+        }
+        v
     }
 }

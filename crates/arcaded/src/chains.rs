@@ -7,7 +7,6 @@ use arcade_chain::p2p::Peer;
 use arcade_chain::params::{by_key, ChainParams, ALL_CHAINS};
 use arcade_chaindb::sync::Syncer;
 use serde_json::{json, Value};
-use std::net::ToSocketAddrs;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -292,13 +291,6 @@ pub fn list(node: &Node) -> Value {
         .collect::<Vec<_>>())
 }
 
-fn candidates(p: &ChainParams) -> Vec<String> {
-    p.fixed_peers
-        .iter()
-        .map(|s| s.to_string())
-        .chain(p.dns_seeds.iter().flat_map(|d| (*d, p.p2p_port).to_socket_addrs().into_iter().flatten().map(|a| a.to_string())))
-        .collect()
-}
 
 /// Follow one installed chain until it is stopped: headers, blocks (each batch one commit,
 /// indexes in the same commit), backfill of any lagging index, then wait for new blocks.
@@ -311,12 +303,13 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
             std::thread::sleep(Duration::from_secs(2));
             continue;
         }
-        let Some(mut peer) = candidates(p).iter().find_map(|a| Peer::connect(p, a, Duration::from_secs(20)).ok()) else {
+        let Some(mut peer) = node.coin_candidates(p).iter().find_map(|a| Peer::connect(p, a, Duration::from_secs(20)).ok()) else {
             set(format!("no {} peer reachable; retrying", p.name));
             std::thread::sleep(Duration::from_secs(20));
             continue;
         };
         run.peer_tip.store(peer.version.start_height.max(0) as u32, Ordering::Relaxed);
+        node.note_coin_peer(p.key, &peer.addr.to_string());
         if let Err(e) = syncer.ensure_genesis(&mut peer) {
             set(format!("genesis: {e}"));
             std::thread::sleep(Duration::from_secs(10));

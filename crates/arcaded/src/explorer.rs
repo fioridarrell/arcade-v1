@@ -38,6 +38,7 @@ pub fn unit(p: &ChainParams) -> &'static str {
         "ltc" => "LTC",
         "ltctest" => "LTCtest",
         "btc" => "BTC",
+        "wjk" => "WJK",
         _ => "",
     }
 }
@@ -203,9 +204,114 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
             Ok(json!({"claim": q, "number": num, "id": id, "owner": owner, "owner_tag": owner.as_deref().and_then(|o| tag_of(&x, o))}))
         }
         "explorer.mempool" => mempool(&x),
+        "explorer.ledger" => { x.need("ledger")?; ledger_summary(&x) }
+        "explorer.ledger_tokens" => { x.need("ledger")?; Ok(json!(ledger_tokens(&x, n(50, 500) as usize))) }
+        "explorer.ledger_token" => { x.need("ledger")?; ledger_token(&x, req["id"].as_u64().or_else(|| s("id").and_then(|v| v.parse().ok())).ok_or("give a token id")? as u32) }
+        "explorer.ledger_inscriptions" => {
+            x.need("ledger")?;
+            let total = ledger_count(&x);
+            let before = req["before"].as_u64().unwrap_or(total).min(total);
+            Ok(json!({"total": total, "items": ledger_latest(&x, before, n(24, 100))}))
+        }
+        "explorer.ledger_inscription" => {
+            x.need("ledger")?;
+            let id = s("id").ok_or("give an inscription txid or number")?;
+            let mut v = arcade_ledger::content::inscription(&x.node.chain, x.c(), id.trim_start_matches('#')).ok_or_else(|| format!("no arcade inscription {id}"))?;
+            v["content"] = ledger_content(&x, v["txid"].as_str().unwrap_or(""), 4 << 20);
+            if let Some(o) = v["owner"].as_str() { v["owner_tag"] = json!(tag_of(&x, o)); }
+            if let Some(o) = v["creator"].as_str() { v["creator_tag"] = json!(tag_of(&x, o)); }
+            Ok(v)
+        }
         "explorer.search" => search(&x, &s("q").ok_or("type something to search for")?),
         other => Err(format!("unknown command {other:?}")),
     }
+}
+
+// ---------------- arcade ledger (tokens, inscriptions, collections) ----------------
+
+use arcade_ledger::engine as led;
+
+fn ledger_count(x: &Ctx) -> u64 {
+    x.node.chain.store.read(|r| r.last_with_prefix(led::BY_NUMBER, &x.c().to_be_bytes())).ok().flatten()
+        .map(|(k, _)| u64::from_be_bytes(k[2..10].try_into().unwrap()) + 1).unwrap_or(0)
+}
+
+/// Arcade token amounts: divisible tokens (type 2) have 8 decimals.
+fn token_amount(prop: &Value, units: u64) -> String {
+    if prop["type"].as_u64() == Some(2) {
+        let w = units / 100_000_000;
+        let f = format!("{:08}", units % 100_000_000);
+        let f = f.trim_end_matches('0');
+        if f.is_empty() { w.to_string() } else { format!("{w}.{f}") }
+    } else {
+        units.to_string()
+    }
+}
+
+fn ledger_content(x: &Ctx, txid: &str, cap: usize) -> Value {
+    match arcade_ledger::content::content(&x.node.chain, x.p, txid) {
+        Ok(c) => {
+            let base = c.content_type.split(';').next().unwrap_or("").trim().to_lowercase();
+            if base.starts_with("text/") || base == "application/json" {
+                json!({"type": c.content_type, "kind": if base == "text/html" { "html" } else { "text" }, "text": String::from_utf8_lossy(&c.bytes[..c.bytes.len().min(64 << 10)]), "size": c.bytes.len()})
+            } else if base.starts_with("image/") && c.bytes.len() <= cap {
+                json!({"type": c.content_type, "kind": "image", "data": format!("data:{base};base64,{}", base64::engine::general_purpose::STANDARD.encode(&c.bytes)), "size": c.bytes.len()})
+            } else {
+                json!({"type": c.content_type, "kind": "other", "size": c.bytes.len()})
+            }
+        }
+        Err(e) => json!({"kind": "missing", "error": e}),
+    }
+}
+
+fn ledger_latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
+    (before.saturating_sub(n)..before).rev().filter_map(|num| {
+        let mut v = arcade_ledger::content::inscription(&x.node.chain, x.c(), &num.to_string())?;
+        v["content"] = ledger_content(x, v["txid"].as_str().unwrap_or(""), 96 << 10);
+        Some(v)
+    }).collect()
+}
+
+fn ledger_tokens(x: &Ctx, n: usize) -> Vec<Value> {
+    // Newest first: the creation-height index, read backwards.
+    let mut rows = x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY_BY_BLOCK, &x.c().to_be_bytes())).unwrap_or_default();
+    rows.reverse();
+    rows.iter().take(n).filter_map(|(k, _)| {
+        let pid = u32::from_be_bytes(k[k.len() - 4..].try_into().ok()?);
+        let mut v: Value = serde_json::from_slice(&x.node.chain.store.read(|r| r.get(led::PROPERTY, &KeyBuf::new().u16(x.c()).u32(pid).done())).ok()??).ok()?;
+        v["total_shown"] = json!(token_amount(&v, v["total"].as_u64().unwrap_or(0)));
+        if let Some(i) = v["issuer"].as_str() { v["issuer_tag"] = json!(tag_of(x, i)); }
+        Some(v)
+    }).collect()
+}
+
+fn ledger_token(x: &Ctx, pid: u32) -> R {
+    let c = x.c();
+    let mut v: Value = serde_json::from_slice(&x.node.chain.store.read(|r| r.get(led::PROPERTY, &KeyBuf::new().u16(c).u32(pid).done())).map_err(e)?.ok_or_else(|| format!("no arcade token {pid}"))?).map_err(e)?;
+    // Holders: balance rows are keyed by address, so scan this chain's and keep this token's.
+    let rows = x.node.chain.store.read(|r| r.scan_prefix(led::BALANCE, &c.to_be_bytes())).map_err(e)?;
+    let mut hs: Vec<(u64, String)> = rows.iter().filter_map(|(k, b)| {
+        if u32::from_be_bytes(k[k.len() - 4..].try_into().ok()?) != pid { return None; }
+        let bal = u64::from_be_bytes(b[..8].try_into().ok()?);
+        (bal > 0).then(|| (bal, String::from_utf8_lossy(&k[2..k.len() - 5]).into_owned()))
+    }).collect();
+    hs.sort_by(|a, b| b.0.cmp(&a.0));
+    v["holders"] = json!(hs.len());
+    v["total_shown"] = json!(token_amount(&v, v["total"].as_u64().unwrap_or(0)));
+    if let Some(i) = v["issuer"].as_str() { v["issuer_tag"] = json!(tag_of(x, i)); }
+    v["top"] = json!(hs.iter().take(25).map(|(b, a)| json!({"address": a, "tag": tag_of(x, a), "balance": token_amount(&v, *b)})).collect::<Vec<_>>());
+    Ok(v)
+}
+
+fn ledger_summary(x: &Ctx) -> R {
+    let c = x.c();
+    let count = |t: &str| x.node.chain.store.read(|r| r.scan_prefix(t, &c.to_be_bytes())).map(|v| v.len()).unwrap_or(0);
+    Ok(json!({
+        "tokens": count(led::PROPERTY), "inscriptions": ledger_count(x), "collections": count(led::COLLECTION),
+        "tags": count(arcade_ledger::index::TAG), "orders": count(led::BOOK), "trades": count(led::TAKE),
+        "indexed_to": x.node.chain.indexed_to(c, "ledger.v1").ok().flatten(),
+        "latest": ledger_latest(x, ledger_count(x), 12), "token_rows": ledger_tokens(x, 8),
+    }))
 }
 
 // ---------------- pieces ----------------

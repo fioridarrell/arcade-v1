@@ -49,6 +49,7 @@ pub fn ord_start(p: &ChainParams) -> Option<u32> {
         "doge" => 4_600_000,
         "dgb" => 0,
         "flop" => 18_295,
+        "wjk" => 1,
         _ => return None,
     })
 }

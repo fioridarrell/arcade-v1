@@ -26,8 +26,8 @@
     // Runes and dunes join here (with their index keys) when those indexes exist.
   ];
   // Pages and the index each needs; a page comes online only when its index is on the chain.
-  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger" };
-  const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps" };
+  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
+  const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
 
   let chains = [], chain = null, sum = null, page = "home", arg = null, seq = 0;
 
@@ -204,13 +204,54 @@
       : h("div", { class: "x-empty" }, "No block maps claimed yet."),
       h("p", { class: "x-note" }, "A map claim is an inscription whose whole text is <block>.<name>map (pepemap, dogemap, bitmap, …). The block can't be above the one it was inscribed in, and the first claim wins.")));
   }
+  // Arcade ledger: the arcade's own tokens (Omni-style properties), inscriptions and collections.
+  function ledgerGrid(list) {
+    if (!list.length) return h("div", { class: "x-empty" }, "No arcade inscriptions yet.");
+    return h("div", { class: "x-grid" }, list.map((i) => h("div", { class: "x-ins", onclick: () => go("linsc", i.txid) },
+      preview({ content: i.content, ct: i.content_type, n: i.number }), h("div", { class: "cap" }, h("b", {}, `#${fmt(i.number)}`), h("span", { class: "faint" }, fmt(i.block_height))))));
+  }
+  function ledgerTokens(list) {
+    if (!list.length) return h("div", { class: "x-empty" }, "No arcade tokens yet.");
+    return table([["Token"], ["Id", 1], ["Supply", 1], ["Issuer"]], list.map((t) => ({ go: () => go("ltoken", String(t.id)),
+      cells: [[h("b", {}, t.name || "(no name)")], [String(t.id), 1], [t.managed ? "managed" : t.total_shown, 1], [addrLink(t.issuer, t.issuer_tag)]] })));
+  }
   async function vLedger() {
-    if (!chain.home) return sect("Arcade ledger", null, h("div", { class: "x-empty" }, "The arcade ledger view is on the home chain for now."));
-    const l = await api("ledger");
-    const same = (l.peers || []).filter((p) => p.same || p.match).length;
-    return h("div", {}, sect("Arcade ledger", null, kv([["Indexed to", fmt(l.indexed_to)], ["Checkpoint", fmt(l.checkpoint)],
-      ["Consensus hash", h("span", { class: "mono" }, l.consensus_hash)], ["Names digest", h("span", { class: "mono" }, l.names_digest)],
-      ["Other arcades", `${(l.peers || []).length} reporting${same ? ` · ${same} agree` : ""}`]])));
+    const L = await api("explorer.ledger", { chain: chain.key });
+    const st = [["Arcade tokens", fmt(L.tokens)], ["Arcade inscriptions", fmt(L.inscriptions)], ["Collections", fmt(L.collections)],
+      ["@tags", fmt(L.tags)], ["Book orders", fmt(L.orders)], ["Trades", fmt(L.trades)]];
+    return h("div", {},
+      h("div", { class: "x-stats" }, st.map(([k, v]) => h("div", { class: "x-stat" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v)))),
+      h("div", { class: "x-cols" },
+        sect("Newest arcade tokens", "ltokens", ledgerTokens(L.token_rows || [])),
+        sect("Newest arcade inscriptions", "linscs", ledgerGrid(L.latest || []))),
+      h("p", { class: "x-note" }, `Indexed to block ${fmt(L.indexed_to)}. Arcade tokens, NFTs and inscriptions are the arcade's own protocol (class B/C payloads), separate from ord.`));
+  }
+  async function vLTokens() {
+    const list = await api("explorer.ledger_tokens", { chain: chain.key, n: 300 });
+    return sect(`Arcade tokens · ${fmt(list.length)}`, null, ledgerTokens(list));
+  }
+  async function vLInscs() {
+    const r = await api("explorer.ledger_inscriptions", { chain: chain.key, before: arg ? Number(arg) : undefined, n: 36 });
+    const last = r.items[r.items.length - 1];
+    return sect(`Arcade inscriptions · ${fmt(r.total)}`, null, h("div", {}, ledgerGrid(r.items), last && last.number > 0 ? h("div", { class: "row" }, h("button", { onclick: () => go("linscs", String(last.number)) }, "Older")) : ""));
+  }
+  async function vLToken() {
+    const t = await api("explorer.ledger_token", { chain: chain.key, id: arg });
+    return h("div", {}, crumbs(link("Arcade ledger", "ledger"), link("Tokens", "ltokens"), t.name || `#${t.id}`),
+      head(t.name || `Token ${t.id}`, h("span", { class: "chip arc" }, t.type === 2 ? "divisible" : "indivisible"), t.managed ? pill("managed", true) : pill("fixed supply", true)),
+      kv([["Id", String(t.id)], ["Supply", t.total_shown], ["Issuer", addrLink(t.issuer, t.issuer_tag)], ["Category", [t.category, t.subcategory].filter(Boolean).join(" · ") || "—"],
+        t.url && ["Url", t.url], t.data && ["Data", t.data], ["Created", link(`block ${fmt(t.creation_block)}`, "block", String(t.creation_block))], ["Creation tx", link(short(t.creation_txid, 12, 8), "tx", t.creation_txid, "mono")], ["Holders", fmt(t.holders)]]),
+      h("h2", { class: "x-h2" }, "Top holders"),
+      t.top.length ? table([["Holder"], ["Balance", 1]], t.top.map((x) => ({ go: () => go("address", x.address), cells: [[addrLink(x.address, x.tag)], [x.balance, 1]] }))) : h("div", { class: "x-empty" }, "Nobody holds any."));
+  }
+  async function vLInsc() {
+    const i = await api("explorer.ledger_inscription", { chain: chain.key, id: arg });
+    return h("div", {}, crumbs(link("Arcade ledger", "ledger"), link("Inscriptions", "linscs"), `#${fmt(i.number)}`),
+      head(`Arcade inscription #${fmt(i.number)}`, h("span", { class: "chip arc" }, (i.content_type || "").split(";")[0] || "no type")),
+      h("div", { class: "x-split" }, preview({ content: i.content, ct: i.content_type, n: i.number }, true),
+        kv([["Txid", link(short(i.txid, 14, 8), "tx", i.txid, "mono")], ["Owner", addrLink(i.owner, i.owner_tag)], ["Creator", addrLink(i.creator, i.creator_tag)],
+          ["Inscribed", link(`block ${fmt(i.block_height)}`, "block", String(i.block_height))], ["Content type", i.content_type || "—"], ["Size", `${fmt(i.content_len)} bytes · ${i.chunks} chunk${i.chunks === 1 ? "" : "s"}`],
+          ["sha256", h("span", { class: "mono" }, i.sha256 || "")], i.json && ["JSON", h("span", { class: "mono" }, JSON.stringify(i.json).slice(0, 300))]])));
   }
   async function vBlock() {
     const b = await api("explorer.block", { chain: chain.key, id: arg });
@@ -289,7 +330,8 @@
       kv([["Winning inscription", link(`#${fmt(m.number)}`, "inscription", m.id)], ["Holder", m.owner ? addrLink(m.owner, m.owner_tag) : "—"], ["Block", link(m.claim.split(".")[0], "block", m.claim.split(".")[0])]]));
   }
   const VIEWS = { home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, ledger: vLedger,
-    block: vBlock, tx: vTx, address: vAddress, inscription: vInscription, token: vToken, name: vName, map: vMap };
+    block: vBlock, tx: vTx, address: vAddress, inscription: vInscription, token: vToken, name: vName, map: vMap,
+    ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc };
 
   // ---------- navigation ----------
   function paintNav() {

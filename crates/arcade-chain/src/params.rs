@@ -501,6 +501,46 @@ pub static BITCOIN_MAIN: ChainParams = ChainParams {
     index_start: 970_000,
 };
 
+/// Wojakcoin: a Bitcoin Core 0.21 fork with sha256d, 120 s blocks, no AuxPoW and no active
+/// SegWit. Difficulty: 3-block retarget below 1,000, then a 24-block averaging window
+/// (pow.cpp GetNextWorkRequiredV2) that can ease far more than 4x per block, so the easier-than-
+/// parent limit is off (proof of work is still checked against each header's bits).
+pub static WOJAKCOIN_MAIN: ChainParams = ChainParams {
+    key: "wjk",
+    net: "wjk",
+    chain_no: 11,
+    name: "Wojakcoin",
+    magic: [0x6f, 0x8d, 0xa5, 0x79],
+    p2p_port: 20759,
+    genesis: "000000004536a4f8fa9d88f0001ca9f9825f8d9fd3ba6383a2f030c0427bf085",
+    genesis_header: "0100000000000000000000000000000000000000000000000000000000000000000000001a798b6eef464db807d1aac4beb08a463cdd8863b202523cbfa0523225b8942d2a808259ffff001d0b87a14a",
+    format: Format::BITCOIN,
+    pow: PowRule::Single(PowAlgo::Sha256d),
+    max_easier: false,
+    pow_limit_bits: 0x1d00ffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: None,
+    auxpow_strict_chain_id: false,
+    bech32_hrp: Some("wj"),
+    p2pkh_version: 73,
+    p2sh_version: 5,
+    wif_version: 201,
+    // The existing arcades derive every mainnet add-on on coin type 3.
+    bip44_coin_type: 3,
+    protocol_version: 70016,
+    dns_seeds: &["wojak-seed.s3na.xyz"],
+    fixed_peers: &[
+        "207.244.232.43:20759", "103.133.25.201:20759", "159.223.90.59:20759", "31.58.58.167:20759",
+        "51.15.16.47:20759", "85.215.252.249:20759", "157.173.198.7:20759", "185.9.254.151:20759", "192.99.169.83:20759",
+    ],
+    checkpoints: &[
+        (500, "000000000000000e9e48539d842e3bc080a8e9821335665883957cb47903a87f"),
+        (600, "0000000000000010394cccce3cfd3379c10a2b27a360c52890cbbd02f1a27110"),
+    ],
+    coinbase_maturity: 20,
+    index_start: 228_000,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
     &[
         &PEPECOIN_TEST,
@@ -513,6 +553,7 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &LITECOIN_MAIN,
         &LITECOIN_TEST,
         &BITCOIN_MAIN,
+        &WOJAKCOIN_MAIN,
     ];
 
 /// A chain by its mesh name (what the existing arcades call it).

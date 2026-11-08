@@ -11,6 +11,7 @@
   }
 }
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Ubuntu, sans-serif; background: var(--bg); color: var(--ink); }
 header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
 .brand { font-weight: 700; font-size: 17px; display: flex; align-items: center; gap: 8px; }
@@ -260,3 +261,25 @@ button.small { padding: 4px 10px; font-size: 12px; }
 .small-file { font-size: 13px; color: var(--muted); cursor: pointer; }
 .small-file input { font-size: 12px; }
 .s.bad { color: var(--bad); }
+
+.mx-ghead { display: flex; gap: 10px; align-items: center; }
+.mx-gpic { width: 40px; height: 40px; border-radius: 10px; object-fit: cover; }
+.mx-pin { align-self: stretch; padding: 6px 10px; border-radius: 10px; background: var(--warn-bg); border: 1px solid var(--warn-line); font-size: 13px; }
+.mx-who { font-size: 11px; font-weight: 600; color: var(--muted); }
+.mx-form { display: flex; flex-direction: column; gap: 8px; }
+.mx-form h3 { margin: 0; }
+button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color: inherit; text-decoration: underline; opacity: .7; }
+
+/* Feed */
+.fd-compose { display: flex; flex-direction: column; gap: 4px; }
+.fd-list { display: flex; flex-direction: column; gap: 10px; }
+.fd-card { background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 12px 14px; display: flex; flex-direction: column; gap: 6px; }
+.fd-sub { margin-left: 16px; border-left: 3px solid var(--line); border-radius: 0 10px 10px 0; padding: 8px 10px; background: var(--bg); }
+.fd-who { font-weight: 650; color: var(--ink); text-decoration: none; }
+.fd-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.fd-file img { max-width: 100%; max-height: 360px; border-radius: 8px; }
+.fd-acts { display: flex; gap: 4px; flex-wrap: wrap; }
+.fd-btn { padding: 3px 9px; font-size: 12px; border-radius: 999px; }
+.fd-btn.on { border-color: var(--accent); color: var(--accent); }
+.fd-reply { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
+.fd-reply textarea { flex: 1; min-width: 200px; }

@@ -25,6 +25,7 @@
   <button data-tab="wallet">Wallet</button>
   <button data-tab="handle">Handle</button>
   <button data-tab="messages">Messages</button>
+  <button data-tab="feed">Feed</button>
   <button data-tab="explorer">Explorer</button>
   <button data-tab="chains">Chains &amp; Coins</button>
   <button data-tab="mine">Mine</button>
@@ -100,9 +101,9 @@
       <aside class="mx-side">
         <div class="card" id="mx-me"></div>
         <div class="mx-views" id="mx-views">
-          <button data-v="chats" class="on">Chats</button><button data-v="requests">Requests<span id="mx-req"></span></button><button data-v="contacts">Contacts</button>
+          <button data-v="chats" class="on">Chats</button><button data-v="groups">Groups</button><button data-v="requests">Requests<span id="mx-req"></span></button><button data-v="contacts">Contacts</button>
         </div>
-        <button class="primary" id="mx-new">New message</button>
+        <div class="row" style="margin:0"><button class="primary" id="mx-new">New message</button><button id="mx-newgroup">New group</button></div>
         <ul id="mx-list" class="mx-list"></ul>
       </aside>
       <div class="mx-main">
@@ -124,6 +125,29 @@
         <p class="note">Messages are sealed on the Pepecoin testnet chain to the other person's key, and a copy to yours, so they come back when you restore your 12 words. Each one is a transaction with a small fee; old Dogecoin Arcade accounts can read and reply.</p>
       </div>
     </div>
+  </section>
+
+  <!-- Feed: public posts on the home chain, the original arcade's feed -->
+  <section id="feed" class="tab">
+    <h1>Feed</h1>
+    <div class="fd-compose card">
+      <textarea id="fd-text" rows="3" placeholder="Post publicly (shows your @tag)…"></textarea>
+      <div class="row">
+        <input id="fd-postch" placeholder="channel (main)" style="width:10em">
+        <label class="small-file">Attach <input type="file" id="fd-file"></label>
+        <button class="primary" id="fd-post">Post</button>
+      </div>
+    </div>
+    <div class="row">
+      <div class="mx-views" id="fd-orders"><button data-o="popular" class="on">Popular</button><button data-o="new">New</button><button data-o="friends">Friends</button></div>
+      <select id="fd-channel"></select>
+      <label class="s"><input type="checkbox" id="fd-hidemuted"> hide muted</label>
+      <label class="s"><input type="checkbox" id="fd-contacts"> contacts only</label>
+    </div>
+    <div class="row" id="fd-tagbar" hidden>Posts by <b id="fd-tagname"></b> <button class="small" id="fd-alltags">Everyone</button></div>
+    <p class="msg" id="fd-msg"></p>
+    <div id="fd-list" class="fd-list"></div>
+    <div class="row"><button id="fd-prev">Newer</button><span class="s" id="fd-page"></span><button id="fd-next">Older</button></div>
   </section>
 
   <section id="explorer" class="tab wide">
@@ -192,5 +216,6 @@
 <script src="chains.js"></script>
 <script src="explorer.js"></script>
 <script src="messages.js"></script>
+<script src="feed.js"></script>
 </body>
 </html>

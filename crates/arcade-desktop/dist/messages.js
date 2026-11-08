@@ -42,8 +42,21 @@
   }
 
   async function refreshList() {
-    const items = view === "contacts" ? await api("contacts.list") : await api("msg.conversations", { requests: view === "requests" });
     const list = $("mx-list");
+    if (view === "groups") {
+      const gs = await api("group.list");
+      if (!gs.length) { list.replaceChildren(h("li", { class: "mx-empty" }, "No groups yet. Make one with New group, or ask someone to add you.")); return; }
+      list.replaceChildren(...gs.map((g) => {
+        const li = h("li", { class: "mx-item" + (open === "g:" + g.id ? " on" : "") },
+          h("div", { class: "mx-row" }, h("b", {}, g.name), h("time", {}, g.last ? when(g.last.at) : "")),
+          h("div", { class: "s" }, g.last ? (g.last.dir === "out" ? "You: " : "") + g.last.text : `${g.members.length} member${g.members.length === 1 ? "" : "s"}`),
+          g.unread ? h("span", { class: "badge" }, String(g.unread)) : "");
+        li.onclick = () => { open = "g:" + g.id; composing = false; draw(); };
+        return li;
+      }));
+      return;
+    }
+    const items = view === "contacts" ? await api("contacts.list") : await api("msg.conversations", { requests: view === "requests" });
     if (!items.length) {
       list.replaceChildren(h("li", { class: "mx-empty" }, view === "contacts" ? "No contacts yet. Add someone from a conversation, or with New message." : view === "requests" ? "No message requests." : "No conversations yet."));
       return;
@@ -81,8 +94,103 @@
     return box;
   }
 
+  async function drawGroup(id) {
+    const head = $("mx-head"), body = $("mx-thread");
+    const t = await api("group.thread", { id });
+    const g = t.group, v1 = g.v1 || {};
+    const me = (await api("msg.me")).key;
+    const admin = g.creator === me || (v1.admins || []).includes(me);
+    const memberLine = (g.members || []).map((m) => (m.tag ? "@" + m.tag : (m.address || "").slice(0, 8) + "…") + ((v1.admins || []).includes(m.key) || g.creator === m.key ? " (admin)" : "")).join(", ");
+    const acts = h("div", { class: "mx-acts" });
+    if (admin) {
+      const edit = h("button", { class: "small" }, "Edit");
+      edit.onclick = () => groupEditor(g);
+      acts.append(edit);
+    }
+    const leave = h("button", { class: "small" }, "Leave");
+    leave.onclick = async () => { if (!leave.dataset.sure) { leave.dataset.sure = 1; leave.textContent = "Leave: sure?"; return; } await api("group.leave", { id }); note(`You left ${g.name}.`); open = null; draw(); };
+    acts.append(leave);
+    head.replaceChildren(h("div", { class: "mx-ghead" },
+      v1.picture ? h("img", { class: "mx-gpic", src: v1.picture, alt: "" }) : "",
+      h("div", {}, h("b", {}, g.name), h("div", { class: "s" }, v1.description || ""), h("div", { class: "s" }, memberLine))), acts);
+    const rows = [];
+    const pinned = v1.pinned && t.lines.find((l) => l.id === v1.pinned);
+    if (pinned) rows.push(h("div", { class: "mx-pin" }, "📌 ", pinned.text));
+    for (const m of t.lines) {
+      const mine = m.dir !== "in";
+      const f = await fileView(m);
+      const who = (g.members || []).find((x) => x.address === m.peer_address);
+      const pin = admin ? h("button", { class: "linkish" }, "pin") : "";
+      if (pin) pin.onclick = async () => { await api("group.update", { id, changes: { pinned: m.id } }); note("Pinned."); draw(); };
+      rows.push(h("div", { class: "mx-msg " + (mine ? "mine" : "theirs") },
+        mine ? "" : h("div", { class: "mx-who" }, who ? (who.tag ? "@" + who.tag : who.address) : m.peer_address),
+        m.text ? h("div", { class: "mx-text" }, m.text) : "", f,
+        h("div", { class: "mx-meta" }, when(m.at), m.height ? "" : " · waiting for a block", " ", pin)));
+    }
+    body.replaceChildren(...(rows.length ? rows : [h("div", { class: "mx-empty" }, "No messages in this group yet.")]));
+    body.scrollTop = body.scrollHeight;
+    $("mx-to-row").hidden = true;
+    $("mx-compose").hidden = false;
+    if (t.lines.some((m) => m.unread)) { await api("group.read", { id }); refreshBadge(); }
+  }
+
+  function groupEditor(g) {
+    const v1 = g.v1 || {};
+    const body = $("mx-thread");
+    const desc = h("input", { value: v1.description || "", placeholder: "Description" });
+    const pic = h("input", { type: "file", accept: "image/*" });
+    let picData = null;
+    pic.onchange = () => {
+      const f = pic.files[0]; if (!f) return;
+      const img = new Image(), r = new FileReader();
+      r.onload = () => { img.onload = () => { const cv = document.createElement("canvas"); cv.width = cv.height = 64; cv.getContext("2d").drawImage(img, 0, 0, 64, 64); picData = cv.toDataURL("image/jpeg", 0.7); }; img.src = r.result; };
+      r.readAsDataURL(f);
+    };
+    const members = (g.members || []).filter((m) => m.key !== g.creator);
+    const removeBoxes = members.map((m) => h("label", {}, h("input", { type: "checkbox", value: m.key }), " ", m.tag ? "@" + m.tag : m.address));
+    const adminBoxes = members.map((m) => h("label", {}, h("input", { type: "checkbox", value: m.key, checked: (v1.admins || []).includes(m.key) }), " ", m.tag ? "@" + m.tag : m.address));
+    const save = h("button", { class: "primary" }, "Save changes");
+    save.onclick = async () => {
+      try {
+        const admins = [g.creator, ...adminBoxes.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.value)];
+        await api("group.update", { id: g.id, changes: { description: desc.value, admins, ...(picData ? { picture: picData } : {}) } });
+        const gone = removeBoxes.map((l) => l.querySelector("input")).filter((i) => i.checked).map((i) => i.value);
+        if (gone.length) { const r = await api("group.remove", { id: g.id, members: gone }); open = "g:" + r.id; }
+        note("Saved. Members see it once it's on chain."); draw();
+      } catch (e) { note(e.message, true); }
+    };
+    body.replaceChildren(h("div", { class: "mx-form" },
+      h("h3", {}, "Edit group"), desc, h("label", {}, "Picture ", pic),
+      h("div", { class: "k" }, "Admins"), ...adminBoxes,
+      members.length ? h("div", { class: "k" }, "Remove (gives everyone else a new group key)") : "", ...removeBoxes,
+      h("div", { class: "row" }, save)));
+  }
+
+  function newGroup() {
+    const body = $("mx-thread");
+    $("mx-head").replaceChildren(h("b", {}, "New group"));
+    const name = h("input", { placeholder: "Group name" });
+    const mem = h("input", { placeholder: "Members: @tags or addresses, separated by commas" });
+    const desc = h("input", { placeholder: "Description (optional)" });
+    const go = h("button", { class: "primary" }, "Create and invite");
+    go.onclick = async () => {
+      go.disabled = true;
+      try {
+        const members = mem.value.split(",").map((x) => x.trim()).filter(Boolean);
+        const r = await api("group.create", { name: name.value, members, description: desc.value });
+        note(`Group made; ${members.length} invite${members.length === 1 ? "" : "s"} sent (fee ${PEP(r.fee)}).`);
+        open = "g:" + r.id; view = "groups"; draw();
+      } catch (e) { note(e.message, true); go.disabled = false; }
+    };
+    body.replaceChildren(h("div", { class: "mx-form" }, name, mem, desc,
+      h("p", { class: "s" }, "Each member gets the group's key in a private message; old Dogecoin Arcade accounts can join too."), h("div", { class: "row" }, go)));
+    $("mx-compose").hidden = true;
+  }
+
   async function drawThread() {
     const head = $("mx-head"), body = $("mx-thread");
+    if (open && open.startsWith("g:")) return drawGroup(open.slice(2));
+    if (composing === "group") return newGroup();
     if (composing || !open) {
       head.replaceChildren(h("b", {}, composing ? "New message" : "Messages"), composing ? "" : h("span", { class: "s" }, " · pick a conversation or start a new one"));
       body.replaceChildren();
@@ -166,6 +274,15 @@
     const to = composing ? $("mx-to").value.trim() : open;
     if (!to) { note("Who to? A @tag, an address or a messaging key.", true); return; }
     const btn = $("mx-send"); btn.disabled = true; note("Sending…");
+    if (to.startsWith("g:")) {
+      try {
+        const r = await api("group.say", { id: to.slice(2), text, file: attached || undefined });
+        $("mx-text").value = ""; $("mx-file").value = ""; attached = null; $("mx-fileinfo").textContent = "";
+        note(`Sent to the group (fee ${PEP(r.fee)}).`); draw();
+      } catch (err) { note(err.message, true); }
+      btn.disabled = false;
+      return;
+    }
     try {
       const r = await api("msg.send", { to, text, file: attached || undefined });
       $("mx-text").value = ""; $("mx-file").value = ""; attached = null; $("mx-fileinfo").textContent = "";
@@ -180,6 +297,7 @@
     try { const w = await api("msg.who", { name: v }); $("mx-towho").textContent = `${nameOf(w)} · ${sub(w)}`; $("mx-towho").className = "s"; }
     catch (e) { $("mx-towho").textContent = e.message; $("mx-towho").className = "s bad"; }
   });
+  $("mx-newgroup").onclick = () => { composing = "group"; open = null; view = "groups"; draw(); };
   $("mx-new").onclick = () => { composing = true; open = null; $("mx-to").value = ""; $("mx-towho").textContent = ""; draw(); $("mx-to").focus(); };
   document.querySelectorAll("#mx-views button").forEach((b) => b.addEventListener("click", () => { view = b.dataset.v; draw(); }));
   document.querySelector('nav button[data-tab="messages"]').addEventListener("click", () => draw());

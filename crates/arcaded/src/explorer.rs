@@ -681,5 +681,45 @@ fn search(x: &Ctx, q: &str) -> R {
     if x.has("tokens") && tokens::tick(&x.node.chain, c, q).is_some() {
         return hit("token", q.to_lowercase());
     }
-    Err(format!("nothing on {} matches {q}", x.p.name))
+    // A plain word: everything it could be on this chain, as a list.
+    let w = q.to_lowercase();
+    let mut items: Vec<Value> = Vec::new();
+    if arcade_ledger::index::tag_row(&x.node.chain, x.node.params.chain_no, &w).ok().flatten().is_some() {
+        items.push(json!({"kind": "tag", "id": w, "label": format!("@{w}"), "what": "@tag"}));
+    }
+    if x.has("names") {
+        let pre = KeyBuf::new().u16(c).u8(0).bytes(w.as_bytes()).done();
+        for (k, v) in x.node.chain.store.read(|r| r.scan_prefix_limit(names::WIN, &pre, 25)).unwrap_or_default() {
+            let name = String::from_utf8_lossy(&k[3..]).into_owned();
+            items.push(json!({"kind": "name", "id": name, "label": name, "what": format!("name · inscription #{}", u64::from_be_bytes(v[..8].try_into().unwrap()))}));
+        }
+    }
+    if x.has("tokens") {
+        let pre = KeyBuf::new().u16(c).bytes(w.as_bytes()).done();
+        for (k, _) in x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::TICK, &pre, 25)).unwrap_or_default() {
+            let t = String::from_utf8_lossy(&k[2..]).into_owned();
+            items.push(json!({"kind": "token", "id": t, "label": t, "what": format!("{} token", tokens::protocol(x.p).map(|p| p.0).unwrap_or("").to_uppercase())}));
+        }
+    }
+    if x.has("ledger") {
+        for (_, v) in x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY, &c.to_be_bytes())).unwrap_or_default() {
+            let Ok(pr) = serde_json::from_slice::<Value>(&v) else { continue };
+            let name = pr["name"].as_str().unwrap_or("");
+            if name.to_lowercase().contains(&w) {
+                items.push(json!({"kind": "ltoken", "id": pr["id"].to_string(), "label": name, "what": "arcade token"}));
+                if items.len() > 60 { break; }
+            }
+        }
+    }
+    if items.is_empty() {
+        let mut looked = vec!["blocks", "transactions", "addresses", "@tags"];
+        for (ix, what) in [("names", "names"), ("maps", "maps"), ("tokens", "tokens"), ("ledger", "arcade tokens")] {
+            if x.has(ix) { looked.push(what); }
+        }
+        return Err(format!("nothing matches \"{q}\" (looked in {})", looked.join(", ")));
+    }
+    if items.len() == 1 {
+        return Ok(json!({"kind": items[0]["kind"], "id": items[0]["id"]}));
+    }
+    Ok(json!({"kind": "results", "id": q, "items": items}))
 }

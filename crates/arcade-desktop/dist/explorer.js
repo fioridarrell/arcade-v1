@@ -26,7 +26,7 @@
     // Runes and dunes join here (with their index keys) when those indexes exist.
   ];
   // Pages and the index each needs; a page comes online only when its index is on the chain.
-  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home" };
+  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
   const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
 
   let chains = [], chain = null, sum = null, page = "home", arg = null, seq = 0;
@@ -350,6 +350,13 @@
       t.top.length ? table([["Holder"], ["Balance", 1], ["Transferable", 1]], t.top.map((x) => ({ go: () => go("address", x.address), cells: [[addrLink(x.address, x.tag)], [units(x.overall, t.dec), 1], [units(x.transferable, t.dec), 1]] })))
         : h("div", { class: "x-empty" }, "Nobody holds any yet."));
   }
+  let lastResults = null;
+  async function vResults() {
+    const r = lastResults && lastResults.id === arg ? lastResults : await api("explorer.search", { chain: chain.key, q: arg });
+    if (r.kind !== "results") { go(r.kind, r.id); return h("div"); }
+    return sect(`Results for "${r.id}" on ${chain.name}`, null, table([["Match"], ["What"]], r.items.map((it) => ({ go: () => go(it.kind, it.id),
+      cells: [[h("span", { class: "mono" }, it.label)], [it.what]] }))));
+  }
   async function vTag() {
     const t = await api("explorer.tag", { chain: chain.key, tag: arg });
     const body = t.addresses.length
@@ -373,7 +380,7 @@
   }
   const VIEWS = { home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, ledger: vLedger,
     block: vBlock, tx: vTx, address: vAddress, inscription: vInscription, token: vToken, name: vName, map: vMap,
-    ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc, tag: vTag };
+    ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc, tag: vTag, results: vResults };
 
   // ---------- navigation ----------
   function paintNav() {
@@ -414,6 +421,7 @@
     try {
       const r = await api("explorer.search", { chain: chain.key, q });
       if (NEEDS[r.kind] && !has(NEEDS[r.kind])) throw new Error(`Turn on the ${NEEDS[r.kind]} index for ${chain.name} in Chains & Coins to look up ${q}.`);
+      if (r.kind === "results") { lastResults = r; go("results", r.id); return; }
       go(r.kind, r.id);
     } catch (e) { $("x-view").replaceChildren(h("div", { class: "x-empty" }, `${chain.name}: ${e.message}`)); }
   });

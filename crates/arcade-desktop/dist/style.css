@@ -283,3 +283,8 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .fd-btn.on { border-color: var(--accent); color: var(--accent); }
 .fd-reply { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .fd-reply textarea { flex: 1; min-width: 200px; }
+
+.ap-new { display: flex; flex-direction: column; gap: 8px; }
+.ap-perms { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 6px; }
+.ap-perms label { display: flex; gap: 6px; align-items: flex-start; }
+#ap-out code { word-break: break-all; font-size: 14px; }

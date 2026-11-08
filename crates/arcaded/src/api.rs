@@ -34,7 +34,7 @@ fn handle(node: Arc<Node>, s: UnixStream) {
     }
 }
 
-fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
+pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     let s = |k: &str| req[k].as_str().map(String::from);
     let p = node.params;
     let c = p.chain_no;
@@ -159,6 +159,14 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let keys: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::grpsvc::remove(node, &s("id").ok_or("id required")?, &keys)
         }
+        "rpc.help" => Ok(crate::commands::help()),
+        "apikey.list" => Ok(crate::apikeys::list(node)),
+        "apikey.create" => {
+            let perms: Vec<String> = req["perms"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::apikeys::create(node, &s("name").ok_or("name required")?, &perms, req["tip_limit"].as_u64().unwrap_or(0))
+        }
+        "apikey.revoke" => crate::apikeys::revoke(node, &s("id").ok_or("id required")?),
+        "rpc.info" => Ok(json!({"url": format!("http://127.0.0.1:{}/rpc", node.http_port.get().copied().unwrap_or(8420)), "api": format!("http://127.0.0.1:{}/api/v1/", node.http_port.get().copied().unwrap_or(8420)), "cookie_file": node.home.canonicalize().unwrap_or_else(|_| node.home.clone()).join(".cookie")})),
         "msg.delete" => crate::msgsvc::delete(node, &s("id").ok_or("id required")?),
         "msg.announce" => Ok(json!({"txid": crate::msgsvc::announce_if_needed(node)?})),
         "contacts.list" => Ok(crate::msgsvc::contacts_list(node)),

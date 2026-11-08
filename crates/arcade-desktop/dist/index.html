@@ -30,6 +30,7 @@
   <button data-tab="chains">Chains &amp; Coins</button>
   <button data-tab="mine">Mine</button>
   <button data-tab="activity">Activity</button>
+  <button data-tab="apitab">API</button>
 </nav>
 
 <main>
@@ -150,6 +151,29 @@
     <div class="row"><button id="fd-prev">Newer</button><span class="s" id="fd-page"></span><button id="fd-next">Older</button></div>
   </section>
 
+  <!-- API: sidecar apps (JSON-RPC with the cookie) and websites (web API with keys) -->
+  <section id="apitab" class="tab">
+    <h1>API</h1>
+    <div class="card">
+      <div class="k">For programs on this computer (sidecar apps)</div>
+      <p>JSON-RPC 2.0 at <code id="ap-rpc"></code>, every command, using the cookie file <code id="ap-cookie"></code> as Basic auth. Bitcoin-style clients work as is.</p>
+      <div class="k">For websites</div>
+      <p>The web API at <code id="ap-api"></code>. Public reads need nothing; the rest need a key from below. It answers only this computer: a website you put online reaches it from its own server code, never visitors' browsers.</p>
+      <p class="s">Every command: <code>GET /api/v1/routes</code> or the method <code>rpc.help</code>. Full list in docs/API.md.</p>
+    </div>
+    <h2>API keys</h2>
+    <table><thead><tr><th>Name</th><th>Can</th><th class="num">Tip limit / day</th><th>Last used</th><th></th></tr></thead><tbody id="ap-keys"></tbody></table>
+    <h2>New key</h2>
+    <div class="card ap-new">
+      <input id="ap-name" placeholder="Name (the website or app it is for)">
+      <div class="ap-perms" id="ap-perms"></div>
+      <label>Tip limit per day <input id="ap-tip" type="number" min="0" step="0.01" value="0" style="width:8em"> PEPtest</label>
+      <div class="row"><button class="primary" id="ap-make">Make key</button></div>
+      <div id="ap-out" class="warn" hidden></div>
+    </div>
+    <p class="msg" id="ap-msg"></p>
+  </section>
+
   <section id="explorer" class="tab wide">
     <div class="x-bar">
       <div class="x-nav" id="x-nav"></div>
@@ -217,5 +241,6 @@
 <script src="explorer.js"></script>
 <script src="messages.js"></script>
 <script src="feed.js"></script>
+<script src="apitab.js"></script>
 </body>
 </html>

@@ -2,10 +2,13 @@
 //! keeps mesh links to other arcades, maintains the @tag index, runs tag claims, and
 //! serves the local API for the `arcade` CLI and the desktop app.
 //!
-//!   arcaded [--home DIR] [--no-mesh] [--no-seeds] [--mesh-port N|0] [--mesh-peer HOST:PORT]... [--p2p-only] [--http-port N|0]
+//!   arcaded [--home DIR] [--no-mesh] [--no-seeds] [--mesh-port N|0] [--mesh-peer HOST:PORT]... [--p2p-only]
+//!           [--http-port N|0] [--http-bind ADDR] [--site DIR]
 
 mod addrsvc;
 mod api;
+mod apikeys;
+mod commands;
 mod chainsvc;
 mod chains;
 mod claims;
@@ -71,6 +74,8 @@ fn main() {
     let identity = app.node_identity().expect("node identity");
     let node = Arc::new(Node {
         home: home.clone(),
+        rpc_cookie: Default::default(),
+        http_port: Default::default(),
         app,
         chain,
         params: &arcade_chain::params::PEPECOIN_TEST,
@@ -187,8 +192,21 @@ fn main() {
     }
     let http_port: u16 = opt("--http-port").and_then(|v| v.parse().ok()).unwrap_or(8420);
     if http_port != 0 {
+        match http::write_cookie(&home) {
+            Ok(c) => {
+                let _ = node.rpc_cookie.set(c);
+            }
+            Err(e) => eprintln!("arcaded: no RPC cookie ({e}); /rpc will refuse everyone"),
+        }
+        let _ = node.http_port.set(http_port);
+        let o = http::Opts {
+            // 127.0.0.1 unless the operator opens it; the API and RPC still answer only this computer.
+            bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),
+            port: http_port,
+            site: opt("--site").map(std::path::PathBuf::from),
+        };
         let n = node.clone();
-        std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, http_port)).unwrap();
+        std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, o)).unwrap();
     }
     api::serve(node, home.join("arcaded.sock"));
 }

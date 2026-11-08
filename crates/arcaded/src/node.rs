@@ -40,8 +40,11 @@ pub struct LinkInfo {
 }
 
 pub struct Node {
-    #[allow(dead_code)]
     pub home: std::path::PathBuf,
+    /// "__cookie__:<secret>" for /rpc (written to <home>/.cookie at start).
+    pub rpc_cookie: std::sync::OnceLock<String>,
+    /// The HTTP port, once serving.
+    pub http_port: std::sync::OnceLock<u16>,
     pub app: AppDb,
     pub chain: ChainDb,
     pub params: &'static ChainParams,

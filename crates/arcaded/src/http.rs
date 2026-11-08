@@ -1,26 +1,98 @@
-//! Local HTTP server for inscription content (127.0.0.1 only).
-//!   GET /content/<txid|number>       the inscription's bytes, rebuilt from the chain
+//! The arcade's HTTP server (default 127.0.0.1:8420; --http-bind to open it).
+//!
+//! Anyone who can reach it:
+//!   GET /content/<txid|number>       an inscription's bytes, rebuilt from the chain (sandboxed)
 //!   GET /inscription/<txid|number>   its details (JSON)
-//! Content is from strangers: served with a sandbox CSP and nosniff so it cannot reach the
-//! arcade's API or the wallet.
+//!   GET /<file>                      the operator's website (--site DIR), if any
+//! Only from this computer (and never through a proxy, which adds X-Forwarded-For):
+//!   POST /rpc                        JSON-RPC 2.0 for sidecar apps; Basic auth with the cookie
+//!                                    file (<home>/.cookie: "__cookie__:<secret>"), every command
+//!   GET|POST /api/v1/<group>/<name>  the web API: public reads need nothing; the rest an API key
+//!                                    (Authorization: Bearer ak_...) with the right permission
+//!   GET /api/v1/routes               every command, its parameters and what it needs
+//! Content is from strangers: served with a sandbox CSP and nosniff so it can't reach the API.
 
 use crate::node::Node;
-use std::io::{BufRead, BufReader, Write};
+use serde_json::{json, Map, Value};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
+use std::path::PathBuf;
 use std::sync::Arc;
 
-pub fn serve(node: Arc<Node>, port: u16) {
-    let l = match TcpListener::bind(("127.0.0.1", port)) {
+const MAX_BODY: usize = 64 << 20;
+
+pub struct Opts {
+    pub bind: String,
+    pub port: u16,
+    pub site: Option<PathBuf>,
+}
+
+pub fn serve(node: Arc<Node>, o: Opts) {
+    let l = match TcpListener::bind((o.bind.as_str(), o.port)) {
         Ok(l) => l,
         Err(e) => {
-            let _ = node.app.event("http", &format!("cannot serve content on 127.0.0.1:{port}: {e}"));
+            let _ = node.app.event("http", &format!("cannot serve HTTP on {}:{}: {e}", o.bind, o.port));
             return;
         }
     };
+    let site = Arc::new(o.site);
     for s in l.incoming().flatten() {
-        let node = node.clone();
-        std::thread::spawn(move || handle(&node, s));
+        let (node, site) = (node.clone(), site.clone());
+        std::thread::spawn(move || handle(&node, s, site.as_ref().as_ref()));
     }
+}
+
+/// The cookie for /rpc: a fresh secret at each start, readable by this user only.
+pub fn write_cookie(home: &std::path::Path) -> std::io::Result<String> {
+    let mut b = [0u8; 32];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
+    let v = format!("__cookie__:{}", hex::encode(b));
+    let p = home.join(".cookie");
+    let _ = std::fs::remove_file(&p);
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(&p)?;
+    f.write_all(v.as_bytes())?;
+    Ok(v)
+}
+
+struct Req {
+    method: String,
+    path: String,
+    query: String,
+    headers: Map<String, Value>,
+    body: Vec<u8>,
+}
+
+fn read_req(s: &TcpStream) -> Option<Req> {
+    let mut r = BufReader::new(s);
+    let mut line = String::new();
+    r.read_line(&mut line).ok()?;
+    let mut parts = line.split_whitespace();
+    let (method, target) = (parts.next()?.to_string(), parts.next()?.to_string());
+    let mut headers = Map::new();
+    loop {
+        let mut h = String::new();
+        if r.read_line(&mut h).ok()? == 0 || h == "\r\n" || h == "\n" {
+            break;
+        }
+        if let Some((k, v)) = h.split_once(':') {
+            headers.insert(k.trim().to_ascii_lowercase(), json!(v.trim()));
+        }
+        if headers.len() > 100 {
+            return None;
+        }
+    }
+    let n: usize = headers.get("content-length").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()).unwrap_or(0);
+    if n > MAX_BODY {
+        return None;
+    }
+    let mut body = vec![0u8; n];
+    r.read_exact(&mut body).ok()?;
+    let (path, query) = match target.split_once('?') {
+        Some((p, q)) => (p.to_string(), q.to_string()),
+        None => (target, String::new()),
+    };
+    Some(Req { method, path, query, headers, body })
 }
 
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) {
@@ -33,14 +105,99 @@ fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)
     let _ = s.write_all(body);
 }
 
-fn handle(node: &Node, mut s: TcpStream) {
-    let mut line = String::new();
-    if BufReader::new(&s).read_line(&mut line).is_err() {
-        return;
+const CORS: [(&str, &str); 3] = [
+    ("Access-Control-Allow-Origin", "*"),
+    ("Access-Control-Allow-Headers", "Authorization, Content-Type"),
+    ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
+];
+
+fn cors() -> Vec<(&'static str, String)> {
+    CORS.iter().map(|(k, v)| (*k, v.to_string())).collect()
+}
+
+fn json_out(s: &mut TcpStream, code: u16, v: &Value) {
+    let status = match code {
+        200 => "200 OK",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        _ => "500 Internal Server Error",
+    };
+    respond(s, status, "application/json", &cors(), v.to_string().as_bytes());
+}
+
+/// From this computer, and not relayed by a proxy (a proxy would make the internet look local).
+fn local(s: &TcpStream, r: &Req) -> bool {
+    let ip_local = s.peer_addr().map(|a| match a.ip() {
+        std::net::IpAddr::V4(v) => v.is_loopback(),
+        std::net::IpAddr::V6(v) => v.is_loopback() || v.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
+    }).unwrap_or(false);
+    ip_local && !r.headers.contains_key("x-forwarded-for") && !r.headers.contains_key("forwarded") && !r.headers.contains_key("x-real-ip")
+}
+
+/// Query string to request fields (numbers and true/false as such).
+fn query_fields(q: &str) -> Map<String, Value> {
+    let mut m = Map::new();
+    for kv in q.split('&').filter(|x| !x.is_empty()) {
+        let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+        let v = pct_decode(v);
+        let val = if let Ok(n) = v.parse::<u64>() {
+            json!(n)
+        } else if v == "true" || v == "false" {
+            json!(v == "true")
+        } else {
+            json!(v)
+        };
+        m.insert(pct_decode(k), val);
     }
-    let mut parts = line.split_whitespace();
-    let (method, path) = (parts.next().unwrap_or(""), parts.next().unwrap_or(""));
-    if method != "GET" && method != "HEAD" {
+    m
+}
+
+fn pct_decode(s: &str) -> String {
+    let b = s.as_bytes();
+    let mut out = Vec::with_capacity(b.len());
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'+' => out.push(b' '),
+            b'%' if i + 2 < b.len() => {
+                match u8::from_str_radix(std::str::from_utf8(&b[i + 1..i + 3]).unwrap_or("zz"), 16) {
+                    Ok(x) => {
+                        out.push(x);
+                        i += 2;
+                    }
+                    Err(_) => out.push(b'%'),
+                }
+            }
+            c => out.push(c),
+        }
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
+    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
+    let Some(r) = read_req(&s) else { return };
+    let is_local = local(&s, &r);
+    if r.method == "OPTIONS" {
+        return respond(&mut s, "204 No Content", "text/plain", &cors(), b"");
+    }
+    let path = r.path.clone();
+    if path == "/rpc" {
+        if !is_local {
+            return json_out(&mut s, 403, &json!({"error": "the RPC answers only this computer"}));
+        }
+        return rpc(node, &mut s, &r);
+    }
+    if let Some(rest) = path.strip_prefix("/api/v1/") {
+        if !is_local {
+            return json_out(&mut s, 403, &json!({"ok": false, "error": "the API answers only this computer"}));
+        }
+        return web_api(node, &mut s, &r, rest);
+    }
+    if r.method != "GET" && r.method != "HEAD" {
         return respond(&mut s, "405 Method Not Allowed", "text/plain", &[], b"GET only\n");
     }
     let p = node.params;
@@ -56,17 +213,128 @@ fn handle(node: &Node, mut s: TcpStream) {
                     ("Cache-Control", "public, max-age=31536000, immutable".into()),
                     ("Content-Security-Policy", "sandbox allow-scripts; default-src 'self' data: blob:; connect-src 'none'".into()),
                 ],
-                if method == "HEAD" { &[] } else { &c.bytes },
+                if r.method == "HEAD" { &[] } else { &c.bytes },
             ),
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         },
         ["inscription", id] => match arcade_ledger::content::inscription(&node.chain, p.chain_no, id) {
             Some(mut v) => {
-                v["content"] = serde_json::json!(format!("/content/{}", v["txid"].as_str().unwrap_or("")));
+                v["content"] = json!(format!("/content/{}", v["txid"].as_str().unwrap_or("")));
                 respond(&mut s, "200 OK", "application/json", &[], v.to_string().as_bytes())
             }
             None => respond(&mut s, "404 Not Found", "text/plain", &[], b"no such inscription\n"),
         },
-        _ => respond(&mut s, "404 Not Found", "text/plain", &[], b"try /content/<txid|number> or /inscription/<txid|number>\n"),
+        _ => match site {
+            Some(dir) => site_file(&mut s, dir, &path, r.method == "HEAD"),
+            None => respond(&mut s, "404 Not Found", "text/plain", &[], b"try /content/<txid|number>, /inscription/<txid|number>, or /api/v1/routes from this computer\n"),
+        },
     }
+}
+
+fn site_file(s: &mut TcpStream, dir: &PathBuf, path: &str, head: bool) {
+    let rel = path.trim_start_matches('/');
+    if rel.split('/').any(|p| p == ".." || p.starts_with('.')) {
+        return respond(s, "404 Not Found", "text/plain", &[], b"not found\n");
+    }
+    let mut f = dir.join(if rel.is_empty() { "index.html" } else { rel });
+    if f.is_dir() {
+        f = f.join("index.html");
+    }
+    let Ok(b) = std::fs::read(&f) else { return respond(s, "404 Not Found", "text/plain", &[], b"not found\n") };
+    let ct = match f.extension().and_then(|e| e.to_str()).unwrap_or("") {
+        "html" | "htm" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript",
+        "css" => "text/css",
+        "json" => "application/json",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "svg" => "image/svg+xml",
+        "webp" => "image/webp",
+        "ico" => "image/x-icon",
+        "txt" => "text/plain; charset=utf-8",
+        "woff2" => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    respond(s, "200 OK", ct, &[], if head { &[] } else { &b });
+}
+
+/// /api/v1/<group>/<name> (or /api/v1/<name>): the command group.name, fields from the query
+/// string (GET) or the JSON body (POST).
+fn web_api(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
+    if rest == "routes" {
+        let routes: Vec<Value> = crate::commands::COMMANDS
+            .iter()
+            .map(|c| json!({"route": format!("/api/v1/{}", c.name.replace('.', "/")), "method": c.name, "needs": c.perm.name(), "params": c.params, "summary": c.summary}))
+            .collect();
+        return json_out(s, 200, &json!({"ok": true, "result": routes}));
+    }
+    let cmd = rest.trim_matches('/').replace('/', ".");
+    let mut req = query_fields(&r.query);
+    if r.method == "POST" && !r.body.is_empty() {
+        match serde_json::from_slice::<Value>(&r.body) {
+            Ok(Value::Object(o)) => req.extend(o),
+            _ => return json_out(s, 400, &json!({"ok": false, "error": "the body must be a JSON object"})),
+        }
+    }
+    req.insert("cmd".into(), json!(cmd));
+    let req = Value::Object(req);
+    let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(|v| v.trim().to_string());
+    if let Err((code, e)) = crate::apikeys::allow(node, key.as_deref(), &req) {
+        return json_out(s, code, &json!({"ok": false, "error": e}));
+    }
+    match crate::api::dispatch(node, &req) {
+        Ok(v) => json_out(s, 200, &json!({"ok": true, "result": v})),
+        Err(e) => json_out(s, 400, &json!({"ok": false, "error": e})),
+    }
+}
+
+/// JSON-RPC 2.0 (single or batch) with the cookie: every command, as on the local socket.
+fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
+    use base64::Engine;
+    let want = node.rpc_cookie.get().cloned().unwrap_or_default();
+    let got = r
+        .headers
+        .get("authorization")
+        .and_then(|v| v.as_str())
+        .and_then(|v| v.strip_prefix("Basic "))
+        .and_then(|b| base64::engine::general_purpose::STANDARD.decode(b.trim()).ok())
+        .map(|b| String::from_utf8_lossy(&b).into_owned())
+        .unwrap_or_default();
+    if want.is_empty() || got != want {
+        return respond(s, "401 Unauthorized", "application/json", &[("WWW-Authenticate", "Basic realm=\"arcade\"".into())], br#"{"error":"use the cookie from <home>/.cookie as Basic auth (__cookie__:secret)"}"#);
+    }
+    let call = |c: &Value| -> Option<Value> {
+        let id = c.get("id").cloned();
+        let out = (|| {
+            let method = c["method"].as_str().ok_or((-32600, "no method".to_string()))?;
+            let mut req = match &c["params"] {
+                Value::Object(o) => o.clone(),
+                Value::Null => Map::new(),
+                _ => return Err((-32602, "params must be an object (named parameters)".to_string())),
+            };
+            if method == "rpc.help" {
+                return Ok(crate::commands::help());
+            }
+            if crate::commands::find(method).is_none() {
+                return Err((-32601, format!("unknown method {method}; see rpc.help")));
+            }
+            req.insert("cmd".into(), json!(method));
+            crate::api::dispatch(node, &Value::Object(req)).map_err(|e| (-32000, e))
+        })();
+        let id = id?; // a notification gets no answer
+        Some(match out {
+            Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
+            Err((code, msg)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}),
+        })
+    };
+    let body: Value = match serde_json::from_slice(&r.body) {
+        Ok(v) => v,
+        Err(_) => return respond(s, "200 OK", "application/json", &[], br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse error"}}"#),
+    };
+    let out = match &body {
+        Value::Array(a) => json!(a.iter().filter_map(call).collect::<Vec<_>>()),
+        c => call(c).unwrap_or(Value::Null),
+    };
+    respond(s, "200 OK", "application/json", &[], out.to_string().as_bytes());
 }

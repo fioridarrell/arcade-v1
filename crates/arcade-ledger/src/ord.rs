@@ -35,7 +35,11 @@ pub const IDS: &str = "ord.v1.ids";
 /// Body pieces of unfinished multi-transaction inscriptions: C|origin txid|piece u32 -> bytes
 /// (kept apart from the pending record so a long inscription isn't rewritten for every piece).
 pub const PENDING_BODY: &str = "ord.v1.pending_body";
-pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE, IDS, PENDING_BODY];
+/// Txids of an unfinished inscription's later pieces: C|origin|piece u32 -> txid (32). Kept
+/// apart so the pending record stays small (rewriting a growing txid list for every piece of
+/// a long inscription was quadratic).
+pub const PENDING_TXS: &str = "ord.v1.pending_txs";
+pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE, IDS, PENDING_BODY, PENDING_TXS];
 pub const GROUPS: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -393,6 +397,46 @@ fn body_key(c: u16, origin: &Hash256, piece: u32) -> Vec<u8> {
     KeyBuf::new().u16(c).bytes(&origin.0).u32(piece).done()
 }
 
+/// Whether an inscription's body bytes are worth keeping while its pieces arrive: what reads
+/// bodies (protocol_of, names, maps, tokens) only looks at text/JSON content or at bodies of
+/// at most 64 KiB. Other big bodies (images, video, ...) are served from the chain itself, so
+/// copying them into the database (and its undo records) only costs writes.
+fn keep_body(ct: &[u8], size: u64) -> bool {
+    if size <= 65_536 {
+        return true;
+    }
+    let t = String::from_utf8_lossy(ct).to_ascii_lowercase();
+    t.contains("text/plain") || t.contains("application/json")
+}
+
+/// Drop the stored pieces of an inscription whose body is not kept.
+fn drop_body(l: &Logged, c: u16, origin: &Hash256) -> Result<()> {
+    let pre = KeyBuf::new().u16(c).bytes(&origin.0).done();
+    for (k, _) in l.scan(PENDING_BODY, &pre)? {
+        l.del(PENDING_BODY, &k)?;
+    }
+    Ok(())
+}
+
+/// Note a later piece's txid.
+fn put_tx(l: &Logged, c: u16, origin: &Hash256, piece: u32, txid: &Hash256) -> Result<()> {
+    l.put(PENDING_TXS, &body_key(c, origin, piece), &txid.0)
+}
+
+/// Every piece's txid in order (the ones kept in the pending record first), and drop the
+/// stored ones.
+fn take_txs(l: &Logged, c: u16, p: &Pending) -> Result<Vec<String>> {
+    let mut txs = p.txs.clone();
+    let pre = KeyBuf::new().u16(c).bytes(&p.origin.0).done();
+    for (k, v) in l.scan(PENDING_TXS, &pre)? {
+        if v.len() == 32 {
+            txs.push(Hash256(v[..].try_into().unwrap()).to_hex());
+        }
+        l.del(PENDING_TXS, &k)?;
+    }
+    Ok(txs)
+}
+
 /// Keep one piece's body bytes of an unfinished inscription.
 fn put_piece(l: &Logged, c: u16, origin: &Hash256, piece: u32, bytes: &[u8]) -> Result<()> {
     l.put(PENDING_BODY, &body_key(c, origin, piece), bytes)
@@ -460,14 +504,20 @@ impl Indexer for OrdIndexer {
             let mut done: Option<Complete> = None;
             if let Some(mut pend) = get_pending(l, c, &in0.prevout.txid)? {
                 if let Some(r) = more(&in0.script_sig, pend.left, d) {
+                    let kept = keep_body(&pend.ct, pend.size);
                     pend.size += r.body.len() as u64;
-                    put_piece(l, c, &pend.origin, pend.pieces, &r.body)?;
+                    if keep_body(&pend.ct, pend.size) {
+                        put_piece(l, c, &pend.origin, pend.pieces, &r.body)?;
+                    } else if kept {
+                        drop_body(l, c, &pend.origin)?;
+                    }
+                    put_tx(l, c, &pend.origin, pend.pieces, &txid)?;
                     pend.pieces += 1;
-                    pend.txs.push(txid.to_hex());
                     pend.left = r.left;
                     l.del(PENDING, &k(c, &in0.prevout.txid.0))?;
                     if r.left == 0 {
-                        pend.body = take_body(l, c, &pend)?;
+                        pend.body = if keep_body(&pend.ct, pend.size) { take_body(l, c, &pend)? } else { Vec::new() };
+                        pend.txs = take_txs(l, c, &pend)?;
                         done = Some(Complete { p: pend, tags: r.tags, single: false });
                     } else {
                         put_pending(l, c, &txid, &pend)?;
@@ -487,7 +537,9 @@ impl Indexer for OrdIndexer {
                     pend.body = r.body;
                     done = Some(Complete { p: pend, tags: r.tags, single: true });
                 } else {
-                    put_piece(l, c, &txid, 0, &r.body)?;
+                    if keep_body(&pend.ct, pend.size) {
+                        put_piece(l, c, &txid, 0, &r.body)?;
+                    }
                     put_pending(l, c, &txid, &pend)?;
                 }
             }

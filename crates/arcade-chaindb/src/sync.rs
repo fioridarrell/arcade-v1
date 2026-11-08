@@ -247,13 +247,12 @@ impl<'a> Syncer<'a> {
         let addresses_live = !defer && self.db.addresses_on(c)?;
         let path: Vec<_> = path.into_iter().take(max as usize).collect();
         let mut height = fork;
-        for chunk in path.chunks(batch.max(1)) {
-            let raws = peer.get_blocks(chunk).map_err(SyncError::Source)?;
-            // Parsing and the per-block checks don't depend on each other: spread them over
-            // the cores (the database writes after stay in order, on this thread).
-            let format = &self.params.format;
-            let (db, params) = (self.db, self.params);
-            let first_height = height + 1;
+        // Parsing and the per-block checks don't depend on each other: spread over the cores.
+        // And the next batch is fetched and checked while this one is written (the database
+        // writes stay in order, on this thread).
+        let format = &self.params.format;
+        let (db, params) = (self.db, self.params);
+        let check_chunk = move |raws: Vec<Vec<u8>>, first_height: u32| -> std::result::Result<HashMap<Hash256, Block>, SyncError> {
             let one = |(i, raw): (usize, &Vec<u8>)| -> std::result::Result<Block, SyncError> {
                 let b = Block::parse_with(raw, format).map_err(|e| SyncError::BadBlock { hash: Hash256::ZERO, why: e.to_string() })?;
                 if b.encode() != *raw {
@@ -269,37 +268,79 @@ impl<'a> Syncer<'a> {
             } else {
                 let per = raws.len().div_ceil(threads);
                 std::thread::scope(|sc| {
+                    let one = &one;
                     let hs: Vec<_> = raws.chunks(per).enumerate().map(|(n, part)| sc.spawn(move || part.iter().enumerate().map(|(i, r)| one((n * per + i, r))).collect::<Vec<_>>())).collect();
                     hs.into_iter().flat_map(|h| h.join().expect("block check thread")).collect()
                 })
             };
-            let mut by_hash: HashMap<Hash256, Block> = HashMap::new();
+            let mut by_hash = HashMap::with_capacity(parsed.len());
             for b in parsed {
                 let b = b?;
                 by_hash.insert(b.hash(), b);
             }
-            let mut blocks = Vec::with_capacity(chunk.len());
-            for h in chunk {
-                height += 1;
-                let b = by_hash
-                    .remove(h)
-                    .ok_or_else(|| SyncError::BadBlock { hash: *h, why: "peer did not send it".into() })?;
-                if let Some(rec) = self.db.header(c, h)? {
-                    let parent = self.db.header(c, &rec.header.prev)?.expect("parent stored");
-                    if let Ok(PowCheck::NeedsBlock) = check_header(self.params, &b.header, &parent.header, height) {
-                        check_block_work(self.params, &b, height)
-                            .map_err(|e| SyncError::BadBlock { hash: *h, why: e.to_string() })?;
+            Ok(by_hash)
+        };
+        let chunks: Vec<&[Hash256]> = path.chunks(batch.max(1)).collect();
+        std::thread::scope(|sc| -> Result<()> {
+            let mut next: Option<(std::thread::ScopedJoinHandle<'_, std::result::Result<HashMap<Hash256, Block>, SyncError>>, std::time::Duration, std::time::Instant)> = None;
+            for (i, chunk) in chunks.iter().enumerate() {
+                let first = height + 1;
+                let (mut by_hash, got, checked) = match next.take() {
+                    Some((h, got, t0)) => {
+                        let m = h.join().expect("block check thread")?;
+                        (m, got, t0.elapsed())
                     }
+                    None => {
+                        let t_get = std::time::Instant::now();
+                        let raws = peer.get_blocks(chunk).map_err(SyncError::Source)?;
+                        let got = t_get.elapsed();
+                        let t0 = std::time::Instant::now();
+                        (check_chunk(raws, first)?, got, t0.elapsed())
+                    }
+                };
+                if let Some(nc) = chunks.get(i + 1) {
+                    let t_get = std::time::Instant::now();
+                    let raws = peer.get_blocks(nc).map_err(SyncError::Source)?;
+                    let got = t_get.elapsed();
+                    let nf = first + chunk.len() as u32;
+                    let check_chunk = &check_chunk;
+                    next = Some((sc.spawn(move || check_chunk(raws, nf)), got, std::time::Instant::now()));
                 }
-                blocks.push(b);
+                let mut blocks = Vec::with_capacity(chunk.len());
+                for h in chunk.iter() {
+                    height += 1;
+                    let b = by_hash
+                        .remove(h)
+                        .ok_or_else(|| SyncError::BadBlock { hash: *h, why: "peer did not send it".into() })?;
+                    if let Some(rec) = self.db.header(c, h)? {
+                        let parent = self.db.header(c, &rec.header.prev)?.expect("parent stored");
+                        if let Ok(PowCheck::NeedsBlock) = check_header(self.params, &b.header, &parent.header, height) {
+                            check_block_work(self.params, &b, height)
+                                .map_err(|e| SyncError::BadBlock { hash: *h, why: e.to_string() })?;
+                        }
+                    }
+                    blocks.push(b);
+                }
+                let before = ChainDb::connect_times();
+                let t_w = std::time::Instant::now();
+                self.db.connect_blocks_checked(self.params, &blocks, defer)?;
+                let wrote = t_w.elapsed();
+                let after = ChainDb::connect_times();
+                if std::env::var_os("ARCADE_SYNC_TIMES").is_some() {
+                    eprintln!(
+                        "sync {} at {}: {} blocks · waiting for them {:.2}s · checks {:.2}s · write {:.2}s (indexes {:.2}s){}",
+                        self.params.key, height, blocks.len(), got.as_secs_f64(), checked.as_secs_f64(), wrote.as_secs_f64(),
+                        (after[1] - before[1]) as f64 / 1e9, if defer { " · addresses and indexes put off" } else { "" }
+                    );
+                }
+                prog.blocks += blocks.len() as u32;
+                // Drop what we connected from the cached path.
+                let mut cached = self.path.borrow_mut();
+                let n = blocks.len().min(cached.1.len());
+                cached.1.drain(..n);
             }
-            self.db.connect_blocks_checked(self.params, &blocks, defer)?;
-            prog.blocks += blocks.len() as u32;
-            // Drop what we connected from the cached path.
-            let mut cached = self.path.borrow_mut();
-            let n = blocks.len().min(cached.1.len());
-            cached.1.drain(..n);
-        }
+            Ok(())
+        })?;
         Ok(prog)
     }
 }

@@ -507,7 +507,8 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         // Measured against the chain's real tip (as far as anyone has told us), not just our blocks.
         let top = tip.max(peer);
         let span = top.saturating_sub(start) + 1;
-        let detail = if !running { "waiting to start (rebuilding)".to_string() } else if is_rider(ix) { format!("from block {start}, with the ord index") } else { format!("from block {start}") };
+        let put_off = peer.saturating_sub(tip) > arcade_chaindb::sync::DEFER_BEHIND as u64 && at < tip && tip + 1 >= start;
+        let detail = if put_off { format!("from block {start}: put off until the chain catches up, then read from the stored blocks") } else if !running { "waiting to start (rebuilding)".to_string() } else if is_rider(ix) { format!("from block {start}, with the ord index") } else { format!("from block {start}") };
         // An index that starts further along the chain than we are can't move yet; for the
         // overall figure it counts at the pace of the blocks (it finishes with them).
         let blocks_pct = pct(tip, peer.max(1));
@@ -754,8 +755,12 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
                     continue 'outer;
                 }
             };
-            let mut names: Vec<&str> = run.indexes.iter().map(|i| indexer_name(i)).collect();
+            let mut names: Vec<&str> = run.indexes.iter().map(|i| indexer_name(i)).filter(|n| !n.is_empty()).collect();
             names.dedup();
+            // Far behind, the chain comes in first; the indexes walk it once it has caught up.
+            if node.far_behind(p) {
+                names.clear();
+            }
             for name in names {
                 while {
                     if run.mode == "shared" {

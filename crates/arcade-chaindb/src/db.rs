@@ -289,6 +289,8 @@ pub(crate) fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: 
     }))
 }
 
+static TIMES: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
 pub struct ChainDb {
     pub store: Store,
     /// Indexers and the chains they run on.
@@ -964,10 +966,23 @@ impl ChainDb {
         });
     }
 
+    /// Nanoseconds spent so far: [core writes, protocol indexes, whole write incl. commit].
+    pub fn connect_times() -> [u64; 3] {
+        [0, 1, 2].map(|i| TIMES[i].load(std::sync::atomic::Ordering::Relaxed))
+    }
+
     pub(crate) fn connect_blocks_with(&self, params: &ChainParams, blocks: &[Block], check: bool, defer: bool) -> Result<Tip> {
         let c = params.chain_no;
-        let ixs: Vec<Arc<dyn Indexer>> = self.indexers.read().unwrap().iter().filter(|(ch, _)| *ch == c).map(|(_, i)| i.clone()).collect();
-        self.store.write(|w| {
+        // Far behind (defer), protocol indexes are left out of the commit: they fall behind
+        // and walk the stored blocks once the chain has caught up (backfill), so the chain
+        // itself comes in first and fastest.
+        let ixs: Vec<Arc<dyn Indexer>> = if defer {
+            Vec::new()
+        } else {
+            self.indexers.read().unwrap().iter().filter(|(ch, _)| *ch == c).map(|(_, i)| i.clone()).collect()
+        };
+        let t0 = std::time::Instant::now();
+        let r = self.store.write(|w| {
             let mut tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v));
             // The Addresses index is a choice per chain (on unless turned off).
             let addr = if w.get(STATE, &k_state(c, crate::addrbuild::OFF))?.is_some() {
@@ -984,7 +999,9 @@ impl ChainDb {
                 tip = Some(connect_one(w, params, b, tip, &ixs, check, addr)?);
             }
             tip.ok_or_else(|| other("nothing connected"))
-        })
+        });
+        TIMES[2].fetch_add(t0.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
+        r
     }
 
     /// Disconnect the tip block using its undo record.
@@ -1185,6 +1202,7 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
     }
 
     // Protocol indexes, in the same commit; only those exactly caught up to the parent.
+    let t_ix = std::time::Instant::now();
     for ix in ixs {
         let k = ix_key(c, ix.name());
         let at = l.get(STATE, &k)?.map(|v| be_u32(&v, 0));
@@ -1198,6 +1216,7 @@ fn connect_one(w: &WriteTxn, params: &ChainParams, blk: &Block, tip: Option<Tip>
             l.put(STATE, &k, &height.to_be_bytes())?;
         }
     }
+    TIMES[1].fetch_add(t_ix.elapsed().as_nanos() as u64, std::sync::atomic::Ordering::Relaxed);
 
     hrec.status = STATUS_MAIN;
     hrec.height = height;

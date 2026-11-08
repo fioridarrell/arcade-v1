@@ -152,6 +152,16 @@ impl Node {
     }
 
     /// Coin peers for a chain: shared and learned ones first, then fixed peers, then DNS seeds.
+    /// More than DEFER_BEHIND blocks short of the chain's height (as our headers or any
+    /// source tell it): addresses and protocol indexes are put off until then.
+    pub fn far_behind(&self, p: &arcade_chain::params::ChainParams) -> bool {
+        let c = p.chain_no;
+        let tip = self.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
+        let best = self.chain.best_header(c).ok().flatten().and_then(|h| self.chain.header(c, &h).ok().flatten()).map(|r| r.height).unwrap_or(0);
+        let told = self.extra.lock().unwrap().values().find(|r| r.params.chain_no == c).map(|r| r.peer_tip.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0);
+        best.max(told).saturating_sub(tip) > arcade_chaindb::sync::DEFER_BEHIND
+    }
+
     pub fn coin_candidates(&self, p: &arcade_chain::params::ChainParams) -> Vec<String> {
         use std::net::ToSocketAddrs;
         let mut v: Vec<String> = self.coin_peers.lock().unwrap().get(p.net).map(|s| s.iter().cloned().collect()).unwrap_or_default();

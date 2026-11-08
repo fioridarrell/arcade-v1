@@ -9,6 +9,10 @@ pub const INDEXES: &[&str] = &["ledger.v1", "profiles.v1", "ord.v1"];
 /// Backfill lagging indexes a batch at a time. Returns blocks processed.
 pub fn catch_up(node: &Node) -> Result<u32, String> {
     let mut n = 0;
+    // Far behind, the chain comes in first (indexes are put off); they walk it afterwards.
+    if node.far_behind(node.params) {
+        return Ok(0);
+    }
     let running = node.chain.indexers_for(node.params.chain_no);
     for name in INDEXES.iter().filter(|i| running.contains(i)) {
         loop {

@@ -81,13 +81,7 @@ pub fn run(node: Arc<Node>) {
                 continue;
             }
             // Only once caught up: while far behind, more rows are still being put aside.
-            let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
-            let best = node.chain.best_header(c).ok().flatten().and_then(|h| node.chain.header(c, &h).ok().flatten()).map(|r| r.height).unwrap_or(0);
-            // Sources that send headers with the blocks leave our best header near the tip:
-            // the height they told us counts too.
-            let told = node.extra.lock().unwrap().values().find(|r| r.params.chain_no == c).map(|r| r.peer_tip.load(Ordering::Relaxed)).unwrap_or(0);
-            let best = best.max(told);
-            if best.saturating_sub(tip) > arcade_chaindb::sync::DEFER_BEHIND {
+            if node.far_behind(p) {
                 continue;
             }
             let stop = Arc::new(AtomicBool::new(false));

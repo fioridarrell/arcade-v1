@@ -8,6 +8,7 @@ license.workspace = true
 arcade-chain = { version = "0.1.0", path = "../arcade-chain" }
 arcade-chaindb = { version = "0.1.0", path = "../arcade-chaindb" }
 arcade-store = { version = "0.1.0", path = "../arcade-store" }
+arcade-msg = { version = "0.1.0", path = "../arcade-msg" }
 bs58 = { version = "0.5.1", features = ["check"] }
 hex = "0.4.3"
 regex = "1.13.1"

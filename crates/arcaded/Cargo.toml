@@ -9,6 +9,7 @@ arcade-app = { version = "0.1.0", path = "../arcade-app" }
 arcade-chain = { version = "0.1.0", path = "../arcade-chain" }
 arcade-chaindb = { version = "0.1.0", path = "../arcade-chaindb" }
 arcade-ledger = { version = "0.1.0", path = "../arcade-ledger" }
+arcade-msg = { version = "0.1.0", path = "../arcade-msg" }
 arcade-mesh = { version = "0.1.0", path = "../arcade-mesh" }
 arcade-store = { version = "0.1.0", path = "../arcade-store" }
 arcade-wallet = { version = "0.1.0", path = "../arcade-wallet" }

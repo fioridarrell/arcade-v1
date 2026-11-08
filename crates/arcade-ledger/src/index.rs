@@ -25,7 +25,7 @@ fn k(c: u16, s: &str) -> Vec<u8> {
 }
 
 /// Arcade transactions in a block: (position, tx, extracted).
-fn arcade_txs<'a>(ctx: &'a BlockCtx) -> Vec<(usize, &'a arcade_chain::Tx, crate::extract::ArcadeTx)> {
+pub(crate) fn arcade_txs<'a>(ctx: &'a BlockCtx) -> Vec<(usize, &'a arcade_chain::Tx, crate::extract::ArcadeTx)> {
     let marker = class_b_marker(ctx.params);
     let mut out = Vec::new();
     for (pos, tx) in ctx.block.txs.iter().enumerate() {
@@ -264,9 +264,13 @@ impl Indexer for ProfileIndexer {
         let c = p.chain_no;
         for (pos, tx, atx) in arcade_txs(ctx) {
             let Some(a) = parse_announcement(&atx.payload) else { continue };
+            // A stated address counts only when it is the sender's own (the old arcade files an
+            // announcement under any address it claims, so anyone could publish a key for
+            // someone else's address and have messages to them sealed to it).
+            let sender_h160 = crate::address::decode_base58check(&atx.sender).map(|(_, h)| h);
             let (address, stated) = match a.stated_h160 {
-                Some(h) => (crate::address::base58check(p.p2pkh_version, &h), true),
-                None => (atx.sender.clone(), false),
+                Some(h) if sender_h160.as_deref() == Some(&h[..]) => (atx.sender.clone(), true),
+                _ => (atx.sender.clone(), false),
             };
             let mut linked: Vec<(String, String)> = Vec::new();
             if let (Some(h), Some(v)) = (a.other_h160, other_version(p)) {

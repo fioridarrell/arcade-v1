@@ -18,6 +18,12 @@ pub const CLAIMS: &str = "app.v1.claims"; // id -> Claim
 pub const FAUCET: &str = "app.v1.faucet"; // id -> FaucetRequest
 pub const PEERS: &str = "app.v1.peers"; // node id -> Peer
 pub const EVENTS: &str = "app.v1.events"; // time u64 | seq u32 -> Event
+/// Messaging (version 2): opened and sent messages (sealed), contacts, mutes, chunk parts, groups.
+pub const MAIL: &str = "app.v2.mail"; // id -> nonce | sealed JSON
+pub const CONTACTS: &str = "app.v2.contacts"; // x25519 pub hex -> JSON
+pub const MUTES: &str = "app.v2.mutes"; // address -> muted_at u64
+pub const MAIL_PARTS: &str = "app.v2.mail_parts"; // sender|msg_id|countdown -> ciphertext piece
+pub const GROUPS: &str = "app.v2.groups"; // group id -> nonce | sealed JSON (holds the group secret)
 
 static TABLES: &[TableDef] = &[
     TableDef::plain(META),
@@ -27,12 +33,21 @@ static TABLES: &[TableDef] = &[
     TableDef::plain(FAUCET),
     TableDef::plain(PEERS),
     TableDef::plain(EVENTS),
+    TableDef::plain(MAIL),
+    TableDef::plain(CONTACTS),
+    TableDef::plain(MUTES),
+    TableDef::plain(MAIL_PARTS),
+    TableDef::plain(GROUPS),
 ];
 
-static MIGRATIONS: &[Migration] = &[];
+fn add_messaging(_w: &arcade_store::WriteTxn) -> arcade_store::Result<()> {
+    Ok(()) // the tables are created before migrations run
+}
+
+static MIGRATIONS: &[Migration] = &[Migration { to: 2, run: add_messaging }];
 
 pub static APP_SCHEMA: Schema =
-    Schema { name: "arcade", version: 1, tables: TABLES, migrations: MIGRATIONS, max_size: 64 << 30 };
+    Schema { name: "arcade", version: 2, tables: TABLES, migrations: MIGRATIONS, max_size: 64 << 30 };
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -189,6 +204,36 @@ impl AppDb {
         }
         let nonce: [u8; 24] = v[..24].try_into().unwrap();
         self.cipher.decrypt(&XNonce::from(nonce), &v[24..]).map(Some).map_err(|_| AppError::BadSecret)
+    }
+
+    /// Put a value in `table`, encrypted with this arcade's secret key (messages, groups).
+    pub fn put_sealed(&self, table: &str, key: &[u8], plain: &[u8]) -> Result<()> {
+        let nonce: [u8; 24] = random();
+        let ct = self.cipher.encrypt(&XNonce::from(nonce), plain).map_err(|_| AppError::BadSecret)?;
+        let mut v = nonce.to_vec();
+        v.extend_from_slice(&ct);
+        self.store.write(|w| w.put(table, key, &v))?;
+        Ok(())
+    }
+
+    fn unseal_row(&self, v: &[u8]) -> Result<Vec<u8>> {
+        if v.len() < 24 {
+            return Err(AppError::BadSecret);
+        }
+        let nonce: [u8; 24] = v[..24].try_into().unwrap();
+        self.cipher.decrypt(&XNonce::from(nonce), &v[24..]).map_err(|_| AppError::BadSecret)
+    }
+
+    pub fn get_sealed(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        match self.store.read(|r| r.get(table, key))? {
+            Some(v) => Ok(Some(self.unseal_row(&v)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Every (key, opened value) under a prefix of a sealed table.
+    pub fn scan_sealed(&self, table: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        self.store.read(|r| r.scan_prefix(table, prefix))?.into_iter().map(|(k, v)| Ok((k, self.unseal_row(&v)?))).collect()
     }
 
     /// An imported wallet's key, kept encrypted like the phrase.

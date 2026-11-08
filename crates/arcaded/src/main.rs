@@ -19,6 +19,7 @@ mod links;
 mod meshsource;
 mod miner;
 mod meshsvc;
+mod msgsvc;
 mod node;
 mod psync;
 mod rpc;
@@ -115,6 +116,10 @@ fn main() {
     {
         let n = node.clone();
         std::thread::Builder::new().name("addresses".into()).spawn(move || addrsvc::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("messages".into()).spawn(move || msgsvc::run(n)).unwrap();
     }
     {
         let n = node.clone();

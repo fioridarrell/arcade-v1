@@ -17,7 +17,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const MODES: &[&str] = &["light", "chain", "index", "full", "shared"];
-pub const INDEXES: &[&str] = &["addresses", "ledger", "profiles", "ord", "names", "maps", "tokens", "runes", "dunes"];
+pub const INDEXES: &[&str] = &["addresses", "messages", "ledger", "profiles", "ord", "names", "maps", "tokens", "runes", "dunes"];
 pub const COMING: &[&str] = &["runes", "dunes"];
 const HOME_DEFAULT: &[&str] = &["ledger", "profiles"];
 
@@ -42,6 +42,7 @@ pub fn indexer_name(index: &str) -> &'static str {
     match index {
         "ledger" => "ledger.v1",
         "profiles" => "profiles.v1",
+        "messages" => "messages.v1",
         "ord" | "names" | "maps" | "tokens" => "ord.v1",
         _ => "",
     }
@@ -57,6 +58,7 @@ fn tables_of(index: &str) -> Vec<String> {
     match index {
         "ledger" => arcade_ledger::engine::LedgerIndexer.tables_named(),
         "profiles" => s(&[arcade_ledger::index::PROFILE, arcade_ledger::index::LINKED]),
+        "messages" => s(arcade_ledger::messages::TABLES),
         "ord" => s(arcade_ledger::ord::TABLES),
         "names" => s(&[arcade_ledger::names::CLAIM, arcade_ledger::names::WIN]),
         "maps" => s(&[arcade_ledger::maps::MAP]),
@@ -71,6 +73,9 @@ fn normalize(p: &ChainParams, indexes: &[String]) -> Result<Vec<String>, String>
     for ix in indexes {
         if !INDEXES.contains(&ix.as_str()) {
             return Err(format!("unknown index {ix}; indexes: {}", INDEXES.join(", ")));
+        }
+        if ix == "messages" {
+            return Err("messages live on the home chain (Pepecoin testnet), where they're always on".into());
         }
         // Runes live on Bitcoin and dunes on Dogecoin only.
         if ix == "runes" && p.key != "btc" {
@@ -104,6 +109,7 @@ fn register_shared(node: &Node, p: &'static ChainParams, indexes: &[String], sha
         let r = match ix.as_str() {
             "ledger" => node.chain.add_indexer(c, Arc::new(arcade_ledger::engine::LedgerIndexer)),
             "profiles" => node.chain.add_indexer(c, Arc::new(arcade_ledger::index::ProfileIndexer)),
+            "messages" => node.chain.add_indexer(c, Arc::new(arcade_ledger::messages::MessageIndexer)),
             "ord" => {
                 let riders: Vec<&str> = indexes.iter().map(|s| s.as_str()).filter(|i| is_rider(i)).collect();
                 node.chain.remove_indexer(c, "ord.v1");
@@ -146,13 +152,16 @@ pub fn home_indexes(node: &Node) -> Vec<String> {
         .flatten()
         .and_then(|v| serde_json::from_slice::<Vec<String>>(&v).ok())
         .map(|mut v| {
-            // The home chain always keeps addresses (the wallet and faucet need its coins).
-            if !v.iter().any(|i| i == "addresses") {
-                v.insert(0, "addresses".into());
+            // The home chain always keeps addresses (the wallet and faucet need its coins) and
+            // messages (messaging lives on the home chain).
+            for (i, ix) in ["addresses", "messages"].iter().enumerate() {
+                if !v.iter().any(|x| x == ix) {
+                    v.insert(i, ix.to_string());
+                }
             }
             v
         })
-        .unwrap_or_else(|| std::iter::once("addresses").chain(HOME_DEFAULT.iter().copied()).map(String::from).collect())
+        .unwrap_or_else(|| ["addresses", "messages"].into_iter().chain(HOME_DEFAULT.iter().copied()).map(String::from).collect())
 }
 
 fn save_home(node: &Node, ix: &[String]) {
@@ -161,6 +170,16 @@ fn save_home(node: &Node, ix: &[String]) {
 
 /// Register the home chain's indexes (at start).
 pub fn start_home(node: &Node) -> Result<(), String> {
+    // Profiles built before a stated address had to be the sender's own: rebuild them once
+    // (they're read from the chain again, from the ledger's start).
+    let flag = b"profiles_rule";
+    if node.app.store.read(|r| r.get(arcade_app::META, flag)).ok().flatten().as_deref() != Some(b"sender-v1".as_slice()) {
+        let c = node.params.chain_no;
+        let t = tables_of("profiles");
+        while node.chain.remove_index_batch(c, "profiles.v1", &t, 20_000).map(|n| n > 0).unwrap_or(false) {}
+        let _ = node.app.store.write(|w| w.put(arcade_app::META, flag, b"sender-v1"));
+        let _ = node.app.event("index", "profiles: rebuilding (a messaging key now counts only for the address that published it)");
+    }
     register_shared(node, node.params, &home_indexes(node), &node.share_of(node.params.key))
 }
 
@@ -363,6 +382,9 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
     let (home, cur, run) = current(node, key)?;
+    if home && index == "messages" {
+        return Err("messaging lives on the home chain, so its Messages index stays".into());
+    }
     if home && index == "ledger" {
         return Err("the home chain's ledger holds your @handle and claims, so it stays".into());
     }
@@ -442,6 +464,7 @@ fn pct(done: u64, total: u64) -> f64 {
 fn label(p: &ChainParams, ix: &str) -> String {
     match ix {
         "addresses" => "Addresses".into(),
+        "messages" => "Messages".into(),
         "ledger" => "Arcade ledger".into(),
         "profiles" => "Profiles".into(),
         "ord" => "Ord index".into(),
@@ -499,7 +522,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         let name = indexer_name(ix);
         let start = match ix.as_str() {
             "ledger" => arcade_ledger::engine::gates(p).activation as u64,
-            "profiles" => p.index_start as u64,
+            "profiles" | "messages" => p.index_start as u64,
             _ => ord_start(p).unwrap_or(0) as u64,
         };
         let running = node.chain.indexers_for(c).contains(&name);

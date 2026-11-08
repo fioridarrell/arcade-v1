@@ -169,6 +169,17 @@ fn main() {
         for a in seeds.into_iter().chain(extra_peers) {
             meshsvc::dial(&node, a);
         }
+        // Arcades that announce themselves on chain (MESH records), checked every 10 minutes.
+        if !no_seeds {
+            let n = node.clone();
+            std::thread::Builder::new().name("mesh chain".into()).spawn(move || loop {
+                let added = meshsvc::chain_announced(&n);
+                if added > 0 {
+                    let _ = n.app.event("mesh", &format!("{added} arcade{} found announced on chain", if added == 1 { "" } else { "s" }));
+                }
+                std::thread::sleep(std::time::Duration::from_secs(600));
+            }).unwrap();
+        }
         if let Some(port) = mesh_port {
             let n = node.clone();
             std::thread::Builder::new().name("mesh listen".into()).spawn(move || meshsvc::listen(n, port)).unwrap();

@@ -92,6 +92,41 @@ fn on_addrs(node: &Node, h: &Value) {
     }
 }
 
+/// Arcades that announced themselves on the home chain (MESH records): known peers, dialled.
+pub fn chain_announced(node: &Arc<Node>) -> usize {
+    let c = node.params.chain_no;
+    let me = hex::encode(node.identity.verifying_key().to_bytes());
+    // The newest announcement per node key.
+    let mut by_key: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for r in arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::MACHINE, c).unwrap_or_default() {
+        if let (Some(addr), Some(key)) = (r["mesh"].as_str(), r["key"].as_str()) {
+            by_key.insert(key.to_string(), addr.to_string());
+        }
+    }
+    let known: std::collections::BTreeSet<String> = node.app.peers().unwrap_or_default().into_iter().map(|p| p.id).collect();
+    let linked: std::collections::BTreeSet<String> = node.links.lock().unwrap().values().map(|l| l.node_id.clone()).collect();
+    let mut n = 0;
+    for (key, addr) in by_key {
+        if key == me || linked.contains(&key) {
+            continue;
+        }
+        if !known.contains(&key) {
+            let (host, port) = if addr.starts_with("wss://") {
+                (addr.clone(), 443)
+            } else {
+                match addr.rsplit_once(':') {
+                    Some((h, p)) => (h.trim_matches(|c| c == '[' || c == ']').to_string(), p.parse().unwrap_or(8421)),
+                    None => continue,
+                }
+            };
+            let _ = node.app.put_peer(&arcade_app::Peer { id: key.clone(), host, port, source: "chain".into(), last_seen: 0, failures: 0 });
+            n += 1;
+        }
+        dial(node, addr);
+    }
+    n
+}
+
 fn on_coin_peers(node: &Node, h: &Value) {
     let Some(nets) = h["nets"].as_object() else { return };
     for (key, list) in nets {
@@ -121,6 +156,14 @@ pub fn run(node: Arc<Node>, addr: String) {
             Ok(mut link) => {
                 fails = 0;
                 let id = link.peer_id.clone();
+                // Already linked to this arcade under another address (one arcade, several
+                // names): it keeps one link per node and closes this one, so don't keep
+                // redialling; look again in half an hour.
+                if node.links.lock().unwrap().values().any(|l| l.node_id == id && l.addr != addr) {
+                    drop(link);
+                    std::thread::sleep(Duration::from_secs(1800));
+                    continue;
+                }
                 node.links.lock().unwrap().insert(addr.clone(), LinkInfo { addr: addr.clone(), node_id: id.clone(), since: now() });
                 let _ = node.app.put_peer(&arcade_app::Peer {
                     id: id.clone(),

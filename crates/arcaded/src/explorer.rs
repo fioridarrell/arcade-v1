@@ -615,6 +615,35 @@ fn mempool(x: &Ctx) -> R {
     Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": if home { json!(crate::claims::pending_tags(x.node)) } else { json!([]) }, "unit": unit(x.p)}))
 }
 
+/// Old arcades with public web addresses, asked for an account's imported wallets
+/// (GET /signin/<tag>/coins). Their word, not a proof: shown as "imported, per <host>".
+const OLD_ARCADE_HOSTS: &[&str] = &["app.dogecoinarcade.com", "pepecoinarcade.com"];
+
+/// (host, chain net -> addresses) per tag, kept 10 minutes.
+fn imported_lists(tag: &str) -> Vec<(String, serde_json::Map<String, Value>)> {
+    use std::sync::{Mutex, OnceLock};
+    static CACHE: OnceLock<Mutex<std::collections::HashMap<String, (std::time::Instant, Vec<(String, serde_json::Map<String, Value>)>)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    if let Some((t, v)) = cache.lock().unwrap().get(tag) {
+        if t.elapsed() < std::time::Duration::from_secs(600) {
+            return v.clone();
+        }
+    }
+    let mut out = Vec::new();
+    for host in OLD_ARCADE_HOSTS {
+        let url = format!("https://{host}/signin/{tag}/coins");
+        if let Ok((200, body)) = arcade_mesh::transport::https_get(&url, std::time::Duration::from_secs(8), 2 << 20) {
+            if let Ok(v) = serde_json::from_slice::<Value>(&body) {
+                if let Some(l) = v["lists"].as_object() {
+                    out.push((host.to_string(), l.clone()));
+                }
+            }
+        }
+    }
+    cache.lock().unwrap().insert(tag.to_string(), (std::time::Instant::now(), out.clone()));
+    out
+}
+
 /// An @tag on the picked chain: the tag lives on Pepecoin testnet; its owner's addresses on
 /// this chain are the ones their published profile lists (there can be several).
 fn tag_page(x: &Ctx, t: &str) -> R {
@@ -642,6 +671,20 @@ fn tag_page(x: &Ctx, t: &str) -> R {
             }
         }
     }
+    // Imported wallets: only old arcades know them (sealed records, per-arcade lists), so
+    // they come with that arcade's word, not a proof.
+    let mut imported: Vec<(String, String)> = Vec::new();
+    for (host, lists) in imported_lists(&t) {
+        if let Some(m) = lists.get(x.p.net).and_then(|v| v.as_object()) {
+            for a in m.keys() {
+                if !addrs.iter().any(|(b, _)| b == a) && !imported.iter().any(|(b, _)| b == a) {
+                    imported.push((a.clone(), format!("imported wallet, according to {host} (not verified)")));
+                }
+            }
+        }
+    }
+    let mut addrs: Vec<(String, String)> = addrs.into_iter().map(|(a, w)| (a, w.to_string())).collect();
+    addrs.extend(imported);
     let list: Vec<Value> = addrs.iter().map(|(a, why)| {
         let bal = script_for(x, a).and_then(|sc| x.node.chain.balance_for_script(x.c(), &sc).ok());
         json!({"address": a, "why": why, "balance": bal})

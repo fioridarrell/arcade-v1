@@ -242,3 +242,44 @@ impl Transport for Wss {
         self.url.clone()
     }
 }
+
+// ---------------- plain HTTPS GET (for public old-arcade routes) ----------------
+
+/// GET `https://host/path` and return (status, body). HTTP/1.0 so the body is never chunked.
+/// Bodies are capped at `max` bytes.
+pub fn https_get(url: &str, timeout: Duration, max: usize) -> io::Result<(u16, Vec<u8>)> {
+    let rest = url.strip_prefix("https://").ok_or_else(|| bad("not an https:// URL"))?;
+    let (host, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let sa = (host, 443u16).to_socket_addrs()?.next().ok_or_else(|| bad("cannot resolve host"))?;
+    let tcp = TcpStream::connect_timeout(&sa, timeout)?;
+    tcp.set_read_timeout(Some(timeout))?;
+    tcp.set_write_timeout(Some(timeout))?;
+    let name = rustls::pki_types::ServerName::try_from(host.to_string()).map_err(|_| bad("bad host name"))?;
+    let conn = rustls::ClientConnection::new(tls_config(), name).map_err(|e| bad(&e.to_string()))?;
+    let mut s = rustls::StreamOwned::new(conn, tcp);
+    let req = format!("GET {path} HTTP/1.0\r\nHost: {host}\r\nUser-Agent: arcade/1.0\r\nAccept: application/json\r\nConnection: close\r\n\r\n");
+    s.write_all(req.as_bytes())?;
+    let mut all = Vec::new();
+    let mut buf = [0u8; 16384];
+    loop {
+        match s.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                all.extend_from_slice(&buf[..n]);
+                if all.len() > max + 16384 {
+                    return Err(bad("response too large"));
+                }
+            }
+            // Servers often close TLS without a close_notify; what we have is the answer.
+            Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => break,
+            Err(e) => return Err(e),
+        }
+    }
+    let split = all.windows(4).position(|w| w == b"\r\n\r\n").ok_or_else(|| bad("no HTTP head"))?;
+    let head = String::from_utf8_lossy(&all[..split]);
+    let status: u16 = head.split_whitespace().nth(1).and_then(|x| x.parse().ok()).ok_or_else(|| bad("bad status line"))?;
+    Ok((status, all[split + 4..].to_vec()))
+}

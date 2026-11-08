@@ -444,7 +444,11 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         let top = tip.max(peer);
         let span = top.saturating_sub(start) + 1;
         let detail = if !running { "waiting to start (rebuilding)".to_string() } else if is_rider(ix) { format!("from block {start}, with the ord index") } else { format!("from block {start}") };
-        stages.push(json!({"name": label(p, ix), "index": ix, "detail": detail,
+        // An index that starts further along the chain than we are can't move yet; for the
+        // overall figure it counts at the pace of the blocks (it finishes with them).
+        let blocks_pct = pct(tip, peer.max(1));
+        let overall_pct = if at + 1 < start { blocks_pct } else if !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) };
+        stages.push(json!({"name": label(p, ix), "index": ix, "detail": detail, "overall_pct": overall_pct,
                            "pct": if at + 1 < start || !running { 0.0 } else { pct(at.saturating_sub(start) + 1, span) }, "at": at, "of": top}));
     }
     if mode == "shared" {
@@ -464,7 +468,8 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     if let Some(cur) = stages.iter_mut().find(|s| s["pct"].as_f64().unwrap_or(0.0) < 100.0) {
         cur["current"] = json!(true);
     }
-    let overall = stages.iter().filter(|s| s["info"] != true).map(|s| s["pct"].as_f64().unwrap_or(0.0)).sum::<f64>() / stages.iter().filter(|s| s["info"] != true).count().max(1) as f64;
+    let overall = stages.iter().filter(|s| s["info"] != true).map(|s| s["overall_pct"].as_f64().or(s["pct"].as_f64()).unwrap_or(0.0)).sum::<f64>()
+        / stages.iter().filter(|s| s["info"] != true).count().max(1) as f64;
     let state = match &run {
         Some(r) => {
             if r.paused.load(Ordering::Relaxed) {

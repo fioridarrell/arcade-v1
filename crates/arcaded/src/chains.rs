@@ -563,7 +563,7 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
         }
     }
     for (id, addr, kind, their) in offers {
-        if run.stop.load(Ordering::Relaxed) || their <= ours() + 10 {
+        if run.stop.load(Ordering::Relaxed) || their <= ours() {
             continue;
         }
         let short = &id[..id.len().min(12)];
@@ -606,7 +606,7 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             }
         }
         let _ = node.app.event("chains", &format!("{} bootstrap from arcade {short} reached {}", p.name, ours()));
-        if ours() + 10 >= their {
+        if ours() >= their {
             break;
         }
     }
@@ -629,7 +629,10 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
         // (another arcade may answer where the last one stopped), P2P only after.
         {
             let ours = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
-            if node.offers_for(p.key).iter().any(|o| o.3 > ours + 1000) && last_mesh.elapsed() > Duration::from_secs(60) {
+            // (When the coin's P2P network is failing too, any arcade that is ahead serves new blocks.)
+            let p2p_failing = run.state.lock().unwrap().starts_with("headers:") || run.state.lock().unwrap().starts_with("no ");
+            let gap = if p2p_failing { 0 } else { 1000 };
+            if node.offers_for(p.key).iter().any(|o| o.3 > ours + gap) && last_mesh.elapsed() > Duration::from_secs(if p2p_failing { 20 } else { 60 }) {
                 mesh_first(&node, &run, &syncer);
                 last_mesh = std::time::Instant::now();
             }

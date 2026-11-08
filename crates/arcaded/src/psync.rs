@@ -272,7 +272,7 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
         .ok_or("no source for block hashes")?;
     let pool = Pool { s: Mutex::new(State { next: tip + 1, want: tip + 1, ..Default::default() }), cv: Condvar::new(), stop: AtomicBool::new(false), top };
     let short = |id: &str| id[..id.len().min(8)].to_string();
-    std::thread::scope(|sc| {
+    std::thread::scope(|sc| -> Result<(), String> {
         sc.spawn(|| feeder(&pool, feeder_src, tip_hash));
         // Every arcade offering the chain, then a few P2P peers.
         for (id, addr, kind, their) in offers.iter() {
@@ -377,7 +377,8 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
         if let Err(e) = &res {
             on_progress(format!("parallel download stopped: {e}"));
         }
-    });
+        res
+    })?;
     let now = node.chain.tip(c).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
     Ok(now.saturating_sub(tip))
 }

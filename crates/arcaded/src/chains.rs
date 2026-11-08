@@ -557,9 +557,22 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             *run.source.lock().unwrap() = format!("parallel: {}", s.split(" · ").skip(1).collect::<Vec<_>>().join(" · "));
             set(format!("downloading in parallel: {s}"));
         };
-        match crate::psync::run(node, p, syncer, top as u32, &progress, &run.stop) {
-            Ok(n) => { let _ = node.app.event("chains", &format!("{}: parallel download connected {n} blocks", p.name)); }
-            Err(e) => { let _ = node.app.event("chains", &format!("{}: parallel download stopped: {e}", p.name)); }
+        // Retry the parallel download after a hiccup (a source vanishing, a slow stretch);
+        // only after three quick failures in a row fall back to one source at a time.
+        let mut quick_fails = 0;
+        while !run.stop.load(Ordering::Relaxed) && ours() + 2000 < top && quick_fails < 3 {
+            let t = std::time::Instant::now();
+            match crate::psync::run(node, p, syncer, top as u32, &progress, &run.stop) {
+                Ok(n) => {
+                    let _ = node.app.event("chains", &format!("{}: parallel download connected {n} blocks", p.name));
+                    quick_fails = 0;
+                }
+                Err(e) => {
+                    let _ = node.app.event("chains", &format!("{}: parallel download stopped at {}: {e}", p.name, ours()));
+                    quick_fails = if t.elapsed() < Duration::from_secs(120) { quick_fails + 1 } else { 0 };
+                    std::thread::sleep(Duration::from_secs(5));
+                }
+            }
         }
     }
     for (id, addr, kind, their) in offers {
@@ -657,7 +670,14 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
             let h = match syncer.sync_headers_once(&mut peer) {
                 Ok(n) => n,
                 Err(e) => {
-                    set(format!("headers: {e}"));
+                    // When the coin's P2P peers fail, new blocks come from the arcade mesh.
+                    let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+                    if node.offers_for(p.key).is_empty() {
+                        set(format!("headers: {e}"));
+                    } else {
+                        set(format!("synced at {tip} · new blocks from the arcade mesh ({} P2P doesn't answer)", p.name));
+                        *run.source.lock().unwrap() = format!("arcade mesh ({} P2P doesn't answer)", p.name);
+                    }
                     continue 'outer;
                 }
             };

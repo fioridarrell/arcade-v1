@@ -395,6 +395,7 @@
       if (!sum || sum.chain !== chain.key) sum = await api("explorer.summary", { chain: chain.key });
       // A page whose index is off on this chain isn't available: back to the overview.
       if (NEEDS[page] && !has(NEEDS[page])) { page = "home"; arg = null; }
+      if (!VIEWS[page]) { page = "home"; arg = null; }
       const v = await VIEWS[page]();
       if (my !== seq) return;
       $("x-view").replaceChildren(v);

@@ -77,7 +77,8 @@ pub fn measure(node: &Node) -> Result<BTreeMap<String, Value>, String> {
 
 /// Background: measure a minute after start, then every six hours.
 pub fn run(node: std::sync::Arc<Node>) {
-    std::thread::sleep(Duration::from_secs(60));
+    // Not right after a start: chains are usually catching up then.
+    std::thread::sleep(Duration::from_secs(15 * 60));
     loop {
         match measure(&node) {
             Ok(m) => {

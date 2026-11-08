@@ -86,13 +86,20 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (or create) the single-file database at `path`.
+    /// Open (or create) the single-file database at `path`; every commit is flushed to disk.
     pub fn open(path: impl AsRef<Path>, schema: &'static Schema) -> Result<Store> {
+        Self::open_sync(path, schema, true)
+    }
+
+    /// Open with a choice of durability. `durable = false` (SafeNoSync) skips the flush on each
+    /// commit: safe against the program crashing, while a power cut can lose the last commits.
+    /// Right for a database that can be rebuilt (chain.mdbx), never for arcade.mdbx.
+    pub fn open_sync(path: impl AsRef<Path>, schema: &'static Schema, durable: bool) -> Result<Store> {
         let opts = DatabaseOptions {
             max_tables: Some(schema.tables.len() as u64 + 1 + ADDON_TABLE_SLOTS),
             no_sub_dir: true,
             mode: Mode::ReadWrite(ReadWriteOptions {
-                sync_mode: SyncMode::Durable,
+                sync_mode: if durable { SyncMode::Durable } else { SyncMode::SafeNoSync },
                 min_size: None,
                 max_size: Some(schema.max_size),
                 growth_step: Some(64 << 20),

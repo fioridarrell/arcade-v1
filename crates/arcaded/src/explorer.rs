@@ -232,6 +232,7 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
             if let Some(o) = v["creator"].as_str() { v["creator_tag"] = json!(tag_of(&x, o)); }
             Ok(v)
         }
+        "explorer.tag" => tag_page(&x, &s("tag").ok_or("give an @tag")?),
         "explorer.search" => search(&x, &s("q").ok_or("type something to search for")?),
         other => Err(format!("unknown command {other:?}")),
     }
@@ -614,14 +615,42 @@ fn mempool(x: &Ctx) -> R {
     Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": if home { json!(crate::claims::pending_tags(x.node)) } else { json!([]) }, "unit": unit(x.p)}))
 }
 
+/// An @tag on the picked chain: the tag lives on Pepecoin testnet; its owner's addresses on
+/// this chain are the ones their published profile lists (there can be several).
+fn tag_page(x: &Ctx, t: &str) -> R {
+    let home = x.node.params;
+    let t = t.trim_start_matches('@').to_lowercase();
+    let row = arcade_ledger::index::tag_row(&x.node.chain, home.chain_no, &t).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
+    let prof = arcade_ledger::index::profile(&x.node.chain, home.chain_no, &row.address).map_err(e)?;
+    let mut addrs: Vec<(String, &str)> = Vec::new();
+    if x.p.chain_no == home.chain_no {
+        addrs.push((row.address.clone(), "the @tag's address"));
+    }
+    for l in prof.as_ref().and_then(|v| v["linked"].as_array().cloned()).unwrap_or_default() {
+        if l["chain"] == x.p.net {
+            if let Some(a) = l["address"].as_str().filter(|a| !a.starts_with("h160:")) {
+                if !addrs.iter().any(|(b, _)| b == a) {
+                    addrs.push((a.to_string(), "listed in their profile"));
+                }
+            }
+        }
+    }
+    let list: Vec<Value> = addrs.iter().map(|(a, why)| {
+        let bal = script_for(x, a).and_then(|sc| x.node.chain.balance_for_script(x.c(), &sc).ok());
+        json!({"address": a, "why": why, "balance": bal})
+    }).collect();
+    Ok(json!({"tag": t, "home_address": row.address, "claimed_at": row.block_height, "addresses": list,
+              "profile": prof.map(|v| json!({"name": v["name"], "bio": v["bio"], "url": v["url"]})), "unit": unit(x.p)}))
+}
+
 fn search(x: &Ctx, q: &str) -> R {
     let c = x.c();
     let q = q.trim();
     let hit = |kind: &str, id: String| Ok(json!({"kind": kind, "id": id}));
     if let Some(t) = q.strip_prefix('@') {
-        let row = arcade_ledger::index::tag_row(&x.node.chain, x.node.params.chain_no, &t.to_lowercase()).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
-        // A tag's address is on the home chain.
-        return Ok(json!({"kind": "address", "id": row.address, "chain": x.node.params.key}));
+        // A tag page: every address the tag's owner has on this chain.
+        arcade_ledger::index::tag_row(&x.node.chain, x.node.params.chain_no, &t.to_lowercase()).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
+        return hit("tag", t.to_lowercase());
     }
     if let Some(num) = q.strip_prefix('#') {
         return hit("inscription", num.to_string());

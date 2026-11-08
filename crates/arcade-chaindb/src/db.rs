@@ -301,7 +301,9 @@ fn ix_key(c: u16, name: &str) -> Vec<u8> {
 
 impl ChainDb {
     pub fn open(path: impl AsRef<Path>) -> Result<ChainDb> {
-        Ok(ChainDb { store: Store::open(path, &CHAIN_SCHEMA)?, indexers: Default::default() })
+        // chain.mdbx can always be rebuilt from the chain: skip the per-commit flush (a power
+        // cut can lose the last few blocks, which the next sync fetches again).
+        Ok(ChainDb { store: Store::open_sync(path, &CHAIN_SCHEMA, false)?, indexers: Default::default() })
     }
 
     /// Run an indexer on one chain: creates its tables. If the chain is already past the

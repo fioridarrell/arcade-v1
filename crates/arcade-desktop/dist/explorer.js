@@ -26,7 +26,7 @@
     // Runes and dunes join here (with their index keys) when those indexes exist.
   ];
   // Pages and the index each needs; a page comes online only when its index is on the chain.
-  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
+  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home" };
   const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
 
   let chains = [], chain = null, sum = null, page = "home", arg = null, seq = 0;
@@ -350,6 +350,16 @@
       t.top.length ? table([["Holder"], ["Balance", 1], ["Transferable", 1]], t.top.map((x) => ({ go: () => go("address", x.address), cells: [[addrLink(x.address, x.tag)], [units(x.overall, t.dec), 1], [units(x.transferable, t.dec), 1]] })))
         : h("div", { class: "x-empty" }, "Nobody holds any yet."));
   }
+  async function vTag() {
+    const t = await api("explorer.tag", { chain: chain.key, tag: arg });
+    const body = t.addresses.length
+      ? table([["Address"], ["Why"], ["Balance", 1]], t.addresses.map((a) => ({ go: () => go("address", a.address),
+          cells: [[h("span", { class: "mono" }, a.address)], [a.why], [a.balance == null ? "—" : coins(a.balance), 1]] })))
+      : h("div", { class: "x-empty" }, `@${t.tag} hasn't published any ${chain.name} address in their profile. Their @tag lives on Pepecoin testnet at ${t.home_address}.`);
+    return h("div", {}, crumbs("@tags", "@" + t.tag), head("@" + t.tag, h("span", { class: "chip arc" }, `claimed at block ${fmt(t.claimed_at)}`)),
+      t.profile && (t.profile.name || t.profile.bio) ? h("p", { class: "x-note" }, [t.profile.name, t.profile.bio, t.profile.url].filter(Boolean).join(" · ")) : "",
+      h("h2", { class: "x-h2" }, `Addresses on ${chain.name}`), body);
+  }
   async function vName() {
     const n = await api("explorer.name", { chain: chain.key, name: arg });
     return h("div", {}, crumbs(link("Names", "names"), n.name), head(n.name),
@@ -363,7 +373,7 @@
   }
   const VIEWS = { home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, ledger: vLedger,
     block: vBlock, tx: vTx, address: vAddress, inscription: vInscription, token: vToken, name: vName, map: vMap,
-    ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc };
+    ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc, tag: vTag };
 
   // ---------- navigation ----------
   function paintNav() {
@@ -402,10 +412,9 @@
     if (!q || !chain) return;
     try {
       const r = await api("explorer.search", { chain: chain.key, q });
-      if (r.chain && r.chain !== chain.key) { const c = chains.find((x) => x.key === r.chain); if (c) { chain = c; paintSelector(); sum = null; } }
       if (NEEDS[r.kind] && !has(NEEDS[r.kind])) throw new Error(`Turn on the ${NEEDS[r.kind]} index for ${chain.name} in Chains & Coins to look up ${q}.`);
       go(r.kind, r.id);
-    } catch (e) { $("x-view").replaceChildren(h("div", { class: "x-empty" }, e.message)); }
+    } catch (e) { $("x-view").replaceChildren(h("div", { class: "x-empty" }, `${chain.name}: ${e.message}`)); }
   });
 
   document.querySelector('nav button[data-tab="explorer"]').addEventListener("click", () => { sum = null; render(); });

@@ -88,6 +88,10 @@ fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
             if node.pending_spent.lock().unwrap().contains(&op) {
                 continue; // already spent by one of our unconfirmed transactions
             }
+            // ... or by any transaction in the pool (ours from before a restart included).
+            if node.chain.mempool_spender(c, &op).ok().flatten().is_some() {
+                continue;
+            }
             if let Ok(Some(coin)) = node.chain.coin(p, &op) {
                 if coin.coinbase && coin.height + p.coinbase_maturity > tip {
                     continue; // immature
@@ -218,6 +222,44 @@ pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
     for i in &tx.inputs {
         ps.insert(i.prevout);
     }
+}
+
+/// Arcade transactions waiting in the home mempool: (tx, what it carries).
+pub fn pending_arcade(node: &Node) -> Vec<(arcade_chain::Tx, arcade_ledger::extract::ArcadeTx)> {
+    use arcade_ledger::extract::{class_b_marker, detect_class, extract, Prevout};
+    let p = node.params;
+    let marker = class_b_marker(p);
+    let pool: Vec<arcade_chain::Tx> = node
+        .chain
+        .mempool(p.chain_no)
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|(_, raw)| arcade_chain::Tx::parse_with(raw, &p.format).ok())
+        .collect();
+    let mut out = Vec::new();
+    for tx in &pool {
+        if detect_class(tx, &marker, p).is_none() {
+            continue;
+        }
+        let prev: Option<Vec<Prevout>> = tx
+            .inputs
+            .iter()
+            .map(|i| {
+                if let Ok(Some(c)) = node.chain.coin(p, &i.prevout) {
+                    return Some(Prevout { value: c.value, script: c.script });
+                }
+                pool.iter()
+                    .find(|t| t.txid == i.prevout.txid)
+                    .and_then(|t| t.outputs.get(i.prevout.vout as usize))
+                    .map(|o| Prevout { value: o.value, script: o.script_pubkey.clone() })
+            })
+            .collect();
+        let Some(prev) = prev else { continue };
+        if let Some(Ok(atx)) = extract(tx, &prev, p) {
+            out.push((tx.clone(), atx));
+        }
+    }
+    out
 }
 
 /// Tag claims waiting in the mempool: (tag, sender address).

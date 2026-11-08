@@ -98,6 +98,19 @@ fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "msg.read" => crate::msgsvc::mark_read(node, &s("peer").ok_or("peer required")?),
         "msg.unread" => Ok(crate::msgsvc::unread(node)),
         "msg.file" => crate::msgsvc::file(node, &s("id").ok_or("id required")?),
+        "msg.send" => {
+            let file = match req["file"].as_object() {
+                Some(f) => {
+                    use base64::Engine;
+                    let bytes = base64::engine::general_purpose::STANDARD.decode(f.get("data").and_then(|d| d.as_str()).unwrap_or("")).map_err(|e| format!("file data: {e}"))?;
+                    Some(arcade_msg::content::File { name: f.get("name").and_then(|x| x.as_str()).unwrap_or("file").into(), mime: f.get("type").and_then(|x| x.as_str()).unwrap_or("application/octet-stream").into(), bytes })
+                }
+                None => None,
+            };
+            crate::msgsvc::send(node, &s("to").ok_or("to required (@tag, address or messaging key)")?, &s("text").unwrap_or_default(), file)
+        }
+        "msg.delete" => crate::msgsvc::delete(node, &s("id").ok_or("id required")?),
+        "msg.announce" => Ok(json!({"txid": crate::msgsvc::announce_if_needed(node)?})),
         "contacts.list" => Ok(crate::msgsvc::contacts_list(node)),
         "contacts.save" => crate::msgsvc::contact_save(node, &s("key").ok_or("key required")?, &s("name").unwrap_or_default(), &s("address").unwrap_or_default(), &s("notes").unwrap_or_default()),
         "contacts.delete" => crate::msgsvc::contact_delete(node, &s("key").ok_or("key required")?),

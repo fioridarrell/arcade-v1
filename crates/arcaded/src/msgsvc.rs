@@ -51,10 +51,16 @@ fn file_key(txid: &str) -> Vec<u8> {
     k
 }
 
-/// Keep one opened (or sent) message. Returns false when it was already kept.
+/// Keep one opened (or sent) message. Returns false when it was already kept (a kept row
+/// seen in the mempool, or sent from here, gets its block height once confirmed).
 pub fn keep(node: &Node, row: &Value, file: Option<&[u8]>) -> Result<bool, String> {
     let txid = row["id"].as_str().unwrap_or_default();
-    if node.app.get_sealed(arcade_app::MAIL, &mail_key(txid)).map_err(|e| e.to_string())?.is_some() {
+    if let Some(old) = node.app.get_sealed(arcade_app::MAIL, &mail_key(txid)).map_err(|e| e.to_string())? {
+        let mut old: Value = serde_json::from_slice(&old).map_err(|e| e.to_string())?;
+        if old["height"] == 0 && row["height"].as_u64().unwrap_or(0) > 0 {
+            old["height"] = row["height"].clone();
+            node.app.put_sealed(arcade_app::MAIL, &mail_key(txid), old.to_string().as_bytes()).map_err(|e| e.to_string())?;
+        }
         return Ok(false);
     }
     if let Some(f) = file {
@@ -184,6 +190,20 @@ pub fn scan(node: &Node) -> Result<usize, String> {
         v.extend_from_slice(&p.to_be_bytes());
         node.app.store.write(|w| w.put(arcade_app::META, &ck, &v)).map_err(|e| e.to_string())?;
     }
+    // Waiting in the mempool: shown at once (single-transaction messages; chunks wait for blocks).
+    for (tx, atx) in crate::claims::pending_arcade(node) {
+        let Some(a) = arcade_ledger::messages::arcm_of(&atx.payload) else { continue };
+        if !matches!(a.get(5), Some(&env::SINGLE) | Some(&env::API)) {
+            continue;
+        }
+        if let Ok(o) = env::open_single(&k.secret, a) {
+            let cand = json!({"txid": tx.txid.to_hex(), "from": atx.sender});
+            let (row, file) = row_of(&me, &o, &cand, 0, arcade_app::now());
+            if keep(node, &row, file.as_deref())? {
+                opened += 1;
+            }
+        }
+    }
     if opened > 0 {
         let _ = node.app.event("messages", &format!("{opened} new message{}", if opened == 1 { "" } else { "s" }));
     }
@@ -198,6 +218,9 @@ fn block_time(node: &Node, h: u32) -> u64 {
 /// Background: scan for new messages every 15 seconds.
 pub fn run(node: std::sync::Arc<Node>) {
     loop {
+        if let Err(e) = announce_if_needed(&node) {
+            let _ = node.app.event("messages", &format!("could not publish your messaging key yet: {e}"));
+        }
         if let Err(e) = scan(&node) {
             let _ = node.app.event("messages", &format!("scan stopped: {e}"));
             std::thread::sleep(Duration::from_secs(300));
@@ -350,6 +373,16 @@ pub fn unread(node: &Node) -> Value {
     json!({"unread": n, "requests": req})
 }
 
+/// Forget a message here (the chain keeps it; this arcade stops showing it).
+pub fn delete(node: &Node, id: &str) -> Result<Value, String> {
+    node.app.store.write(|w| {
+        w.del(arcade_app::MAIL, &mail_key(id))?;
+        w.del(arcade_app::MAIL, &file_key(id))?;
+        Ok(())
+    }).map_err(|e| e.to_string())?;
+    Ok(json!({"deleted": id}))
+}
+
 pub fn file(node: &Node, id: &str) -> Result<Value, String> {
     let m = node.app.get_sealed(arcade_app::MAIL, &mail_key(id)).map_err(|e| e.to_string())?.ok_or("no such message")?;
     let m: Value = serde_json::from_slice(&m).map_err(|e| e.to_string())?;
@@ -394,4 +427,121 @@ pub fn mute(node: &Node, address: &str, on: bool) -> Result<Value, String> {
         .write(|w| if on { w.put(arcade_app::MUTES, address.as_bytes(), &arcade_app::now().to_be_bytes()) } else { w.del(arcade_app::MUTES, address.as_bytes()).map(|_| ()) })
         .map_err(|e| e.to_string())?;
     Ok(json!({"address": address, "muted": on}))
+}
+
+// ---------------- sending ----------------
+
+/// The key we send from: the one holding our @tag on the home chain (else slot 0).
+fn sender_key(node: &Node) -> Result<(String, Option<String>, arcade_wallet::SecretKey), String> {
+    let p = node.params;
+    let keys = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?;
+    for k in &keys {
+        if let Ok(Some(t)) = arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address) {
+            let (k, sk) = node.app.tag_key(p, k.index).map_err(|e| e.to_string())?;
+            return Ok((k.address, Some(t), sk));
+        }
+    }
+    let (k, sk) = node.app.tag_key(p, 0).map_err(|e| e.to_string())?;
+    Ok((k.address, None, sk))
+}
+
+/// Send arcm payloads as transactions, each spending the change of the one before.
+fn send_payloads(node: &Node, payloads: &[Vec<u8>]) -> Result<(Vec<String>, u64), String> {
+    let p = node.params;
+    let (_, _, sk) = sender_key(node)?;
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+    let mut txids = Vec::new();
+    let mut fees = 0u64;
+    for pl in payloads {
+        let coins = crate::claims::spendable(node, &script);
+        let tx = arcade_wallet::tx::build_arcade(p, &arcade_wallet::tx::any_data(pl), vec![], &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, arcade_app::now() as u32)
+            .map_err(|e| format!("could not build the message transaction: {e}"))?;
+        let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
+        let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+        fees += ins.saturating_sub(outs);
+        // Our own pool must take it (no coin spent twice), or nobody else will.
+        if !node.chain.mempool_add(p, &tx, arcade_app::now()).map_err(|e| e.to_string())? {
+            return Err(if txids.is_empty() {
+                "the message transaction was refused (its coins are spent by another waiting transaction); nothing was sent".into()
+            } else {
+                format!("only {} of {} transactions went out; the rest was refused", txids.len(), payloads.len())
+            });
+        }
+        crate::claims::mark_spent(node, &tx);
+        node.tx_outbox.lock().unwrap().push(tx.raw.clone());
+        txids.push(tx.txid.to_hex());
+    }
+    Ok((txids, fees))
+}
+
+/// Send a private message (text and/or a file) to @tag, address or messaging key. A copy
+/// sealed to our own key goes on chain too, so a restore from the 12 words brings it back.
+pub fn send(node: &Node, to: &str, text: &str, file: Option<arcade_msg::content::File>) -> Result<Value, String> {
+    let k = keys(node)?;
+    let who = if hex::decode(to).map(|b| b.len()) == Ok(32) {
+        person(node, to, "", &profiles_by_key(node), &contacts(node))
+    } else {
+        who(node, to)?
+    };
+    let rk: [u8; 32] = hex::decode(who["key"].as_str().unwrap_or("")).ok().and_then(|b| b.try_into().ok()).ok_or("no messaging key")?;
+    let rcpt = crypto_box_public(&rk);
+    let mut body = Body::text(text);
+    body.file = file;
+    let to_them = body.encode();
+    let mut mine = body.clone();
+    mine.extra.insert("to".into(), json!(hex::encode(rk)));
+    mine.extra.insert("to_address".into(), who["address"].clone());
+    let to_me = mine.encode();
+    let theirs = env::private(&k.secret, &rcpt, &to_them);
+    let ours = if rk == k.public_bytes() { vec![] } else { env::private(&k.secret, &k.public, &to_me) };
+    let (mut txids, mut fee) = send_payloads(node, &theirs)?;
+    let (own, f2) = send_payloads(node, &ours)?;
+    fee += f2;
+    // Shown at once; the scan finds our own copy later under the same id and keeps this one.
+    let id = own.first().or(txids.first()).cloned().unwrap_or_default();
+    let row = json!({
+        "id": id, "txids": txids, "own_txids": own, "dir": if rk == k.public_bytes() { "note" } else { "out" },
+        "peer": hex::encode(rk), "peer_address": who["address"], "at": arcade_app::now(), "height": 0, "kind": "dm",
+        "text": text, "file": body.file.as_ref().map(|f| json!({"name": f.name, "type": f.mime, "size": f.bytes.len()})),
+        "extra": {}, "unread": false, "fee": fee,
+    });
+    keep(node, &row, body.file.as_ref().map(|f| f.bytes.as_slice()))?;
+    txids.extend(own);
+    let _ = node.app.event("messages", &format!("message sent to {} ({} transaction{}, fee {})", who["tag"].as_str().map(|t| format!("@{t}")).unwrap_or_else(|| who["address"].as_str().unwrap_or("").to_string()), txids.len(), if txids.len() == 1 { "" } else { "s" }, fee));
+    Ok(json!({"id": id, "txids": txids, "fee": fee, "to": who}))
+}
+
+fn crypto_box_public(b: &[u8; 32]) -> crypto_box::PublicKey {
+    crypto_box::PublicKey::from(*b)
+}
+
+/// Publish our messaging key (a key announcement from our @tag's address) when we hold a
+/// @tag and no announcement of this key is on chain yet. Returns the txid when one was sent.
+pub fn announce_if_needed(node: &Node) -> Result<Option<String>, String> {
+    if !node.app.has_wallet().map_err(|e| e.to_string())? {
+        return Ok(None);
+    }
+    let (address, tag, _) = sender_key(node)?;
+    let Some(tag) = tag else { return Ok(None) };
+    let k = keys(node)?;
+    let key = hex::encode(k.public_bytes());
+    let c = node.params.chain_no;
+    let prof = arcade_ledger::index::profile(&node.chain, c, &address).map_err(|e| e.to_string())?;
+    if prof.as_ref().is_some_and(|p| p["pubkey"] == key.as_str() && p["stated"] == true) {
+        return Ok(None);
+    }
+    // One in flight at a time (it confirms in a block or two).
+    let flag = format!("announce:{key}");
+    if let Some(v) = node.app.store.read(|r| r.get(arcade_app::META, flag.as_bytes())).ok().flatten() {
+        if arcade_app::now() < u64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])) + 1800 {
+            return Ok(None);
+        }
+    }
+    let (_, h160) = arcade_ledger::address::decode_base58check(&address).ok_or("bad address")?;
+    let a = arcade_msg::public::Announce { key: k.public_bytes(), hash160: Some(h160.try_into().map_err(|_| "bad address")?), name: tag.clone(), tag: Some(tag.clone()), ..Default::default() };
+    let (txids, fee) = send_payloads(node, &[a.encode()])?;
+    node.app.store.write(|w| w.put(arcade_app::META, flag.as_bytes(), &arcade_app::now().to_be_bytes())).map_err(|e| e.to_string())?;
+    let _ = node.app.event("messages", &format!("published your messaging key for @{tag} (fee {fee})"));
+    Ok(txids.into_iter().next())
 }

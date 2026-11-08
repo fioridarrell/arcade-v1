@@ -227,3 +227,36 @@ main:has(#explorer.on) { max-width: 1240px; }
 .pg-info { display: flex; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
 .pg-go { display: inline-flex; gap: 6px; }
 .pg-go input { width: 120px; padding: 5px 8px; font-size: 13px; }
+
+/* Messages */
+.mx { display: grid; grid-template-columns: 280px 1fr; gap: 16px; min-height: 70vh; }
+@media (max-width: 760px) { .mx { grid-template-columns: 1fr; } }
+.mx-side { display: flex; flex-direction: column; gap: 10px; }
+.mx-views { display: flex; gap: 4px; }
+.mx-views button { flex: 1; padding: 6px 8px; font-size: 13px; }
+.mx-views button.on { background: var(--bg); font-weight: 600; }
+.mx-list { list-style: none; margin: 0; padding: 0; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; overflow: hidden; }
+.mx-item { padding: 10px 12px; border-bottom: 1px solid var(--line); cursor: pointer; position: relative; }
+.mx-item:last-child { border-bottom: 0; }
+.mx-item.on, .mx-item:hover { background: var(--bg); }
+.mx-item .s { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; padding-right: 24px; }
+.mx-row { display: flex; justify-content: space-between; gap: 8px; }
+.mx-row time { color: var(--muted); font-size: 12px; }
+.mx-empty { padding: 14px; color: var(--muted); }
+.badge { display: inline-block; min-width: 18px; padding: 0 6px; border-radius: 999px; background: var(--accent); color: var(--accent-ink); font-size: 11px; font-weight: 700; text-align: center; margin-left: 6px; }
+.mx-item .badge { position: absolute; right: 10px; bottom: 10px; }
+.mx-main { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.mx-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; padding: 10px 14px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.mx-acts { display: flex; gap: 6px; }
+.mx-thread { flex: 1; min-height: 300px; max-height: 60vh; overflow-y: auto; display: flex; flex-direction: column; gap: 8px; padding: 12px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; }
+.mx-msg { max-width: 78%; padding: 8px 12px; border-radius: 14px; background: var(--bg); border: 1px solid var(--line); }
+.mx-msg.mine { align-self: flex-end; background: var(--accent); color: var(--accent-ink); border-color: var(--accent); }
+.mx-msg.theirs { align-self: flex-start; }
+.mx-text { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mx-meta { font-size: 11px; opacity: .75; margin-top: 2px; }
+.mx-file img { max-width: 100%; max-height: 320px; border-radius: 8px; }
+.mono { font-family: ui-monospace, "DejaVu Sans Mono", monospace; }
+button.small { padding: 4px 10px; font-size: 12px; }
+.small-file { font-size: 13px; color: var(--muted); cursor: pointer; }
+.small-file input { font-size: 12px; }
+.s.bad { color: var(--bad); }

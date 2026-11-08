@@ -179,6 +179,103 @@ pub fn build_claim(
     Ok(sign_p2pkh(p, &chosen, &outs, key, time))
 }
 
+/// Omni AnyData (version 0, type 200) around raw bytes, as arcade records travel.
+pub fn any_data(data: &[u8]) -> Vec<u8> {
+    let mut p = vec![0, 0, 0, 200];
+    p.extend_from_slice(data);
+    p
+}
+
+/// Most AnyData bytes a Class B transaction carries (255 packets of 30).
+pub const CLASS_B_MAX: usize = 255 * 30;
+/// Each Class B output (the marker and every multisig) carries 0.01.
+pub const CLASS_B_OUTPUT: u64 = 1_000_000;
+
+fn multisig(keys: &[[u8; 33]]) -> Vec<u8> {
+    let mut s = vec![0x51]; // OP_1
+    for k in keys {
+        s.push(33);
+        s.extend_from_slice(k);
+    }
+    s.push(0x50 + keys.len() as u8); // OP_2 / OP_3
+    s.push(0xae); // OP_CHECKMULTISIG
+    s
+}
+
+/// Give a Class B data key a valid curve point (its last byte is free; readers ignore it).
+fn fix_point(mut k: [u8; 33]) -> [u8; 33] {
+    for b in 0..=255u8 {
+        k[32] = b;
+        if PublicKey::from_slice(&k).is_ok() {
+            return k;
+        }
+    }
+    k
+}
+
+/// An arcade transaction carrying `payload` (AnyData bytes) from `key`'s P2PKH address:
+/// Class C (OP_RETURN "arcd" + payload) when it fits, else Class B (the marker output,
+/// 1-of-3 bare multisig outputs with our own key first and two obfuscated data keys, 0.01
+/// each), plus any `extra` outputs, change back to the sender.
+pub fn build_arcade(
+    p: &ChainParams,
+    payload: &[u8],
+    extra: Vec<TxOutSpec>,
+    key: &SecretKey,
+    coins: &[Utxo],
+    fee_per_kb: u64,
+    dust: u64,
+    time: u32,
+) -> Result<Tx, BuildError> {
+    let pk = PublicKey::from_secret_key(SECP256K1, key);
+    let h = arcade_ledger::address::hash160(&pk.serialize());
+    let change_script = arcade_ledger::address::p2pkh_script(&h);
+    let sender = arcade_ledger::address::base58check(p.p2pkh_version, &h);
+    let mut outs: Vec<TxOutSpec> = Vec::new();
+    if MARKER.len() + payload.len() <= 80 {
+        let mut data = MARKER.to_vec();
+        data.extend_from_slice(payload);
+        outs.push(TxOutSpec { value: 0, script: op_return(&data) });
+    } else {
+        if payload.len() > CLASS_B_MAX {
+            return Err(BuildError::PayloadTooLarge(payload.len()));
+        }
+        let marker = arcade_ledger::extract::class_b_marker(p);
+        let (_, mh) = arcade_ledger::address::decode_base58check(&marker).expect("marker address");
+        outs.push(TxOutSpec { value: CLASS_B_OUTPUT, script: arcade_ledger::address::p2pkh_script(&mh.try_into().expect("hash160")) });
+        let data: Vec<[u8; 33]> = arcade_ledger::extract::class_b_keys(payload, &sender).into_iter().map(fix_point).collect();
+        for pair in data.chunks(2) {
+            let mut keys = vec![pk.serialize()];
+            keys.extend_from_slice(pair);
+            outs.push(TxOutSpec { value: CLASS_B_OUTPUT, script: multisig(&keys) });
+        }
+    }
+    outs.extend(extra);
+    let spend: u64 = outs.iter().map(|o| o.value).sum();
+    let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
+    sorted.sort_by(|a, b| b.value.cmp(&a.value));
+    let lens: Vec<usize> = outs.iter().map(|o| o.script.len()).chain(std::iter::once(25)).collect();
+    let fee_for = |n_in: usize| (estimate_size(n_in, &lens) as u64 * fee_per_kb).div_ceil(1000);
+    let mut chosen: Vec<Utxo> = Vec::new();
+    let mut have = 0u64;
+    for u in sorted {
+        chosen.push(u.clone());
+        have += u.value;
+        if have >= spend + fee_for(chosen.len()) + dust {
+            break;
+        }
+    }
+    let fee = fee_for(chosen.len().max(1));
+    if chosen.is_empty() || have < spend + fee {
+        return Err(BuildError::InsufficientFunds { have, need: spend + fee });
+    }
+    let change = have - spend - fee;
+    if change >= dust {
+        outs.push(TxOutSpec { value: change, script: change_script });
+    }
+    Ok(sign_p2pkh(p, &chosen, &outs, key, time))
+}
+
 /// Pay `amount` to `to_script` from coins of `key`'s P2PKH address, change back to it.
 pub fn build_send(
     p: &ChainParams,
@@ -232,6 +329,26 @@ mod tests {
         )
         .unwrap();
         tag_key(&seed[..], 1, 0).unwrap().key
+    }
+
+    #[test]
+    fn arcade_tx_class_b_and_c_read_back() {
+        let p = &PEPECOIN_TEST;
+        let k = key();
+        let pk = PublicKey::from_secret_key(SECP256K1, &k);
+        let script = arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
+        let coin = Utxo { outpoint: OutPoint { txid: Hash256([7; 32]), vout: 0 }, value: 500_000_000_000, script: script.clone() };
+        for len in [20usize, 76, 77, 500, 7650] {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 % 256) as u8).collect();
+            let tx = build_arcade(p, &data, vec![], &k, &[coin.clone()], 1_000_000, 1_000_000, 0).unwrap();
+            let prev = vec![Prevout { value: coin.value, script: script.clone() }];
+            let atx = extract(&tx, &prev, p).unwrap().unwrap();
+            assert_eq!(atx.class, if len <= 76 { Class::C } else { Class::B }, "{len}");
+            // Class B pads the last packet with zeros.
+            assert_eq!(&atx.payload[..len], &data[..], "{len}");
+            assert!(atx.payload[len..].iter().all(|b| *b == 0));
+            assert!(verify_p2pkh_input(p, &tx, &[coin.clone()], 0));
+        }
     }
 
     #[test]

@@ -32,7 +32,10 @@ pub const BLOCK: &str = "ord.v1.block";
 pub const STATE: &str = "ord.v1.state";
 /// Every inscription id -> its number (all groups, also on Shared storage).
 pub const IDS: &str = "ord.v1.ids";
-pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE, IDS];
+/// Body pieces of unfinished multi-transaction inscriptions: C|origin txid|piece u32 -> bytes
+/// (kept apart from the pending record so a long inscription isn't rewritten for every piece).
+pub const PENDING_BODY: &str = "ord.v1.pending_body";
+pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE, IDS, PENDING_BODY];
 pub const GROUPS: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -381,13 +384,35 @@ fn get_pending(l: &Logged, c: u16, txid: &Hash256) -> Result<Option<Pending>> {
         pieces: v["pieces"].as_u64().unwrap_or(0) as u32,
         origin: Hash256::from_hex(v["origin"].as_str().unwrap_or("")).unwrap_or(Hash256([0; 32])),
         txs: v["txs"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default(),
+        // Older records carried the body inline; new ones keep it in PENDING_BODY.
         body: hex::decode(v["body"].as_str().unwrap_or("")).unwrap_or_default(),
     }))
+}
+
+fn body_key(c: u16, origin: &Hash256, piece: u32) -> Vec<u8> {
+    KeyBuf::new().u16(c).bytes(&origin.0).u32(piece).done()
+}
+
+/// Keep one piece's body bytes of an unfinished inscription.
+fn put_piece(l: &Logged, c: u16, origin: &Hash256, piece: u32, bytes: &[u8]) -> Result<()> {
+    l.put(PENDING_BODY, &body_key(c, origin, piece), bytes)
+}
+
+/// The whole body so far (inline part first, then the stored pieces), and drop the pieces.
+fn take_body(l: &Logged, c: u16, p: &Pending) -> Result<Vec<u8>> {
+    let mut body = p.body.clone();
+    let pre = KeyBuf::new().u16(c).bytes(&p.origin.0).done();
+    for (k, v) in l.scan(PENDING_BODY, &pre)? {
+        body.extend_from_slice(&v);
+        l.del(PENDING_BODY, &k)?;
+    }
+    Ok(body)
 }
 
 fn put_pending(l: &Logged, c: u16, txid: &Hash256, p: &Pending) -> Result<()> {
     let v = json!({"ct": hex::encode(&p.ct), "left": p.left, "size": p.size, "pieces": p.pieces,
                    "origin": p.origin.to_hex(), "txs": p.txs, "body": hex::encode(&p.body)});
+    // p.body is only ever the inline part from older records; new pieces go to PENDING_BODY.
     l.put(PENDING, &k(c, &txid.0), v.to_string().as_bytes())
 }
 
@@ -436,30 +461,33 @@ impl Indexer for OrdIndexer {
             if let Some(mut pend) = get_pending(l, c, &in0.prevout.txid)? {
                 if let Some(r) = more(&in0.script_sig, pend.left, d) {
                     pend.size += r.body.len() as u64;
-                    pend.body.extend_from_slice(&r.body);
+                    put_piece(l, c, &pend.origin, pend.pieces, &r.body)?;
                     pend.pieces += 1;
                     pend.txs.push(txid.to_hex());
                     pend.left = r.left;
                     l.del(PENDING, &k(c, &in0.prevout.txid.0))?;
                     if r.left == 0 {
+                        pend.body = take_body(l, c, &pend)?;
                         done = Some(Complete { p: pend, tags: r.tags, single: false });
                     } else {
                         put_pending(l, c, &txid, &pend)?;
                     }
                 }
             } else if let Some((_, ct, r)) = start(&in0.script_sig, d) {
-                let pend = Pending {
+                let mut pend = Pending {
                     ct,
                     left: r.left,
                     size: r.body.len() as u64,
                     pieces: 1,
                     origin: txid,
                     txs: vec![txid.to_hex()],
-                    body: r.body,
+                    body: Vec::new(),
                 };
                 if r.left == 0 {
+                    pend.body = r.body;
                     done = Some(Complete { p: pend, tags: r.tags, single: true });
                 } else {
+                    put_piece(l, c, &txid, 0, &r.body)?;
                     put_pending(l, c, &txid, &pend)?;
                 }
             }

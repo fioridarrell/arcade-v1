@@ -173,26 +173,41 @@
   }
   // Pages: the page number lives in the address arg as "p<N>" (1 = newest).
   const pageOf = () => (arg && /^p\d+$/.test(arg) ? Math.max(1, Number(arg.slice(1))) : 1);
+  // Pages of a list (Martin 2026-11-10: buttons must not change size or place). Seven number
+  // slots of one width (the widest page number of this list), the current page in the middle
+  // one; First, Prev, Next and Last always in place (greyed at the ends); the count and the Go
+  // box on their own line. Go takes a page, or with gotoPage "#" and an inscription number.
+  function windowOf(page, pages) {
+    if (pages <= 7) return Array.from({ length: 7 }, (_, k) => (k < pages ? k + 1 : null));
+    if (page <= 4) return [1, 2, 3, 4, 5, "…", pages];
+    if (page >= pages - 3) return [1, "…", pages - 4, pages - 3, pages - 2, pages - 1, pages];
+    return [1, "…", page - 1, page, page + 1, "…", pages];
+  }
   function pager(total, size, page, where, gotoLabel, gotoPage) {
     const pages = Math.max(1, Math.ceil(total / size));
     page = Math.min(page, pages);
-    const btn = (label, p, on) => h("button", { class: "pg" + (on ? " on" : ""), disabled: p < 1 || p > pages || (on && true), onclick: () => go(where, `p${p}`) }, label);
-    const nums = [];
-    const lo = Math.max(1, page - 2), hi = Math.min(pages, page + 2);
-    if (lo > 1) { nums.push(btn("1", 1)); if (lo > 2) nums.push(h("span", { class: "pg-gap" }, "…")); }
-    for (let i = lo; i <= hi; i++) nums.push(btn(fmt(i), i, i === page));
-    if (hi < pages) { if (hi < pages - 1) nums.push(h("span", { class: "pg-gap" }, "…")); nums.push(btn(fmt(pages), pages)); }
-    const box = h("input", { type: "text", inputmode: "numeric", placeholder: gotoLabel || "page", "aria-label": gotoLabel || "Go to page" });
+    const to = (p) => go(where, `p${Math.min(pages, Math.max(1, p))}`);
+    const nav = (cls, label, p, title, short) => h("button", { type: "button", class: cls, disabled: p < 1 || p > pages || p === page, title, "aria-label": title, "data-short": short || "", onclick: () => to(p) }, label);
+    const slots = windowOf(page, pages).map((v) =>
+      v === null ? h("button", { type: "button", class: "slot empty", tabindex: "-1", "aria-hidden": "true" }, "0")
+      : v === "…" ? h("button", { type: "button", class: "slot gap", tabindex: "-1", "aria-hidden": "true" }, "…")
+      : h("button", { type: "button", class: "slot" + (v === page ? " on" : ""), disabled: v === page, "aria-current": v === page ? "page" : false, onclick: () => to(v) }, fmt(v)));
+    const box = h("input", { type: "text", inputmode: "numeric", placeholder: gotoPage ? `page or #${(gotoLabel || "number").replace(/\s*#$/, "")}` : "page", "aria-label": gotoPage ? "Go to a page, or # and a number" : "Go to a page" });
+    const err = h("span", { class: "pg-err", "aria-live": "polite" });
     const jump = () => {
-      const v = Number(String(box.value).replace(/[,#\s]/g, ""));
-      if (!Number.isFinite(v) || box.value === "") return;
-      const p = gotoPage ? gotoPage(v) : v;
-      go(where, `p${Math.min(pages, Math.max(1, p))}`);
+      const raw = String(box.value).trim(), v = Number(raw.replace(/[,#\s]/g, ""));
+      if (!raw || !Number.isFinite(v) || v < 0) { err.textContent = gotoPage ? "Type a page number, or # and a number." : "Type a page number."; return; }
+      to(gotoPage && raw.startsWith("#") ? gotoPage(v) : v);
     };
     box.onkeydown = (e) => { if (e.key === "Enter") jump(); };
-    return h("div", { class: "x-pager" },
-      h("div", { class: "pg-nums" }, btn("« First", 1, false), btn("‹ Prev", page - 1, false), ...nums, btn("Next ›", page + 1, false), btn("Last »", pages, false)),
-      h("div", { class: "pg-info" }, `Page ${fmt(page)} of ${fmt(pages)} · ${fmt(total)} in all`, h("span", { class: "pg-go" }, box, h("button", { class: "pg", onclick: jump }, "Go"))));
+    return h("div", { class: "pgr", style: `--slot: calc(${fmt(pages).length + 1.5}ch + 10px)` },
+      h("div", { class: "pgr-bar" },
+        nav("edge", "|‹", 1, "First page"), nav("step", "‹ Prev", page - 1, "Previous page", "‹"),
+        h("div", { class: "pgr-slots" }, ...slots),
+        nav("step", "Next ›", page + 1, "Next page", "›"), nav("edge", "›|", pages, "Last page")),
+      h("div", { class: "pgr-foot" },
+        h("span", { class: "pgr-where" }, `Page ${fmt(page)} of ${fmt(pages)} · ${fmt(total)} in all`), err,
+        h("span", { class: "pgr-go" }, box, h("button", { type: "button", onclick: jump }, "Go"))));
   }
   const sect = (title, more, body) => h("section", { class: "x-sect" }, h("header", {}, h("h2", {}, title), more ? link("View all →", more) : ""), body);
   const kv = (rows) => h("div", { class: "x-kv" }, rows.filter(Boolean).flatMap(([k, v]) => [h("div", { class: "k" }, k), h("div", {}, v)]));

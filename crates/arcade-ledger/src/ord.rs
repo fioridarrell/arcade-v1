@@ -701,7 +701,7 @@ pub fn resolve(db: &ChainDb, c: u16, id: &str) -> Option<[u8; 36]> {
         return Some(iid_bytes(&Hash256::from_hex(id).ok()?, 0));
     }
     let n: u64 = id.parse().ok()?;
-    let v = db.store.read(|r| r.get(NUM, &KeyBuf::new().u16(c).u64(n).done())).ok()??;
+    let v = db.store(c).read(|r| r.get(NUM, &KeyBuf::new().u16(c).u64(n).done())).ok()??;
     v.as_slice().try_into().ok()
 }
 
@@ -709,9 +709,9 @@ pub fn resolve(db: &ChainDb, c: u16, id: &str) -> Option<[u8; 36]> {
 pub fn inscription(db: &ChainDb, p: &ChainParams, id: &str) -> Option<Value> {
     let c = p.chain_no;
     let iid = resolve(db, c, id)?;
-    let mut v: Value = serde_json::from_slice(&db.store.read(|r| r.get(INSC, &k(c, &iid))).ok()??).ok()?;
+    let mut v: Value = serde_json::from_slice(&db.store(c).read(|r| r.get(INSC, &k(c, &iid))).ok()??).ok()?;
     v["id"] = json!(iid_str(&iid));
-    if let Some(at) = db.store.read(|r| r.get(AT, &k(c, &iid))).ok().flatten() {
+    if let Some(at) = db.store(c).read(|r| r.get(AT, &k(c, &iid))).ok().flatten() {
         let mut t = [0u8; 32];
         t.copy_from_slice(&at[..32]);
         let txid = Hash256(t);
@@ -773,7 +773,7 @@ pub fn chunk(db: &ChainDb, p: &ChainParams, n: u32) -> Option<(String, u32)> {
     let mut cat = String::with_capacity(6400);
     let mut births = 0;
     for h in base..base + 100 {
-        let v = db.store.read(|r| r.get(BLOCK, &KeyBuf::new().u16(p.chain_no).u32(h).done())).ok()??;
+        let v = db.store(p.chain_no).read(|r| r.get(BLOCK, &KeyBuf::new().u16(p.chain_no).u32(h).done())).ok()??;
         cat.push_str(&hex::encode(&v[..32]));
         births += u32::from_be_bytes(v[64..68].try_into().ok()?);
     }
@@ -782,7 +782,7 @@ pub fn chunk(db: &ChainDb, p: &ChainParams, n: u32) -> Option<(String, u32)> {
 
 /// An inscription's number, whether or not its record is held here.
 pub fn number_of(db: &ChainDb, c: u16, iid: &[u8; 36]) -> Option<u64> {
-    let v = db.store.read(|r| r.get(IDS, &k(c, iid))).ok()??;
+    let v = db.store(c).read(|r| r.get(IDS, &k(c, iid))).ok()??;
     Some(u64::from_be_bytes(v[..8].try_into().ok()?))
 }
 
@@ -794,7 +794,7 @@ pub fn content_types(db: &ChainDb, c: u16, lo: u64, hi: u64) -> Vec<(u64, String
     }
     let pre = KeyBuf::new().u16(c).done();
     let mut out = Vec::new();
-    db.store
+    db.store(c)
         .read(|r| {
             let after = KeyBuf::new().u16(c).u64(lo.saturating_sub(1)).done();
             let rows = r.scan_after(NUM, &pre, (lo > 0).then_some(&after[..]), (hi - lo) as usize)?;
@@ -815,7 +815,7 @@ pub fn content_types(db: &ChainDb, c: u16, lo: u64, hi: u64) -> Vec<(u64, String
 }
 
 pub fn count(db: &ChainDb, c: u16) -> u64 {
-    db.store
+    db.store(c)
         .read(|r| r.get(STATE, &k(c, b"next")))
         .ok()
         .flatten()
@@ -828,7 +828,7 @@ pub fn held_by(db: &ChainDb, p: &ChainParams, script: &[u8]) -> Result<Vec<Strin
     let c = p.chain_no;
     let mut out = Vec::new();
     for (op, _, _) in db.coins_for_script(p, script)? {
-        for (key, _) in db.store.read(|r| r.scan_prefix(LOC, &loc_prefix(c, &op.txid, op.vout)))? {
+        for (key, _) in db.store(c).read(|r| r.scan_prefix(LOC, &loc_prefix(c, &op.txid, op.vout)))? {
             out.push(iid_str(&key[key.len() - 36..]));
         }
     }

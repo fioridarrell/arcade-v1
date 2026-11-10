@@ -22,7 +22,7 @@ fn main() {
     // 1. Tx index rows (every value of the dup table), counted without copying.
     let (mut rows, mut after): (u64, Option<Vec<u8>>) = (0, None);
     loop {
-        let (n, _, last) = db.store.read(|r| r.sum_prefix(TXS, &pre, after.as_deref(), BATCH)).expect("read");
+        let (n, _, last) = db.store_for(&pre).read(|r| r.sum_prefix(TXS, &pre, after.as_deref(), BATCH)).expect("read");
         rows += n;
         if rows % 10_000_000 < n {
             eprintln!("tx index rows so far: {rows} ({:.0} s)", t0.elapsed().as_secs_f64());
@@ -39,7 +39,7 @@ fn main() {
     // 2. Txs with an unspent coin: distinct (B, P) among outputs keys C|B|P|vout.
     let (mut coins, mut live, mut prev, mut after): (u64, u64, Option<[u8; 8]>, Option<Vec<u8>>) = (0, 0, None, None);
     loop {
-        let page = db.store.read(|r| r.scan_after(OUTPUTS, &pre, after.as_deref(), BATCH)).expect("read");
+        let page = db.store_for(&pre).read(|r| r.scan_after(OUTPUTS, &pre, after.as_deref(), BATCH)).expect("read");
         if page.is_empty() {
             break;
         }

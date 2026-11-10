@@ -151,7 +151,7 @@ fn coins_of(db: &ChainDb, p: &ChainParams, blocks: &[Block]) -> Vec<ImportCoin> 
 }
 
 fn table(db: &ChainDb, t: &str) -> Vec<(Vec<u8>, Vec<u8>)> {
-    db.store.read(|r| r.scan_prefix(t, b"")).unwrap()
+    db.scan_all(t).unwrap()
 }
 
 struct Env {

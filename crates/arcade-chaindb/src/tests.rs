@@ -65,7 +65,7 @@ static LOGGED: &[&str] = &[HEADERS, HEIGHT, TXS, OUTPUTS, SPENDS, BY_SCRIPT, SCR
 fn dump(db: &ChainDb) -> Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
     LOGGED
         .iter()
-        .map(|t| (t.to_string(), db.store.read(|r| r.scan_prefix(t, b"")).unwrap()))
+        .map(|t| (t.to_string(), db.scan_all(t).unwrap()))
         .collect()
 }
 
@@ -261,13 +261,13 @@ fn indexer_in_commit_undo_and_backfill_agree() {
     let spend = tx(&[(cb1.txid, 0)], &[(4000, p2pkh(2))], 0);
     let b2 = block(b1.hash(), vec![tx(&[], &[(1, p2pkh(9))], 2), spend], 3);
     a.db.connect_blocks(a.p, &[b1.clone(), b2.clone()]).unwrap();
-    let rows_a = a.db.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap();
+    let rows_a = a.db.scan_all("addon.v1.count").unwrap();
     assert_eq!(rows_a.len(), 2);
     assert_eq!(&rows_a[1].1[4..], &5000u64.to_be_bytes(), "prevout values reach the indexer");
     assert_eq!(a.db.indexed_to(a.p.chain_no, "count").unwrap(), Some(2));
     // Reorg undoes the index row with the block.
     a.db.disconnect_tip(a.p.chain_no).unwrap();
-    assert_eq!(a.db.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap().len(), 1);
+    assert_eq!(a.db.scan_all("addon.v1.count").unwrap().len(), 1);
     assert_eq!(a.db.indexed_to(a.p.chain_no, "count").unwrap(), Some(1));
     a.db.connect_blocks(a.p, &[b2.clone()]).unwrap();
 
@@ -277,10 +277,10 @@ fn indexer_in_commit_undo_and_backfill_agree() {
     bdb.connect_blocks(a.p, &[a.g.clone(), b1, b2]).unwrap();
     bdb.add_indexer(a.p.chain_no, std::sync::Arc::new(CountTx)).unwrap();
     while bdb.backfill(a.p, "count", 1).unwrap() > 0 {}
-    assert_eq!(bdb.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap(), a.db.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap());
+    assert_eq!(bdb.scan_all("addon.v1.count").unwrap(), a.db.scan_all("addon.v1.count").unwrap());
     // Backfilled rows inside the undo window are undone by a reorg too.
     bdb.disconnect_tip(a.p.chain_no).unwrap();
-    assert_eq!(bdb.store.read(|r| r.scan_prefix("addon.v1.count", b"")).unwrap().len(), 1);
+    assert_eq!(bdb.scan_all("addon.v1.count").unwrap().len(), 1);
 }
 
 #[test]
@@ -378,7 +378,7 @@ fn busy_chain(g: &Block, n: u32) -> Vec<Block> {
 }
 
 fn address_tables(db: &ChainDb) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
-    [SCRIPT_HIST, BY_SCRIPT, SPENDS, OUTPUTS, ADDR_LOG].iter().map(|t| db.store.read(|r| r.scan_prefix(t, b"")).unwrap()).collect()
+    [SCRIPT_HIST, BY_SCRIPT, SPENDS, OUTPUTS, ADDR_LOG].iter().map(|t| db.scan_all(t).unwrap()).collect()
 }
 
 fn build(f: &Fixture) {
@@ -402,7 +402,7 @@ fn addresses_built_later_match_live() {
     let f = fixture();
     f.db.connect_blocks_with(f.p, &blocks, true, true).unwrap();
     assert!(f.db.addresses_pending(c).unwrap());
-    assert!(f.db.store.read(|r| r.scan_prefix(SCRIPT_HIST, b"")).unwrap().is_empty());
+    assert!(f.db.store(c).read(|r| r.scan_prefix(SCRIPT_HIST, b"")).unwrap().is_empty());
     build(&f);
     assert_eq!(address_tables(&f.db), want, "logged then built");
 
@@ -410,7 +410,7 @@ fn addresses_built_later_match_live() {
     let f = fixture();
     f.db.set_addresses_off(c).unwrap();
     f.db.connect_blocks(f.p, &blocks).unwrap();
-    assert!(f.db.store.read(|r| r.scan_prefix(BY_SCRIPT, b"")).unwrap().is_empty());
+    assert!(f.db.store(c).read(|r| r.scan_prefix(BY_SCRIPT, b"")).unwrap().is_empty());
     f.db.set_addresses_on(c).unwrap();
     build(&f);
     assert_eq!(address_tables(&f.db), want, "built from stored blocks");
@@ -445,7 +445,7 @@ fn coin_tables(db: &ChainDb) -> Vec<Vec<(Vec<u8>, Vec<u8>)>> {
     [OUTPUTS, TXS, BY_SCRIPT, HEIGHT, STATE]
         .iter()
         .map(|t| {
-            let mut v = db.store.read(|r| r.scan_prefix(t, b"")).unwrap();
+            let mut v = db.scan_all(t).unwrap();
             if *t == STATE {
                 // Undo-related and cache bookkeeping rows differ by design; compare the tip only.
                 v.retain(|(k, _)| k.ends_with(b"tip"));
@@ -469,12 +469,12 @@ fn coin_cache_matches_direct_and_survives_a_crash() {
         f.db.connect_blocks_with(f.p, part, true, true).unwrap();
     }
     assert!(!f.db.coins_settled(c), "the cache holds the stretch");
-    assert!(f.db.store.read(|r| r.scan_prefix(OUTPUTS, b"")).unwrap().len() < 3, "nothing but genesis's coin written yet");
+    assert!(f.db.store(c).read(|r| r.scan_prefix(OUTPUTS, b"")).unwrap().len() < 3, "nothing but genesis's coin written yet");
     f.db.flush_coins(c).unwrap();
-    assert!(f.db.store.read(|r| r.get(STATE, &k_state(c, crate::addrbuild::TXS_PENDING))).unwrap().is_some(), "spent txs' index rows put off");
+    assert!(f.db.store(c).read(|r| r.get(STATE, &k_state(c, crate::addrbuild::TXS_PENDING))).unwrap().is_some(), "spent txs' index rows put off");
     assert_eq!(f.db.backfill(f.p, "none", 1).unwrap_or(0), 0);
     build(&f);
-    assert!(f.db.store.read(|r| r.get(STATE, &k_state(c, crate::addrbuild::TXS_PENDING))).unwrap().is_none(), "built");
+    assert!(f.db.store(c).read(|r| r.get(STATE, &k_state(c, crate::addrbuild::TXS_PENDING))).unwrap().is_none(), "built");
     let mut want = coin_tables(&direct.db);
     let got = coin_tables(&f.db);
     // BY_SCRIPT: the direct run writes address rows live; the deferred one only deletes old ones.
@@ -524,14 +524,14 @@ fn tx_index_runs_many_flushes_then_built() {
         f.db.connect_blocks_with(f.p, part, true, true).unwrap();
         f.db.flush_coins(c).unwrap();
     }
-    let runs = crate::txruns::of(f.db.store.id(), c).expect("runs while catching up");
+    let runs = crate::txruns::of(f.db.store(c).id(), c).expect("runs while catching up");
     let (n, levels): (usize, Vec<u32>) = {
         let r = runs.read().unwrap();
         (r.list.len(), r.list.iter().map(|x| x.level).collect())
     };
     assert!(n < 20 && levels.contains(&1), "level 0 merged: {levels:?}");
     // Every tx with a coin left is found through the runs (TXS holds none of them yet).
-    f.db.store
+    f.db.store(c)
         .read(|r| {
             for (k, _) in r.scan_prefix(OUTPUTS, &k_chain(c))? {
                 let (b, p) = (arcade_store::key::be_u32(&k, 2), arcade_store::key::be_u32(&k, 6));
@@ -544,8 +544,8 @@ fn tx_index_runs_many_flushes_then_built() {
         .unwrap();
     // Reopened, the filters come back from the rows.
     build(&f);
-    assert!(crate::txruns::of(f.db.store.id(), c).is_none(), "runs dropped after the build");
-    assert!(f.db.store.read(|r| r.scan_prefix(TXS_RUNS, b"")).unwrap().is_empty());
+    assert!(crate::txruns::of(f.db.store(c).id(), c).is_none(), "runs dropped after the build");
+    assert!(f.db.store(c).read(|r| r.scan_prefix(TXS_RUNS, b"")).unwrap().is_empty());
     let mut want = coin_tables(&direct.db);
     let got = coin_tables(&f.db);
     want[2] = got[2].clone();
@@ -610,7 +610,7 @@ fn address_build_resumes_and_reports_steps() {
             }
         });
         assert!(!r.unwrap(), "{stop_in}: stopped part way");
-        assert!(f.db.store.read(|r| r.get(STATE, &k_state(c, crate::addrbuild::RUNS_STATE))).unwrap().is_some(), "{stop_in}: record kept");
+        assert!(f.db.store(c).read(|r| r.get(STATE, &k_state(c, crate::addrbuild::RUNS_STATE))).unwrap().is_some(), "{stop_in}: record kept");
         let files = f.db.addr_resume_files();
         assert!(!files.is_empty() && files.iter().all(|p| p.exists()), "{stop_in}: run files kept");
         // The next start goes on; every step's progress ends at its total.
@@ -625,11 +625,73 @@ fn address_build_resumes_and_reports_steps() {
         let steps = last.expect("progress reported");
         assert!(steps[..5].iter().all(|s| s.state == 2 && s.done == s.total), "{stop_in}: steps 1-5 done: {steps:?}");
         assert!(f.db.build_progress(c).is_none(), "progress cleared at the end");
-        assert!(f.db.store.read(|r| r.get(STATE, &k_state(c, crate::addrbuild::RUNS_STATE))).unwrap().is_none(), "record gone");
+        assert!(f.db.store(c).read(|r| r.get(STATE, &k_state(c, crate::addrbuild::RUNS_STATE))).unwrap().is_none(), "record gone");
         assert!(files.iter().all(|p| !p.exists()), "run files deleted");
         let mut got = address_tables(&f.db);
         // OUTPUTS and the log compare as for an uninterrupted build (see addresses_built_later_match_live).
         got[3] = want[3].clone();
         assert_eq!(got, want, "{stop_in}: resumed build = live");
     }
+}
+
+/// One chain's rows in the file that holds it (SPLITDB).
+fn dump_chain(db: &ChainDb, c: u16) -> Vec<(String, Vec<(Vec<u8>, Vec<u8>)>)> {
+    let s = db.store(c);
+    LOGGED.iter().map(|t| (t.to_string(), s.read(|r| r.scan_prefix(t, &k_chain(c))).unwrap())).collect()
+}
+
+#[test]
+fn chain_files_shared_split_and_removed() {
+    // A fresh home: the chain gets its own file.
+    let f = fixture();
+    let c = f.p.chain_no;
+    let b1 = block(f.g.hash(), vec![tx(&[], &[(5000, p2pkh(1))], 1)], 2);
+    f.db.connect_blocks(f.p, &[b1.clone()]).unwrap();
+    assert!(f.db.has_own_file(c));
+    assert!(f.db.own_path(c).is_file());
+    let want = dump_chain(&f.db, c);
+
+    // That file as another home's shared chain.mdbx: an arcade from before SPLITDB.
+    let home = tempfile::tempdir().unwrap();
+    let shared_path = home.path().join("chain.mdbx");
+    f.db.store(c).compact_copy(&shared_path).unwrap();
+    let b2 = block(b1.hash(), vec![tx(&[], &[(5000, p2pkh(2))], 2)], 3);
+    let want2 = {
+        let db = ChainDb::open(&shared_path).unwrap();
+        assert!(!db.has_own_file(c), "a chain with rows in the shared file stays there");
+        assert_eq!(dump_chain(&db, c), want);
+        db.connect_blocks(f.p, &[b2.clone()]).unwrap();
+        assert!(!db.has_own_file(c));
+        dump_chain(&db, c)
+    };
+    assert!(!home.path().join("chains").exists());
+
+    // Moved out: the copy is checked, and the arcade uses it from the next start.
+    let own = home.path().join("chains").join(chain_dir_name(c)).join("chain.mdbx");
+    {
+        let shared = arcade_store::Store::open_readonly(&shared_path, &CHAIN_SCHEMA).unwrap();
+        assert_eq!(crate::split::chains_in(&shared).unwrap(), vec![c]);
+        let r = crate::split::split_chain(&shared, &own, c, &|_| {}).unwrap();
+        assert!(r.rows() > 0 && own.is_file());
+        assert!(crate::split::split_chain(&shared, &own, c, &|_| {}).is_err(), "never over a chain's own file");
+    }
+    let db = ChainDb::open(&shared_path).unwrap();
+    assert!(db.has_own_file(c));
+    assert_eq!(dump_chain(&db, c), want2);
+    assert_eq!(db.tip(c).unwrap().unwrap().height, 2);
+    // New blocks go to the own file; the shared file keeps its old rows.
+    let b3 = block(b2.hash(), vec![tx(&[], &[(5000, p2pkh(3))], 3)], 4);
+    db.connect_blocks(f.p, &[b3]).unwrap();
+    assert_eq!(db.tip(c).unwrap().unwrap().height, 3);
+    assert_eq!(db.legacy_store().read(|r| r.get(STATE, &k_state(c, "tip"))).unwrap().map(|v| be_u32_at(&v, 32)), Some(2));
+
+    // Removing the chain: its rows in the shared file, then its own file whole.
+    while db.remove_chain_batch(c, 7).unwrap() > 0 {}
+    assert!(!own.exists() && !own.parent().unwrap().exists());
+    assert!(crate::split::chains_in(&db.legacy_store()).unwrap().is_empty());
+    assert_eq!(db.tip(c).unwrap(), None);
+}
+
+fn be_u32_at(v: &[u8], i: usize) -> u32 {
+    u32::from_be_bytes(v[i..i + 4].try_into().unwrap())
 }

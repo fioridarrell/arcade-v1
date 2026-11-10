@@ -233,6 +233,29 @@ impl Store {
         Ok(out)
     }
 
+    /// A write transaction committed by hand ([`WriteTxn::commit`]); dropped uncommitted,
+    /// it is aborted. For copies too big for one transaction.
+    pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
+        Ok(WriteTxn { txn: self.db.begin_rw_txn()?, schema: self.schema, id: self.id })
+    }
+
+    /// Add-on tables present in this file, with whether each is a dup table.
+    pub fn addon_defs(&self) -> Result<Vec<(String, bool)>> {
+        let txn = self.db.begin_ro_txn()?;
+        let meta = txn.open_table(Some(META))?;
+        let mut c = txn.cursor(&meta)?;
+        let mut out = Vec::new();
+        let mut cur: Option<(Vec<u8>, Vec<u8>)> = c.set_range(b"addon:")?;
+        while let Some((k, v)) = cur {
+            if !k.starts_with(b"addon:") {
+                break;
+            }
+            out.push((String::from_utf8_lossy(&k[6..]).into_owned(), v.first() == Some(&1)));
+            cur = c.next()?;
+        }
+        Ok(out)
+    }
+
     /// Create an add-on table (e.g. `ord.v1.insc`) if it does not exist yet. Add-on tables
     /// are derived indexes: built by replaying stored blocks, dropped with [`Store::drop_table`].
     pub fn add_table(&self, def: TableDef) -> Result<()> {
@@ -525,6 +548,26 @@ impl WriteTxn<'_> {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Like [`WriteTxn::append`] for a dup table: rows in ascending (key, value) order.
+    pub fn append_dup(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        check(self.schema, table)?;
+        let t = self.txn.open_table(Some(table))?;
+        match self.txn.put(&t, key, value, WriteFlags::APPEND_DUP) {
+            Ok(()) => Ok(()),
+            Err(libmdbx::Error::KeyMismatch) | Err(libmdbx::Error::KeyExist) => {
+                self.txn.put(&t, key, value, WriteFlags::UPSERT)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Commit a transaction from [`Store::begin_write`].
+    pub fn commit(self) -> Result<()> {
+        self.txn.commit()?;
+        Ok(())
     }
 
     /// Insert only if absent. Returns false if the key already existed.

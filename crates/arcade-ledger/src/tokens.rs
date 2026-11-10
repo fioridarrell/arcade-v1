@@ -279,13 +279,13 @@ impl OrdHook for TokensHook {
 // ---------------- reads ----------------
 
 pub fn tick(db: &ChainDb, c: u16, t: &str) -> Option<Value> {
-    db.store.read(|r| r.get(TICK, &k_tick(c, &t.to_lowercase()))).ok()?.and_then(|v| serde_json::from_slice(&v).ok())
+    db.store(c).read(|r| r.get(TICK, &k_tick(c, &t.to_lowercase()))).ok()?.and_then(|v| serde_json::from_slice(&v).ok())
 }
 
 /// Balances of an owner: [(tick, overall, transferable)] in base units.
 pub fn balances(db: &ChainDb, c: u16, owner: &str) -> Vec<(String, String, String)> {
     let pre = KeyBuf::new().u16(c).var(owner.as_bytes()).done();
-    db.store
+    db.store(c)
         .read(|r| r.scan_prefix(BAL, &pre))
         .unwrap_or_default()
         .into_iter()
@@ -297,7 +297,7 @@ pub fn balances(db: &ChainDb, c: u16, owner: &str) -> Vec<(String, String, Strin
 }
 
 pub fn tick_count(db: &ChainDb, c: u16) -> u64 {
-    db.store.read(|r| r.scan_prefix(TICK, &KeyBuf::new().u16(c).done())).map(|v| v.len() as u64).unwrap_or(0)
+    db.store(c).read(|r| r.scan_prefix(TICK, &KeyBuf::new().u16(c).done())).map(|v| v.len() as u64).unwrap_or(0)
 }
 
 #[cfg(test)]

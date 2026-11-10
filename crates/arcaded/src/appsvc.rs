@@ -65,7 +65,7 @@ fn gather(node: &Node) -> Vec<App> {
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, home).unwrap_or_default();
     for p in ledger_chains(node) {
         let c = p.chain_no;
-        let rows = node.chain.store.read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &KeyBuf::new().u16(c).done())).unwrap_or_default();
+        let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &KeyBuf::new().u16(c).done())).unwrap_or_default();
         let mut by: BTreeMap<(String, String), Vec<Ver>> = BTreeMap::new();
         for (_, v) in rows {
             let Ok(v) = serde_json::from_slice::<Value>(&v) else { continue };

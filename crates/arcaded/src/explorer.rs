@@ -385,7 +385,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let off = req["offset"].as_u64().unwrap_or(0) as usize;
             let want = n(50, 200) as usize;
             let pre = KeyBuf::new().u16(x.c()).done();
-            let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::TICK, &pre, off + want)).map_err(e)?;
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, off + want)).map_err(e)?;
             Ok(json!({"protocol": tokens::protocol(x.p).map(|t| t.0).unwrap_or("tokens"), "total": tokens::tick_count(&x.node.chain, x.c()),
                 "offset": off, "items": rows.into_iter().skip(off).filter_map(|(k, v)| {
                 let mut v: Value = serde_json::from_slice(&v).ok()?;
@@ -405,7 +405,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             }
             let mut v = local.ok_or_else(|| format!("no token {t}"))?;
             let pre = KeyBuf::new().u16(x.c()).var(t.as_bytes()).done();
-            let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::HOLDER, &pre, 5000)).map_err(e)?;
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::HOLDER, &pre, 5000)).map_err(e)?;
             let more = rows.len() >= 5000;
             let mut hs: Vec<(u128, String, String)> = rows
                 .iter()
@@ -430,7 +430,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let (off, want) = (req["offset"].as_u64().unwrap_or(0) as usize, n(50, 200) as usize);
             let rows = match s("after") {
                 Some(a) => scan_after(&x, names::WIN, pre.clone(), Some(a), want),
-                None => x.node.chain.store.read(|r| r.scan_prefix_limit(names::WIN, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
+                None => x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(names::WIN, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
             };
             Ok(json!({"counts": counts, "total": counts[0], "offset": off, "items": rows.iter().map(|(k, v)| name_row(pre.len(), k, v)).collect::<Vec<_>>()}))
         }
@@ -453,7 +453,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let (off, want) = (req["offset"].as_u64().unwrap_or(0) as usize, n(50, 200) as usize);
             let rows = match s("after") {
                 Some(a) => scan_after(&x, maps::MAP, pre, Some(a), want),
-                None => x.node.chain.store.read(|r| r.scan_prefix_limit(maps::MAP, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
+                None => x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(maps::MAP, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
             };
             Ok(json!({"total": total, "offset": off, "items": rows.iter().map(|(k, v)| map_row(k, v)).collect::<Vec<_>>()}))
         }
@@ -469,7 +469,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
         "explorer.ledger_tokens" => {
             x.need("ledger")?;
             let off = req["offset"].as_u64().unwrap_or(0) as usize;
-            let total = x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY, &x.c().to_be_bytes())).map(|v| v.len()).unwrap_or(0);
+            let total = x.node.chain.store(x.c()).read(|r| r.scan_prefix(led::PROPERTY, &x.c().to_be_bytes())).map(|v| v.len()).unwrap_or(0);
             Ok(json!({"total": total, "offset": off, "items": ledger_tokens_page(&x, off, n(50, 200) as usize)}))
         }
         "explorer.ledger_token" => { x.need("ledger")?; ledger_token(&x, req["id"].as_u64().or_else(|| s("id").and_then(|v| v.parse().ok())).ok_or("give a token id")? as u32) }
@@ -499,7 +499,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
 use arcade_ledger::engine as led;
 
 fn ledger_count(x: &Ctx) -> u64 {
-    x.node.chain.store.read(|r| r.last_with_prefix(led::BY_NUMBER, &x.c().to_be_bytes())).ok().flatten()
+    x.node.chain.store(x.c()).read(|r| r.last_with_prefix(led::BY_NUMBER, &x.c().to_be_bytes())).ok().flatten()
         .map(|(k, _)| be_u64(&k, 2) + 1).unwrap_or(0)
 }
 
@@ -538,7 +538,7 @@ fn ledger_tokens(x: &Ctx, n: usize) -> Vec<Value> {
 
 fn ledger_tokens_page(x: &Ctx, off: usize, n: usize) -> Vec<Value> {
     // Newest first: the creation-height index, read backwards.
-    let mut rows = x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY_BY_BLOCK, &x.c().to_be_bytes())).unwrap_or_default();
+    let mut rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix(led::PROPERTY_BY_BLOCK, &x.c().to_be_bytes())).unwrap_or_default();
     rows.reverse();
     rows.iter().skip(off).take(n).filter_map(|(k, _)| {
         let pid = u32::from_be_bytes(k[k.len() - 4..].try_into().ok()?);
@@ -563,7 +563,7 @@ fn ledger_token(x: &Ctx, pid: u32) -> R {
 
 fn ledger_summary(x: &Ctx) -> R {
     let c = x.c();
-    let count = |t: &str| x.node.chain.store.read(|r| r.scan_prefix(t, &c.to_be_bytes())).map(|v| v.len()).unwrap_or(0);
+    let count = |t: &str| x.node.chain.store(c).read(|r| r.scan_prefix(t, &c.to_be_bytes())).map(|v| v.len()).unwrap_or(0);
     Ok(json!({
         "tokens": count(led::PROPERTY), "inscriptions": ledger_count(x), "collections": count(led::COLLECTION),
         "tags": count(arcade_ledger::index::TAG), "orders": count(led::BOOK), "trades": count(led::TAKE),
@@ -585,7 +585,7 @@ fn tag_of(x: &Ctx, a: &str) -> Option<String> {
 
 fn scan_after(x: &Ctx, table: &str, pre: Vec<u8>, after: Option<String>, n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     // Simple paging: skip rows up to and including the `after` key text.
-    let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(table, &pre, n + 2000)).unwrap_or_default();
+    let rows = x.node.chain.store_for(&pre).read(|r| r.scan_prefix_limit(table, &pre, n + 2000)).unwrap_or_default();
     let start = match after {
         Some(a) => rows.iter().position(|(k, _)| String::from_utf8_lossy(&k[pre.len()..]).ends_with(&a)).map(|i| i + 1).unwrap_or(0),
         None => 0,
@@ -597,7 +597,7 @@ fn geneses(x: &Ctx, height: u32) -> Option<u32> {
     if !x.has("ord") {
         return None;
     }
-    let v = x.node.chain.store.read(|r| r.get(ord::BLOCK, &KeyBuf::new().u16(x.c()).u32(height).done())).ok()??;
+    let v = x.node.chain.store(x.c()).read(|r| r.get(ord::BLOCK, &KeyBuf::new().u16(x.c()).u32(height).done())).ok()??;
     Some(u32::from_be_bytes(v[64..68].try_into().ok()?))
 }
 
@@ -762,7 +762,7 @@ fn summary(x: &Ctx) -> R {
     }
     if x.has("maps") {
         let rows = scan_after(x, maps::MAP, KeyBuf::new().u16(c).done(), None, 6);
-        v["maps"] = json!(x.node.chain.store.count(maps::MAP).unwrap_or(0));
+        v["maps"] = json!(x.node.chain.store(c).count(maps::MAP).unwrap_or(0));
         v["map_rows"] = json!(rows.iter().map(|(k, b)| map_row(k, b)).collect::<Vec<_>>());
     }
     Ok(v)
@@ -829,7 +829,7 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
     let spent = x.node.chain.spender(x.p, &op).ok().flatten().and_then(|(b, p, vin)| x.node.chain.tx_at(x.p, b, p).ok().flatten().map(|t| json!({"txid": t.txid.to_hex(), "vin": vin})));
     let ins: Vec<String> = if x.has("ord") {
         let pre = KeyBuf::new().u16(x.c()).bytes(&txid.0).u32(vout).done();
-        x.node.chain.store.read(|r| r.scan_prefix_limit(ord::LOC, &pre, 50)).unwrap_or_default().iter().map(|(k, _)| ord::iid_str(&k[k.len() - 36..])).collect()
+        x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(ord::LOC, &pre, 50)).unwrap_or_default().iter().map(|(k, _)| ord::iid_str(&k[k.len() - 36..])).collect()
     } else {
         vec![]
     };
@@ -1052,20 +1052,20 @@ fn search(x: &Ctx, q: &str) -> R {
     }
     if x.has("names") {
         let pre = KeyBuf::new().u16(c).u8(0).bytes(w.as_bytes()).done();
-        for (k, v) in x.node.chain.store.read(|r| r.scan_prefix_limit(names::WIN, &pre, 25)).unwrap_or_default() {
+        for (k, v) in x.node.chain.store(c).read(|r| r.scan_prefix_limit(names::WIN, &pre, 25)).unwrap_or_default() {
             let name = String::from_utf8_lossy(&k[3..]).into_owned();
             items.push(json!({"kind": "name", "id": name, "label": name, "what": format!("name · inscription #{}", be_u64(&v, 0))}));
         }
     }
     if x.has("tokens") {
         let pre = KeyBuf::new().u16(c).bytes(w.as_bytes()).done();
-        for (k, _) in x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::TICK, &pre, 25)).unwrap_or_default() {
+        for (k, _) in x.node.chain.store(c).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, 25)).unwrap_or_default() {
             let t = String::from_utf8_lossy(&k[2..]).into_owned();
             items.push(json!({"kind": "token", "id": t, "label": t, "what": format!("{} token", tokens::protocol(x.p).map(|p| p.0).unwrap_or("").to_uppercase())}));
         }
     }
     if x.has("ledger") {
-        for (_, v) in x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY, &c.to_be_bytes())).unwrap_or_default() {
+        for (_, v) in x.node.chain.store(c).read(|r| r.scan_prefix(led::PROPERTY, &c.to_be_bytes())).unwrap_or_default() {
             let Ok(pr) = serde_json::from_slice::<Value>(&v) else { continue };
             let name = pr["name"].as_str().unwrap_or("");
             if name.to_lowercase().contains(&w) {

@@ -18,7 +18,7 @@ pub fn announced(node: &Node) -> Vec<(String, String)> {
     let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
     let from = tip.saturating_sub(WITHIN_BLOCKS);
     let pre = c.to_be_bytes().to_vec();
-    let rows = node.chain.store.read(|r| r.scan_prefix(arcade_ledger::messages::MACHINE, &pre)).unwrap_or_default();
+    let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::messages::MACHINE, &pre)).unwrap_or_default();
     let mut latest: BTreeMap<(String, bool), (u32, String)> = BTreeMap::new();
     for (k, v) in rows {
         if k.len() < 6 {

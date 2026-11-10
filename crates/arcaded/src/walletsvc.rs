@@ -50,7 +50,7 @@ fn text(v: &Value) -> String {
 fn all_inscriptions(node: &Node) -> Vec<Value> {
     let mut rows: Vec<Value> = node
         .chain
-        .store
+        .store(c(node))
         .read(|r| r.scan_prefix(led::INSCRIPTION, &KeyBuf::new().u16(c(node)).done()))
         .unwrap_or_default()
         .into_iter()

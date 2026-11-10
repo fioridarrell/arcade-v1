@@ -8,6 +8,7 @@ pub mod copyout;
 pub mod db;
 pub mod indexer;
 pub mod schema;
+pub mod split;
 pub mod sync;
 pub mod txruns;
 pub mod undo;

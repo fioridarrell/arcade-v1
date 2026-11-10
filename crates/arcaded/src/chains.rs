@@ -556,6 +556,8 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
     let c = r.params.chain_no;
     let name = r.params.name;
     std::thread::spawn(move || {
+        // Let the chain's threads see the stop first: a chain's own file is deleted whole.
+        std::thread::sleep(std::time::Duration::from_secs(10));
         while n.chain.remove_chain_batch(c, 20_000).map(|x| x > 0).unwrap_or(false) {}
         let _ = n.app.event("chains", &format!("removed {name} and its data"));
     });

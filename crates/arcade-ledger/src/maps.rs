@@ -67,13 +67,13 @@ impl OrdHook for MapsHook {
 pub fn lookup(db: &ChainDb, c: u16, claim: &str) -> Option<(u64, String)> {
     let (n, ns) = claim.trim().split_once('.')?;
     let n: u64 = n.parse().ok()?;
-    let v = db.store.read(|r| r.get(MAP, &key(c, &ns.to_ascii_lowercase(), n))).ok()??;
+    let v = db.store(c).read(|r| r.get(MAP, &key(c, &ns.to_ascii_lowercase(), n))).ok()??;
     (v.len() == 44).then(|| (u64::from_be_bytes(v[..8].try_into().unwrap()), iid_str(&v[8..])))
 }
 
 /// Claimed blocks per namespace.
 pub fn counts(db: &ChainDb, c: u16) -> Vec<(String, u64)> {
-    let rows = db.store.read(|r| r.scan_prefix(MAP, &KeyBuf::new().u16(c).done())).unwrap_or_default();
+    let rows = db.store(c).read(|r| r.scan_prefix(MAP, &KeyBuf::new().u16(c).done())).unwrap_or_default();
     let mut out: Vec<(String, u64)> = Vec::new();
     for (k, _) in rows {
         let len = k[2] as usize;

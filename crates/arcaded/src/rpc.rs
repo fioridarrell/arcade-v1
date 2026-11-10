@@ -369,7 +369,7 @@ pub fn tx_json(p: &arcade_chain::params::ChainParams, t: &Tx) -> Value {
 fn block_of(node: &Node, p: &arcade_chain::params::ChainParams, b: u32) -> Option<(Hash256, u32)> {
     // Block meta holds the header; hash it, then read its record for the height.
     let c = p.chain_no;
-    let raw = node.chain.store.read(|r| r.get(arcade_chaindb::schema::BLOCK_META, &arcade_chaindb::schema::k_block(c, b))).ok()??;
+    let raw = node.chain.store(c).read(|r| r.get(arcade_chaindb::schema::BLOCK_META, &arcade_chaindb::schema::k_block(c, b))).ok()??;
     let h: [u8; 80] = raw.get(..80)?.try_into().ok()?;
     let hash = p.block_id(&arcade_chain::Header::parse(&h));
     let rec = node.chain.header(c, &hash).ok()??;

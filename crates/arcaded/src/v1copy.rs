@@ -102,7 +102,7 @@ pub fn canonical(v: &Value) -> String {
 /// Make a copy of one family of chain `p` now, from a single read transaction. The copy's
 /// height is the tip (blocks, coins) or the family's index height as of that view.
 pub fn make(node: &Node, p: &'static ChainParams, fam: &str) -> Result<Value, String> {
-    node.chain.store.read(|r| Ok(make_in(node, p, fam, r))).map_err(|e| e.to_string())?
+    node.chain.store(p.chain_no).read(|r| Ok(make_in(node, p, fam, r))).map_err(|e| e.to_string())?
 }
 
 /// Make a copy of one family from the read transaction `r` (all families asked for at one height
@@ -269,7 +269,7 @@ pub fn checkpoint(node: &std::sync::Arc<Node>, p: &'static ChainParams, tip: u32
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let n = node.clone();
     let spawned = std::thread::Builder::new().name(format!("checkpoint-{}", p.net)).spawn(move || {
-        let _ = n.chain.store.read(|r| {
+        let _ = n.chain.store(p.chain_no).read(|r| {
             let _ = tx.send(());
             for f in &fams {
                 if let Err(e) = make_in(&n, p, f, r) {

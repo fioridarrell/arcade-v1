@@ -152,7 +152,8 @@ pub fn make_in(node: &Node, p: &'static ChainParams, fam: &str, r: &arcade_store
                 let Some(h) = h else {
                     return Ok(Err(format!("{} has no {fam} index here", p.name)));
                 };
-                let have: Vec<String> = crate::chains::tables_of(fam);
+                // Derived tables (built by each arcade from the rest) aren't copied.
+                let have: Vec<String> = crate::chains::tables_of(fam).into_iter().filter(|t| !arcade_ledger::ord::DERIVED.contains(&t.as_str())).collect();
                 let tables: Vec<&str> = have.iter().map(|s| s.as_str()).collect();
                 copyout::export_tables(r, c, &tables, &mut sink)?;
                 (h, json!({"tables": tables}))

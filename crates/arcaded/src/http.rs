@@ -1,7 +1,9 @@
 //! The arcade's HTTP server (default 127.0.0.1:8420; --http-bind to open it).
 //!
 //! Anyone who can reach it:
-//!   GET /content/<txid|number>       an inscription's bytes, rebuilt from the chain (sandboxed)
+//!   GET /content/<txid|number>       an inscription's bytes, rebuilt from the chain (sandboxed):
+//!                                    the arcade ledger's, else an ord inscription on any chain kept here
+//!   GET /ord/<chain>/<id>            an ord inscription's image bytes (the Explorer's previews)
 //!   GET /inscription/<txid|number>   its details (JSON)
 //!   GET /<file>                      the operator's website (--site DIR), if any
 //! Only from this computer (and never through a proxy, which adds X-Forwarded-For):
@@ -229,7 +231,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
         let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
-        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me}; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
+        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
         return match arcade_ledger::content::content(&node.chain, cp, id) {
             Ok(c) => respond(
                 &mut s,
@@ -244,6 +246,26 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
                 ],
                 if r.method == "HEAD" { &[] } else { &c.bytes },
             ),
+            Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
+        };
+    }
+    // An ord inscription's bytes on a chain kept here (the Explorer's image previews load
+    // from here, one request each). Images only: anything else is for the inscription's page.
+    if let Some(rest) = path.strip_prefix("/ord/") {
+        let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
+        let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
+        return match arcade_ledger::ord::content(&node.chain, cp, id) {
+            Ok((ct, bytes)) if ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase().starts_with("image/") => respond(
+                &mut s,
+                "200 OK",
+                &ct,
+                &[
+                    ("Content-Security-Policy", "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'".into()),
+                    ("X-Content-Type-Options", "nosniff".into()),
+                ],
+                if r.method == "HEAD" { &[] } else { &bytes },
+            ),
+            Ok(_) => respond(&mut s, "404 Not Found", "text/plain", &[], b"not an image\n"),
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         };
     }
@@ -304,7 +326,23 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
                 ],
                 if r.method == "HEAD" { &[] } else { &c.bytes },
             ),
-            Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
+            // Not an arcade-ledger inscription: an ord inscription on a chain kept here
+            // (recursive Doginals/Pepinals ask /content/<id>; Martin 2026-11-10).
+            Err(e) => match ord_content(node, id) {
+                Some((ct, bytes)) => {
+                    let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
+                    // Sandboxed (opaque origin, scripts only), loading only from this arcade.
+                    let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
+                    respond(
+                        &mut s,
+                        "200 OK",
+                        if ct.is_empty() { "application/octet-stream" } else { &ct },
+                        &[("Content-Security-Policy", csp), ("Access-Control-Allow-Origin", "*".into()), ("X-Content-Type-Options", "nosniff".into())],
+                        if r.method == "HEAD" { &[] } else { &bytes },
+                    )
+                }
+                None => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
+            },
         },
         ["inscription", id] => match arcade_ledger::content::inscription(&node.chain, p.chain_no, id) {
             Some(mut v) => {
@@ -318,6 +356,21 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             None => respond(&mut s, "404 Not Found", "text/plain", &[], b"try /content/<txid|number>, /inscription/<txid|number>, or /api/v1/routes from this computer\n"),
         },
     }
+}
+
+/// An ord inscription's content type and bytes, from the first chain kept here with the ord
+/// index that has it (the home chain first).
+fn ord_content(node: &Node, id: &str) -> Option<(String, Vec<u8>)> {
+    let mut chains: Vec<&'static arcade_chain::params::ChainParams> = Vec::new();
+    if crate::chains::home_indexes(node).iter().any(|i| i == "ord") {
+        chains.push(node.params);
+    }
+    for r in node.extra.lock().unwrap().values() {
+        if r.indexes.iter().any(|i| i == "ord") {
+            chains.push(r.params);
+        }
+    }
+    chains.into_iter().find_map(|p| arcade_ledger::ord::content(&node.chain, p, id).ok())
 }
 
 fn site_file(s: &mut TcpStream, dir: &PathBuf, path: &str, head: bool) {

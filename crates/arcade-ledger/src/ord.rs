@@ -13,6 +13,7 @@
 //!     line = sha256(block hash hex + "\n" + per genesis piece "<txid>i0:0:<ctype hex>\n"), as dx;
 //!     chunk hash = sha256(the 100 line hex strings concatenated), chunks of 100 from ord_start
 //!   ord.v1.state    C|"next"          -> next number u64
+//!   ord.v1.types    by content type (ordtypes.rs; derived, not in index copies)
 //! iid = genesis txid (internal byte order) | n u32 (always 0 here); shown as "<txid>i0".
 
 use arcade_chain::params::ChainParams;
@@ -41,6 +42,8 @@ pub const PENDING_BODY: &str = "ord.v1.pending_body";
 /// a long inscription was quadratic).
 pub const PENDING_TXS: &str = "ord.v1.pending_txs";
 pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE, IDS, PENDING_BODY, PENDING_TXS];
+/// Tables each arcade derives from the others itself (index copies leave them out).
+pub const DERIVED: &[&str] = &[crate::ordtypes::TYPES];
 pub const GROUPS: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -473,7 +476,7 @@ impl Indexer for OrdIndexer {
         "ord.v1"
     }
     fn tables(&self) -> Vec<TableDef> {
-        let mut t: Vec<TableDef> = TABLES.iter().map(|n| TableDef::plain(n)).collect();
+        let mut t: Vec<TableDef> = TABLES.iter().chain(DERIVED).map(|n| TableDef::plain(n)).collect();
         for h in &self.hooks {
             t.extend(h.tables());
         }
@@ -491,6 +494,9 @@ impl Indexer for OrdIndexer {
         let mut moves = String::new();
         let mut births = 0u32;
         let mut next = l.get(STATE, &k(c, b"next"))?.map(|v| be_u64(&v, 0)).unwrap_or(0);
+        // The type rows (once built on this chain): the block's new inscriptions are added.
+        let mut types = crate::ordtypes::trim(l, c, next)?;
+        let mut typed = false;
         for (pos, tx) in ctx.block.txs.iter().enumerate() {
             if tx.is_coinbase() {
                 continue;
@@ -669,6 +675,10 @@ impl Indexer for OrdIndexer {
                 if self.keeps(number) {
                     l.put(INSC, &k(c, &iid), row.to_string().as_bytes())?;
                     l.put(NUM, &KeyBuf::new().u16(c).u64(number).done(), &iid)?;
+                    if let Some(m) = types.as_mut() {
+                        crate::ordtypes::add(l, c, m, number, &ct)?;
+                        typed = true;
+                    }
                 }
                 for h in &self.hooks {
                     h.born(l, c, &Born { params: p, iid: &iid, number, height: ctx.height, ctype: &ct, body: &cm.p.body,
@@ -678,6 +688,9 @@ impl Indexer for OrdIndexer {
         }
         if births > 0 || !lines.is_empty() || !moves.is_empty() {
             l.put(STATE, &k(c, b"next"), &next.to_be_bytes())?;
+        }
+        if let (true, Some(m)) = (typed, &types) {
+            crate::ordtypes::save(l, c, m)?;
         }
         // Fingerprint inputs for this block (dx).
         let line: [u8; 32] = Sha256::digest(format!("{}\n{lines}", ctx.block.header.hash().to_hex()).as_bytes()).into();

@@ -48,6 +48,9 @@ struct Ctx<'a> {
     node: &'a Node,
     p: &'static ChainParams,
     indexes: Vec<String>,
+    /// Inscription lists give images as a link to this arcade's /ord/<chain>/<id> instead of
+    /// their bytes (asked by this computer's UI only; see `handle_with`).
+    img_links: bool,
 }
 
 impl Ctx<'_> {
@@ -79,7 +82,7 @@ fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
     } else {
         node.extra.lock().unwrap().get(p.key).map(|r| r.indexes.clone()).ok_or_else(|| format!("{} is not installed", p.name))?
     };
-    Ok(Ctx { node, p, indexes })
+    Ok(Ctx { node, p, indexes, img_links: false })
 }
 
 /// Explorer questions another arcade may answer for us (all public, read-only).
@@ -175,7 +178,14 @@ fn missing_index(e: &str) -> Option<String> {
 /// mesh should be available in the explorer). Such answers carry "_mesh": {node, tag}; they
 /// are that arcade's word, not checked here.
 pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
-    let local = handle_here(node, cmd, req);
+    handle_with(node, cmd, req, false)
+}
+
+/// [`handle`], for this computer's own UI: with `img_links`, inscription lists made here give
+/// images as links (`content.src`) the UI loads one by one, so the list comes back at once.
+/// Answers from other arcades keep the bytes (their links would point at them).
+pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    let local = handle_here(node, cmd, req, img_links);
     if req["local"] == true || !FORWARDABLE.contains(&cmd) {
         return local;
     }
@@ -266,8 +276,9 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
     }
 }
 
-fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
-    let x = ctx(node, req)?;
+fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    let mut x = ctx(node, req)?;
+    x.img_links = img_links;
     // Not kept here, or kept but still catching up (borrowed meanwhile, the home chain
     // included): the borrowed chain answers what it can; indexes still come from here or
     // the mesh.
@@ -357,7 +368,11 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let mut v = match ord::inscription(&x.node.chain, x.p, q) {
                 Some(v) => {
                     let mut v = v;
-                    v["content"] = content(&x, v["id"].as_str().unwrap_or(""), 4 << 20);
+                    let id = v["id"].as_str().unwrap_or("").to_string();
+                    v["content"] = content(&x, &id, 4 << 20);
+                    if x.img_links && v["content"]["kind"] == "html" {
+                        v["content"]["src"] = json!(format!("/content/{id}"));
+                    }
                     v
                 }
                 None => {
@@ -612,6 +627,37 @@ fn blocks(x: &Ctx, before: u32, n: u32) -> Vec<Value> {
     (before.saturating_sub(n)..before).rev().filter_map(|h| block_row(x, h)).collect()
 }
 
+/// An image's or an HTML page's preview as a link to it on this arcade, from its record alone
+/// (no read of the chain), when the UI asked for links: images with their own body up to
+/// `cap` (/ord/<chain>/<id>), HTML (/content/<id>, run in a sandboxed frame; Martin
+/// 2026-11-10).
+fn image_link(x: &Ctx, rec: &Value, id: &str, cap: usize) -> Option<Value> {
+    if !x.img_links || !rec["delegate"].is_null() {
+        return None;
+    }
+    let ct = rec["ct"].as_str().unwrap_or("");
+    let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
+    let size = rec["size"].as_u64()?;
+    if base == "text/html" && size > 0 {
+        return Some(json!({"type": ct, "kind": "html", "src": format!("/content/{id}"), "size": size}));
+    }
+    if !base.starts_with("image/") || size == 0 || size > cap as u64 {
+        return None;
+    }
+    Some(json!({"type": ct, "kind": "image", "src": format!("/ord/{}/{id}", x.p.key), "size": size}))
+}
+
+/// A list item with no preview (video, audio, models, ...): its type and size from the record,
+/// without rebuilding its bytes from the chain (a video's many pieces took seconds each).
+fn no_preview(rec: &Value) -> Option<Value> {
+    let ct = rec["ct"].as_str().unwrap_or("");
+    let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
+    if !rec["delegate"].is_null() || base.is_empty() || base.starts_with("text/") || base == "application/json" || base.starts_with("image/") {
+        return None;
+    }
+    Some(json!({"type": ct, "kind": "other", "size": rec["size"]}))
+}
+
 /// Text or image preview of an inscription's content (empty for other types).
 fn content(x: &Ctx, id: &str, cap: usize) -> Value {
     content_of(x, id, None, cap)
@@ -654,29 +700,7 @@ pub fn type_matches(ct: &str, ty: &str) -> bool {
 
 /// The content-type group of `ct` (see [`type_matches`]).
 pub fn type_group(ct: &str) -> &'static str {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    let group = |b: &str| -> &'static str {
-        if b == "image/svg+xml" {
-            "svg"
-        } else if b.starts_with("image/") {
-            "image"
-        } else if b == "text/html" {
-            "html"
-        } else if b == "application/json" || b.ends_with("+json") {
-            "json"
-        } else if b.starts_with("text/") {
-            "text"
-        } else if b.starts_with("audio/") {
-            "audio"
-        } else if b.starts_with("video/") {
-            "video"
-        } else if b.starts_with("model/") {
-            "model"
-        } else {
-            "other"
-        }
-    };
-    group(&base)
+    arcade_ledger::ordtypes::GROUP_NAMES[arcade_ledger::ordtypes::group_of(ct) as usize]
 }
 
 /// Newest inscriptions below `before` of one content type: (items, where to go on from,
@@ -711,7 +735,7 @@ fn latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
                 Some(v) => {
                     let mut v = v;
                     let id = v["id"].as_str().unwrap_or("").to_string();
-                    v["content"] = content(x, &id, 96 << 10);
+                    v["content"] = image_link(x, &v, &id, 96 << 10).or_else(|| no_preview(&v)).unwrap_or_else(|| content(x, &id, 96 << 10));
                     v
                 }
                 // Shared storage: records of other groups come from the arcades holding them.

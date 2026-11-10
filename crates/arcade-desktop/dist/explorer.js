@@ -34,6 +34,15 @@
   const has = (ix) => !!sum && (sum.indexes.includes(ix) || (sum.mesh_indexes || []).includes(ix));
   // Pages (or parts) answered by another arcade say so.
   let meshFrom = null;
+  // This arcade's HTTP server: inscription lists ask for images as links to it (img: "links")
+  // and each picture loads on its own, so the list itself comes back at once.
+  let httpBase = null;
+  const imgArgs = async () => {
+    if (httpBase === null) {
+      try { httpBase = (await api("rpc.info")).url.replace(/\/rpc$/, ""); } catch { httpBase = ""; }
+    }
+    return httpBase ? { img: "links" } : {};
+  };
   const xapi = async (cmd, args) => {
     const r = await api(cmd, args);
     if (r && r._mesh) meshFrom = r._mesh;
@@ -84,7 +93,11 @@
   function preview(i, big) {
     const t = h("div", { class: big ? "x-big" : "x-thumb" });
     const c = i.content || {};
-    if (c.kind === "image") t.append(h("img", { src: c.data, alt: `inscription ${i.n}`, loading: "lazy" }));
+    if (c.kind === "image") {
+      const img = h("img", { src: c.src && httpBase ? httpBase + c.src : c.data, alt: `inscription ${i.n}`, loading: "lazy", decoding: "async" });
+      img.onerror = () => img.replaceWith(h("div", { class: "x-ph" }, "image not available"));
+      t.append(img);
+    }
     else if (c.kind === "text") t.append(h("pre", {}, c.text.slice(0, big ? 20000 : 400)));
     else t.append(h("div", { class: "x-ph" }, c.kind === "html" ? "HTML (not run here)" : c.kind === "missing" ? "content not stored" : (c.type || "binary")));
     if (!big) t.append(h("span", { class: "tag" }, (i.ct || "").split(";")[0] || "no type"));
@@ -236,7 +249,7 @@
     if (oldKey !== key) { oldKey = key; oldAcc = r.items; oldNext = r.next_before ?? null; }
     const more = oldNext != null ? h("div", { class: "row" }, h("button", { onclick: async (ev) => {
       ev.target.disabled = true; ev.target.textContent = "Looking…";
-      const rr = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, before: oldNext, n: 36 });
+      const rr = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, before: oldNext, n: 36, ...(await imgArgs()) });
       oldAcc = oldAcc.concat(rr.items); oldNext = rr.next_before ?? null;
       render();
     } }, `Show older (looked down to #${fmt(oldNext)})`)) : h("p", { class: "x-note" }, "That's all of them.");
@@ -250,7 +263,7 @@
     const total = first.total;
     if (insType) {
       // Paged like the full list (newest first), with the type's own total.
-      const r = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, offset: (page - 1) * size, n: size });
+      const r = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, offset: (page - 1) * size, n: size, ...(await imgArgs()) });
       const label = INS_TYPES.find((t) => t[0] === insType)[1];
       if (r.type_total == null) return oldTyped(r, label);
       const tt = r.type_total;
@@ -258,7 +271,7 @@
       return sect(`${label} · ${fmt(tt)}${r.counting ? "+" : ""}`, null, h("div", {}, typeChips(), note, pager(tt, size, page, "inscriptions"),
         r.items.length ? insGrid(r.items) : h("div", { class: "x-empty" }, "None."), pager(tt, size, page, "inscriptions")));
     }
-    const r = await xapi("explorer.inscriptions", { chain: chain.key, before: Math.max(0, total - (page - 1) * size), n: size });
+    const r = await xapi("explorer.inscriptions", { chain: chain.key, before: Math.max(0, total - (page - 1) * size), n: size, ...(await imgArgs()) });
     const toPage = (num) => Math.floor((total - 1 - num) / size) + 1;
     return sect(`Inscriptions · ${fmt(total)}`, null, h("div", {}, typeChips(), pager(total, size, page, "inscriptions", "inscription #", toPage), insGrid(r.items), pager(total, size, page, "inscriptions", "inscription #", toPage)));
   }

@@ -24,12 +24,14 @@ pub const XFER: &str = "tok.v1.xfer";
 
 const MAX_SUPPLY: u128 = u64::MAX as u128;
 
-/// The token protocol of a chain: PRC-20 on Pepecoin, DRC-20 on Dogecoin. Other chains have
+/// The token protocol of a chain: PRC-20 on Pepecoin, DRC-20 on Dogecoin, WJK-20 on
+/// Wojakcoin (Martin 2026-11-10). Other chains have
 /// their own, found as their ord indexes run; until one is added here a chain has none.
 pub fn protocol(p: &ChainParams) -> Option<(&'static str, bool)> {
     match p.net {
         "main" | "test" => Some(("prc-20", false)),
         "doge" => Some(("drc-20", false)),
+        "wjk" => Some(("wjk-20", false)),
         _ => None,
     }
 }
@@ -95,6 +97,15 @@ pub enum Op {
     Transfer { tick: String, amt: String },
 }
 
+/// A tick's length: 4 bytes for PRC-20 and DRC-20; WJK-20 ticks are 1 to 16 characters
+/// (its deploys use 3 to 8: wojak, awojak, ananwojk, wjk, ...; Martin 2026-11-10).
+fn tick_ok(proto: &str, tick: &str) -> bool {
+    match proto {
+        "wjk-20" => (1..=16).contains(&tick.chars().count()),
+        _ => tick.len() == 4,
+    }
+}
+
 pub fn token_op(proto: &str, brc: bool, ctype: &str, body: &[u8]) -> Option<Op> {
     let text = std::str::from_utf8(body).ok()?;
     if text.chars().count() < 40 && !brc {
@@ -109,7 +120,7 @@ pub fn token_op(proto: &str, brc: bool, ctype: &str, body: &[u8]) -> Option<Op> 
         return None;
     }
     let tick = o.get("tick")?.as_str()?;
-    if tick.len() != 4 {
+    if !tick_ok(proto, tick) {
         return None;
     }
     let tick = tick.to_string();
@@ -312,5 +323,12 @@ mod tests {
         assert!(num("18446744073709551616").map(|n| !n.le_int(MAX_SUPPLY)).unwrap());
         let body = br#"{"p":"prc-20","op":"deploy","tick":"lord","max":"69","lim":"1"}"#;
         assert!(matches!(token_op("prc-20", false, "text/plain;charset=utf-8", body), Some(Op::Deploy { .. })));
+        // WJK-20: ticks of 1 to 16 characters; PRC-20 keeps 4.
+        let mint = br#"{"p":"wjk-20","op":"mint","tick":"wojak","amt":"1000"}"#;
+        assert!(matches!(token_op("wjk-20", false, "text/plain", mint), Some(Op::Mint { .. })));
+        let deploy = b"{\n  \"p\": \"wjk-20\",\n  \"op\": \"deploy\",\n  \"tick\": \"ananwojk\",\n  \"max\": \"44400000\",\n  \"lim\": \"111\"\n}";
+        assert!(matches!(token_op("wjk-20", false, "text/plain", deploy), Some(Op::Deploy { .. })));
+        assert!(token_op("wjk-20", false, "text/plain", br#"{"p":"wjk-20","op":"mint","tick":"abcdefghijklmnopq","amt":"1"}"#).is_none());
+        assert!(token_op("prc-20", false, "text/plain", br#"{"p":"prc-20","op":"mint","tick":"wojak","amt":"1000"}"#).is_none());
     }
 }

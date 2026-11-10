@@ -2,6 +2,7 @@
 //!
 //! Anyone who can reach it:
 //!   GET /content/<txid|number>       an inscription's bytes, rebuilt from the chain (sandboxed)
+//!   GET /ord/<chain>/<id>            an ord inscription's image bytes (the Explorer's previews)
 //!   GET /inscription/<txid|number>   its details (JSON)
 //!   GET /<file>                      the operator's website (--site DIR), if any
 //! Only from this computer (and never through a proxy, which adds X-Forwarded-For):
@@ -244,6 +245,26 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
                 ],
                 if r.method == "HEAD" { &[] } else { &c.bytes },
             ),
+            Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
+        };
+    }
+    // An ord inscription's bytes on a chain kept here (the Explorer's image previews load
+    // from here, one request each). Images only: anything else is for the inscription's page.
+    if let Some(rest) = path.strip_prefix("/ord/") {
+        let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
+        let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
+        return match arcade_ledger::ord::content(&node.chain, cp, id) {
+            Ok((ct, bytes)) if ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase().starts_with("image/") => respond(
+                &mut s,
+                "200 OK",
+                &ct,
+                &[
+                    ("Content-Security-Policy", "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'".into()),
+                    ("X-Content-Type-Options", "nosniff".into()),
+                ],
+                if r.method == "HEAD" { &[] } else { &bytes },
+            ),
+            Ok(_) => respond(&mut s, "404 Not Found", "text/plain", &[], b"not an image\n"),
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         };
     }

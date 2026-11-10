@@ -62,7 +62,7 @@ pub(crate) fn tables_of(index: &str) -> Vec<String> {
         "ledger" => arcade_ledger::engine::LedgerIndexer.tables_named(),
         "profiles" => s(&[arcade_ledger::index::PROFILE, arcade_ledger::index::LINKED]),
         "messages" => s(arcade_ledger::messages::TABLES),
-        "ord" => s(arcade_ledger::ord::TABLES),
+        "ord" => s(&[arcade_ledger::ord::TABLES, arcade_ledger::ord::DERIVED].concat()),
         "names" => s(&[arcade_ledger::names::CLAIM, arcade_ledger::names::WIN]),
         "maps" => s(&[arcade_ledger::maps::MAP]),
         "tokens" => s(&[arcade_ledger::tokens::TICK, arcade_ledger::tokens::BAL, arcade_ledger::tokens::HOLDER, arcade_ledger::tokens::XFER]),

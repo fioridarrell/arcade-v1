@@ -42,7 +42,11 @@ var/arcade/chains/<key>/chain.mdbx  one chain: core.*, ord.*, tok.*, names.*, ma
    - `flush_all_for_stop`.
 3. **Scans across all chains go per store:**
    - `load_runs` and addrbuild scan `STATE` with an empty prefix to find the chains; they loop over the stores instead.
-4. **Audit cross-chain writes:** list every write transaction that touches two chains, for example the faucet, claims, swaps and borrowing. Each one is split, or documented as safe to split. I expect few or none, since every key carries C.
+4. **Audit of cross-chain writes: done on the GX10, 2026-11-10. Clean.**
+   - Every write transaction on chain.mdbx touches one chain. `connect_blocks_with` filters indexers by chain. `flush_coins`, `recover_coins`, `remove_*_batch`, `mempool_*`, `put_headers`, prune/restore, `disconnect_tip`, addrbuild and coreimport all take one C. The `0..=255` loops (recover at open, `flush_all_for_stop`) do one write per chain.
+   - arcaded and arcade-ledger never write chain.mdbx directly; they go through chaindb or indexers in the chain's own commit.
+   - Every key begins with u16 C. That was checked for every KeyBuf builder, including `engine.rs:714`.
+   - Cross-chain **reads** exist: the Explorer and tag pages read the home ledger while showing another chain. No transaction needs those reads consistent, so separate files are fine.
 5. **Callers that open `chain.mdbx` by path get a home instead:**
    - `arcaded/main.rs`, `sitesvc.rs` tests, `arcade-oldimport`, and the read-only probes (`--blocks-from`).
    - `ChainDb::open_home(home)` finds every `chains/*/chain.mdbx` plus the legacy file.
@@ -55,14 +59,20 @@ A new tool, `arcade-split --home DIR --chain KEY` (or `--all`), runs with arcade
 2. For each table, put a cursor on prefix C and copy every row into `chains/<key>/chain.mdbx.part` with `append` (dup tables: append-dup).
    - The rows come out in key order, so this is a sequential read and a sequential write.
    - Free pages aren't copied, so the new file is compact.
-3. **Check:** row counts per table and the first and last key per table are equal, and every `STATE` key is equal.
+3. **Check:** row counts per table and the first and last key per table are equal, and `STATE` matches **row for row, byte for byte**.
+   - **`_meta`:** copy only this chain's `addon:<table>` registrations (with the dup flag byte) plus the schema and version. Don't copy the whole `_meta`.
+   - **Dup tables** (`core.v1.txs` and any dup add-on table) are copied with append-dup.
 4. Rename `.part` to `chain.mdbx`. From the next start, arcaded uses it.
 5. **The old rows stay where they are** until every chain has moved and the checks have passed. Then `chain.mdbx` is deleted, which needs **Martin's word**. Until then, going back is just deleting `chains/<key>/`.
 
 - **Order:** small chains first (peptest, flop, pep, kot), Dogecoin last.
 - **Space on the JB20B:** 939 GB is free. The new files together are smaller than the live data in the 739 GiB file, so everything fits before the old file is deleted.
-- **Time:** unknown until measured. It's a sequential copy of roughly 700 GB on the NVMe, so it should take hours, not days. Measure it on the GX10 first, with a home that holds Pepecoin and a Doge-sized table.
-- **Restarting:** a chain is either finished (renamed) or not. An interrupted chain starts over from its `.part` file, and finished chains are skipped.
+- **Time:** measured on the GX10 with Pepecoin testnet, from the live chain.mdbx opened read-only.
+  - **Method:** 200k-row chunks, each read in its own short read transaction and appended in one write transaction.
+  - **Result:** 37 tables, 24,644,147 rows and 2.51 GB copied in 9 s, about 280 MB/s. Every table matched on row count and first and last key.
+  - **Size:** the new file was 2.95 GB against 4.1 GB shared.
+  - **Caveat:** the source was mostly in the page cache. The JB20B's 739 GiB will be read-bound, so plan for **1–3 h for `--all`**. `block_tx` and the ledger row tables are the big-value ones.
+- **Restarting:** a chain is either finished (renamed) or not. An interrupted chain starts over: its `.part` file is deleted and the chain is copied again. Finished chains are skipped. A dup table can't be resumed in the middle of a key, so restarting the whole chain is the simple, safe rule.
 
 ## Later (not in this plan)
 - **Index copies as files:** a read transaction copies one chain's index tables (`ord.*`, `tok.*`, `names.*`, `maps.*`) into a standalone mdbx file, in key order, at a known block.

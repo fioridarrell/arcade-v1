@@ -311,7 +311,8 @@
       oldAcc.length ? insGrid(oldAcc) : h("div", { class: "x-empty" }, oldNext != null ? "None in the newest ones looked at yet." : "None."), more));
   }
   async function vInscriptions() {
-    const size = 36, page = pageOf();
+    // HTML pages run live: nine to a page (Martin 2026-11-10), the rest 36.
+    const size = insType === "html" ? 9 : 36, page = pageOf();
     const first = await xapi("explorer.inscriptions", { chain: chain.key, n: 1 });
     const total = first.total;
     if (insType) {

@@ -253,6 +253,7 @@ fn main() {
         home_mode: opt("--home-mode").filter(|m| m == "shared").unwrap_or_else(|| "full".into()),
         asks: Mutex::new(Default::default()),
         asks_done: Mutex::new(Default::default()),
+        asks_sent: Mutex::new(Default::default()),
         pending_spent: Mutex::new(Default::default()),
         block_outbox: Mutex::new(Vec::new()),
         miner: Default::default(),

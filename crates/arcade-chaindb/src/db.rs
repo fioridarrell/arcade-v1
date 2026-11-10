@@ -878,9 +878,10 @@ impl ChainDb {
     pub fn remove_index_batch(&self, chain_no: u16, name: &str, tables: &[String], max: usize) -> Result<usize> {
         self.remove_indexer(chain_no, name);
         let pre = k_chain(chain_no);
+        let have = self.tables_in(chain_no)?;
         self.store(chain_no).write(|w| {
             let mut n = 0;
-            for t in tables {
+            for t in tables.iter().filter(|t| have.contains(t.as_str())) {
                 if n >= max {
                     break;
                 }
@@ -900,9 +901,10 @@ impl ChainDb {
     /// indexer's progress (for an index riding on another). Call until it returns 0.
     pub fn clear_rows_batch(&self, chain_no: u16, tables: &[String], max: usize) -> Result<usize> {
         let pre = k_chain(chain_no);
+        let have = self.tables_in(chain_no)?;
         self.store(chain_no).write(|w| {
             let mut n = 0;
-            for t in tables {
+            for t in tables.iter().filter(|t| have.contains(t.as_str())) {
                 if n >= max {
                     break;
                 }
@@ -913,6 +915,14 @@ impl ChainDb {
             }
             Ok(n)
         })
+    }
+
+    /// The tables that exist in chain `c`'s file. Clearing a list of tables skips the ones a
+    /// file never had: an index never added there (adding the tokens rider to a chain that
+    /// had no tok.* tables stopped the ord rows' removal part way, Wojakcoin 2026-11-10).
+    fn tables_in(&self, c: u16) -> Result<std::collections::HashSet<String>> {
+        let s = self.store(c);
+        Ok(s.addon_tables()?.into_iter().chain(s.schema().tables.iter().map(|t| t.name.to_string())).collect())
     }
 
     /// Delete everything stored for a chain, a batch at a time. Returns rows deleted in this

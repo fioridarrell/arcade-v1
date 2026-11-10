@@ -187,6 +187,24 @@ fn rows_missed_by_an_older_version_are_filled() {
 }
 
 #[test]
+fn removing_the_ord_index_skips_tables_the_file_never_had() {
+    // Adding the tokens rider rebuilds ord: its rows go with the tok.* tables', which a chain
+    // that never had tokens doesn't have (Wojakcoin 2026-11-10: the removal stopped part way
+    // and the ord index was never rebuilt).
+    let mut ch = Chain::new();
+    let c = ch.p.chain_no;
+    ch.inscribe(&["image/png", "text/plain"]);
+    ordtypes::build_tail(&ch.db, c, 0, &|_| {}).unwrap();
+    assert!(ch.db.indexed_to(c, "ord.v1").unwrap().is_some());
+    let mut tables: Vec<String> = arcade_ledger::ord::TABLES.iter().chain(arcade_ledger::ord::DERIVED).map(|t| t.to_string()).collect();
+    tables.extend([arcade_ledger::tokens::TICK, arcade_ledger::tokens::BAL, arcade_ledger::tokens::HOLDER, arcade_ledger::tokens::XFER].map(String::from));
+    while ch.db.remove_index_batch(c, "ord.v1", &tables, 3).unwrap() > 0 {}
+    assert_eq!(ch.db.indexed_to(c, "ord.v1").unwrap(), None);
+    assert!(ordtypes::meta(&ch.db, c).is_none());
+    assert_eq!(arcade_ledger::ord::count(&ch.db, c), 0);
+}
+
+#[test]
 fn groups() {
     let g = |ct: &str| ordtypes::GROUP_NAMES[ordtypes::group_of(ct) as usize];
     assert_eq!(g("image/png"), "image");

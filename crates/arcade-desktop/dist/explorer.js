@@ -100,9 +100,11 @@
     }
     else if (c.kind === "html" && c.src && httpBase) {
       // Run sandboxed: an opaque origin, scripts only (no forms, popups or top navigation),
-      // loading only from this arcade (its CSP). A thumbnail is drawn at 4x and scaled down,
-      // and doesn't take clicks (the card does).
-      t.append(h("iframe", { class: big ? "x-html" : "x-html mini", src: httpBase + c.src, sandbox: "allow-scripts allow-pointer-lock", loading: "lazy", referrerpolicy: "no-referrer", title: `inscription ${i.n}` }));
+      // loading only from this arcade (its CSP). An inscription's own page runs at once; a
+      // thumbnail (drawn at 4x and scaled down, not taking clicks) waits for one of the
+      // HTML_MAX places while it is on screen.
+      if (big) t.append(htmlFrame(c.src, i.n, false));
+      else { t._src = c.src; t._n = i.n; t.append(htmlWaiting()); htmlObs.observe(t); }
     }
     else if (c.kind === "text" || c.kind === "html") t.append(h("pre", {}, (c.text || "").slice(0, big ? 20000 : 400)));
     else t.append(h("div", { class: "x-ph" }, c.kind === "missing" ? "content not stored" : (c.type || "binary")));
@@ -115,6 +117,37 @@
       h("div", { class: "x-mid" }, h("div", { class: "x-hash" }, b.hash),
         h("div", { class: "chips" }, b.txs != null ? h("span", { class: "chip" }, `${b.txs} tx`) : "", b.inscriptions ? h("span", { class: "chip ins" }, `${b.inscriptions} inscription${b.inscriptions > 1 ? "s" : ""}`) : "")))));
   }
+  // HTML thumbnails take turns (Martin 2026-11-10: nine at a time, more overwhelms the page):
+  // at most HTML_MAX run at once, only those on screen; one that scrolls away or leaves the
+  // page stops, and the next waiting one starts.
+  const HTML_MAX = 9;
+  const htmlLive = new Set(), htmlWait = [];
+  const htmlFrame = (src, n, mini) => h("iframe", { class: mini ? "x-html mini" : "x-html", src: httpBase + src, sandbox: "allow-scripts allow-pointer-lock", referrerpolicy: "no-referrer", title: `inscription ${n}` });
+  const htmlWaiting = () => h("div", { class: "x-ph x-wait" }, "HTML · waits its turn");
+  function htmlStart(t) {
+    t.querySelector(".x-wait")?.replaceWith(htmlFrame(t._src, t._n, true));
+    htmlLive.add(t);
+  }
+  function htmlStop(t) {
+    if (!htmlLive.delete(t)) return;
+    t.querySelector("iframe.x-html")?.replaceWith(htmlWaiting());
+  }
+  function htmlPump() {
+    for (const t of [...htmlLive]) if (!t.isConnected) { htmlLive.delete(t); htmlObs.unobserve(t); }
+    for (let k = htmlWait.length - 1; k >= 0; k--) if (!htmlWait[k].isConnected) { htmlObs.unobserve(htmlWait[k]); htmlWait.splice(k, 1); }
+    while (htmlLive.size < HTML_MAX && htmlWait.length) htmlStart(htmlWait.shift());
+  }
+  const htmlObs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const t = e.target, k = htmlWait.indexOf(t);
+      if (e.isIntersecting) { if (!htmlLive.has(t) && k < 0) htmlWait.push(t); }
+      else { if (k >= 0) htmlWait.splice(k, 1); htmlStop(t); }
+    }
+    htmlPump();
+  });
+  // A new page drops the frames of the old one (their elements leave the document).
+  new MutationObserver(() => htmlPump()).observe(document.body, { childList: true, subtree: true });
+
   // The content on its own, full size, in a new arcade window (path on this arcade's server).
   function contentLink(path, title) {
     if (!httpBase || !path) return "";

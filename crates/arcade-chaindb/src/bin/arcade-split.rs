@@ -6,7 +6,7 @@
 //!   arcade-split --home DIR --all            move every chain still in the shared file,
 //!                                            the one with the lowest tip first
 //!
-//! The shared file is only read: a moved chain's rows stay in it until the shared file is
+//! The shared file is only read (opened read-write so mdbx can recover an unsynced stop): a moved chain's rows stay in it until the shared file is
 //! deleted by hand. Going back = deleting chains/<key>/ (the arcade then uses the shared file).
 use arcade_chaindb::db::chain_dir_name;
 use arcade_chaindb::schema::*;
@@ -50,7 +50,9 @@ fn run(home: &Path, chain: Option<String>, all: bool) -> Result<(), String> {
     if !shared_path.exists() {
         return Err(format!("no {}", shared_path.display()));
     }
-    let shared = Store::open_readonly(&shared_path, &CHAIN_SCHEMA).map_err(|e| e.to_string())?;
+    // Opened read-write (safe: the tool holds the arcade's lock) so mdbx can recover a last
+    // commit left unsynced by a stop that didn't sync; the tool itself only reads it.
+    let shared = Store::open_sync(&shared_path, &CHAIN_SCHEMA, false).map_err(|e| e.to_string())?;
     let mut chains = split::chains_in(&shared).map_err(|e| e.to_string())?;
     chains.sort_by_key(|&c| tip_of(&shared, c));
     let todo: Vec<u16> = match (chain, all) {

@@ -11,11 +11,12 @@ Decisions taken with the approval (the plan's defaults): transition mode (chains
 - **Removing a chain:** its rows in the shared file are deleted in batches, then its own directory is deleted whole. arcaded waits 10 s after stopping the chain's threads.
 - **Tools and tests that read a whole table** use `scan_all` / `count_all` / `table_sizes_all` / `addon_tables_all` across every file.
 - **Tests with several databases in one directory:** a shared file not named `chain.mdbx` keeps its chains in `<name>.chains/`.
-- **`arcade-split`** (`cargo build --release -p arcade-chaindb --bin arcade-split`):
+- **`arcade-split`** (`cargo build --release -p arcade-chaindb --bin arcade-split`, as its own command: with `-p arcaded` on the same line, `--bin` would apply to both and arcaded would not be rebuilt):
   - `arcade-split --home DIR` lists the chains and where each one lives;
   - `--chain KEY` moves one chain;
   - `--all` moves every chain still in the shared file, lowest tip first.
-  It takes the home's `arcaded.lock`, so it refuses while the arcade runs. It copies with appends in durable ~256 MB transactions from one read snapshot, into `chain.mdbx.part`. It checks rows per table, first and last key, and STATE byte for byte, then renames. The release tarball doesn't carry it yet.
+  It takes the home's `arcaded.lock`, so it refuses while the arcade runs. It opens the shared file read-write so mdbx can recover a stop that didn't sync; it only reads from it.
+- **Stop syncs every file:** `flush_all_for_stop` ends with a forced sync of each file. The files are written SafeNoSync and arcaded exits without closing them, so before this fix the last commit stayed weak, and a read-only open afterwards failed with `MDBX_WANNA_RECOVERY` (found by the GX10 test). It copies with appends in durable ~256 MB transactions from one read snapshot, into `chain.mdbx.part`. It checks rows per table, first and last key, and STATE byte for byte, then renames. The release tarball doesn't carry it yet.
 
 ## Why
 Today every chain lives in one file, `var/arcade/chain.mdbx`. On the JB20B that file is 739 GiB.

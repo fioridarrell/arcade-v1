@@ -695,3 +695,52 @@ fn chain_files_shared_split_and_removed() {
 fn be_u32_at(v: &[u8], i: usize) -> u32 {
     u32::from_be_bytes(v[i..i + 4].try_into().unwrap())
 }
+
+/// Run one of the child tests below in a new process.
+fn child(test: &str, var: &str, path: &std::path::Path) -> String {
+    let out = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", test, "--nocapture", "--test-threads", "1"])
+        .env(var, path)
+        .output()
+        .unwrap();
+    format!("{}{}", String::from_utf8_lossy(&out.stdout), String::from_utf8_lossy(&out.stderr))
+}
+
+#[test]
+fn stop_leaves_files_a_read_only_open_can_use() {
+    // arcaded's stop: flush_all_for_stop, then exit without closing the files. Another process
+    // opening them read-only afterwards (arcade-split, the probes) must find nothing to recover.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("chain.mdbx");
+    let w = child("tests::stop_child", "ARCADE_STOP_CHILD", &path);
+    assert!(w.contains("child stopped"), "{w}");
+    let r = child("tests::read_only_open_child", "ARCADE_RO_CHILD", &path);
+    assert!(r.contains("child read tip 3"), "{r}");
+}
+
+#[test]
+fn stop_child() {
+    let Some(path) = std::env::var_os("ARCADE_STOP_CHILD") else { return };
+    let mut prev = Hash256::ZERO;
+    let mut blocks = Vec::new();
+    for i in 0..4u32 {
+        let b = block(prev, vec![tx(&[], &[(50, p2pkh(i as u8))], i)], i + 1);
+        prev = b.hash();
+        blocks.push(b);
+    }
+    let p = params_for(&blocks[0]);
+    let db = ChainDb::open(&path).unwrap();
+    for b in &blocks {
+        db.connect_blocks(p, std::slice::from_ref(b)).unwrap();
+    }
+    assert!(db.flush_all_for_stop().iter().all(|(_, r)| r.is_ok()));
+    println!("child stopped");
+    std::process::exit(0);
+}
+
+#[test]
+fn read_only_open_child() {
+    let Some(path) = std::env::var_os("ARCADE_RO_CHILD") else { return };
+    let ro = ChainDb::open_readonly(&path).unwrap();
+    println!("child read tip {}", ro.tip(PEPECOIN_TEST.chain_no).unwrap().unwrap().height);
+}

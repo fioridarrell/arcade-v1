@@ -233,6 +233,13 @@ impl Store {
         Ok(out)
     }
 
+    /// Flush every commit to disk now (a SafeNoSync file's last commits included), so the next
+    /// open, read-only ones too, finds a steady state with nothing to recover.
+    pub fn sync(&self) -> Result<()> {
+        self.db.sync(true)?;
+        Ok(())
+    }
+
     /// A write transaction committed by hand ([`WriteTxn::commit`]); dropped uncommitted,
     /// it is aborted. For copies too big for one transaction.
     pub fn begin_write(&self) -> Result<WriteTxn<'_>> {

@@ -788,7 +788,7 @@ impl ChainDb {
     }
 
     /// Stopping: wait for a batch being connected to commit (or roll back), then write every
-    /// coin cache. Nothing connects afterwards (STOPPING is set first by the caller).
+    /// coin cache, then sync every file (an error there comes back as chain u16::MAX). Nothing connects afterwards (STOPPING is set first by the caller).
     pub fn flush_all_for_stop(&self) -> Vec<(u16, Result<()>)> {
         let mut out = Vec::new();
         for c in 0..=255u16 {
@@ -796,6 +796,13 @@ impl ChainDb {
                 let lock = self.batch_of(&self.store(c));
                 let _batch = lock.lock().unwrap_or_else(|e| e.into_inner());
                 out.push((c, self.flush_coins(c)));
+            }
+        }
+        // The files are written without a flush per commit: put them on disk now, or the next
+        // open finds a weak last commit (a read-only open, e.g. arcade-split's, can't recover it).
+        for s in self.stores() {
+            if let Err(e) = s.sync() {
+                out.push((u16::MAX, Err(e)));
             }
         }
         out

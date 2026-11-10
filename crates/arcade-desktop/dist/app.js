@@ -442,13 +442,31 @@ function copyText(text, btn) {
 
 async function refreshMine() {
   const ch = picked();
-  $("m-note").hidden = ch.home; $("m-body").hidden = !ch.home;
-  $("m-note").textContent = ch.home ? "" : `Mining here is for Pepecoin testnet only. ${ch.name} is mined by its own miners and pools.`;
+  const kot = ch.key === "kot";
+  $("k-body").hidden = !kot;
+  $("m-note").hidden = ch.home || kot; $("m-body").hidden = !ch.home;
+  $("m-note").textContent = ch.home || kot ? "" : `Mining here is for Pepecoin testnet only, and staking for Kotia. ${ch.name} is mined by its own miners and pools.`;
+  document.querySelector("#mine h1").textContent = kot ? "Stake Kotia" : "Mine testnet";
+  if (kot) return refreshStake();
   if (!ch.home) return;
   const m = await api("mine.status");
   $("m-state").textContent = m.running ? `mining (${m.threads} threads)` : "stopped";
   $("m-rate").textContent = m.hash_rate ? Math.round(m.hash_rate).toLocaleString() + " H/s" : "—";
   $("m-found").textContent = m.found;
+}
+
+async function refreshStake() {
+  const k = await api("stake.status");
+  const kot = (v) => (v / 1e8).toLocaleString(undefined, { maximumFractionDigits: 4 }) + " KOT";
+  $("k-state").textContent = !k.installed ? "Kotia not installed" : k.on ? "on" : "off";
+  $("k-coins").textContent = k.coins ? `${kot(k.coins.mature)} ready` : "—";
+  $("k-found").textContent = String((k.staked || []).length);
+  $("k-addr").textContent = k.address ? `Staking address: ${k.address}${k.coins && k.coins.total > k.coins.mature ? ` · ${kot(k.coins.total - k.coins.mature)} still maturing (20 confirmations)` : ""}. Send KOT here to stake it.` : "";
+  const c = k.self_check;
+  $("k-check").textContent = !k.installed ? "Install Kotia in full (Chains & Coins) to stake: staking needs the whole chain on this PC."
+    : (k.state ? k.state + ". " : "") + (c ? (c.ok ? `Stake rules checked against the newest ${c.checked} blocks: all match.` : c.why ? c.why : `Stake rules: ${c.passed} of ${c.checked} newest blocks match; staking waits until all do.`) : "");
+  $("k-start").disabled = !k.installed || k.on; $("k-stop").disabled = !k.on;
+  $("k-list").replaceChildren(...(k.staked || []).slice().reverse().map((b) => h("li", {}, `Block ${num(b.height)} · ${new Date(b.at * 1000).toLocaleString()} · ${b.block.slice(0, 16)}…`)));
 }
 
 async function refreshActivity() {
@@ -619,6 +637,9 @@ $("w-sendnow").addEventListener("click", async () => {
 // Mining
 $("m-start").addEventListener("click", async () => { try { await api("mine.start"); refresh(); } catch (e) { alert(e.message); } });
 $("m-stop").addEventListener("click", async () => { await api("mine.stop"); refresh(); });
+$("k-start").addEventListener("click", async () => { try { await api("stake.set", { on: true }); refresh(); } catch (e) { alert(e.message); } });
+$("k-stop").addEventListener("click", async () => { await api("stake.set", { on: false }); refresh(); });
+$("k-recheck").addEventListener("click", async () => { await api("stake.check"); refresh(); });
 
 refresh();
 setInterval(refresh, 4000);

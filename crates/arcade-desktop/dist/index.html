@@ -308,6 +308,18 @@
     </div>
     <div class="row"><button class="primary" id="m-start">Start</button><button id="m-stop">Stop</button></div>
     </div>
+    <div id="k-body" hidden>
+    <p>Stakes this wallet's Kotia on this PC: every 16 seconds each coin with 20 confirmations gets a chance to make the next block, in proportion to its size. A staked block pays 20 KOT back to the same address, with the coin. Coins never leave your address. A block the network refuses changes nothing.</p>
+    <div class="grid">
+      <div class="card"><div class="k">State</div><div class="v" id="k-state">—</div></div>
+      <div class="card"><div class="k">Staking</div><div class="v" id="k-coins">—</div></div>
+      <div class="card"><div class="k">Blocks staked</div><div class="v" id="k-found">—</div></div>
+    </div>
+    <p class="hint" id="k-addr"></p>
+    <p class="hint" id="k-check"></p>
+    <div class="row"><button class="primary" id="k-start">Start staking</button><button id="k-stop">Stop</button><button id="k-recheck">Check the stake rules</button></div>
+    <ul class="list" id="k-list"></ul>
+    </div>
   </section>
 
   <!-- Activity -->

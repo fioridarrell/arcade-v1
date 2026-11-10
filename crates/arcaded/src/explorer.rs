@@ -368,7 +368,11 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let mut v = match ord::inscription(&x.node.chain, x.p, q) {
                 Some(v) => {
                     let mut v = v;
-                    v["content"] = content(&x, v["id"].as_str().unwrap_or(""), 4 << 20);
+                    let id = v["id"].as_str().unwrap_or("").to_string();
+                    v["content"] = content(&x, &id, 4 << 20);
+                    if x.img_links && v["content"]["kind"] == "html" {
+                        v["content"]["src"] = json!(format!("/content/{id}"));
+                    }
                     v
                 }
                 None => {
@@ -623,8 +627,10 @@ fn blocks(x: &Ctx, before: u32, n: u32) -> Vec<Value> {
     (before.saturating_sub(n)..before).rev().filter_map(|h| block_row(x, h)).collect()
 }
 
-/// An image's preview as a link to its bytes on this arcade, from its record alone (no read
-/// of the chain): when the UI asked for links, for images with their own body up to `cap`.
+/// An image's or an HTML page's preview as a link to it on this arcade, from its record alone
+/// (no read of the chain), when the UI asked for links: images with their own body up to
+/// `cap` (/ord/<chain>/<id>), HTML (/content/<id>, run in a sandboxed frame; Martin
+/// 2026-11-10).
 fn image_link(x: &Ctx, rec: &Value, id: &str, cap: usize) -> Option<Value> {
     if !x.img_links || !rec["delegate"].is_null() {
         return None;
@@ -632,6 +638,9 @@ fn image_link(x: &Ctx, rec: &Value, id: &str, cap: usize) -> Option<Value> {
     let ct = rec["ct"].as_str().unwrap_or("");
     let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
     let size = rec["size"].as_u64()?;
+    if base == "text/html" && size > 0 {
+        return Some(json!({"type": ct, "kind": "html", "src": format!("/content/{id}"), "size": size}));
+    }
     if !base.starts_with("image/") || size == 0 || size > cap as u64 {
         return None;
     }

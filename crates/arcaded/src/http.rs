@@ -231,7 +231,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
         let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
-        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me}; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
+        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
         return match arcade_ledger::content::content(&node.chain, cp, id) {
             Ok(c) => respond(
                 &mut s,
@@ -332,7 +332,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
                 Some((ct, bytes)) => {
                     let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
                     // Sandboxed (opaque origin, scripts only), loading only from this arcade.
-                    let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me}; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
+                    let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
                     respond(
                         &mut s,
                         "200 OK",

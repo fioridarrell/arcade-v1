@@ -638,6 +638,17 @@ fn image_link(x: &Ctx, rec: &Value, id: &str, cap: usize) -> Option<Value> {
     Some(json!({"type": ct, "kind": "image", "src": format!("/ord/{}/{id}", x.p.key), "size": size}))
 }
 
+/// A list item with no preview (video, audio, models, ...): its type and size from the record,
+/// without rebuilding its bytes from the chain (a video's many pieces took seconds each).
+fn no_preview(rec: &Value) -> Option<Value> {
+    let ct = rec["ct"].as_str().unwrap_or("");
+    let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
+    if !rec["delegate"].is_null() || base.is_empty() || base.starts_with("text/") || base == "application/json" || base.starts_with("image/") {
+        return None;
+    }
+    Some(json!({"type": ct, "kind": "other", "size": rec["size"]}))
+}
+
 /// Text or image preview of an inscription's content (empty for other types).
 fn content(x: &Ctx, id: &str, cap: usize) -> Value {
     content_of(x, id, None, cap)
@@ -715,7 +726,7 @@ fn latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
                 Some(v) => {
                     let mut v = v;
                     let id = v["id"].as_str().unwrap_or("").to_string();
-                    v["content"] = image_link(x, &v, &id, 96 << 10).unwrap_or_else(|| content(x, &id, 96 << 10));
+                    v["content"] = image_link(x, &v, &id, 96 << 10).or_else(|| no_preview(&v)).unwrap_or_else(|| content(x, &id, 96 << 10));
                     v
                 }
                 // Shared storage: records of other groups come from the arcades holding them.

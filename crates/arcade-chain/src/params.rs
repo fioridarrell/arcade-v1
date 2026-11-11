@@ -709,15 +709,8 @@ pub static SHIBACOIN_MAIN: ChainParams = ChainParams {
     protocol_version: 70016,
     dns_seeds: &["seeds.shibacoinshic.org", "seednodes.shibacoinshic.org"],
     fixed_peers: &[
-        "64.176.223.96:33864",
-        "149.28.227.162:33864",
-        "45.77.205.224:33864",
-        "64.237.50.150:33864",
-        "45.76.167.242:33864",
-        "149.28.35.100:33864",
-        "64.176.201.18:33864",
-        "108.61.195.97:33864",
-        "45.63.8.92:33864",
+        // Answering 2026-11-11 (the ThinkPad's check; the earlier list's 45.x/64.x/108.x/149.x
+        // hosts were gone): what seeds.shibacoinshic.org and seednodes.shibacoinshic.org gave.
         "109.123.245.37:33864",
         "161.97.106.45:33864",
         "173.249.4.210:33864",

@@ -275,15 +275,12 @@ impl Node {
         v
     }
 
-    /// Shared, fixed and DNS-seeded peers (no address book).
+    /// Shared, DNS-seeded and fixed peers (no address book). The DNS seeds come before the fixed
+    /// list: they answer with nodes that are up now, where a fixed list goes stale (Shibacoin's
+    /// had 9 of 10 gone, 2026-11-11).
     pub fn coin_candidates_static(&self, p: &arcade_chain::params::ChainParams) -> Vec<String> {
         use std::net::ToSocketAddrs;
         let mut v: Vec<String> = self.coin_peers.lock().unwrap().get(p.net).map(|s| s.iter().cloned().collect()).unwrap_or_default();
-        for f in p.fixed_peers {
-            if !v.iter().any(|x| x == f) {
-                v.push(f.to_string());
-            }
-        }
         for d in p.dns_seeds {
             let mut found: Vec<String> = (*d, p.p2p_port).to_socket_addrs().into_iter().flatten().map(|a| a.to_string()).collect();
             if found.is_empty() {
@@ -296,6 +293,41 @@ impl Node {
                 }
             }
         }
+        for f in p.fixed_peers {
+            if !v.iter().any(|x| x == f) {
+                v.push(f.to_string());
+            }
+        }
         v
     }
+
+    /// The first of `addrs` to answer, dialing [`DIAL_AT_ONCE`] at a time with a short timeout
+    /// (one at a time with 20 s each, a list of dead seeds took minutes). The others that
+    /// answer at the same time are let go.
+    pub fn dial_first(p: &'static arcade_chain::params::ChainParams, addrs: &[String], relay: bool) -> Option<arcade_chain::p2p::Peer> {
+        for batch in addrs.chunks(DIAL_AT_ONCE) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for a in batch {
+                let (tx, a) = (tx.clone(), a.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(arcade_chain::p2p::Peer::connect_with(p, &a, DIAL_TIMEOUT, relay).ok());
+                });
+            }
+            drop(tx);
+            // The first that answers; when every one of the batch failed, the next batch.
+            while let Ok(got) = rx.recv() {
+                if let Some(peer) = got {
+                    // Back to the read timeout the sync uses once linked.
+                    let _ = peer.set_read_timeout(std::time::Duration::from_secs(20));
+                    return Some(peer);
+                }
+            }
+        }
+        None
+    }
 }
+
+/// Coin peers dialed at once when looking for one.
+pub const DIAL_AT_ONCE: usize = 8;
+/// How long a dial (connect and handshake) may take.
+pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);

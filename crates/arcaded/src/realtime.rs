@@ -34,6 +34,14 @@ const HERE_FULL: u32 = 6;
 const REMOTE_GONE: u64 = 24;
 const SUB_EVERY: Duration = Duration::from_secs(30);
 const ROUTE_LIFE: u64 = 105;
+/// Room routes (room, origin) kept in all; a sub past this adds no new ones.
+const MAX_ROUTES: usize = 16384;
+/// Arcades whose sub we remember hearing.
+const MAX_HEARD: usize = 4096;
+/// Subs taken from one link: 30 a second, 120 at once (every arcade's sub passes each link
+/// every 30 s, so this is ~900 arcades).
+const SUB_LINK_RATE: f64 = 30.0;
+const SUB_LINK_BURST: f64 = 120.0;
 /// A window that stops polling for this long has left its rooms.
 const SEAT_LIFE: Duration = Duration::from_secs(30);
 const OUTQ_MAX: usize = 4000;
@@ -156,6 +164,37 @@ fn sign(node: &Node, h: &mut Value, blob: &[u8]) {
 
 fn verify(h: &Value, blob: &[u8]) -> bool {
     arcade_mesh::canon::verify_json(h, STRIP, "o", blob)
+}
+
+#[cfg(test)]
+#[test]
+fn subs_are_capped_per_link_and_routes_in_all() {
+    let t = crate::sitesvc::tests::setup();
+    let sub = |i: u32, rooms: &[String]| {
+        let mut k = [9u8; 32];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        let sk = ed25519_dalek::SigningKey::from_bytes(&k);
+        let mut h = json!({"t": "sub", "o": hex::encode(sk.verifying_key().to_bytes()), "q": now_us(), "rooms": rooms, "hops": 0});
+        arcade_mesh::canon::sign_json(&sk, &mut h, STRIP, b"");
+        h
+    };
+    // One link, many origins at once: only so many are taken.
+    let mut st = St::default();
+    let one = vec![format!("{:016x}", 1)];
+    let subs: Vec<Value> = (0..400).map(|i| sub(i, &one)).collect();
+    for h in &subs {
+        on_sub(&t.node, &mut st, "L1", h);
+    }
+    let took = st.heard.len();
+    assert!(took <= SUB_LINK_BURST as usize + 30, "took {took} subs from one link at once");
+    // Many links, every sub with MAX_ROOMS rooms: routes stop at the cap.
+    let mut st = St::default();
+    let rooms: Vec<String> = (0..MAX_ROOMS).map(|i| format!("{i:016x}")).collect();
+    for i in 0..20 {
+        on_sub(&t.node, &mut st, &format!("L{i}"), &sub(1000 + i, &rooms));
+    }
+    let total: usize = st.routes.values().map(|r| r.len()).sum();
+    assert!(total <= MAX_ROUTES, "{total} routes");
 }
 
 #[cfg(test)]
@@ -418,6 +457,9 @@ fn on_sub(node: &Node, st: &mut St, from: &str, h: &Value) {
     if st.seen.contains_key(&key) || h["hops"].as_u64().unwrap_or(99) >= MAX_HOPS {
         return;
     }
+    if !allow(st, format!("sublink|{from}"), SUB_LINK_RATE, SUB_LINK_BURST) {
+        return;
+    }
     let Some(rooms) = h["rooms"].as_array() else { return };
     if rooms.len() > MAX_ROOMS || rooms.iter().any(|r| r.as_str().is_none_or(|s| s.len() != 16)) {
         return;
@@ -430,7 +472,9 @@ fn on_sub(node: &Node, st: &mut St, from: &str, h: &Value) {
         return;
     }
     st.seen.insert(key, now_s());
-    st.heard.insert(origin.clone(), (from.to_string(), now_s()));
+    if st.heard.len() < MAX_HEARD || st.heard.contains_key(&origin) {
+        st.heard.insert(origin.clone(), (from.to_string(), now_s()));
+    }
     let exp = now_s() + ROUTE_LIFE;
     let wanted: HashSet<String> = rooms.iter().filter_map(|r| r.as_str().map(String::from)).collect();
     for (rid, r) in st.routes.iter_mut() {
@@ -440,9 +484,15 @@ fn on_sub(node: &Node, st: &mut St, from: &str, h: &Value) {
     }
     // A newcomer to one of our rooms hears who is here soon (a full beat).
     let ours: HashMap<String, String> = st.locals.keys().map(|r| (room_id(r), r.clone())).collect();
+    let mut total: usize = st.routes.values().map(|r| r.len()).sum();
     for rid in &wanted {
+        let known = st.routes.get(rid).is_some_and(|r| r.contains_key(&origin));
+        if !known && total >= MAX_ROUTES {
+            continue;
+        }
         let r = st.routes.entry(rid.clone()).or_default();
-        let new = !r.contains_key(&origin);
+        let new = !known;
+        total += new as usize;
         r.insert(origin.clone(), (from.to_string(), exp));
         if new {
             if let Some(room) = ours.get(rid) {

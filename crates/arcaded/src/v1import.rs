@@ -1,7 +1,8 @@
 //! Installing a chain from V1.0 copies (docs/V1SHARE.md §5, phase 3): headers from the
 //! network (checked by proof of work), then the blocks copy and the coins copy, each fetched
 //! from every arcade holding it and taken in WHILE it comes (§5.0): rows in order, blocks
-//! checked against our headers, no scripts run, pieces deleted once used. Each coin is checked
+//! checked against our headers, no scripts run, pieces deleted once used. Copies count only
+//! when 2 or more established arcades made them (vxshare::established). Each coin is checked
 //! against the transaction at its position in those blocks as it is taken in; that the coins
 //! are unspent is the makers' word ("trusted") until the re-check, started right after.
 
@@ -45,7 +46,8 @@ pub fn status() -> Value {
     json!(jobs().iter().map(|(k, j)| json!({"key": k, "phase": j.phase, "detail": j.detail, "started": j.started, "rows": j.rows, "rows_per_s": j.rows_rate})).collect::<Vec<_>>())
 }
 
-/// share.install: take a chain in from V1.0 copies (blocks and coins) made by 2 or more arcades.
+/// share.install: take a chain in from V1.0 copies (blocks and coins) made by 2 or more
+/// established arcades.
 pub fn start(node: Arc<Node>, key: &str) -> Result<Value, String> {
     start_with(node, key, 1800)
 }
@@ -53,6 +55,8 @@ pub fn start(node: Arc<Node>, key: &str) -> Result<Value, String> {
 /// First start of an arcade far behind on its home chain: install it from copies when the
 /// mesh offers them within a few minutes (the usual sync goes on meanwhile and takes over if
 /// not), borrowing the chain meanwhile (crate::borrow) so balances and claims work at once.
+/// Only when enough established arcades are known (an arcade this far behind knows few from
+/// its own chain: the operator names them, ARCADE_COPY_TRUSTED); otherwise it syncs as usual.
 pub fn auto_home(node: Arc<Node>) {
     std::thread::Builder::new()
         .name("install-home".into())
@@ -63,6 +67,7 @@ pub fn auto_home(node: Arc<Node>) {
             // as the home chain is far behind (ThinkPad 2026-11-10 synced from zero after one
             // early check).
             let mut last_try: Option<Instant> = None;
+            let mut told = false;
             loop {
                 std::thread::sleep(Duration::from_secs(60));
                 let (lag, _) = crate::borrow::home_lag(&node);
@@ -75,6 +80,13 @@ pub fn auto_home(node: Arc<Node>) {
                     // Caught up the usual way (and tips known): nothing more to do.
                     if !running && lag < 1_000 && node.mesh_tips.lock().unwrap().len() > 0 {
                         return;
+                    }
+                    continue;
+                }
+                if !vxshare::enough_established(&node) {
+                    if !told {
+                        told = true;
+                        let _ = node.app.event("chain", &format!("{} is {lag} blocks behind; no copies are asked for: too few established arcades known to vouch for them (ARCADE_COPY_TRUSTED names some), so it syncs the usual way", node.params.name));
                     }
                     continue;
                 }
@@ -140,7 +152,7 @@ fn wait_for_copies(node: &Arc<Node>, p: &'static ChainParams, cancel: &Arc<Atomi
             return Err("cancelled".into());
         }
         let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
-        if let (Some((bid, bcp, _)), Some((cid, ccp, _))) = (vxshare::best(p.net, "blocks"), vxshare::best(p.net, "coins")) {
+        if let (Some((bid, bcp, _)), Some((cid, ccp, _))) = (vxshare::best(node, p.net, "blocks"), vxshare::best(node, p.net, "coins")) {
             if bcp == ccp && bcp > tip {
                 return Ok((bid, cid, bcp as u32));
             }
@@ -162,7 +174,7 @@ fn wait_for_copies(node: &Arc<Node>, p: &'static ChainParams, cancel: &Arc<Atomi
             set(p.key, "asking", format!("asked {n} V1.0 arcade{} for copies at block {h} (network tip {top}); they are made when the arcades reach it", if n == 1 { "" } else { "s" }));
         }
         if t0.elapsed() > Duration::from_secs(wait_secs) {
-            return Err(format!("no copies made by 2 or more arcades came within {} minutes; it syncs the usual way", wait_secs / 60));
+            return Err(format!("no copies made by 2 or more established arcades came within {} minutes; it syncs the usual way", wait_secs / 60));
         }
         // Caught up meanwhile the usual way: nothing to take in.
         if node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64 + 1000 >= net_tip(node, p) as u64).unwrap_or(false) {

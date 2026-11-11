@@ -6,7 +6,8 @@
 //!   GET /ord/<chain>/<id>            an ord inscription's image bytes (the Explorer's previews)
 //!   GET /inscription/<txid|number>   its details (JSON)
 //!   GET /<file>                      the operator's website (--site DIR), if any
-//! Only from this computer (and never through a proxy, which adds X-Forwarded-For):
+//! Only from this computer (asked for by its loopback name, and never through a proxy, which adds
+//! X-Forwarded-For; with --behind-proxy, nothing over TCP counts as this computer):
 //!   POST /rpc                        JSON-RPC 2.0 for sidecar apps; Basic auth with the cookie
 //!                                    file (<home>/.cookie: "__cookie__:<secret>"), every command
 //!   GET|POST /api/v1/<group>/<name>  the web API: public reads need nothing; the rest an API key
@@ -42,11 +43,15 @@ pub struct Opts {
     pub bind: String,
     pub port: u16,
     pub site: Option<PathBuf>,
+    /// Behind a reverse proxy or a tunnel (which may add no X-Forwarded-For): no request over
+    /// TCP counts as this computer's, so /rpc, /api/v1, /r/ and the rest answer only the socket.
+    pub behind_proxy: bool,
 }
 
 /// What each connection needs from the options.
 struct Conf {
     site: Option<PathBuf>,
+    behind_proxy: bool,
 }
 
 /// One connection being served (counted while it lives).
@@ -66,7 +71,7 @@ pub fn serve(node: Arc<Node>, o: Opts) {
             return;
         }
     };
-    let conf = Arc::new(Conf { site: o.site });
+    let conf = Arc::new(Conf { site: o.site, behind_proxy: o.behind_proxy });
     let open = Arc::new(AtomicUsize::new(0));
     for s in l.incoming().flatten() {
         // At most MAX_CONNS at once: the next connection waits until one closes.
@@ -229,13 +234,47 @@ fn json_out(s: &mut TcpStream, code: u16, v: &Value) {
     respond(s, status, "application/json", &cors(), v.to_string().as_bytes());
 }
 
-/// From this computer, and not relayed by a proxy (a proxy would make the internet look local).
-fn local(s: &TcpStream, r: &Req) -> bool {
+fn port(node: &Node) -> u16 {
+    node.http_port.get().copied().unwrap_or(8420)
+}
+
+/// From this computer, and not relayed by a proxy (a proxy would make the internet look local):
+/// a loopback peer, asking for this port by a loopback name (a website whose name was pointed
+/// at 127.0.0.1 asks with its own name), with no proxy's headers. Never with --behind-proxy.
+fn local(node: &Node, s: &TcpStream, r: &Req, behind_proxy: bool) -> bool {
+    if behind_proxy {
+        return false;
+    }
     let ip_local = s.peer_addr().map(|a| match a.ip() {
         std::net::IpAddr::V4(v) => v.is_loopback(),
         std::net::IpAddr::V6(v) => v.is_loopback() || v.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
     }).unwrap_or(false);
-    ip_local && !r.headers.contains_key("x-forwarded-for") && !r.headers.contains_key("forwarded") && !r.headers.contains_key("x-real-ip")
+    ip_local
+        && loopback_host(r.headers.get("host").and_then(|v| v.as_str()), port(node))
+        && !r.headers.contains_key("x-forwarded-for")
+        && !r.headers.contains_key("forwarded")
+        && !r.headers.contains_key("x-real-ip")
+}
+
+/// A Host header naming this computer and this port: 127.0.0.1, localhost or [::1].
+fn loopback_host(host: Option<&str>, port: u16) -> bool {
+    let Some(h) = host.map(|h| h.trim().to_ascii_lowercase()) else { return false };
+    let (name, p) = match h.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((a, rest)) => (format!("[{a}]"), rest.strip_prefix(':').map(String::from).or(rest.is_empty().then(String::new))),
+            None => return false,
+        },
+        None => match h.split_once(':') {
+            Some((a, p)) => (a.to_string(), Some(p.to_string())),
+            None => (h.clone(), Some(String::new())),
+        },
+    };
+    let port_ok = match p.as_deref() {
+        Some("") => port == 80,
+        Some(p) => p.parse::<u16>().ok() == Some(port),
+        None => false,
+    };
+    matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]") && port_ok
 }
 
 /// Query string to request fields (numbers and true/false as such).
@@ -284,7 +323,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     let Ok(rs) = s.try_clone() else { return };
     let mut rd = BufReader::new(Timed { s: rs, until: Instant::now() + HEAD_TIME });
     let Some(mut r) = read_head(&mut rd) else { return };
-    let is_local = local(&s, &r);
+    let is_local = local(node, &s, &r, conf.behind_proxy);
     let n = content_length(&r);
     if n > body_cap(node, &r, is_local) {
         return respond(&mut s, status_line(413), "text/plain", &[], b"the body is too large for this request\n");
@@ -806,7 +845,7 @@ pub(crate) mod tests {
     }
 
     fn conf() -> Conf {
-        Conf { site: None }
+        Conf { site: None, behind_proxy: false }
     }
 
     fn get(path: &str, extra: &str) -> Vec<u8> {
@@ -815,6 +854,42 @@ pub(crate) mod tests {
 
     fn status(answer: &str) -> &str {
         answer.split(' ').nth(1).unwrap_or("")
+    }
+
+    #[test]
+    fn loopback_names_only() {
+        for h in ["127.0.0.1:8420", "localhost:8420", "LOCALHOST:8420", "[::1]:8420"] {
+            assert!(loopback_host(Some(h), 8420), "{h}");
+        }
+        for h in ["127.0.0.1:8421", "127.0.0.1", "evil.example:8420", "127.0.0.1.evil.example:8420", "[::1]", "[::2]:8420", ""] {
+            assert!(!loopback_host(Some(h), 8420), "{h}");
+        }
+        assert!(!loopback_host(None, 8420));
+        assert!(loopback_host(Some("localhost"), 80));
+    }
+
+    #[test]
+    fn the_page_api_answers_only_its_own_name() {
+        let (_one, t) = crate::http::tests::node();
+        // A website whose name points at 127.0.0.1 asks with its own name.
+        let a = ask(&t.node, &conf(), b"GET /r/blockheight HTTP/1.1\r\nHost: rebind.example:8420\r\n\r\n");
+        assert_eq!(status(&a), "403", "{a}");
+        let a = ask(&t.node, &conf(), b"GET /api/v1/routes HTTP/1.1\r\nHost: rebind.example:8420\r\n\r\n");
+        assert_eq!(status(&a), "403", "{a}");
+        let a = ask(&t.node, &conf(), &get("/r/blockheight", ""));
+        assert_eq!(status(&a), "200", "{a}");
+        let a = ask(&t.node, &conf(), &get("/api/v1/routes", ""));
+        assert_eq!(status(&a), "200");
+    }
+
+    #[test]
+    fn behind_a_proxy_nothing_is_local() {
+        let (_one, t) = crate::http::tests::node();
+        let proxied = Conf { site: None, behind_proxy: true };
+        assert_eq!(status(&ask(&t.node, &proxied, &get("/api/v1/routes", ""))), "403");
+        assert_eq!(status(&ask(&t.node, &proxied, &get("/r/blockheight", ""))), "403");
+        assert_eq!(status(&ask(&t.node, &proxied, b"POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:8420\r\n\r\n")), "403");
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/api/v1/routes", ""))), "200");
     }
 
     #[test]

@@ -9,6 +9,7 @@ pub mod dns;
 pub mod encode;
 pub mod format;
 pub mod hash;
+pub mod kotia_pos;
 pub mod p2p;
 pub mod params;
 pub mod pepecoin;

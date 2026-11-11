@@ -202,6 +202,9 @@ cmds! {
     "mine.start" Admin "threads?" "Mine the home chain.";
     "mine.stop" Admin "" "Stop mining.";
     "mine.status" Read "" "Mining state and hash rate.";
+    "stake.status" Read "" "KOT staking: on or off, coins, self-check, blocks staked.";
+    "stake.set" Admin "on" "Turn KOT staking on or off.";
+    "stake.check" Read "" "Check our KOT stake rules against the newest blocks.";
     // Apps (app cards)
     "apps.store" Public "sort?, q?, flagged?" "The App Store: app cards from every chain with the arcade ledger (popular or new; starred first).";
     "apps.installed" Read "" "Apps installed on this arcade, each at its newest version.";

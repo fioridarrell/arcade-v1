@@ -42,6 +42,7 @@ mod meshview;
 mod mempoolshare;
 mod msgsvc;
 mod ordtypes;
+mod staker;
 mod sitesvc;
 mod grpsvc;
 mod feedsvc;
@@ -293,6 +294,10 @@ fn main() {
     {
         let n = node.clone();
         std::thread::Builder::new().name("messages".into()).spawn(move || msgsvc::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("staker".into()).spawn(move || staker::run(n)).unwrap();
     }
     {
         let n = node.clone();

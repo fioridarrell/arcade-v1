@@ -322,6 +322,9 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             node.miner.running.store(false, std::sync::atomic::Ordering::Relaxed);
             Ok(json!({"running": false}))
         }
+        "stake.status" => Ok(crate::staker::status(node)),
+        "stake.set" => crate::staker::set_on(node, req["on"] == true),
+        "stake.check" => Ok(crate::staker::ask_check()),
         "mine.status" => {
             use std::sync::atomic::Ordering;
             let secs = node.miner.started.lock().unwrap().map(|t| t.elapsed().as_secs_f64()).unwrap_or(0.0);

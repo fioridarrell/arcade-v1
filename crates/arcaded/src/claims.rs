@@ -38,8 +38,9 @@ pub fn check(node: &Node, tag: &str) -> Check {
 }
 
 /// Spendable coins of a tag key's address.
+/// Coins carrying an inscription are left out (crate::ordsafe).
 pub fn spendable(node: &Node, script: &[u8]) -> Vec<Utxo> {
-    coins(node, script)
+    crate::ordsafe::keep_free(node, node.params, coins(node, script))
 }
 
 pub(crate) fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {

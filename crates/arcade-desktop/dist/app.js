@@ -418,8 +418,16 @@ function drawPane(ch) {
       list.push(h("div", { class: "wl-row click", onclick: () => openExplorer("token", t.tick) }, h("span", { class: "ic" }, (t.tick || "?")[0].toUpperCase()),
         h("div", { class: "mid" }, h("div", {}, t.tick), h("div", { class: "s" }, t.transferable !== "0" ? `${units(t.transferable, t.dec)} transferable` : "")),
         h("span", { class: "amt" }, units(t.overall, t.dec))));
-    pane.replaceChildren(list.length ? h("div", { class: "wl-rows" }, list)
-      : h("div", { class: "x-empty" }, v.tokens ? "No tokens in this wallet." : `No tokens shown: ${ch.name} needs its tokens index here (Chains & Coins).`));
+    // Arcade tokens (the arcade ledger): kept here, or from an arcade on the mesh that keeps it.
+    for (const t of v.ledger_tokens || [])
+      list.push(h("div", { class: "wl-row click", onclick: () => openExplorer("ltoken", String(t.propertyid)) }, h("span", { class: "ic" }, (t.name || "#")[0].toUpperCase()),
+        h("div", { class: "mid" }, h("div", {}, t.name || `Arcade token #${t.propertyid}`), h("div", { class: "s" }, `arcade token #${t.propertyid}`)),
+        h("span", { class: "amt" }, t.balance)));
+    // Chain tokens (PRC-20, DRC-20...): from the tokens index here, else from an arcade keeping it.
+    const none = !v.tokens && !v.ledger_tokens;
+    const note = v.tokens ? "" : `${ch.name}'s chain tokens aren't shown: no arcade keeping its tokens index answered (add the index in Chains & Coins to keep it here).`;
+    pane.replaceChildren(list.length ? h("div", { class: "wl-rows" }, list) : h("div", { class: "x-empty" }, none ? note : "No tokens in this wallet."),
+      note && !none ? h("p", { class: "note" }, note) : "");
   } else {
     const ins = v.inscriptions;
     if (!ins) { pane.replaceChildren(h("div", { class: "x-empty" }, `No NFTs shown: ${ch.name} needs its ord index here (Chains & Coins).`)); return; }

@@ -93,6 +93,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens", "explorer.ledger_token",
     "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag", "explorer.search",
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
+    "explorer.ord_outpoints",
 ];
 
 /// Page routes another arcade may answer for an app on a chain it keeps: every public read
@@ -179,6 +180,9 @@ fn mesh_from(id: &str) -> Value {
 /// The index a question needs, whatever the error says: a borrowed chain answers "borrowed",
 /// which names no index, and these must go to an arcade keeping the chain's arcade ledger.
 fn needed_index(cmd: &str) -> Option<&'static str> {
+    if cmd == "explorer.ord_outpoints" {
+        return Some("ord");
+    }
     (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards")).then_some("ledger")
 }
 
@@ -250,16 +254,30 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 v["mesh_indexes"] = json!(more);
             }
             if cmd == "explorer.address" && v.is_object() {
-                // NFTs and tokens of the address from an arcade that keeps them.
-                for (ix, keys) in [("ord", &["inscriptions", "inscription_count"][..]), ("tokens", &["tokens"][..])] {
+                // What this arcade doesn't keep for the address, from an arcade that keeps it:
+                // its balance and history, NFTs, tokens, and arcade ledger holdings.
+                let parts: [(&str, &[&str]); 4] = [
+                    ("addresses", &["balance", "tx_count", "history"]),
+                    ("ord", &["inscriptions", "inscription_count"]),
+                    ("tokens", &["tokens"]),
+                    ("ledger", &["ledger_tokens", "ledger_inscriptions", "ledger_inscription_count"]),
+                ];
+                for (ix, keys) in parts {
                     if v.get(keys[0]).is_none() {
                         let mut q = req.clone();
                         q["chain"] = json!(p.key);
                         if let Ok((r, id)) = mesh_ask(node, p, ix, cmd, &q) {
+                            if r.get(keys[0]).is_none() {
+                                continue; // that arcade doesn't answer this part (an older version)
+                            }
                             for k in keys {
                                 if !r[*k].is_null() {
                                     v[*k] = r[*k].clone();
                                 }
+                            }
+                            if ix == "addresses" {
+                                // The note said balances weren't kept here; now they came.
+                                v["note"] = r["note"].clone();
                             }
                             v["mesh_parts"][ix] = mesh_from(&id);
                         }
@@ -346,6 +364,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     let s = |k: &str| req[k].as_str().map(String::from);
     let n = |d: u64, max: u64| req["n"].as_u64().unwrap_or(d).clamp(1, max);
     match cmd {
+        "explorer.ord_outpoints" => crate::ordsafe::answer(node, x.p, req),
         "explorer.summary" => summary(&x),
         "explorer.blocks" => {
             let tip = tip(&x);
@@ -984,6 +1003,29 @@ fn addr(x: &Ctx, a: &str) -> R {
             let dec = tokens::tick(&x.node.chain, c, &t).and_then(|i| i["dec"].as_u64()).unwrap_or(18);
             json!({"tick": t, "overall": o, "transferable": tr, "dec": dec})
         }).collect::<Vec<_>>());
+    }
+    // The arcade ledger: the address's arcade tokens and arcade inscriptions.
+    if x.has("ledger") {
+        let toks: Vec<Value> = arcade_ledger::engine::holdings(&x.node.chain, c, a)
+            .into_iter()
+            .map(|(pid, units)| {
+                let p = arcade_ledger::engine::property(&x.node.chain, c, pid).ok().flatten().unwrap_or(Value::Null);
+                let div = p["divisible"] == true || p["type"] == 2;
+                json!({"propertyid": pid, "name": p["name"], "units": units, "balance": arcade_ledger::amount::token_plain(div, units)})
+            })
+            .collect();
+        v["ledger_tokens"] = json!(toks);
+        let owned: Vec<Value> = x.node.chain.store(c)
+            .read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &arcade_store::KeyBuf::new().u16(c).done()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, raw)| serde_json::from_slice::<Value>(&raw).ok())
+            .filter(|i| i["owner"].as_str() == Some(a))
+            .collect();
+        v["ledger_inscription_count"] = json!(owned.len());
+        let mut newest = owned;
+        newest.sort_by(|p, q| q["number"].as_u64().cmp(&p["number"].as_u64()));
+        v["ledger_inscriptions"] = json!(newest.iter().take(60).map(|i| json!({"txid": i["txid"], "number": i["number"], "content_type": i["content_type"]})).collect::<Vec<_>>());
     }
     Ok(v)
 }

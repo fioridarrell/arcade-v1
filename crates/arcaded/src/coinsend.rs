@@ -109,6 +109,7 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
                 coins.push(Utxo { outpoint: op, value, script: sc.clone() });
             }
         }
+        let coins = crate::ordsafe::keep_free(node, p, coins);
         let total: u64 = coins.iter().map(|u| u.value).sum();
         let picked = from.is_some_and(|f| scripts.iter().any(|(a, _)| a == f));
         if picked {
@@ -140,6 +141,7 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
                 }
                 coins.push(Utxo { outpoint: op, value, script: sc.clone() });
             }
+            let coins = crate::ordsafe::keep_free(node, p, coins);
             Some((sk, vec![(f.to_string(), sc)], coins))
         }
         _ => None,

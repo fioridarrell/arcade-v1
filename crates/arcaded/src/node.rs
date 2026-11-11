@@ -89,14 +89,17 @@ impl Outbox {
         }
     }
 
+    #[cfg(test)]
     pub fn len(&self) -> usize {
         self.frames.len()
     }
 
+    #[cfg(test)]
     pub fn is_empty(&self) -> bool {
         self.frames.is_empty()
     }
 
+    #[cfg(test)]
     pub fn last(&self) -> Option<&Value> {
         self.frames.back()
     }

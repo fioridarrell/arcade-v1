@@ -1,5 +1,6 @@
 pub mod dd;
 pub mod ddtrade;
+pub mod ddlock;
 pub mod keys;
 pub mod legacy;
 pub mod legs;

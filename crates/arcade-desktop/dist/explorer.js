@@ -254,7 +254,9 @@
       has("maps") && sect("Maps", "maps", (sum.map_rows || []).length ? table([["Claim"], ["Inscription", 1]], sum.map_rows.map((r) => ({ go: () => go("map", r.claim), cells: [[h("span", { class: "mono" }, r.claim)], [`#${fmt(r.number)}`, 1]] }))) : h("div", { class: "x-empty" }, "No block maps claimed yet.")),
     ].filter(Boolean);
     return h("div", {},
-      sum.borrowed ? h("p", { class: "x-note" }, `This arcade is still catching up on ${chain.name} (block ${fmt(sum.syncing_at)}): the newest blocks and the mempool come from a lender meanwhile.`) : "",
+      sum.borrowed ? h("p", { class: "x-note" }, chain.installed
+        ? `This arcade is still catching up on ${chain.name} (block ${fmt(sum.syncing_at)}): the newest blocks and the mempool come from a lender meanwhile.`
+        : `${chain.name} is borrowed here, not installed: its blocks and the mempool come from a lender.`) : "",
       h("div", { class: "x-stats" }, st.map(([k, v, s]) => h("div", { class: "x-stat" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), h("div", { class: "s" }, s)))),
       h("div", { class: has("ord") ? "x-cols" : "x-cols one" },
         sect("Latest blocks", "blocks", blockRows(sum.blocks)),

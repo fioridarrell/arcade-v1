@@ -325,8 +325,8 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
-    // Same rule as the testnet, but not yet compared with the mainnet's headers: Some(2)
-    // once examples/rpcheaders has walked the whole chain clean.
+    // Same rule as the testnet. examples/rpcheaders against a Pepecoin Core node: the rule
+    // gives the bits of every mainnet header from 1 to 1,288,000.
     digishield_from: Some(2),
     auxpow_chain_id: Some(0x3f),
     auxpow_strict_chain_id: false,
@@ -1031,7 +1031,9 @@ mod tests {
         // The old step rule alone let the gapless powLimit block through.
         assert!(!too_easy(p, 0x1e0fffff, 0x1d00ffff));
         // Chains without the rule (it is off until checked against their headers) skip it.
-        assert_eq!(check_context(&PEPECOIN_MAIN, &child(&PEPECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Ok(()));
+        assert_eq!(check_context(&DOGECOIN_MAIN, &child(&DOGECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Ok(()));
+        // Pepecoin's mainnet has it on, as its testnet.
+        assert_eq!(check_context(&PEPECOIN_MAIN, &child(&PEPECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Err(HeaderError::BadDifficulty));
         // Before digishield_from, or without a grandparent, nothing to compare.
         assert_eq!(check_context(p, &child(p, &g, g.time + 1, 0x1c00ffff), 1, &[g], now), Ok(()));
     }

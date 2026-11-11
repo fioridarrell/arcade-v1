@@ -257,6 +257,9 @@ fn fail(addr: &str, err: &str) {
     x.last_err = err.chars().take(200).collect();
 }
 
+/// Lenders' tips told within this many seconds of the newest are compared with one another.
+const TIPS_TOGETHER: u64 = 20;
+
 fn note_tip(key: &str, addr: &str, h: u64) {
     ST.tips.lock().unwrap().entry(key.to_string()).or_default().insert(addr.to_string(), (h, arcade_app::now()));
 }
@@ -1436,16 +1439,23 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     let offers = node.offers_for(p.key);
     let told = ST.tips.lock().unwrap().get(p.key).cloned().unwrap_or_default();
     let mut seen = BTreeSet::new();
+    let mut fresh: Vec<(u64, u64)> = Vec::new();
     for (id, addr, kind, h) in offers {
         if kind != "cr" || !seen.insert(addr.clone()) {
             continue;
         }
         let t = told.get(&addr).map(|x| x.0).unwrap_or(h);
+        if let Some((tip, at)) = told.get(&addr) {
+            fresh.push((*tip, *at));
+        }
         let fails = recent_fails(&addr);
         let (rtt, last) = ST.health.lock().unwrap().get(&addr).map(|x| (Some(x.rtt_ms), Some(x.last_err.clone()).filter(|s| !s.is_empty()))).unwrap_or((None, None));
         lenders_v.push(json!({"node": &id[..id.len().min(16)], "addr": addr, "tip": t, "rtt_ms": rtt, "fails": fails, "last_error": last}));
     }
-    let tips: Vec<u64> = lenders_v.iter().filter_map(|l| l["tip"].as_u64()).collect();
+    // Only tips told at about the same time can disagree: one told a while ago is behind
+    // because the chain went on, not because its lender is on another chain.
+    let newest = fresh.iter().map(|x| x.1).max().unwrap_or(0);
+    let tips: Vec<u64> = fresh.iter().filter(|x| x.1 + TIPS_TOGETHER >= newest).map(|x| x.0).collect();
     let mismatch = match (tips.iter().min(), tips.iter().max()) {
         (Some(a), Some(b)) if b - a > 3 => Some(format!("lenders disagree on the tip: {a} to {b}")),
         _ => None,

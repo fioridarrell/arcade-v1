@@ -1,8 +1,9 @@
 //! Installing a chain from V1.0 copies (docs/V1SHARE.md §5, phase 3): headers from the
 //! network (checked by proof of work), then the blocks copy and the coins copy, each fetched
 //! from every arcade holding it and taken in WHILE it comes (§5.0): rows in order, blocks
-//! checked against our headers, no scripts run, pieces deleted once used. The coins are
-//! marked trusted (made by N arcades) until the background re-check.
+//! checked against our headers, no scripts run, pieces deleted once used. Each coin is checked
+//! against the transaction at its position in those blocks as it is taken in; that the coins
+//! are unspent is the makers' word ("trusted") until the background re-check.
 
 use crate::node::Node;
 use crate::vxshare;
@@ -411,22 +412,29 @@ fn run(node: &Arc<Node>, p: &'static ChainParams, bid: &str, cid: &str, cp: u32,
     if m["cp"].as_u64() != Some(cp as u64) {
         return Err("the coins copy is at another height".into());
     }
-    let mut bad: Option<String> = None;
+    // The copy's count and total are checked when its last coin is read, before anything is
+    // written (every coin is checked against its block by import_coins_at).
+    let (mut n, mut total) = (0u64, 0u128);
     let mut next = || -> Result<Option<(u32, u32, u32, u64, bool, Vec<u8>)>, String> {
-        let Some(r) = cs.record()? else { return Ok(None) };
+        let Some(r) = cs.record()? else {
+            if m["coins"].as_u64() != Some(n) || m["total"].as_u64().map(|t| t as u128) != Some(total) {
+                return Err(format!("the coins copy holds {n} coins, its manifest says {}", m["coins"]));
+            }
+            return Ok(None);
+        };
         if r.len() < 21 {
-            bad = Some("short coin record".into());
             return Err("short coin record".into());
         }
         let h = u32::from_be_bytes(r[0..4].try_into().unwrap());
         let pos = u32::from_be_bytes(r[4..8].try_into().unwrap());
         let vout = u32::from_be_bytes(r[8..12].try_into().unwrap());
         let value = u64::from_le_bytes(r[12..20].try_into().unwrap());
+        n += 1;
+        total += value as u128;
         Ok(Some((h, pos, vout, value, r[20] != 0, r[21..].to_vec())))
     };
     let trusted = json!({"from": "V1.0 copies", "blocks": bid, "coins": cid, "height": cp, "at": arcade_app::now()}).to_string();
     let rep = node.chain.import_coins_at(p, &path, cp, &mut next, &trusted, &tmp, cancel, &mut |s| set(p.key, "coins", s)).map_err(|e| e.to_string())?;
-    let _ = bad;
     if m["coins"].as_u64() != Some(rep.kept) || m["total"].as_u64().map(|t| t as u128) != Some(rep.kept_amount) {
         return Err(format!("coin set taken in ({} coins) doesn't match the copy's manifest ({})", rep.kept, m["coins"]));
     }

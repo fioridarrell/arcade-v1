@@ -8,8 +8,9 @@
 //!    an "all" copy the blocks come from its blk files instead (indexed by hash, taken along
 //!    our header chain); the tx index of the new blocks in one sorted pass; the coin set read
 //!    once to check it against the manifest's utxo summary (count and total) and its best
-//!    block; then taken in (arcade_chaindb::coreimport::import_coins). The coins are marked
-//!    "trusted from <maker>".
+//!    block; then taken in (arcade_chaindb::coreimport::import_coins), each coin checked
+//!    against the transaction at its position in our own blocks. That they are unspent is the
+//!    maker's word ("trusted from <maker>") until step 3.
 //! 3. verify (afterwards, in the background): the coin set derived from the blocks again,
 //!    the normal way; equal -> "verified"; different -> ours replaces the copy's, the address
 //!    rows are built again, and an event names the maker.

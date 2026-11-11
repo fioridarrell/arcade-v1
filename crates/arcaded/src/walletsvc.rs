@@ -188,11 +188,11 @@ fn token_json(node: &Node, pid: u32) -> Option<Value> {
 // ---------------- the wallet's own addresses ----------------
 
 /// This wallet's addresses on the home chain (tag slots).
-fn ours(node: &Node) -> Vec<String> {
+pub(crate) fn ours(node: &Node) -> Vec<String> {
     node.app.tag_keys(c(node)).unwrap_or_default().into_iter().map(|k| k.address).collect()
 }
 
-fn key_for(node: &Node, address: &str) -> Result<arcade_wallet::SecretKey, String> {
+pub(crate) fn key_for(node: &Node, address: &str) -> Result<arcade_wallet::SecretKey, String> {
     let p = node.params;
     for k in node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())? {
         if k.address == address {
@@ -472,6 +472,10 @@ fn amount_units(s: &str, divisible: bool) -> Result<u64, String> {
 pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
     let refuse = |e: String| (400, json!({"error": e}));
     let kind = body["kind"].as_str().unwrap_or("");
+    if kind == "market" {
+        // An order, cancel or take (marketsvc.rs): filed the same way, with its terms.
+        return crate::marketsvc::file(node, page, body["op"].as_str().unwrap_or(""), body);
+    }
     if !matches!(kind, "coins" | "token" | "inscription") {
         return refuse("kind is coins, token or inscription".into());
     }
@@ -536,9 +540,32 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
     (202, r)
 }
 
+/// File a market request (marketsvc.rs): `what` is its terms in words, `to` the maker a take pays.
+pub(crate) fn file_market(node: &Node, page: &str, what: &str, to: Option<String>, market: Value) -> (u16, Value) {
+    if requests(node, None).as_array().map(|a| a.len()).unwrap_or(0) >= MAX_WAITING {
+        return (400, json!({"error": "more than twenty requests are already waiting"}));
+    }
+    let id = arcade_mesh::random::hex(8);
+    let to_tag = to.as_deref().and_then(|t| tag_of(node, t));
+    let r = json!({"id": id, "page": page, "kind": "market", "market": market, "to": to.clone().unwrap_or_else(|| "the order book".into()),
+                   "to_tag": to_tag, "units": 0, "what": what, "status": "pending", "created": arcade_app::now(),
+                   "txid": Value::Null, "error": Value::Null});
+    put_req(node, &r);
+    let _ = node.app.event("wallet", &format!("a page asks for {what}"));
+    (202, r)
+}
+
 /// Build (and, when `send`, broadcast) a request's transaction: (txid, fee, outputs).
 fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
     let p = node.params;
+    if r["kind"] == "market" {
+        let (tx, from, fee) = crate::marketsvc::build(node, &r["market"], send)?;
+        let outs: Vec<Value> = tx.outputs.iter().map(|o| {
+            let a = arcade_ledger::address::address_of(&o.script_pubkey, p);
+            json!({"address": a, "value": o.value, "mine": a.as_deref().is_some_and(|a| a == from), "data": a.is_none()})
+        }).collect();
+        return Ok((tx.txid.to_hex(), fee, outs));
+    }
     let to = r["to"].as_str().unwrap_or("");
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or("bad address")?;
     let units = r["units"].as_u64().unwrap_or(0);

@@ -351,6 +351,16 @@ pub fn takes(db: &arcade_chaindb::ChainDb, c: u16, pid: Option<u32>) -> Vec<Valu
         .collect()
 }
 
+/// Every property the ledger knows: (property id, its JSON).
+pub fn properties(db: &arcade_chaindb::ChainDb, c: u16) -> Vec<(u32, Value)> {
+    db.store(c)
+        .read(|r| r.scan_prefix(crate::engine::PROPERTY, &KeyBuf::new().u16(c).done()))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(k, v)| Some((u32::from_be_bytes(k.get(k.len() - 4..)?.try_into().ok()?), serde_json::from_slice(&v).ok()?)))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

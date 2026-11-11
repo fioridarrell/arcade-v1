@@ -305,6 +305,82 @@ fn pair_of(node: &Node, q: &Map<String, Value>) -> Result<(u32, u32), String> {
     Ok((base, quote))
 }
 
+/// A chain's coin icon (docs/MARKET.md "Coin icons", inscribed on Pepecoin testnet).
+fn coin_icon(key: &str) -> Option<&'static str> {
+    Some(match key {
+        "bel" => "aeb761003d131b0ec643713b9663e00034345bbb4bf9d40744867892b5425ec2",
+        "dgb" => "5796bfe950c32aed2a3ad848eb0afe23ded4f62dabc7b85b50154c0762999d9a",
+        "dgbtest" => "807c7cdb64000a3e67f5f34bdc64e883d034ad7c26c106cbc5b5323dde79b682",
+        "doge" => "8c6f3bb878b2ab9cf80837020576b5eeb770279be60fd471299f2b84482fb91a",
+        "flop" => "9ad22450724ed29cce47782b8911a288cebd62af68a1bac894a142c5ffb928fd",
+        "kot" => "0ee77138d2e23272db4d84c9d440cb55e2e8d9c5bdb1b80bf6c44045dd2fb33a",
+        "lky" => "5502e6b46f64756b88441d536d014bcd991abc63705671569162dde6514aa29f",
+        "ltc" => "d8bff4aa74cabfabe238b89ba7cd8fc5ca11ce6b5d351ab4133996c941d22a3a",
+        "ltctest" => "8ba15b7c8c09dfdc06155db2acf587dc7d4d1b37dc00341c39ee4dc5c7a17f0f",
+        "pep" => "ea060e94568de806493cdc76f5f590dd9d06e4521a873aa7c025540641e571ab",
+        "peptest" => "5c94ebc6f08ea85d0480ee5ecf91617218b143d9cf27fbc13e7e5b7b247cb7f4",
+        "wjk" => "e1d07b7f8d6e25f784c0d6551c8145be0987e4f709225479db5ee8dc04a896b9",
+        "dd" => "44a1c86f8cacccc7227eb4f2fd3ae85ece5a07e99a21cc1157e26bca3d8fa20a",
+        "ddtest" => "e5d1b9dd393681c87170417f3dd9e8245fef7877eb7796a608288f9168433594",
+        _ => return None,
+    })
+}
+
+/// The assets a market can name, matching `q` (a name or an id): the coin, then tokens by id.
+pub fn assets(node: &Node, q: &str) -> Vec<Value> {
+    let q = q.trim().to_lowercase();
+    let unit = crate::explorer::unit(node.params);
+    let mut out = Vec::new();
+    if q.is_empty() || unit.to_lowercase().contains(&q) || "coin".contains(&q) {
+        let mut a = asset(node, 0);
+        a["icon"] = json!(coin_icon(node.params.key));
+        out.push(a);
+    }
+    for (pid, p) in mk::properties(&node.chain, c(node)) {
+        if p["type"] == 5 {
+            continue; // non-fungible: not traded on the book
+        }
+        let name = p["name"].as_str().unwrap_or("").to_lowercase();
+        if q.is_empty() || name.contains(&q) || pid.to_string() == q {
+            out.push(asset(node, pid));
+        }
+        if out.len() >= 200 {
+            break;
+        }
+    }
+    out
+}
+
+/// What a trade of `give` for `get` costs and how it settles here (the page shows it before asking).
+fn terms_read(node: &Node, q: &Map<String, Value>) -> Result<Value, String> {
+    let (give, get) = (side(node, q.get("give"))?, side(node, q.get("get"))?);
+    let fee_one = crate::claims::FEE_PER_KB * 300 / 1000; // a one-input order, about 300 bytes
+    let (supported, why) = if give == get {
+        (false, "a trade is two different assets")
+    } else if give != 0 && get != 0 && led::gates(node.params).token_pairs_from.is_none() {
+        (false, "this chain's ledger trades tokens for its coin only")
+    } else {
+        (true, "")
+    };
+    Ok(json!({"network_fees": fee_one, "operator_bps": 0, "lock_reserve": 0, "confirmations": 0, "lock_hours": 0,
+              "cap": Value::Null, "min_fill": crate::claims::DUST, "modes": ["fast"], "slice": Value::Null,
+              "supported": supported, "why_not": why, "venue": "ledger"}))
+}
+
+/// This wallet's orders on the book and its market requests waiting for an answer.
+fn mine(node: &Node) -> Value {
+    let ours = crate::walletsvc::ours(node);
+    let (orders, pool) = standing(node, true);
+    let mine: Vec<Value> = orders
+        .iter()
+        .filter(|o| ours.contains(&o.address))
+        .map(|o| json!({"order": o.txid, "address": o.address, "give": {"asset": o.sale_property, "amount": o.sale_amount},
+                        "get": {"asset": o.want_property, "amount": o.want_amount}, "pending": o.pending,
+                        "taking": pool.taking.get(&o.txid).copied().unwrap_or(0), "status": "open"}))
+        .collect();
+    json!({"orders": mine, "swaps": [], "listings": [], "offers": []})
+}
+
 /// One read by name, with its arguments (the socket API and /r/market/<name>).
 pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, String> {
     match name {
@@ -330,6 +406,9 @@ pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, St
             let (base, quote) = pair_of(node, q)?;
             Ok(json!(candles(node, base, quote, num(q, "span", 3600), num(q, "count", 48) as usize)))
         }
+        "assets" => Ok(json!(assets(node, q.get("q").and_then(|v| v.as_str()).unwrap_or("")))),
+        "terms" => terms_read(node, q),
+        "mine" => Ok(mine(node)),
         _ => Err(format!("{name} is not a market read")),
     }
 }
@@ -358,5 +437,210 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> Result<Value, String> {
         "ledger.trades" => read(node, "trades", &q),
         "ledger.pairs" => read(node, "markets", &q),
         _ => Err(format!("unknown command {cmd}")),
+    }
+}
+
+// ---------------- writes: orders, cancels and takes (docs/MARKET.md step 2) ----------------
+//
+// A page asks with POST /r/market/<place|cancel|take>; the request waits in the wallet's approval queue
+// (walletsvc) like a send, and the person's Approve builds and broadcasts it. A page never names bytes,
+// a signature or a receiving address: it names terms, and what is built is shown from the transaction.
+
+/// Omni-style payload: version 0, the type, then the fields (payload.py MetaDEx*).
+pub fn payload(mtype: u16, fields: &[&[u8]]) -> Vec<u8> {
+    let mut p = vec![0, 0];
+    p.extend_from_slice(&mtype.to_be_bytes());
+    for f in fields {
+        p.extend_from_slice(f);
+    }
+    p
+}
+
+/// Type 25: sell `sa` of `sale` for `wa` of `want` (an ask or a bid: the same message, the pair reversed).
+pub fn order_payload(sale: u32, sa: u64, want: u32, wa: u64) -> Vec<u8> {
+    payload(25, &[&sale.to_be_bytes(), &sa.to_be_bytes(), &want.to_be_bytes(), &wa.to_be_bytes()])
+}
+
+/// Type 26: cancel this address's orders on the pair at exactly this price (compared by cross products).
+pub fn cancel_price_payload(sale: u32, sa: u64, want: u32, wa: u64) -> Vec<u8> {
+    payload(26, &[&sale.to_be_bytes(), &sa.to_be_bytes(), &want.to_be_bytes(), &wa.to_be_bytes()])
+}
+
+/// Type 29: take `amount` of `pid` from the resting ask `order` (the payment is an output of its own).
+pub fn take_payload(pid: u32, amount: u64, order: &[u8; 32]) -> Vec<u8> {
+    payload(29, &[&pid.to_be_bytes(), &amount.to_be_bytes(), order])
+}
+
+fn units_of(v: &Value) -> Option<u64> {
+    v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).filter(|n| *n > 0 && *n < (1u64 << 63))
+}
+
+fn words(node: &Node, pid: u32, units: u64) -> String {
+    if pid == 0 {
+        return format!("{} {}", arcade_ledger::amount::token_plain(true, units), crate::explorer::unit(node.params));
+    }
+    let p = prop(node, pid);
+    let div = p.as_ref().map(led::divisible).unwrap_or(false);
+    format!("{} {}", arcade_ledger::amount::token_plain(div, units), p.as_ref().and_then(|p| p["name"].as_str()).unwrap_or("tokens"))
+}
+
+/// A side of a write: {asset: property id | "coin", amount: base units}.
+fn write_side(node: &Node, v: &Value) -> Result<(u32, u64), String> {
+    let pid = side(node, Some(&v["asset"]))?;
+    if pid != 0 && prop(node, pid).is_none() {
+        return Err(format!("no such property {pid}"));
+    }
+    let amount = units_of(&v["amount"]).ok_or("an amount is a whole number of base units above zero")?;
+    Ok((pid, amount))
+}
+
+/// Which of this wallet's addresses holds `units` of `pid` free.
+fn holder(node: &Node, pid: u32, units: u64) -> Option<String> {
+    crate::walletsvc::ours(node).into_iter().find(|a| led::holdings(&node.chain, c(node), a).iter().any(|(x, u)| *x == pid && *u >= units))
+}
+
+/// The terms of a market request, checked against the book now: (what it says, the maker paid if a take).
+fn terms(node: &Node, m: &Value) -> Result<(String, Option<String>), String> {
+    match m["op"].as_str().unwrap_or("") {
+        "place" => {
+            let (sale, sa) = write_side(node, &m["give"])?;
+            let (want, wa) = write_side(node, &m["get"])?;
+            if sale == want {
+                return Err("an order gives one asset for another".into());
+            }
+            if sale != 0 && want != 0 && led::gates(node.params).token_pairs_from.is_none() {
+                return Err("this chain's ledger trades tokens for its coin only".into());
+            }
+            if sale != 0 && holder(node, sale, sa).is_none() {
+                return Err(format!("this wallet does not hold {} free", words(node, sale, sa)));
+            }
+            let said = if sale == 0 {
+                format!("buy {} for {}", words(node, want, wa), words(node, sale, sa))
+            } else {
+                format!("sell {} for {}", words(node, sale, sa), words(node, want, wa))
+            };
+            Ok((format!("an order to {said}, resting on the book until it is taken or cancelled"), None))
+        }
+        "cancel" => {
+            let o = own_order(node, m["order"].as_str().unwrap_or(""))?;
+            Ok((format!("a cancel: take back your order selling {} for {} (and any other of yours at that price on that pair)",
+                        words(node, o.sale_property, o.sale_amount), words(node, o.want_property, o.want_amount)), None))
+        }
+        "take" => {
+            let (o, units, need) = take_terms(node, m)?;
+            Ok((format!("a take: buy {} for {} from the order book", words(node, o.sale_property, units), words(node, 0, need)), Some(o.address)))
+        }
+        op => Err(format!("{op} is not a market write (place, cancel or take)")),
+    }
+}
+
+/// The mined order `txid` if it is this wallet's.
+fn own_order(node: &Node, txid: &str) -> Result<Order, String> {
+    let o = mk::book_orders(&node.chain, c(node)).into_iter().find(|o| o.txid == txid).ok_or("that order is not on the book (filled, cancelled, or not in a block yet)")?;
+    if !crate::walletsvc::ours(node).contains(&o.address) {
+        return Err("that order is not this wallet's".into());
+    }
+    Ok(o)
+}
+
+/// A take: (the resting ask, units taken, coins it costs). The engine's own arithmetic, so the payment is
+/// exactly what it checks; what other takes in the mempool are buying comes off the top (app.py take).
+fn take_terms(node: &Node, m: &Value) -> Result<(Order, u64, u64), String> {
+    let txid = m["order"].as_str().unwrap_or("");
+    let o = mk::book_orders(&node.chain, c(node)).into_iter().find(|o| o.txid == txid).ok_or("that order is not on the book (filled, cancelled, or not in a block yet)")?;
+    if o.want_property != 0 || o.sale_property == 0 {
+        return Err("only an ask, tokens for coins, can be taken".into());
+    }
+    if crate::walletsvc::ours(node).contains(&o.address) {
+        return Err("that is your own order; cancel it instead of taking it".into());
+    }
+    let units = units_of(&m["amount"]).ok_or("take an amount above zero, in base units")?;
+    let p = pool(node);
+    let gone = mk::cancelled(std::slice::from_ref(&o), &p);
+    if gone.contains(&o.txid) {
+        return Err("its maker is cancelling that order right now; nothing was sent".into());
+    }
+    let free = o.reserved.saturating_sub(p.taking.get(&o.txid).copied().unwrap_or(0));
+    if free == 0 {
+        return Err("somebody is buying all of this order right now; wait for its block".into());
+    }
+    if units > free {
+        return Err(format!("that order has {} left to buy; take that much or less", words(node, o.sale_property, free)));
+    }
+    let need = (o.want_amount as u128 * units as u128 / o.sale_amount as u128) as u64;
+    if need < crate::claims::DUST {
+        return Err(format!("that comes to {}, under the {} the network carries to one address; take more", words(node, 0, need), words(node, 0, crate::claims::DUST)));
+    }
+    Ok((o, units, need))
+}
+
+/// POST /r/market/<op>: file a market request in the wallet's approval queue.
+pub fn file(node: &Node, page: &str, op: &str, body: &Value) -> (u16, Value) {
+    let mut m = body.clone();
+    m["op"] = json!(op);
+    let (what, to) = match terms(node, &m) {
+        Ok(t) => t,
+        Err(e) => return (400, json!({"ok": false, "error": e})),
+    };
+    let market = json!({"op": op, "give": m["give"], "get": m["get"], "order": m["order"], "amount": m["amount"]});
+    crate::walletsvc::file_market(node, page, &what, to, market)
+}
+
+/// Build (and, when `send`, broadcast) a market request's transaction: (txid, fee, outputs).
+pub fn build(node: &Node, m: &Value, send: bool) -> Result<(arcade_chain::Tx, String, u64), String> {
+    let p = node.params;
+    terms(node, m)?; // asked again at the Approve: the book may have moved since the card was drawn
+    let (from, data, extra): (String, Vec<u8>, Vec<arcade_wallet::tx::TxOutSpec>) = match m["op"].as_str().unwrap_or("") {
+        "place" => {
+            let (sale, sa) = write_side(node, &m["give"])?;
+            let (want, wa) = write_side(node, &m["get"])?;
+            let from = if sale != 0 { holder(node, sale, sa).ok_or("this wallet no longer holds that")? } else { crate::msgsvc::sender_key(node)?.0 };
+            (from, order_payload(sale, sa, want, wa), vec![])
+        }
+        "cancel" => {
+            let o = own_order(node, m["order"].as_str().unwrap_or(""))?;
+            (o.address.clone(), cancel_price_payload(o.sale_property, o.sale_amount, o.want_property, o.want_amount), vec![])
+        }
+        _ => {
+            let (o, units, need) = take_terms(node, m)?;
+            let order: [u8; 32] = hex::decode(&o.txid).ok().and_then(|b| b.try_into().ok()).ok_or("bad order id")?;
+            let pay = arcade_ledger::address::p2pkh_script_for_address(p, &o.address).ok_or("the maker's address is not one this wallet can pay")?;
+            (crate::msgsvc::sender_key(node)?.0, take_payload(o.sale_property, units, &order), vec![arcade_wallet::tx::TxOutSpec { value: need, script: pay }])
+        }
+    };
+    let sk = crate::walletsvc::key_for(node, &from)?;
+    let from_script = arcade_ledger::address::p2pkh_script_for_address(p, &from).ok_or("bad address")?;
+    let coins = crate::claims::spendable(node, &from_script);
+    let tx = arcade_wallet::tx::build_arcade(p, &data, extra, &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, arcade_app::now() as u32).map_err(|e| e.to_string())?;
+    let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
+    let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
+    if send {
+        if !crate::mempoolshare::add(node, p, &tx) {
+            return Err("the transaction was refused: its coins are spent by another waiting transaction".into());
+        }
+        crate::claims::mark_spent(node, &tx);
+        node.tx_outbox.lock().unwrap().push(tx.raw.clone());
+    }
+    Ok((tx, from, fee))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Payload bytes equal the original's encoders (payload.py MetaDExTrade, MetaDExCancelPrice, MetaDExTake),
+    /// vectors in tests/data/market_payloads.json.
+    #[test]
+    fn payloads_match_the_original() {
+        let v: Value = serde_json::from_str(include_str!("../tests/data/market_payloads.json")).unwrap();
+        for t in v.as_array().unwrap() {
+            let f = t["f"].as_array().unwrap();
+            let got = match t["type"].as_u64().unwrap() {
+                25 => order_payload(f[0].as_u64().unwrap() as u32, f[1].as_u64().unwrap(), f[2].as_u64().unwrap() as u32, f[3].as_u64().unwrap()),
+                26 => cancel_price_payload(f[0].as_u64().unwrap() as u32, f[1].as_u64().unwrap(), f[2].as_u64().unwrap() as u32, f[3].as_u64().unwrap()),
+                _ => take_payload(f[0].as_u64().unwrap() as u32, f[1].as_u64().unwrap(), &hex::decode(f[2].as_str().unwrap()).unwrap().try_into().unwrap()),
+            };
+            assert_eq!(hex::encode(got), t["hex"].as_str().unwrap(), "type {}", t["type"]);
+        }
     }
 }

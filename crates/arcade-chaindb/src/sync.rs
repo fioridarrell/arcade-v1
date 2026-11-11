@@ -1,16 +1,17 @@
 //! Headers-first sync from P2P peers into a ChainDb.
 //!
-//! 1. Headers: ask for headers after our best, check each (link, difficulty step, work),
-//!    store with cumulative work; `best` follows the most work.
+//! 1. Headers: ask for headers after our best, check each (link, checkpoints, difficulty,
+//!    time, work), store with cumulative work; `best` follows the most work. A header whose
+//!    work isn't checked counts only the chain's minimum work (ChainParams::header_work).
 //! 2. Blocks: walk from the best header back to the connected chain (the fork point),
 //!    disconnect anything above the fork, then fetch and connect blocks forward in
 //!    batches, each batch one commit.
 
 use crate::db::{ChainDb, HeaderRec, Tip, STATUS_HEADER};
-use arcade_chain::params::{check_block_work, check_header, ChainParams, PowCheck};
+use arcade_chain::params::{check_block_work, check_context, check_header, ChainParams, PowCheck, MEDIAN_TIME_SPAN};
 use arcade_chain::p2p::{HeaderEntry, Peer};
-use arcade_chain::pow::{meets_target, pow_hash, work_from_bits, PowAlgo};
-use arcade_chain::{Block, Hash256};
+use arcade_chain::pow::{meets_target, pow_hash, work_from_bits, PowAlgo, U256};
+use arcade_chain::{Block, Hash256, Header};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -27,6 +28,10 @@ pub enum SyncError {
     BadBlock { hash: Hash256, why: String },
     #[error("reorg of {0} blocks is deeper than the undo window")]
     ReorgTooDeep(u32),
+    #[error("reorg to below the checkpoint at height {0}")]
+    BelowCheckpoint(u32),
+    #[error("reorg of {0} blocks onto a branch with no checked proof of work")]
+    UnverifiedReorg(u32),
 }
 
 pub type Result<T> = std::result::Result<T, SyncError>;
@@ -63,6 +68,15 @@ pub struct Syncer<'a> {
     /// the blocks (sources that send headers with the blocks).
     pub known_top: std::cell::Cell<u32>,
 }
+
+/// The deepest reorg taken onto a branch none of whose headers has a checked proof of work
+/// (DigiByte algorithms not implemented here, proof-of-stake blocks). Such headers all count
+/// the same minimum work, so between them the longest branch wins and anyone can make one up;
+/// this keeps a made-up branch from taking back more than this many blocks. A real branch
+/// that deep almost always carries a checked block on DigiByte (three of its five algorithms
+/// are checked); on a chain of staked blocks a real reorg deeper than this stops the sync
+/// (UnverifiedReorg) until someone looks, as ReorgTooDeep does past the undo window.
+pub const UNVERIFIED_REORG_DEPTH: u32 = 100;
 
 /// Blocks behind the best header from which address rows are logged and built later.
 pub const DEFER_BEHIND: u32 = 20_000;
@@ -144,6 +158,16 @@ impl<'a> Syncer<'a> {
         let entries = peer.get_headers(&self.locator()?).map_err(SyncError::Source)?;
         let mut batch: Vec<(Hash256, HeaderRec)> = Vec::with_capacity(entries.len());
         let mut pending: HashMap<Hash256, HeaderRec> = HashMap::new();
+        // No fork may start below the highest checkpoint our best header has passed.
+        let best_height = match self.db.best_header(c)? {
+            Some(b) => self.db.header(c, &b)?.map(|r| r.height).unwrap_or(0),
+            None => 0,
+        };
+        let floor = self.params.last_checkpoint(best_height);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        // The headers under the one being checked, parent first (for the time and difficulty
+        // rules); slid along while the batch runs in order, looked up again when it doesn't.
+        let mut below: (Hash256, Vec<Header>) = (Hash256::ZERO, Vec::new());
         for e in entries {
             let hash = self.params.block_id(&e.header);
             if pending.contains_key(&hash) || self.db.header(c, &hash)?.is_some() {
@@ -158,9 +182,15 @@ impl<'a> Syncer<'a> {
             };
             let height = parent.height + 1;
             let bad = |why: String| SyncError::BadHeader { height, why };
-            match check_header(self.params, &e.header, &parent.header, height)
-                .map_err(|x| bad(x.to_string()))?
-            {
+            if let Some(cp) = floor.filter(|cp| height < *cp) {
+                return Err(bad(format!("forks below the checkpoint at height {cp}")));
+            }
+            let check = check_header(self.params, &e.header, &parent.header, height).map_err(|x| bad(x.to_string()))?;
+            if below.0 != e.header.prev || below.1.is_empty() {
+                below = (e.header.prev, self.headers_below(&pending, e.header.prev)?);
+            }
+            check_context(self.params, &e.header, height, &below.1, now).map_err(|x| bad(x.to_string()))?;
+            match check {
                 PowCheck::AuxPow => {
                     let a = e.auxpow.as_ref().ok_or_else(|| bad("AuxPoW flag without data".into()))?;
                     let chain_id = self.params.auxpow_chain_id.unwrap_or(e.header.chain_id());
@@ -177,19 +207,58 @@ impl<'a> Syncer<'a> {
                 b: 0,
                 height,
                 status: STATUS_HEADER,
-                work: ChainDb::child_work(&parent, e.header.bits),
+                // Unchecked work (NotCheckable, and NeedsBlock even if its block later turns
+                // out to be proof of work) counts the minimum: never more than was checked.
+                work: parent.work.checked_add(self.params.header_work(e.header.bits, check)).unwrap_or(U256::MAX),
                 header: e.header,
                 // Checked above; the proof is kept once, with the block (block_meta).
                 auxpow: Vec::new(),
             };
             pending.insert(hash, rec.clone());
             batch.push((hash, rec));
+            below.0 = hash;
+            below.1.insert(0, e.header);
+            below.1.truncate(MEDIAN_TIME_SPAN);
         }
         let n = batch.len() as u32;
         if n > 0 {
             self.db.put_headers(c, &batch)?;
         }
         Ok(n)
+    }
+
+    /// Up to MEDIAN_TIME_SPAN headers ending at `prev`, newest first, from this batch or the store.
+    fn headers_below(&self, pending: &HashMap<Hash256, HeaderRec>, prev: Hash256) -> Result<Vec<Header>> {
+        let mut v = Vec::with_capacity(MEDIAN_TIME_SPAN);
+        let mut h = prev;
+        while v.len() < MEDIAN_TIME_SPAN {
+            let rec = match pending.get(&h) {
+                Some(r) => r.clone(),
+                None => match self.db.header(self.c(), &h)? {
+                    Some(r) => r,
+                    None => break,
+                },
+            };
+            v.push(rec.header);
+            if rec.height == 0 {
+                break;
+            }
+            h = rec.header.prev;
+        }
+        Ok(v)
+    }
+
+    /// Does any header on `path` (above the block at height `fork`) have a checked proof of work?
+    fn has_checked_work(&self, fork: u32, path: &[Hash256]) -> Result<bool> {
+        let c = self.c();
+        for (i, h) in path.iter().enumerate() {
+            let rec = self.db.header(c, h)?.expect("best chain headers are stored");
+            let parent = self.db.header(c, &rec.header.prev)?.expect("parent stored");
+            if let Ok(PowCheck::Verified | PowCheck::AuxPow) = check_header(self.params, &rec.header, &parent.header, fork + 1 + i as u32) {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Hashes from just above the fork point up to the best header, and the fork height.
@@ -236,6 +305,12 @@ impl<'a> Syncer<'a> {
             let depth = tip.height - fork;
             if depth > crate::db::UNDO_DEPTH {
                 return Err(SyncError::ReorgTooDeep(depth));
+            }
+            if let Some(cp) = self.params.last_checkpoint(tip.height).filter(|cp| fork < *cp) {
+                return Err(SyncError::BelowCheckpoint(cp));
+            }
+            if depth > UNVERIFIED_REORG_DEPTH && !self.has_checked_work(fork, &path)? {
+                return Err(SyncError::UnverifiedReorg(depth));
             }
             for _ in 0..depth {
                 self.db.disconnect_tip(c)?;
@@ -373,4 +448,271 @@ impl<'a> Syncer<'a> {
 fn commit_txs() -> usize {
     static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *N.get_or_init(|| std::env::var("ARCADE_COMMIT_TXS").ok().and_then(|v| v.parse().ok()).filter(|n| *n > 0).unwrap_or(20_000))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcade_chain::encode::write_varint;
+    use arcade_chain::hash::merkle_root;
+    use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN, LITECOIN_MAIN, PEPECOIN_TEST};
+    use arcade_chain::pow::{try_pow_hash, PowRule};
+    use arcade_chain::{Format, Header, Tx};
+
+    const T0: u32 = 1_600_000_000;
+    const EASY: u32 = 0x207fffff;
+    /// Target 1: claims nearly 2^256 work.
+    const TINY: u32 = 0x0300_0001;
+
+    fn coinbase(tag: u32) -> Tx {
+        let mut o = Vec::new();
+        o.extend_from_slice(&1i32.to_le_bytes());
+        write_varint(&mut o, 1);
+        o.extend_from_slice(&[0; 32]);
+        o.extend_from_slice(&u32::MAX.to_le_bytes());
+        write_varint(&mut o, 4);
+        o.extend_from_slice(&tag.to_le_bytes());
+        o.extend_from_slice(&u32::MAX.to_le_bytes());
+        write_varint(&mut o, 1);
+        o.extend_from_slice(&50u64.to_le_bytes());
+        write_varint(&mut o, 1);
+        o.push(0x51);
+        o.extend_from_slice(&0u32.to_le_bytes());
+        Tx::parse(&o).unwrap()
+    }
+
+    /// A one-transaction block, mined when `algo` is one we can check.
+    fn block(prev: Hash256, version: i32, time: u32, bits: u32, tag: u32, algo: Option<PowAlgo>) -> Block {
+        let cb = coinbase(tag);
+        let mut header = Header { version, prev, merkle_root: merkle_root(&[cb.txid]), time, bits, nonce: 0 };
+        if let Some(a) = algo {
+            while try_pow_hash(a, &header.encode()).is_some_and(|h| !meets_target(&h, bits)) {
+                header.nonce += 1;
+            }
+        }
+        let mut raw = header.encode().to_vec();
+        write_varint(&mut raw, 1);
+        raw.extend_from_slice(&cb.raw);
+        Block::parse(&raw).unwrap()
+    }
+
+    /// `n` blocks on top of `parent` (at `height`), one minute apart.
+    fn extend(parent: &Block, height: u32, n: u32, version: i32, bits: u32, tag: u32, algo: Option<PowAlgo>) -> Vec<Block> {
+        let mut v: Vec<Block> = Vec::new();
+        for i in 1..=n {
+            let prev = v.last().unwrap_or(parent);
+            v.push(block(prev.hash(), version, T0 + 60 * (height + i) + tag % 60, bits, tag * 10_000 + i, algo));
+        }
+        v
+    }
+
+    fn genesis() -> Block {
+        block(Hash256::ZERO, 1, T0, EASY, 0, None)
+    }
+
+    /// Test params from `base`: our genesis, plain blocks, an easy powLimit.
+    fn params(base: &ChainParams, g: &Block, tweak: impl FnOnce(&mut ChainParams)) -> &'static ChainParams {
+        let mut p = base.clone();
+        p.genesis = Box::leak(g.hash().to_hex().into_boxed_str());
+        p.genesis_header = "";
+        p.format = Format::BITCOIN;
+        p.pow_limit_bits = EASY;
+        p.checkpoints = &[];
+        tweak(&mut p);
+        Box::leak(Box::new(p))
+    }
+
+    struct Src {
+        headers: Vec<Header>,
+        blocks: HashMap<Hash256, Vec<u8>>,
+    }
+
+    impl Src {
+        fn new(blocks: &[&[Block]]) -> Src {
+            let all: Vec<&Block> = blocks.iter().flat_map(|x| x.iter()).collect();
+            Src { headers: all.iter().map(|b| b.header).collect(), blocks: all.iter().map(|b| (b.hash(), b.encode())).collect() }
+        }
+    }
+
+    impl BlockSource for Src {
+        /// Headers after the first locator hash it has, else all of them.
+        fn get_headers(&mut self, locator: &[Hash256]) -> std::result::Result<Vec<HeaderEntry>, String> {
+            let ids: Vec<Hash256> = self.headers.iter().map(|h| h.hash()).collect();
+            let from = locator.iter().find_map(|l| ids.iter().position(|x| x == l)).map(|i| i + 1).unwrap_or(0);
+            Ok(self.headers[from..].iter().map(|h| HeaderEntry { header: *h, auxpow: None }).collect())
+        }
+        fn get_blocks(&mut self, hashes: &[Hash256]) -> std::result::Result<Vec<Vec<u8>>, String> {
+            hashes.iter().map(|h| self.blocks.get(h).cloned().ok_or_else(|| format!("no block {h}"))).collect()
+        }
+        fn describe(&self) -> String {
+            "test".into()
+        }
+    }
+
+    fn sync(s: &Syncer, src: &mut Src) -> Result<()> {
+        s.ensure_genesis(src)?;
+        while s.sync_headers_once(src)? > 0 {}
+        s.sync_blocks(src, 100_000, 50)?;
+        Ok(())
+    }
+
+    fn open() -> (tempfile::TempDir, ChainDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(dir.path().join("chain.mdbx")).unwrap();
+        (dir, db)
+    }
+
+    /// One made-up header whose work isn't checked (a DigiByte algorithm not implemented here,
+    /// a proof-of-stake block, a PoS candidate before the last PoW height) claims huge work
+    /// with tiny bits: it counts the minimum, so it neither becomes best nor takes the tip.
+    #[test]
+    fn unchecked_header_with_tiny_bits_does_not_become_best() {
+        let g = genesis();
+        let cases: Vec<(&'static ChainParams, i32, Option<PowAlgo>, i32)> = vec![
+            // DigiByte: honest sha256d blocks; the made-up one says groestl.
+            (params(&DIGIBYTE_MAIN, &g, |_| {}), 0x0202, Some(PowAlgo::Sha256d), 0x0402),
+            // Proof of stake from block 1 on: nothing is checked, honest blocks included.
+            (params(&KOTIA_MAIN, &g, |p| p.pow = PowRule::PowThenStake { algo: PowAlgo::Scrypt, last_pow_height: 0 }), 1, None, 1),
+            // Before the last PoW height: a header missing its target waits for its block.
+            (params(&KOTIA_MAIN, &g, |p| p.pow = PowRule::PowThenStake { algo: PowAlgo::Scrypt, last_pow_height: 1000 }), 1, Some(PowAlgo::Scrypt), 1),
+        ];
+        for (p, version, algo, forged_version) in cases {
+            let (_d, db) = open();
+            let s = Syncer::new(&db, p);
+            let honest = extend(&g, 0, 5, version, EASY, 1, algo);
+            sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+            let top = honest.last().unwrap().hash();
+            assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, top);
+
+            let forged = block(g.hash(), forged_version, T0 + 30, TINY, 99, None);
+            let mut bad = Src::new(&[&[forged.clone()]]);
+            assert_eq!(s.sync_headers_once(&mut bad).unwrap(), 1, "{}: stored as a side branch", p.name);
+            assert_eq!(db.best_header(p.chain_no).unwrap(), Some(top), "{}: the made-up header is not best", p.name);
+            s.sync_blocks(&mut bad, 100, 50).unwrap();
+            assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, top, "{}: no reorg", p.name);
+        }
+    }
+
+    /// Between unchecked branches the longest wins (each block counts the same), but not past
+    /// UNVERIFIED_REORG_DEPTH; a branch with checked work may go deeper.
+    #[test]
+    fn unchecked_branches_reorg_only_so_deep() {
+        let g = genesis();
+        let p = params(&KOTIA_MAIN, &g, |p| p.pow = PowRule::PowThenStake { algo: PowAlgo::Scrypt, last_pow_height: 0 });
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let n = UNVERIFIED_REORG_DEPTH + 5;
+        let honest = extend(&g, 0, n, 1, EASY, 1, None);
+        sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+        // Shallow: three blocks replaced by four.
+        let fork = &honest[n as usize - 4];
+        let shallow = extend(fork, n - 3, 4, 1, EASY, 2, None);
+        sync(&s, &mut Src::new(&[&shallow])).unwrap();
+        assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, shallow.last().unwrap().hash());
+        // Deep, from genesis: the headers are kept but the tip stays.
+        let tip = db.tip(p.chain_no).unwrap().unwrap();
+        let deep = extend(&g, 0, n + 10, 1, EASY, 3, None);
+        let r = sync(&s, &mut Src::new(&[&deep]));
+        assert!(matches!(r, Err(SyncError::UnverifiedReorg(d)) if d == tip.height), "{r:?}");
+        assert_eq!(db.tip(p.chain_no).unwrap().unwrap(), tip);
+
+        // DigiByte: an unchecked (groestl) chain gives way to a deeper sha256d branch.
+        let p = params(&DIGIBYTE_MAIN, &g, |_| {});
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let groestl = extend(&g, 0, n, 0x0402, EASY, 1, None);
+        sync(&s, &mut Src::new(&[&[g.clone()], &groestl])).unwrap();
+        let sha = extend(&g, 0, n + 1, 0x0202, EASY, 2, Some(PowAlgo::Sha256d));
+        sync(&s, &mut Src::new(&[&sha])).unwrap();
+        assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, sha.last().unwrap().hash());
+    }
+
+    fn checked_params(g: &Block, tweak: impl FnOnce(&mut ChainParams)) -> &'static ChainParams {
+        params(&LITECOIN_MAIN, g, |p| {
+            p.pow = PowRule::Single(PowAlgo::Sha256d);
+            tweak(p)
+        })
+    }
+
+    #[test]
+    fn checkpoints_hold_in_sync() {
+        let g = genesis();
+        let sha = Some(PowAlgo::Sha256d);
+        let honest = extend(&g, 0, 5, 1, EASY, 1, sha);
+        let cp: &'static str = Box::leak(honest[2].hash().to_hex().into_boxed_str());
+        let p = checked_params(&g, |p| p.checkpoints = Box::leak(vec![(3, cp)].into_boxed_slice()));
+
+        // Another block at the checkpoint's height is refused.
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let other3 = extend(&honest[1], 2, 1, 1, EASY, 2, sha);
+        let r = sync(&s, &mut Src::new(&[&[g.clone()], &honest[..2], &other3]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 3, why }) if why.contains("checkpoint")), "{r:?}");
+
+        // Past the checkpoint, a heavier branch forking below it is refused.
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+        let below = extend(&honest[0], 1, 10, 1, EASY, 3, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&below]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 2, why }) if why.contains("checkpoint")), "{r:?}");
+        // And if such a branch is stored anyway, the tip does not go back below the checkpoint.
+        let mut parent = db.header(p.chain_no, &honest[0].hash()).unwrap().unwrap();
+        let mut recs = Vec::new();
+        for b in &below {
+            let rec = HeaderRec { b: 0, height: parent.height + 1, status: STATUS_HEADER, work: ChainDb::child_work(&parent, b.header.bits), header: b.header, auxpow: vec![] };
+            parent = rec.clone();
+            recs.push((b.hash(), rec));
+        }
+        db.put_headers(p.chain_no, &recs).unwrap();
+        assert_eq!(db.best_header(p.chain_no).unwrap(), Some(below.last().unwrap().hash()));
+        let r = s.sync_blocks(&mut Src::new(&[&below]), 100, 50);
+        assert!(matches!(r, Err(SyncError::BelowCheckpoint(3))), "{r:?}");
+        assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, honest[4].hash());
+    }
+
+    #[test]
+    fn header_times_are_checked_in_sync() {
+        let g = genesis();
+        let sha = Some(PowAlgo::Sha256d);
+        let p = checked_params(&g, |_| {});
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let honest = extend(&g, 0, 12, 1, EASY, 1, sha);
+        sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+        let tip = honest.last().unwrap();
+        // The median of the last 11 (blocks 2..=12) is block 7's time.
+        let old = block(tip.hash(), 1, honest[6].header.time, EASY, 50, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&[old]]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 13, why }) if why.contains("median")), "{r:?}");
+        let ok = block(tip.hash(), 1, honest[6].header.time + 1, EASY, 51, sha);
+        assert_eq!(s.sync_headers_once(&mut Src::new(&[&[ok]])).unwrap(), 1);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let future = block(tip.hash(), 1, now + 3 * 3600, EASY, 52, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&[future]]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 13, why }) if why.contains("ahead")), "{r:?}");
+    }
+
+    /// Pepecoin: bits must be exactly the Digishield next work (the step limit alone let any
+    /// harder or powLimit bits through).
+    #[test]
+    fn pepecoin_bits_are_checked_in_sync() {
+        let g = genesis();
+        let sha = Some(PowAlgo::Sha256d);
+        let p = params(&PEPECOIN_TEST, &g, |p| p.pow = PowRule::Single(PowAlgo::Sha256d));
+        assert_eq!(p.digishield_from, Some(2));
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        // One-minute blocks at powLimit: Digishield keeps powLimit.
+        let honest = extend(&g, 0, 5, 1, EASY, 1, sha);
+        sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+        let tip = honest.last().unwrap();
+        let want = arcade_chain::pepecoin::next_bits(p, 5, tip.header.bits, tip.header.time, Some(honest[3].header.time), tip.header.time + 60);
+        assert_eq!(want, EASY);
+        let harder = block(tip.hash(), 1, tip.header.time + 60, 0x2000ffff, 50, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&[harder]]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 6, why }) if why.contains("difficulty")), "{r:?}");
+        let right = block(tip.hash(), 1, tip.header.time + 60, want, 51, sha);
+        assert_eq!(s.sync_headers_once(&mut Src::new(&[&[right]])).unwrap(), 1);
+    }
 }

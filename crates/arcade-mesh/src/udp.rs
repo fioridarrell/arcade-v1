@@ -754,12 +754,17 @@ impl Stream {
         Stream { hub, cell, buf: Vec::new(), timeout: Duration::from_secs(45) }
     }
 
-    fn whole(&self) -> Option<usize> {
+    /// The length of the next whole frame in the buffer. A length over MAX_INBOUND is refused
+    /// as soon as its prefix is here, before the rest is taken in (as TCP and WSS do).
+    fn whole(&self) -> io::Result<Option<usize>> {
         if self.buf.len() < 4 {
-            return None;
+            return Ok(None);
         }
         let n = u32::from_be_bytes(self.buf[..4].try_into().unwrap()) as usize;
-        (self.buf.len() >= 4 + n).then_some(n)
+        if n > crate::transport::MAX_INBOUND {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
+        }
+        Ok((self.buf.len() >= 4 + n).then_some(n))
     }
 
     fn fill(&mut self, d: Duration) -> io::Result<bool> {
@@ -799,10 +804,7 @@ impl crate::transport::Transport for Stream {
     fn recv(&mut self) -> io::Result<Vec<u8>> {
         let end = Instant::now() + self.timeout;
         loop {
-            if let Some(n) = self.whole() {
-                if n > crate::transport::MAX_INBOUND {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "frame too large"));
-                }
+            if let Some(n) = self.whole()? {
                 let body = self.buf[4..4 + n].to_vec();
                 self.buf.drain(..4 + n);
                 return Ok(body);
@@ -1056,5 +1058,20 @@ mod tests {
         let mut c = Path::new(&[1; 32], &[2; 32], vec![ba], t0);
         c.tick(t0 + Duration::from_secs(11));
         assert_eq!(c.down.as_deref(), Some("no answer"));
+    }
+
+    #[test]
+    fn stream_refuses_a_long_length_before_the_body() {
+        use crate::transport::Transport;
+        let hub = Hub::start(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+        let cell = hub.add(Path::new(&[1; 32], &[2; 32], vec![], Instant::now()));
+        let mut s = Stream::new(hub.clone(), cell.clone());
+        s.set_read_timeout(Duration::from_millis(200)).unwrap();
+        // Only the prefix of a frame larger than MAX_INBOUND has come: refused at once.
+        let n = (crate::transport::MAX_INBOUND + 1) as u32;
+        cell.p.lock().unwrap().frames.push_back(n.to_be_bytes().to_vec());
+        let e = s.recv().unwrap_err();
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData);
+        hub.remove(&cell);
     }
 }

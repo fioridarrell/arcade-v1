@@ -22,6 +22,13 @@ pub enum BuildError {
     InsufficientFunds { have: u64, need: u64 },
     #[error("payload too large for one OP_RETURN ({0} bytes)")]
     PayloadTooLarge(usize),
+    #[error("the amounts add up to more than any amount can be")]
+    TooMuch,
+}
+
+/// `a + b`, refused when it doesn't fit (a wrapped sum would pay what nobody asked).
+fn add(a: u64, b: u64) -> Result<u64, BuildError> {
+    a.checked_add(b).ok_or(BuildError::TooMuch)
 }
 
 #[derive(Debug, Clone)]
@@ -324,20 +331,21 @@ pub fn build_send_keyhash(
     let mut have = 0u64;
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= amount + fee_for(&chosen) {
+        have = add(have, u.value).map_err(|e| e.to_string())?;
+        if add(amount, fee_for(&chosen)).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(&chosen);
-    if chosen.is_empty() || have < amount + fee {
-        return Err(BuildError::InsufficientFunds { have, need: amount + fee }.to_string());
+    let need = add(amount, fee).map_err(|e| e.to_string())?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need }.to_string());
     }
     if amount < dust {
         return Err(format!("{amount} is below the network's dust limit ({dust})"));
     }
     let mut outs = vec![TxOutSpec { value: amount, script: to_script.to_vec() }];
-    let change = have - amount - fee;
+    let change = have - need;
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script.to_vec() });
     }
@@ -382,14 +390,15 @@ pub fn build_claim(
     let fee_for = |n_in: usize| (estimate_size(n_in, &[ret.len(), 25]) as u64 * fee_per_kb).div_ceil(1000);
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= fee_for(chosen.len()) + dust {
+        have = add(have, u.value)?;
+        if add(fee_for(chosen.len()), dust).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(chosen.len().max(1));
-    if chosen.is_empty() || have < fee + dust {
-        return Err(BuildError::InsufficientFunds { have, need: fee + dust });
+    let need = add(fee, dust)?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need });
     }
     let outs = vec![
         TxOutSpec { value: 0, script: ret },
@@ -470,7 +479,7 @@ pub fn build_arcade(
         }
     }
     outs.extend(extra);
-    let spend: u64 = outs.iter().map(|o| o.value).sum();
+    let spend = outs.iter().try_fold(0u64, |t, o| add(t, o.value))?;
     let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let lens: Vec<usize> = outs.iter().map(|o| o.script.len()).chain(std::iter::once(25)).collect();
@@ -479,16 +488,17 @@ pub fn build_arcade(
     let mut have = 0u64;
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= spend + fee_for(chosen.len()) + dust {
+        have = add(have, u.value)?;
+        if add(spend, fee_for(chosen.len())).and_then(|n| add(n, dust)).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(chosen.len().max(1));
-    if chosen.is_empty() || have < spend + fee {
-        return Err(BuildError::InsufficientFunds { have, need: spend + fee });
+    let need = add(spend, fee)?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need });
     }
-    let change = have - spend - fee;
+    let change = have - need;
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script });
     }
@@ -556,17 +566,18 @@ pub fn build_send(
     let mut have = 0u64;
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= amount + fee_for(chosen.len()) {
+        have = add(have, u.value)?;
+        if add(amount, fee_for(chosen.len())).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(chosen.len().max(1));
-    if chosen.is_empty() || have < amount + fee {
-        return Err(BuildError::InsufficientFunds { have, need: amount + fee });
+    let need = add(amount, fee)?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need });
     }
     let mut outs = vec![TxOutSpec { value: amount, script: to_script.to_vec() }];
-    let change = have - amount - fee;
+    let change = have - need;
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script });
     }
@@ -729,6 +740,25 @@ mod tests {
         assert_eq!(tx.outputs[0].script_pubkey, to);
         assert_eq!(tx.outputs[1].script_pubkey, me);
         assert!(build_send(p, &to, 600_000_000, &k, &coins, 1_000_000, 1_000_000, 0).is_err());
+    }
+
+    #[test]
+    fn amounts_that_overflow_are_refused() {
+        let p = &PEPECOIN_TEST;
+        let k = key();
+        let pk = PublicKey::from_secret_key(SECP256K1, &k);
+        let me = crate::keys::p2pkh_script_for(&pk);
+        let to = arcade_ledger::address::p2pkh_script(&[3; 20]);
+        let coins = vec![Utxo { outpoint: OutPoint { txid: Hash256([5; 32]), vout: 0 }, value: 500_000_000, script: me.clone() }];
+        // An amount that wraps to a few coins once the fee is added: refused, never a small payment.
+        assert_eq!(build_send(p, &to, u64::MAX - 10, &k, &coins, 1_000_000, 1_000_000, 0).unwrap_err(), BuildError::TooMuch);
+        let wpkh = arcade_ledger::address::p2wpkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
+        let dgb = &arcade_chain::params::DIGIBYTE_MAIN;
+        let wcoins = vec![Utxo { outpoint: OutPoint { txid: Hash256([6; 32]), vout: 0 }, value: 500_000_000, script: wpkh.clone() }];
+        assert!(build_send_keyhash(dgb, &to, u64::MAX - 10, &k, &wcoins, &wpkh, 1_000_000, 5_460, 0).unwrap_err().contains("more than any amount"));
+        // Coins whose values add past u64: refused.
+        let two = vec![coins[0].clone(), Utxo { outpoint: OutPoint { txid: Hash256([7; 32]), vout: 0 }, value: u64::MAX, script: me }];
+        assert_eq!(build_send(p, &to, u64::MAX - 1, &k, &two, 1_000_000, 1_000_000, 0).unwrap_err(), BuildError::TooMuch);
     }
 
     #[test]

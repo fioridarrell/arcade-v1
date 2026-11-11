@@ -103,12 +103,34 @@ pub fn allow(node: &Node, key: Option<&str>, req: &Value) -> Result<(), (u16, St
         }
         let spent = rec["spent"]["sats"].as_u64().unwrap_or(0);
         let limit = rec["tip_limit"].as_u64().unwrap_or(0);
-        if spent + amount > limit {
+        let after = spent.checked_add(amount).filter(|t| *t <= limit);
+        let Some(after) = after else {
             return Err((403, format!("this key's tip limit is {limit} satoshis a day; {spent} used today")));
-        }
-        rec["spent"]["sats"] = json!(spent + amount);
+        };
+        rec["spent"]["sats"] = json!(after);
     }
     rec["last_used"] = json!(arcade_app::now());
     let _ = node.app.store.write(|w| w.put(arcade_app::META, &key_of(id), rec.to_string().as_bytes()));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_tip_that_would_wrap_the_days_total_is_refused() {
+        let (_one, t) = crate::http::tests::node();
+        let k = create(&t.node, "site", &["tip".into()], 1000).unwrap();
+        let key = k["key"].as_str().unwrap();
+        let tip = |amount: u64| allow(&t.node, Some(key), &json!({"cmd": "feed.act", "kind": "tip", "amount": amount}));
+        assert!(tip(600).is_ok());
+        // 600 + this wraps to 499 in a 64-bit sum: under the limit if it wrapped.
+        assert_eq!(tip(u64::MAX - 100).unwrap_err().0, 403);
+        assert_eq!(tip(401).unwrap_err().0, 403, "the day's total is still 600");
+        assert!(tip(400).is_ok());
+        assert!(known(&t.node, key));
+        assert!(!known(&t.node, &format!("{key}x")));
+        assert!(!known(&t.node, "ak_nope_nope"));
+    }
 }

@@ -30,7 +30,7 @@ const TICKERS = { peptest: "PEPtest", pep: "PEP", doge: "DOGE", dgb: "DGB", dgbt
 // A chain's colour, behind its letter when it has no icon.
 const COLORS = { peptest: "#2e8b44", pep: "#3f9c55", doge: "#c2a633", dgb: "#0066cc", dgbtest: "#3388dd", kot: "#7a4cc2", flop: "#d0602a", ltc: "#345d9d", ltctest: "#5b7fb8", btc: "#f7931a", shic: "#e0812b", bel: "#c9a227", lky: "#2f9e5b", jkc: "#8a6d3b", arc: "#b0228c", arctest: "#c25aa6" };
 // The original Dogecoin Arcade's coin icons (coins/<key>.png); others get a letter.
-const COIN_ICONS = ["peptest", "pep", "doge", "dgb", "dgbtest", "kot", "flop", "ltc", "ltctest", "btc", "wjk", "arc", "arctest"];
+const COIN_ICONS = ["peptest", "pep", "doge", "dgb", "dgbtest", "kot", "flop", "ltc", "ltctest", "btc", "wjk", "arc", "arctest", "bel", "lky", "shic", "jkc"];
 const ICON_FILE = (k) => `coins/${k}.${k === "btc" ? "svg" : "png"}`;
 // A chain's coin as an element (`tag`.`cls`): its icon, or its first letter on its colour.
 function coinLogo(key, name, tag, cls) {

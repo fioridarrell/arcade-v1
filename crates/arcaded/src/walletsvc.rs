@@ -630,12 +630,22 @@ fn page_card(node: &Node, page: &str) -> Value {
     json!({"page": page, "app": card, "creator": i["creator"], "creator_tag": i["creator"].as_str().and_then(|a| tag_of(node, a))})
 }
 
+/// Approvals one at a time: a request is looked at, sent and saved before the next approval
+/// looks, so a request approved twice at once (two windows, a double click) is sent once.
+static APPROVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 pub fn approve(node: &Node, id: &str) -> Result<Value, String> {
+    approve_with(node, id, |r| build(node, r, true))
+}
+
+/// Approve with `send` building and broadcasting the transaction: (txid, fee, outputs).
+fn approve_with(node: &Node, id: &str, send: impl FnOnce(&Value) -> Result<(String, u64, Vec<Value>), String>) -> Result<Value, String> {
+    let _one = APPROVING.lock().unwrap_or_else(|e| e.into_inner());
     let mut r = get_req(node, id).ok_or("no such request")?;
     if r["status"] != "pending" {
         return Err(format!("that request is {}", r["status"].as_str().unwrap_or("closed")));
     }
-    match build(node, &r, true) {
+    match send(&r) {
         Ok((txid, fee, _)) => {
             r["status"] = json!("sent");
             r["txid"] = json!(txid);
@@ -817,6 +827,30 @@ pub fn pending_moves(node: &Node, address: &str) -> (Vec<Value>, Vec<Value>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_approved_twice_at_once_is_sent_once() {
+        let (_one, t) = crate::http::tests::node();
+        let r = json!({"id": "r1", "page": "a".repeat(64), "kind": "coins", "to": "x", "units": 1000, "what": "1000",
+                       "status": "pending", "created": arcade_app::now(), "txid": Value::Null, "error": Value::Null});
+        put_req(&t.node, &r);
+        let sent = std::sync::atomic::AtomicUsize::new(0);
+        let answers: Vec<Result<Value, String>> = std::thread::scope(|sc| {
+            let go = || {
+                approve_with(&t.node, "r1", |_| {
+                    sent.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(200));
+                    Ok(("ab".repeat(32), 100, vec![]))
+                })
+            };
+            let (a, b) = (sc.spawn(go), sc.spawn(go));
+            vec![a.join().unwrap(), b.join().unwrap()]
+        });
+        assert_eq!(sent.load(std::sync::atomic::Ordering::SeqCst), 1, "built and broadcast once");
+        assert_eq!(answers.iter().filter(|a| a.is_ok()).count(), 1);
+        assert!(answers.iter().any(|a| a.as_ref().is_err_and(|e| e.contains("sent"))), "the other is told it was sent: {answers:?}");
+        assert_eq!(get_req(&t.node, "r1").unwrap()["status"], "sent");
+    }
 
     #[test]
     fn one_page_cannot_fill_the_queue() {

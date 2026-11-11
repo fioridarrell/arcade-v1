@@ -457,6 +457,12 @@
       a.tokens && a.tokens.length ? h("div", {}, h("h2", { class: "x-h2" }, "Tokens"), table([["Tick"], ["Balance", 1], ["Transferable", 1]],
         a.tokens.map((t) => ({ go: () => go("token", t.tick), cells: [[h("b", {}, t.tick)], [units(t.overall, t.dec), 1], [units(t.transferable, t.dec), 1]] })))) : "",
       a.inscriptions && a.inscriptions.length ? h("div", {}, h("h2", { class: "x-h2" }, "Inscriptions"), insGrid(a.inscriptions)) : "",
+      // The arcade ledger: arcade tokens and arcade inscriptions this address holds.
+      a.ledger_tokens && a.ledger_tokens.length ? h("div", {}, h("h2", { class: "x-h2" }, "Arcade tokens"), table([["Token"], ["Id", 1], ["Balance", 1]],
+        a.ledger_tokens.map((t) => ({ go: () => go("ltoken", String(t.propertyid)), cells: [[h("b", {}, t.name || `#${t.propertyid}`)], [fmt(t.propertyid), 1], [t.balance, 1]] })))) : "",
+      a.ledger_inscriptions && a.ledger_inscriptions.length ? h("div", {}, h("h2", { class: "x-h2" }, `Arcade inscriptions (${fmt(a.ledger_inscription_count)})`),
+        table([["Number"], ["Type"], ["Txid"]], a.ledger_inscriptions.map((i) => ({ go: () => go("linsc", i.txid),
+          cells: [[`#${fmt(i.number)}`], [(i.content_type || "").split(";")[0]], [h("span", { class: "mono" }, short(i.txid || "", 16, 8))]] })))) : "",
       a.history ? h("h2", { class: "x-h2" }, "History") : "",
       !a.history ? "" : a.history.length ? table([["Block"], ["Txid"], ["Received", 1], ["Sent", 1]], a.history.map((r) => ({ go: r.txid ? () => go("tx", r.txid) : null,
         cells: [[fmt(r.height)], [h("span", { class: "mono" }, short(r.txid || "", 16, 8))], [r.received ? coins(r.received) : "", 1], [r.sent ? coins(r.sent) : "", 1]] })))

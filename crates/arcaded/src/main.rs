@@ -227,7 +227,15 @@ fn main() {
     let extra_peers: Vec<String> =
         args.iter().enumerate().filter(|(_, a)| *a == "--mesh-peer").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
     let no_seeds = args.iter().any(|a| a == "--no-seeds");
+    let fresh = !home.exists();
     std::fs::create_dir_all(&home).expect("create home");
+    // A home made here holds the wallet and its key file: this user only. One made by the package (StateDirectory,
+    // shared with the arcade group) keeps its mode.
+    #[cfg(unix)]
+    if fresh {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    }
     // One arcaded per home: a second one would fight over the databases and the socket.
     let _lock = match lock_home(&home) {
         Ok(f) => f,

@@ -766,6 +766,13 @@ mod tests {
 mod clash_tests {
     use super::*;
     #[test]
+    fn a_holder_still_syncing_is_asked_only_when_nobody_is_caught_up() {
+        let v = vec![("a".to_string(), 1_565_654), ("b".to_string(), 1_565_000), ("c".to_string(), 134_000)];
+        assert_eq!(caught_up(v).iter().map(|x| x.0.as_str()).collect::<Vec<_>>(), ["a", "b"]);
+        let alone = vec![("c".to_string(), 134_000)];
+        assert_eq!(caught_up(alone).len(), 1);
+    }
+    #[test]
     fn simultaneous_joiners_spread_out() {
         // Three arcades that all picked lane A at 0 at once: lower ids keep, the others re-join in turn.
         let mut v: Vec<Place> = (0..3).map(|i| (format!("{i:064x}"), 0, 0.0)).collect();
@@ -804,7 +811,18 @@ pub fn index_holders(node: &Node, net: &str, ix: &str) -> Vec<(String, u64)> {
         })
         .collect();
     v.sort_by(|a, b| b.1.cmp(&a.1));
-    v
+    caught_up(v)
+}
+
+/// How far behind the highest holder an arcade may be and still answer for a chain.
+pub const HOLDER_LAG: u64 = 2_000;
+
+/// Holders still syncing (far behind the highest) answer from a part of the chain: an address's
+/// tokens or inscriptions from them would be wrong. They are asked only when nobody is caught up.
+fn caught_up(v: Vec<(String, u64)>) -> Vec<(String, u64)> {
+    let best = v.iter().map(|x| x.1).max().unwrap_or(0);
+    let near: Vec<(String, u64)> = v.iter().filter(|x| x.1 + HOLDER_LAG >= best).cloned().collect();
+    if near.is_empty() { v } else { near }
 }
 
 /// Ask an Explorer question of the arcades holding what it needs, until one answers:

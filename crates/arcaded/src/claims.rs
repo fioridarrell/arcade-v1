@@ -50,8 +50,7 @@ pub(crate) fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
         return out;
     }
     let mut out = confirmed_coins(node, script);
-    // Waiting coins aren't in the ord index yet: small ones are left alone (coinsend::ord_hold).
-    out.extend(unconfirmed_coins(node, script).into_iter().filter(|u| matches!(crate::coinsend::ord_hold(node, node.params, &u.outpoint, u.value, None), Ok(None))));
+    out.extend(unconfirmed_coins(node, script));
     out
 }
 
@@ -89,7 +88,7 @@ fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     let c = p.chain_no;
     let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
     let mut out = Vec::new();
-    for (op, value, h) in node.chain.coins_for_script(p, script).unwrap_or_default() {
+    for (op, value, _h) in node.chain.coins_for_script(p, script).unwrap_or_default() {
         {
             if node.pending_spent.lock().unwrap().contains(&op) {
                 continue; // already spent by one of our unconfirmed transactions
@@ -101,9 +100,6 @@ fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
             if let Ok(Some(coin)) = node.chain.coin(p, &op) {
                 if coin.coinbase && coin.height + p.coinbase_maturity > tip {
                     continue; // immature
-                }
-                if !matches!(crate::coinsend::ord_hold(node, p, &op, value, Some(h)), Ok(None)) {
-                    continue; // an inscription's coin, or maybe one (coinsend::ord_hold)
                 }
                 out.push(Utxo { outpoint: op, value, script: script.to_vec() });
             }

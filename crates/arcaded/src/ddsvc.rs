@@ -192,7 +192,7 @@ pub fn send(node: &Node, chain: Option<&str>, to: &str, cents: i64, broadcast: b
             }
         }
     } else {
-        out["broadcast"] = crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&b.tx.raw), "chain": p.key}))?;
+        out["broadcast"] = crate::sitesvc::broadcast_own(node, &json!({"hex": hex::encode(&b.tx.raw), "chain": p.key}))?;
     }
     // Spent DigiDollar coins leave the cache with the send.
     for i in &b.tx.inputs {

@@ -283,7 +283,7 @@ fn finish(node: &Node, p: &'static ChainParams, q: &Value) -> Result<Value, Stri
     if f.cents > left || o["status"] != "open" {
         return Err("that order changed while the fill was signed".into());
     }
-    crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key}))?;
+    crate::sitesvc::broadcast_own(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key}))?;
     let txid = tx.txid.to_hex();
     o["left"] = json!(left - f.cents);
     if left - f.cents == 0 {

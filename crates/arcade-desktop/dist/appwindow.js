@@ -15,6 +15,12 @@
     return;
   }
   const here = frame.split("/").pop();
+  // The chain the app is inscribed on (its frame's address). Its reads answer on that chain; this
+  // arcade's wallet writes on its home chain only, so the doors that write say so for another.
+  const appChain = frame.split("/")[4];
+  let homeChain = null;
+  const homeReady = api("chains.list").then((l) => { const h = (l.chains || l || []).find((c) => c.home); homeChain = h ? h.key : null; }).catch(() => {});
+  const WRITES = { inscribe: () => true, swap: (m) => m.op !== "items", seed: () => true, claim: () => true, owner: (m) => m.op === "send" };
   let appState = { state: "open", timeout: null, closesAt: null, inShell: false };
 
   const perms = async () => (id ? await api("apps.perms", { id }) : {});
@@ -570,7 +576,10 @@
     if (m.arcade === "inscribe" || m.arcade === "claim") el.contentWindow.postMessage({ arcade: m.arcade, seq: m.seq, heard: true }, "*");
     const door = doors[m.arcade];
     let body;
+    if (WRITES[m.arcade] && WRITES[m.arcade](m)) await homeReady;
     if (!door) body = { ok: false, error: `${m.arcade} is coming to Arcade V1.0` };
+    else if (WRITES[m.arcade] && WRITES[m.arcade](m) && homeChain && appChain !== homeChain)
+      body = { ok: false, error: `this app is on ${appChain}: this arcade's wallet writes on ${homeChain} only` };
     else {
       try { body = { ok: true, ...(await door(m)) }; }
       catch (err) { body = { ok: false, error: String(err && err.message || err) }; }

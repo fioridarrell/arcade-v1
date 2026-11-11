@@ -58,24 +58,62 @@ fn app_id(chain: &str, creator: &str, key: &str) -> String {
     format!("{chain}:{creator}:{key}")
 }
 
-/// Every app on every ledger chain, grouped and resolved.
+/// The inscription rows of chain `p` that may be app cards (HTML whose record names a game or
+/// an app), from this arcade's ledger.
+pub fn card_rows(node: &Node, p: &ChainParams) -> Vec<Value> {
+    let c = p.chain_no;
+    let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &KeyBuf::new().u16(c).done())).unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice::<Value>(&v).ok())
+        .filter(|v| v["content_type"].as_str().unwrap_or("").to_ascii_lowercase().starts_with("text/html"))
+        .filter(|v| v["json"].as_str().is_some_and(|j| j.contains("\"game\"") || j.contains("\"app\"")))
+        .map(|v| json!({"txid": v["txid"], "number": v["number"], "creator": v["creator"], "json": v["json"], "block_height": v["block_height"], "position": v["position"]}))
+        .collect()
+}
+
+/// Card rows of chains this arcade only borrows, from an arcade on the mesh that keeps their
+/// ledger: kept here, asked again in the background every 10 minutes (the store never waits).
+static BORROWED_CARDS: std::sync::Mutex<BTreeMap<String, (std::time::Instant, Vec<Value>)>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn borrowed_card_rows(node: &Node, kept: &[&'static ChainParams]) -> Vec<(&'static ChainParams, Vec<Value>)> {
+    let mut out = Vec::new();
+    for p in arcade_chain::params::ALL_CHAINS.iter().copied() {
+        if kept.iter().any(|k| k.chain_no == p.chain_no) || !crate::borrow::is_borrowed(p.key) {
+            continue;
+        }
+        let (stale, rows) = match BORROWED_CARDS.lock().unwrap().get(p.key) {
+            Some((at, rows)) => (at.elapsed().as_secs() > 600, rows.clone()),
+            None => (true, Vec::new()),
+        };
+        if stale {
+            // Marked fresh now, so one ask at a time; the answer replaces it when it comes.
+            BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows.clone()));
+            let n = node.self_arc();
+            std::thread::spawn(move || {
+                if let Ok(v) = crate::explorer::handle(&n, "explorer.app_cards", &json!({"chain": p.key})) {
+                    let got = v["rows"].as_array().cloned().unwrap_or_default();
+                    BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), got));
+                }
+            });
+        }
+        out.push((p, rows));
+    }
+    out
+}
+
+/// Every app on every ledger chain (this arcade's, and the chains it borrows), grouped and resolved.
 fn gather(node: &Node) -> Vec<App> {
     let mut apps = Vec::new();
     let home = node.params.chain_no;
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, home).unwrap_or_default();
-    for p in ledger_chains(node) {
+    let kept = ledger_chains(node);
+    let mut chains: Vec<(&'static ChainParams, Vec<Value>)> = kept.iter().map(|p| (*p, card_rows(node, p))).collect();
+    chains.extend(borrowed_card_rows(node, &kept));
+    for (p, rows) in chains {
         let c = p.chain_no;
-        let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &KeyBuf::new().u16(c).done())).unwrap_or_default();
         let mut by: BTreeMap<(String, String), Vec<Ver>> = BTreeMap::new();
-        for (_, v) in rows {
-            let Ok(v) = serde_json::from_slice::<Value>(&v) else { continue };
-            if !v["content_type"].as_str().unwrap_or("").to_ascii_lowercase().starts_with("text/html") {
-                continue;
-            }
+        for v in rows {
             let j = v["json"].as_str().unwrap_or("");
-            if !(j.contains("\"game\"") || j.contains("\"app\"")) {
-                continue;
-            }
             let Some(card) = cards::parse(j) else { continue };
             let creator = v["creator"].as_str().unwrap_or("").to_string();
             by.entry((creator.clone(), card.key())).or_default().push(Ver {

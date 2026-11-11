@@ -104,7 +104,7 @@ static SCAN: Mutex<Option<Scan>> = Mutex::new(None);
 /// Read inscriptions numbered from where the last look stopped; keep the ones carrying a good
 /// attestation. Each inscription is checked once (inscriptions do not change).
 fn catch_up(node: &Node) -> Vec<Found> {
-    let c = node.params.chain_no;
+    let c = crate::pagechain::params(node).chain_no;
     let mut g = SCAN.lock().unwrap();
     let scan = g.get_or_insert_with(Scan::default);
     if scan.chain != c {
@@ -153,7 +153,7 @@ fn catch_up(node: &Node) -> Vec<Found> {
 
 /// The judge an id names: an inscription that is JavaScript.
 fn judge_row(node: &Node, key: &str) -> Result<Value, String> {
-    let row = arcade_ledger::content::inscription(&node.chain, node.params.chain_no, key.trim_start_matches('#')).ok_or("there is no such judge")?;
+    let row = arcade_ledger::content::inscription(&node.chain, crate::pagechain::params(node).chain_no, key.trim_start_matches('#')).ok_or("there is no such judge")?;
     if !row["content_type"].as_str().unwrap_or("").contains("javascript") {
         return Err(format!("#{} is not JavaScript, so it cannot judge", row["number"]));
     }
@@ -180,7 +180,7 @@ pub fn verified(node: &Node, judge: &str, referee: Option<&str>, after: i64, lim
         .map(|f| {
             let mut r = f.row;
             let a = r["creator"].as_str().unwrap_or("").to_string();
-            let tag = tags.entry(a.clone()).or_insert_with(|| json!(arcade_ledger::index::tag_of(&node.chain, node.params.chain_no, &a).ok().flatten())).clone();
+            let tag = tags.entry(a.clone()).or_insert_with(|| json!(arcade_ledger::index::tag_of(&node.chain, crate::pagechain::params(node).chain_no, &a).ok().flatten())).clone();
             r["creatortag"] = tag;
             r
         })

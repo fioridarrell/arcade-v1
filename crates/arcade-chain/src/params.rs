@@ -305,6 +305,7 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
     checkpoints: &[
         (0, "f9f4ea4ae7f6ea4c55040ede2019ba0a53e262f46ec9bce3dcda2cb11f96fc52"),
         (42001, "1b111a1eb8cb3e35d0aa6b89a06245574a78ce65996e5f2932f0df17027a5cd1"),
+        (1_500_000, "283de0ba36bdb5ff9902a8a11119097f8546104f63efc9dade795e95cb4c242b"),
     ],
     coinbase_maturity: 240,
     index_start: 1_496_133,
@@ -326,7 +327,7 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     min_difficulty_blocks: false,
     // Same rule as the testnet, but not yet compared with the mainnet's headers: Some(2)
     // once examples/rpcheaders has walked the whole chain clean.
-    digishield_from: None,
+    digishield_from: Some(2),
     auxpow_chain_id: Some(0x3f),
     auxpow_strict_chain_id: false,
     bech32_hrp: None,
@@ -351,7 +352,10 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
         "64.227.69.247:33874",
         "3.73.126.174:33874",
     ],
-    checkpoints: &[],
+    checkpoints: &[
+        (1_208_000, "77348329cbd64c5c62f663a644177d4740e9a2e8d38de923319d6e2beb39d54f"),
+        (1_280_000, "5de45799be38cb26f73876f645f7c4db1f062b897b55186885e0a2a83d15b7df"),
+    ],
     coinbase_maturity: 240,
     index_start: 1_208_000,
 };
@@ -387,7 +391,10 @@ pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
         "seed.tuyul.cc",
     ],
     fixed_peers: &[],
-    checkpoints: &[],
+    checkpoints: &[
+        (24_450_000, "6354bf0c6d0b308c00b20b9e70e3555041439f94288fe05b7277b30cd4c59b2a"),
+        (24_530_000, "00000000000000069e962e840f14abf41a4fbaaeebd01d9b7815c01635b33409"),
+    ],
     coinbase_maturity: 100,
     index_start: 24_450_000,
 };
@@ -519,7 +526,9 @@ pub static LITECOIN_MAIN: ChainParams = ChainParams {
     protocol_version: 70017,
     dns_seeds: &["seed-a.litecoin.loshan.co.uk", "dnsseed.thrasher.io", "dnsseed.ltcpool.org", "dnsseed.koin-project.com"],
     fixed_peers: &[],
-    checkpoints: &[],
+    checkpoints: &[
+        (3_000_000, "ed232cbb31d5b922042e309b15a53168e437ff66467322435080f51d6fdd45fd"),
+    ],
     coinbase_maturity: 100,
     index_start: 3_197_300,
 };
@@ -549,7 +558,9 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
     protocol_version: 70017,
     dns_seeds: &["seed-b.litecoin.loshan.co.uk", "dnsseed-testnet.thrasher.io"],
     fixed_peers: &[],
-    checkpoints: &[],
+    checkpoints: &[
+        (3_200_000, "86169ba8283d09ffde76c21880fe7e22ea294411016f22ca2593295712176fad"),
+    ],
     coinbase_maturity: 100,
     index_start: 4_926_300,
 };
@@ -588,7 +599,9 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
         "74.139.78.63:22556", "217.115.120.70:22556", "144.76.234.216:22556", "80.211.154.104:22556",
         "13.228.138.193:22556", "135.181.56.49:22556", "47.241.177.51:22556",
     ],
-    checkpoints: &[],
+    checkpoints: &[
+        (6_400_000, "d9248a55b06dfa46841ae7fdff2d918c5c1d1434eaa60ba9cca27455903dd393"),
+    ],
     coinbase_maturity: 240,
     index_start: 6_415_000,
 };

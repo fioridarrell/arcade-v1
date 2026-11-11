@@ -455,7 +455,7 @@ mod tests {
     use super::*;
     use arcade_chain::encode::write_varint;
     use arcade_chain::hash::merkle_root;
-    use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN, LITECOIN_MAIN};
+    use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN, LITECOIN_MAIN, PEPECOIN_TEST};
     use arcade_chain::pow::{try_pow_hash, PowRule};
     use arcade_chain::{Format, Header, Tx};
 
@@ -691,5 +691,28 @@ mod tests {
         let future = block(tip.hash(), 1, now + 3 * 3600, EASY, 52, sha);
         let r = s.sync_headers_once(&mut Src::new(&[&[future]]));
         assert!(matches!(&r, Err(SyncError::BadHeader { height: 13, why }) if why.contains("ahead")), "{r:?}");
+    }
+
+    /// Pepecoin: bits must be exactly the Digishield next work (the step limit alone let any
+    /// harder or powLimit bits through).
+    #[test]
+    fn pepecoin_bits_are_checked_in_sync() {
+        let g = genesis();
+        let sha = Some(PowAlgo::Sha256d);
+        let p = params(&PEPECOIN_TEST, &g, |p| p.pow = PowRule::Single(PowAlgo::Sha256d));
+        assert_eq!(p.digishield_from, Some(2));
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        // One-minute blocks at powLimit: Digishield keeps powLimit.
+        let honest = extend(&g, 0, 5, 1, EASY, 1, sha);
+        sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+        let tip = honest.last().unwrap();
+        let want = arcade_chain::pepecoin::next_bits(p, 5, tip.header.bits, tip.header.time, Some(honest[3].header.time), tip.header.time + 60);
+        assert_eq!(want, EASY);
+        let harder = block(tip.hash(), 1, tip.header.time + 60, 0x2000ffff, 50, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&[harder]]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 6, why }) if why.contains("difficulty")), "{r:?}");
+        let right = block(tip.hash(), 1, tip.header.time + 60, want, 51, sha);
+        assert_eq!(s.sync_headers_once(&mut Src::new(&[&[right]])).unwrap(), 1);
     }
 }

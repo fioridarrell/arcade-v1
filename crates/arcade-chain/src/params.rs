@@ -39,6 +39,11 @@ pub struct ChainParams {
     pub pow_limit_bits: u32,
     /// A block at or below powLimit difficulty is always accepted (testnet rule).
     pub min_difficulty_blocks: bool,
+    /// From this height a header's bits must be exactly the Digishield next work
+    /// ([`crate::pepecoin::next_bits`], testnet min-difficulty rule included). None = only the
+    /// MAX_EASIER step is checked. Set only where the rule was compared with every real header
+    /// (arcade-chaindb examples/checkbits, or arcade-chain examples/rpcheaders against a node).
+    pub digishield_from: Option<u32>,
     /// AuxPoW chain id to check in merge-mined headers; None = not checked.
     pub auxpow_chain_id: Option<u32>,
     pub auxpow_strict_chain_id: bool,
@@ -139,6 +144,8 @@ pub enum HeaderError {
     TimeTooOld,
     #[error("time is more than two hours ahead of our clock")]
     TimeTooNew,
+    #[error("bits are not the chain's next difficulty")]
+    BadDifficulty,
 }
 
 pub fn too_easy(params: &ChainParams, bits: u32, parent_bits: u32) -> bool {
@@ -235,9 +242,10 @@ pub fn check_block_work(params: &ChainParams, b: &crate::block::Block, height: u
 
 /// The rules that look past the parent, or at the clock: the header's time must be after the
 /// median of the last [`MEDIAN_TIME_SPAN`] blocks' times and at most [`MAX_FUTURE_BLOCK_TIME`]
-/// ahead of `now` (unix seconds). `below` is the chain under the header, parent first; the
-/// median rule is skipped when its blocks aren't all there (it needs min(11, height) of them).
-pub fn check_context(_params: &ChainParams, h: &Header, height: u32, below: &[Header], now: u64) -> Result<(), HeaderError> {
+/// ahead of `now` (unix seconds), and from `digishield_from` its bits must be exactly the next
+/// difficulty. `below` is the chain under the header, parent first; a rule whose blocks aren't
+/// all there is skipped (the median needs min(11, height) of them, the difficulty two).
+pub fn check_context(params: &ChainParams, h: &Header, height: u32, below: &[Header], now: u64) -> Result<(), HeaderError> {
     let need = MEDIAN_TIME_SPAN.min(height as usize);
     if need > 0 && below.len() >= need {
         let mut times: Vec<u32> = below[..need].iter().map(|x| x.time).collect();
@@ -248,6 +256,14 @@ pub fn check_context(_params: &ChainParams, h: &Header, height: u32, below: &[He
     }
     if h.time as u64 > now + MAX_FUTURE_BLOCK_TIME as u64 {
         return Err(HeaderError::TimeTooNew);
+    }
+    if let (Some(from), [parent, grandparent, ..]) = (params.digishield_from, below) {
+        if height >= from {
+            let want = crate::pepecoin::next_bits(params, height.saturating_sub(1), parent.bits, parent.time, Some(grandparent.time), h.time);
+            if h.bits != want {
+                return Err(HeaderError::BadDifficulty);
+            }
+        }
     }
     Ok(())
 }
@@ -266,6 +282,8 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: true,
+    // examples/checkbits: the rule gives the bits of every testnet block from 2 to 1,561,558.
+    digishield_from: Some(2),
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: None,
@@ -306,6 +324,9 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    // Same rule as the testnet, but not yet compared with the mainnet's headers: Some(2)
+    // once examples/rpcheaders has walked the whole chain clean.
+    digishield_from: None,
     auxpow_chain_id: Some(0x3f),
     auxpow_strict_chain_id: false,
     bech32_hrp: None,
@@ -349,6 +370,7 @@ pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("dgb"),
@@ -385,6 +407,7 @@ pub static DIGIBYTE_TEST: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: true,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("dgbt"),
@@ -419,6 +442,7 @@ pub static KOTIA_MAIN: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: None,
@@ -453,6 +477,7 @@ pub static FLOPCOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: Some(0xa3),
     auxpow_strict_chain_id: true,
     bech32_hrp: None,
@@ -483,6 +508,7 @@ pub static LITECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("ltc"),
@@ -512,6 +538,7 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: true,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("tltc"),
@@ -542,6 +569,10 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    // Digishield (the same next_bits) from block 145,001 (Dogecoin Core: parent height
+    // 145,000); before that a different retarget. Not yet compared with the real headers:
+    // Some(145_001) once examples/rpcheaders has walked from there clean.
+    digishield_from: None,
     auxpow_chain_id: Some(0x62),
     auxpow_strict_chain_id: true,
     bech32_hrp: None,
@@ -577,6 +608,7 @@ pub static BITCOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1d00ffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("bc"),
@@ -613,6 +645,7 @@ pub static WOJAKCOIN_MAIN: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1d00ffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("wj"),
@@ -838,6 +871,32 @@ mod tests {
         // The real Pepecoin testnet genesis is in the past.
         let g = PEPECOIN_TEST.genesis_header().unwrap();
         assert_eq!(check_context(&PEPECOIN_TEST, &g, 0, &[], now), Ok(()));
+    }
+
+    #[test]
+    fn pepecoin_bits_must_be_the_next_difficulty() {
+        let p = &PEPECOIN_TEST;
+        let now = 2_000_000_000u64;
+        let g = p.genesis_header().unwrap();
+        let grand = child(p, &g, 1_000_000, 0x1d00ffff);
+        let parent = child(p, &grand, 1_000_060, 0x1d00ffff);
+        let below = [parent, grand];
+        let h = 1_561_001;
+        // On time: Digishield keeps the target; anything else is refused.
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_120, 0x1d00ffff), h, &below, now), Ok(()));
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_120, 0x1d00fffe), h, &below, now), Err(HeaderError::BadDifficulty));
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Err(HeaderError::BadDifficulty));
+        // Testnet min difficulty only after a gap of more than two spacings (120 s).
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_180, 0x1e0fffff), h, &below, now), Err(HeaderError::BadDifficulty));
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_181, 0x1e0fffff), h, &below, now), Ok(()));
+        // After the gap it must be exactly powLimit.
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_181, 0x1d00ffff), h, &below, now), Err(HeaderError::BadDifficulty));
+        // The old step rule alone let the gapless powLimit block through.
+        assert!(!too_easy(p, 0x1e0fffff, 0x1d00ffff));
+        // Chains without the rule (it is off until checked against their headers) skip it.
+        assert_eq!(check_context(&PEPECOIN_MAIN, &child(&PEPECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Ok(()));
+        // Before digishield_from, or without a grandparent, nothing to compare.
+        assert_eq!(check_context(p, &child(p, &g, g.time + 1, 0x1c00ffff), 1, &[g], now), Ok(()));
     }
 
     #[test]

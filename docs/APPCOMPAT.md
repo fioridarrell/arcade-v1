@@ -128,7 +128,7 @@ Martin, 2026-11-10: this work comes before the market plan (`docs/MARKET.md`).
 4. Gap 7, 12, 13 (**M**, **S**, **S**). Built.
 5. Gap 1 step 2 and gap 2 (**L**, **L**): the daemon's direct lane, then media. Five apps. Built between V1.0 arcades; original arcades not reached.
 6. Gap 4 with `docs/MARKET.md` steps 3 and 4; gap 6, 10, 11.
-7. Gap 9.
+7. Gap 9. Built; not run end to end (see Step 7).
 
 ## Built so far
 
@@ -361,6 +361,31 @@ The refereed runs used a stand-in referee built from the original's referee code
 Not yet: a claim from a real original referee (it needs a winning run, and the original arcade is read-only for
 these tests), session seeds beyond passing `session`, the "once per wallet" check on this side (the referee and
 the chain's pool rules still apply), and a trade with a player on an original arcade.
+
+### Step 7: apps on a chain other than the home chain (gap 9)
+
+An app frame's address names its chain (`/app/<chain>/<txid>`), and its requests carry that address as
+their Referer. So:
+- **the app's page** comes from this arcade's ledger of that chain, or, for a chain it only borrows, from
+  an arcade on the mesh that keeps the chain's ledger (`explorer.ledger_bytes`, checked against its
+  sha256, kept in memory);
+- **its reads** (`/r/...`, `/content/<id>`) answer on that chain (`crates/arcaded/src/pagechain.rs`): from
+  this arcade's ledger, or answered by such an arcade (`explorer.page`, public reads only, never the
+  asking arcade's wallet or send requests); `/r/wallet` is this wallet on that chain (its addresses there,
+  its coins there);
+- **writes stay on the home chain**: a payment (`/r/send`) or a door that writes with the wallet
+  (inscribe, trades, seeds, claims, owner send) from an app on another chain is refused, saying so;
+- **the App Store** lists the apps of chains this arcade only borrows, from an arcade that keeps their
+  ledger (`explorer.app_cards`, asked in the background every 10 minutes).
+- `ARCADE_COIN_PEERS` takes `net=host:port` (a peer for one chain).
+
+Tests: unit tests for the frame's chain, the page reads another arcade may answer, per-chain coin peers.
+
+Not run end to end: no arcade on the mesh keeps Pepecoin mainnet's arcade ledger today (the one deployed
+app on another chain is inscription #2 there), so a borrowed-chain app has nothing to load from. A test
+arcade began syncing mainnet in a private network and was stopped at block 753,000: a full mainnet copy
+is about 17 GB, more than this computer had free. The arcade ledger on mainnet starts at block
+1,208,000, so an arcade that already keeps mainnet needs little more for the ledger index.
 
 ## Test that decides "done"
 

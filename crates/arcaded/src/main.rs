@@ -51,6 +51,7 @@ mod node;
 mod peerbook;
 mod psync;
 mod realtime;
+mod pagechain;
 mod prizesvc;
 mod refereesvc;
 mod tradesvc;

@@ -188,7 +188,7 @@ fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time
 /// 14.783 x (the node's own RPC doesn't check, so it looks fine there; 2026-11-11, an app inscription's
 /// later pieces were never relayed).
 pub fn per_started_kb(p: &ChainParams) -> bool {
-    matches!(p.key, "doge" | "pep" | "peptest" | "lky" | "bel" | "wjk" | "flop")
+    matches!(p.key, "doge" | "pep" | "peptest" | "lky" | "wjk" | "flop" | "shic")
 }
 
 /// The fee a transaction of `size` bytes pays at `fee_per_kb` on chain `p`.

@@ -561,6 +561,107 @@ pub static WOJAKCOIN_MAIN: ChainParams = ChainParams {
     index_start: 228_000,
 };
 
+/// Shibacoin (SHIC): a Scrypt chain built from Dogecoin Core like Pepecoin, merge-mined with AuxPoW from block
+/// 24,000 (chain id 74, strict). From Shibacoin Core 1.2.1 (github.com/shibacoinppc/shibacoin master,
+/// chainparams.cpp, chainparamsseeds.h, version.h), 2026-11-11; the genesis header below hashes to its genesis.
+pub static SHIBACOIN_MAIN: ChainParams = ChainParams {
+    key: "shic",
+    net: "shic",
+    chain_no: 12,
+    name: "Shibacoin",
+    magic: [0xb0, 0xc0, 0xe0, 0xf0],
+    p2p_port: 33864,
+    genesis: "ff271edcc83f7d71e7a4e4b0a43b386a188e1470a28671cdbdc47e900118ac7f",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000450f8ab5cade1c53c2ef36d655076fd0a114378cc54678073b966dff820459e40c845f67f0ff0f1ef9890100",
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: Some(0x4a),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: None,
+    p2pkh_version: 63,
+    p2sh_version: 22,
+    wif_version: 158,
+    bip44_coin_type: 3,
+    protocol_version: 70016,
+    dns_seeds: &["seeds.shibacoinshic.org", "seednodes.shibacoinshic.org"],
+    fixed_peers: &[
+        "64.176.223.96:33864",
+        "149.28.227.162:33864",
+        "45.77.205.224:33864",
+        "64.237.50.150:33864",
+        "45.76.167.242:33864",
+        "149.28.35.100:33864",
+        "64.176.201.18:33864",
+        "108.61.195.97:33864",
+        "45.63.8.92:33864",
+        "109.123.245.37:33864",
+        "161.97.106.45:33864",
+        "173.249.4.210:33864",
+        "157.173.201.78:33864",
+    ],
+    checkpoints: &[
+        (0, "ff271edcc83f7d71e7a4e4b0a43b386a188e1470a28671cdbdc47e900118ac7f"),
+        (100, "4c5ad0c33d31bdbdb6f353231bfd95916ff380c648e6c3ff0a07513a34f7965b"),
+        (1000, "1678b9c5af79d2d42264ba6ca6a0c94cd748ee0172b616b912aac0b62b7565ed"),
+        (20000, "2035d66dd969aa8ba3342e45dc949f032ddd5cca934a4d5f9c209958bcf455c6"),
+        (24000, "c771781bb5c79f53d17fcf4f541289e154cae38e4e4f4419ef1fa4c4c8be1d0e"),
+        (25800, "91e9d5d9c4ac1f236c1baf5f62fc8a96cfc0e844ae4739516ea53e0d6bb78f46"),
+    ],
+    coinbase_maturity: 240,
+    index_start: 0,
+};
+
+/// Bellscoin (BEL), Bells 3: Scrypt, AuxPoW (chain id 16, strict) and SegWit both from block 144,000, bech32 "bel".
+/// From Bells Core (github.com/Nintondo/bellscoinV3 master, src/kernel/chainparams.cpp, chainparamsseeds.h,
+/// node/protocol_version.h, consensus/consensus.h), 2026-11-11; the genesis header below hashes to its genesis.
+/// It kept Dogecoin's magic (c0c0c0c0); its port and genesis tell the two apart.
+pub static BELLSCOIN_MAIN: ChainParams = ChainParams {
+    key: "bel",
+    net: "bel",
+    chain_no: 13,
+    name: "Bellscoin",
+    magic: [0xc0, 0xc0, 0xc0, 0xc0],
+    p2p_port: 19919,
+    genesis: "e5be24df57c43a82d15c2f06bda961296948f8f8eb48501bed1efb929afe0698",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000696ad20e2dd4365c7459b4a4a5af743d5e92c6da3229e6532cd605f6533f2a5b1aae7652f0ff0f1ec1ad0000",
+    format: Format::AUXPOW_SEGWIT,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: Some(16),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: Some("bel"),
+    p2pkh_version: 25,
+    p2sh_version: 30,
+    wif_version: 153,
+    bip44_coin_type: 3,
+    protocol_version: 70016,
+    dns_seeds: &["bdnsseeder.quark.blue"],
+    fixed_peers: &[
+        "65.21.180.169:19919",
+        "5.161.184.103:19919",
+        "23.162.56.39:19919",
+        "135.181.31.54:19919",
+        "162.55.243.23:19919",
+        "3.66.245.44:19919",
+    ],
+    checkpoints: &[
+        (0, "e5be24df57c43a82d15c2f06bda961296948f8f8eb48501bed1efb929afe0698"),
+        (1000, "35668ee4f0fc1334849813c8a8e583814e9b22bfe5dc5a2bd2ded2b3aeec6643"),
+        (10000, "2c05ea6918e28ca2d216c6518940c8782c09bebfe705d792155465662e275351"),
+        (20000, "e705ee3c0097e6466155f8eea44a813f4f3e0774f1336ab20da1e7076dcc36d9"),
+        (30000, "22b2474f45c8d29f31e9caeb6bcccc68f583e2d40afb782e10ad19b63ff47f84"),
+        (40000, "50c259c50c5c2ab235f2ceb45da49f7c046f0411667c00d81cb8165f2b843ea1"),
+    ],
+    coinbase_maturity: 30,
+    // The original arcade's Bellscoin floor (config.py BEL_MAINNET_FLOOR).
+    index_start: 1_289_000,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
     &[
         &PEPECOIN_TEST,
@@ -574,6 +675,8 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &LITECOIN_TEST,
         &BITCOIN_MAIN,
         &WOJAKCOIN_MAIN,
+        &SHIBACOIN_MAIN,
+        &BELLSCOIN_MAIN,
     ];
 
 /// The ARCADE chain's two networks (crates/arcade-arc): chain number and key. They are not in
@@ -660,7 +763,13 @@ mod tests {
             for b in &ALL_CHAINS[i + 1..] {
                 assert_ne!(a.chain_no, b.chain_no);
                 assert_ne!(a.key, b.key);
-                assert_ne!(a.magic, b.magic);
+                assert_ne!(a.genesis, b.genesis, "{} and {}", a.name, b.name);
+                // A shared magic is only Bellscoin's, which kept Dogecoin's: a connection already knows its chain,
+                // and a peer of the other one never leads back to this chain's genesis.
+                if a.magic == b.magic {
+                    let pair = [a.key, b.key];
+                    assert!(pair.contains(&"bel") && pair.contains(&"doge"), "{} and {} share a magic", a.name, b.name);
+                }
             }
         }
     }

@@ -28,12 +28,15 @@ pub fn fee_policy(p: &ChainParams) -> FeePolicy {
         // output under (34 + 148) x 30 = 5,460 sat is dust.
         "dgb" | "dgbtest" => FeePolicy { fallback_per_kb: 1_000_000, floor_per_kb: 100_000, dust: 5_460 },
         // The Dogecoin family (1 coin/kB rules), as the arcade's claims use them.
-        "peptest" | "pep" | "doge" | "flop" | "wjk" | "kot" => {
+        "peptest" | "pep" | "doge" | "flop" | "wjk" | "kot" | "shic" => {
             FeePolicy { fallback_per_kb: crate::claims::FEE_PER_KB, floor_per_kb: 1_000, dust: crate::claims::DUST }
         }
         // The ARCADE chain: its pool's floor and the chain's own smallest output (a rule
         // there, not a habit). Twice the floor, so a signature a byte longer still clears it.
         "arc" | "arctest" => FeePolicy { fallback_per_kb: 2 * arcade_arc::params::MIN_FEE_PER_KB, floor_per_kb: arcade_arc::params::MIN_FEE_PER_KB, dust: arcade_arc::params::DUST },
+        // Bells 3 (the original arcade's settings): 0.0001 BEL/kB, ten times its minimum relay fee; no soft dust;
+        // change from 0.0001 BEL.
+        "bel" => FeePolicy { fallback_per_kb: 10_000, floor_per_kb: 1_000, dust: 10_000 },
         _ => FeePolicy { fallback_per_kb: 20_000, floor_per_kb: 1_000, dust: 1_000 },
     }
 }

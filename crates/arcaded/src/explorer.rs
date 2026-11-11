@@ -43,6 +43,8 @@ pub fn unit(p: &ChainParams) -> &'static str {
         "wjk" => "WJK",
         "arc" => "ARCADE",
         "arctest" => "ARCADEtest",
+        "shic" => "SHIC",
+        "bel" => "BEL",
         _ => "",
     }
 }

@@ -14,7 +14,9 @@
 set -euo pipefail
 
 OWNER_REPO="${ARCADE_GITHUB:-martinseeger2002/arcade-v1}"
-BRANCH="${ARCADE_BRANCH:-main}"
+# A source build takes the newest release's tag, the same code as the prebuilt downloads; ARCADE_BRANCH=main (or any
+# branch) builds that branch instead.
+BRANCH="${ARCADE_BRANCH:-}"
 DATA="${XDG_DATA_HOME:-$HOME/.local/share}"
 SRC="${ARCADE_SRC:-$DATA/arcade-v1-src}"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/arcade-v1"
@@ -43,7 +45,7 @@ prebuilt() {
   rm -rf "$CACHE" && mkdir -p "$CACHE"
   curl -fsSL "$url" -o "$CACHE/$name.tar.gz" || { echo "No prebuilt download for this PC yet."; return 1; }
   curl -fsSL "$url.sha256" -o "$CACHE/$name.tar.gz.sha256" || { echo "The download has no checksum."; return 1; }
-  (cd "$CACHE" && sha256sum -c --quiet "$name.tar.gz.sha256") || { echo "The download is damaged (checksum)." >&2; return 1; }
+  (cd "$CACHE" && sha256sum -c --quiet "$name.tar.gz.sha256") || { echo "The download is damaged (checksum)." >&2; return 4; }
   tar -xzf "$CACHE/$name.tar.gz" -C "$CACHE"
   dir="$CACHE/$name"
   [ -f "$dir/COMMIT" ] && echo "  version $(cut -c1-12 "$dir/COMMIT")"
@@ -58,8 +60,13 @@ needs_tools() {
   ! command -v cc >/dev/null || ! command -v pkg-config >/dev/null || ! have_libclang \
     || ! pkg-config --exists webkit2gtk-4.1 gtk+-3.0 2>/dev/null
 }
+latest_tag() {
+  curl -fsSL "https://api.github.com/repos/$OWNER_REPO/releases/latest" 2>/dev/null \
+    | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1
+}
 from_source() {
-  say "Building Arcade V1.0 from source (the first build takes 10-20 minutes)..."
+  if [ -z "$BRANCH" ]; then BRANCH="$(latest_tag || true)"; BRANCH="${BRANCH:-main}"; fi
+  say "Building Arcade V1.0 ($BRANCH) from source (the first build takes 10-20 minutes)..."
   if needs_tools; then
     if command -v apt-get >/dev/null; then
       local pkgs=(build-essential pkg-config clang libclang-dev curl ca-certificates) p
@@ -86,19 +93,19 @@ from_source() {
   mkdir -p "$(dirname "$SRC")"
   if command -v git >/dev/null; then
     if [ -d "$SRC/.git" ]; then
+      # A branch or a release tag: either way the build is exactly what was fetched.
       git -C "$SRC" fetch -q origin "$BRANCH"
-      git -C "$SRC" checkout -q "$BRANCH"
-      git -C "$SRC" reset -q --hard "origin/$BRANCH"
+      git -C "$SRC" checkout -q -f --detach FETCH_HEAD
     else
       rm -rf "$SRC"
       git clone -q --branch "$BRANCH" "https://github.com/$OWNER_REPO.git" "$SRC"
     fi
   else
     local tmp; tmp="$(mktemp -d)"
-    curl -fsSL "https://codeload.github.com/$OWNER_REPO/tar.gz/refs/heads/$BRANCH" | tar -xz -C "$tmp"
+    curl -fsSL "https://codeload.github.com/$OWNER_REPO/tar.gz/$BRANCH" | tar -xz -C "$tmp"
     if [ -d "$SRC/target" ]; then mv "$SRC/target" "$tmp/target.keep"; fi   # keep the build: updates are quick
     rm -rf "$SRC"
-    mv "$tmp"/*-"$BRANCH" "$SRC"
+    mv "$tmp"/arcade-v1-*/ "$SRC"   # one folder: arcade-v1-<branch>, or arcade-v1-<tag without its v>
     if [ -d "$tmp/target.keep" ]; then mv "$tmp/target.keep" "$SRC/target"; fi
     rm -rf "$tmp"
   fi
@@ -111,6 +118,11 @@ if [ "${ARCADE_BUILD:-0}" != 1 ]; then
   code=$?
   set -e
   [ "$code" = 0 ] && exit 0
+  # 4: the download doesn't match its checksum. Stop: installing something else instead would hide it.
+  if [ "$code" = 4 ]; then
+    echo "Nothing was installed. Try again later; if it keeps happening, build from source with ARCADE_BUILD=1." >&2
+    exit 1
+  fi
   # 3: the prebuilt programs don't run on this Linux. Anything else before installing: no usable download.
   say "Falling back to building from source."
 fi

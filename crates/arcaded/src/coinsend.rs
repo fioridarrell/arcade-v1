@@ -4,7 +4,7 @@
 //! has on a chain, live here too.
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, ChainParams};
+use arcade_chain::params::ChainParams;
 use arcade_ledger::address::{base58check, bech32, decode_base58check, hash160, p2pkh_script, p2wpkh_script, script_for_address};
 use arcade_wallet::secp256k1::PublicKey;
 use arcade_wallet::tx::Utxo;
@@ -31,6 +31,9 @@ pub fn fee_policy(p: &ChainParams) -> FeePolicy {
         "peptest" | "pep" | "doge" | "flop" | "wjk" | "kot" => {
             FeePolicy { fallback_per_kb: crate::claims::FEE_PER_KB, floor_per_kb: 1_000, dust: crate::claims::DUST }
         }
+        // The ARCADE chain: its pool's floor and the chain's own smallest output (a rule
+        // there, not a habit). Twice the floor, so a signature a byte longer still clears it.
+        "arc" | "arctest" => FeePolicy { fallback_per_kb: 2 * arcade_arc::params::MIN_FEE_PER_KB, floor_per_kb: arcade_arc::params::MIN_FEE_PER_KB, dust: arcade_arc::params::DUST },
         _ => FeePolicy { fallback_per_kb: 20_000, floor_per_kb: 1_000, dust: 1_000 },
     }
 }
@@ -66,7 +69,7 @@ pub fn warning(p: &ChainParams, to: &str) -> Option<String> {
 pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<&str>, broadcast: bool) -> R {
     let from = from.map(str::trim).filter(|f| !f.is_empty());
     let p: &'static ChainParams = match key.filter(|k| !k.is_empty()) {
-        Some(k) => by_key(k).ok_or_else(|| format!("unknown chain {k}"))?,
+        Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
         None => node.params,
     };
     let warn = warning(p, to);
@@ -76,8 +79,15 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
         v["warning"] = json!(warn);
         return Ok(v);
     }
-    let installed = p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key);
-    if !installed {
+    // The ARCADE chain's waiting transactions are in its own pool, not the store's.
+    let arc = crate::arcsvc::runs(p);
+    let waiting_spend = |op: &arcade_chain::OutPoint| -> Result<bool, String> {
+        if arc {
+            return Ok(crate::arcsvc::spender(op).is_some());
+        }
+        Ok(node.chain.mempool_spender(p.chain_no, op).map_err(|e| e.to_string())?.is_some())
+    };
+    if !crate::chains::kept(node, p) {
         return Err(format!("{} is neither installed nor borrowed here", p.name));
     }
     if !node.chain.addresses_on(p.chain_no).map_err(|e| e.to_string())? {
@@ -98,7 +108,7 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
         for (_, sc) in &scripts {
             for (op, value, _h) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
                 // Not spent by a waiting transaction, and not an immature coinbase.
-                if node.chain.mempool_spender(p.chain_no, &op).map_err(|e| e.to_string())?.is_some() {
+                if waiting_spend(&op)? {
                     continue;
                 }
                 if let Some(c) = node.chain.coin(p, &op).map_err(|e| e.to_string())? {
@@ -131,7 +141,7 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
             }
             let mut coins = Vec::new();
             for (op, value, _h) in node.chain.coins_for_script(p, &sc).map_err(|e| e.to_string())? {
-                if node.chain.mempool_spender(p.chain_no, &op).map_err(|e| e.to_string())?.is_some() {
+                if waiting_spend(&op)? {
                     continue;
                 }
                 if let Some(c) = node.chain.coin(p, &op).map_err(|e| e.to_string())? {
@@ -161,7 +171,12 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
     let mut out = json!({"chain": p.key, "txid": tx.txid.to_hex(), "from": scripts[0].0, "to": to, "amount": amount, "fee": fee,
                          "size": tx.raw.len(), "vsize": vsize, "sent": false, "warning": warn});
     if broadcast {
-        let r = crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key}))?;
+        let r = if arc {
+            let (id, fee) = crate::arcsvc::send_raw(&tx.raw)?;
+            json!({"txid": id.to_hex(), "fee": fee, "size": tx.raw.len()})
+        } else {
+            crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key}))?
+        };
         out["sent"] = json!(true);
         out["broadcast"] = r;
     }

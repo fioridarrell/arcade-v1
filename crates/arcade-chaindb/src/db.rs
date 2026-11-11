@@ -514,12 +514,17 @@ pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// The directory name of a chain's own file: its key (`chains/doge/chain.mdbx`), or `c<number>`
 /// for a chain number no params know (tests).
 pub fn chain_dir_name(c: u16) -> String {
-    arcade_chain::params::ALL_CHAINS.iter().find(|p| p.chain_no == c).map(|p| p.key.to_string()).unwrap_or_else(|| format!("c{c}"))
+    use arcade_chain::params::{ALL_CHAINS, ARCADE_CHAINS};
+    let known = ALL_CHAINS.iter().find(|p| p.chain_no == c).map(|p| p.key).or_else(|| ARCADE_CHAINS.iter().find(|a| a.0 == c).map(|a| a.1));
+    known.map(String::from).unwrap_or_else(|| format!("c{c}"))
 }
 
 fn chain_no_of_dir(name: &str) -> Option<u16> {
     if let Some(p) = arcade_chain::params::ALL_CHAINS.iter().find(|p| p.key == name) {
         return Some(p.chain_no);
+    }
+    if let Some(a) = arcade_chain::params::ARCADE_CHAINS.iter().find(|a| a.1 == name) {
+        return Some(a.0);
     }
     name.strip_prefix('c').and_then(|n| n.parse().ok())
 }

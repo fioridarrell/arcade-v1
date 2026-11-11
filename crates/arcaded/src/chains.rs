@@ -309,6 +309,13 @@ pub fn run_queue(node: Arc<Node>) {
 /// chains.add: install a chain now, or, while another chain is still being installed, put it
 /// in the queue (one install at a time: each gets the disk and network to itself).
 pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Result<Value, String> {
+    // The ARCADE chain: its blocks come over the mesh, so no queue and nothing to choose.
+    if crate::arcsvc::defines(key) {
+        crate::arcsvc::install(node)?;
+        // Its own copy takes over from a borrowed one.
+        crate::borrow::manage(node);
+        return status(node, key);
+    }
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
     if let Some(busy) = installing_now(node).filter(|b| b.key != p.key) {
@@ -543,6 +550,11 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
 
 /// Stop following a chain and delete its data (in the background).
 pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
+    if crate::arcsvc::defines(key) {
+        crate::arcsvc::remove(node)?;
+        crate::borrow::manage(node);
+        return Ok(json!({"removed": key.to_ascii_lowercase()}));
+    }
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let r = node.extra.lock().unwrap().remove(key).ok_or_else(|| format!("{key} is not installed"))?;
@@ -584,6 +596,16 @@ fn label(p: &ChainParams, ix: &str) -> String {
 
 /// Staged progress, as the Chains & Coins tab and `arcade chain status` show it.
 pub fn status(node: &Node, key: &str) -> Result<Value, String> {
+    if let Some(mut st) = Some(key).filter(|k| crate::arcsvc::defines(k)).and_then(|_| crate::arcsvc::chain_status(node)) {
+        // Not installed, but maybe borrowed, as any coin.
+        if let Some(b) = Some(&st).filter(|st| st["installed"] == false).and_then(|st| crate::borrow::status(node, st["key"].as_str().unwrap_or(key))) {
+            let (arcade, local) = (st["arcade"].clone(), st["local"].clone());
+            st = b;
+            st["arcade"] = arcade;
+            st["local"] = local;
+        }
+        return Ok(st);
+    }
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
@@ -755,6 +777,29 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
               "borrow_state": if borrowed { crate::borrow::state_text(p.key) } else { None }}))
 }
 
+/// A chain by the key a request names: a coin, or the ARCADE chain this arcade knows,
+/// installed or not (it isn't in the list of coins; see `arcsvc`). For what reads a chain's
+/// store and for borrowing: following stays with [`by_key`], and the ARCADE chain is
+/// installed and removed by `arcsvc`.
+pub fn find(key: &str) -> Option<&'static ChainParams> {
+    by_key(key).or_else(|| crate::arcsvc::params_for(key))
+}
+
+/// A chain by its name on the mesh, the ARCADE chain included.
+pub fn find_net(net: &str) -> Option<&'static ChainParams> {
+    arcade_chain::params::by_net(net).or_else(|| crate::arcsvc::defined().filter(|p| p.net == net))
+}
+
+/// Every coin, and the ARCADE chain this arcade knows.
+pub fn all() -> impl Iterator<Item = &'static ChainParams> {
+    ALL_CHAINS.iter().copied().chain(crate::arcsvc::defined())
+}
+
+/// Whether this arcade keeps `p`'s blocks in its own store.
+pub fn kept(node: &Node, p: &ChainParams) -> bool {
+    p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key) || crate::arcsvc::runs(p)
+}
+
 pub fn list(node: &Node) -> Value {
     json!(ALL_CHAINS
         .iter()
@@ -768,6 +813,7 @@ pub fn list(node: &Node) -> Value {
                    "borrowed": st["borrowed"] == true, "lenders": st["lenders"], "tip": st["tip"], "floor": st["floor"], "mismatch": st["mismatch"],
                    "queued": queued_at(node, p.key)})
         })
+        .chain(crate::arcsvc::row(node))
         .collect::<Vec<_>>())
 }
 

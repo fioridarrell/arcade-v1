@@ -41,6 +41,8 @@ pub fn unit(p: &ChainParams) -> &'static str {
         "ltctest" => "LTCtest",
         "btc" => "BTC",
         "wjk" => "WJK",
+        "arc" => "ARCADE",
+        "arctest" => "ARCADEtest",
         _ => "",
     }
 }
@@ -72,11 +74,14 @@ impl Ctx<'_> {
 
 fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
     let p = match req["chain"].as_str() {
-        Some(k) => by_key(k).ok_or_else(|| format!("unknown chain {k}"))?,
+        Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
         None => node.params,
     };
     let indexes = if p.chain_no == node.params.chain_no {
         crate::chains::home_indexes(node)
+    } else if crate::arcsvc::runs(p) {
+        // The ARCADE chain: its blocks, transactions and addresses, nothing else.
+        if node.chain.addresses_on(p.chain_no).unwrap_or(false) { vec!["addresses".to_string()] } else { vec![] }
     } else if !node.extra.lock().unwrap().contains_key(p.key) && crate::borrow::is_borrowed(p.key) {
         // Borrowed: no indexes here; blocks and transactions come from lenders (crate::borrow).
         vec![]
@@ -319,7 +324,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     // Not kept here, or kept but still catching up (borrowed meanwhile, the home chain
     // included): the borrowed chain answers what it can; indexes still come from here or
     // the mesh.
-    let kept = x.p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(x.p.key);
+    let kept = crate::chains::kept(node, x.p);
     if !kept || crate::borrow::is_borrowed(x.p.key) {
         if cmd == "explorer.mempool" {
             return Ok(shared_pool(node, x.p, crate::borrow::explorer(node, cmd, req, x.p).and_then(|r| r.ok()), 2500));
@@ -829,10 +834,19 @@ fn latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
         .collect()
 }
 
+/// The transactions waiting for a block, each with when it was first seen (the ARCADE
+/// chain's wait in its own pool, which keeps no times).
+fn waiting(x: &Ctx) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    if crate::arcsvc::runs(x.p) {
+        return Ok(crate::arcsvc::waiting(2_500).into_iter().map(|raw| (0, raw)).collect());
+    }
+    x.node.chain.mempool(x.c()).map_err(e)
+}
+
 fn summary(x: &Ctx) -> R {
     let c = x.c();
     let t = tip(x);
-    let pool = x.node.chain.mempool(c).map_err(e)?;
+    let pool = waiting(x)?;
     let mut v = json!({
         "chain": x.p.key, "name": x.p.name, "unit": unit(x.p), "indexes": x.indexes, "tip": t,
         "tip_time": x.node.chain.hash_at(c, t).ok().flatten().and_then(|h| x.node.chain.header(c, &h).ok().flatten()).map(|r| r.header.time),
@@ -917,10 +931,19 @@ fn block(x: &Ctx, id: &str) -> R {
                "out": tx.outputs.iter().map(|o| o.value).sum::<u64>(), "size": tx.raw.len(),
                "inscription": x.has("ord") && !tx.is_coinbase() && ord::genesis_ctype(&tx.inputs[0].script_sig, d).is_some()})
     }).collect();
-    Ok(json!({"height": rec.height, "hash": hash.to_hex(), "prev": rec.header.prev.to_hex(), "next": x.node.chain.hash_at(c, rec.height + 1).ok().flatten().filter(|_| best).map(|h| h.to_hex()),
+    let mut v = json!({"height": rec.height, "hash": hash.to_hex(), "prev": rec.header.prev.to_hex(), "next": x.node.chain.hash_at(c, rec.height + 1).ok().flatten().filter(|_| best).map(|h| h.to_hex()),
               "time": rec.header.time, "bits": format!("{:08x}", rec.header.bits), "nonce": rec.header.nonce, "version": rec.header.version,
               "merkle_root": rec.header.merkle_root.to_hex(), "best": best, "confirmations": if best { t.saturating_sub(rec.height) + 1 } else { 0 },
-              "tx_count": blk.txs.len(), "size": blk.encode().len(), "txs": txs, "inscriptions": geneses(x, rec.height), "unit": unit(x.p)}))
+              "tx_count": blk.txs.len(), "size": blk.encode().len(), "txs": txs, "inscriptions": geneses(x, rec.height), "unit": unit(x.p)});
+    if crate::arcsvc::runs(x.p) {
+        // The store's header only stands in for the ARCADE one (arcade-arc store.rs): what
+        // the block itself says comes from the chain.
+        if let Ok(a) = crate::arcsvc::block(&json!({"id": hash.to_hex()})) {
+            v["arcade"] = json!({"writer": a["writer"], "difficulty": a["difficulty"], "score": a["score"], "steps": a["steps"]});
+            v["size"] = a["bytes"].clone();
+        }
+    }
+    Ok(v)
 }
 
 fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Value {
@@ -938,12 +961,11 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
 }
 
 fn tx(x: &Ctx, id: &str) -> R {
-    let c = x.c();
     let txid = Hash256::from_hex(id.trim()).map_err(|_| format!("{id} is not a txid"))?;
     let (t, height) = match tx_any(x, &txid) {
         Some(found) => found,
         None => {
-            let pool = x.node.chain.mempool(c).map_err(e)?;
+            let pool = waiting(x)?;
             let t = pool.iter().filter_map(|(_, raw)| Tx::parse_with(raw, &x.p.format).ok()).find(|t| t.txid == txid).ok_or_else(|| format!("no transaction {id} on {}", x.p.name))?;
             (t, None)
         }
@@ -1031,13 +1053,15 @@ fn addr(x: &Ctx, a: &str) -> R {
 }
 
 fn mempool(x: &Ctx) -> R {
-    let pool = x.node.chain.mempool(x.c()).map_err(e)?;
+    let pool = waiting(x)?;
+    // The ARCADE chain's pools never swap a waiting transaction for another.
+    let arc = crate::arcsvc::runs(x.p);
     let d = ord::dialect(x.p);
     let txs: Vec<Value> = pool.iter().filter_map(|(seen, raw)| Tx::parse_with(raw, &x.p.format).ok().map(|t| (seen, t))).map(|(seen, t)| {
         let kind = if x.has("ord") && ord::genesis_ctype(&t.inputs[0].script_sig, d).is_some() { "inscription" }
             else if t.outputs.iter().any(|o| o.script_pubkey.first() == Some(&0x6a)) { "data" } else { "payment" };
         json!({"txid": t.txid.to_hex(), "seen": seen, "size": t.raw.len(), "out": t.outputs.iter().map(|o| o.value).sum::<u64>(),
-               "rbf": t.inputs.iter().any(|i| i.sequence < 0xffff_fffe), "kind": kind})
+               "rbf": !arc && t.inputs.iter().any(|i| i.sequence < 0xffff_fffe), "kind": kind})
     }).collect();
     let home = x.p.chain_no == x.node.params.chain_no;
     Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": if home { json!(crate::claims::pending_tags(x.node)) } else { json!([]) }, "unit": unit(x.p)}))

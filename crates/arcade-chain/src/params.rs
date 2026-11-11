@@ -576,6 +576,11 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &WOJAKCOIN_MAIN,
     ];
 
+/// The ARCADE chain's two networks (crates/arcade-arc): chain number and key. They are not in
+/// [`ALL_CHAINS`]: nothing about them is followed over a coin's P2P network, and the service
+/// that runs one makes its parameters when it starts (its block 0 comes from its settings).
+pub const ARCADE_CHAINS: &[(u16, &str)] = &[(12, "arc"), (13, "arctest")];
+
 /// A chain by its mesh name (what the existing arcades call it).
 impl ChainParams {
     /// The user agent sent in the P2P version message. Flopcoin Core 2.0 drops any peer whose
@@ -630,6 +635,13 @@ mod tests {
                 };
                 assert!(!private, "{}: fixed peer {a} is a private address", p.name);
             }
+        }
+    }
+
+    #[test]
+    fn the_arcade_chain_shares_no_number_or_key_with_a_coin() {
+        for (c, key) in ARCADE_CHAINS {
+            assert!(ALL_CHAINS.iter().all(|p| p.chain_no != *c && p.key != *key && p.net != *key));
         }
     }
 

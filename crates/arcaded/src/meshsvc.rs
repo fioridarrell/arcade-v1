@@ -285,6 +285,7 @@ fn serve_loop(
     last_offer: &mut Value,
 ) -> Result<(), LinkError> {
     let cr_reqs = &mut *cr_reqs;
+    crate::arcsvc::new_link(&link.peer_id);
     loop {
         // Queued frames: every link sends every frame once.
         let pending: Vec<Value> = {
@@ -304,6 +305,7 @@ fn serve_loop(
         crate::udpsvc::tick(node, link)?;
         crate::coreboot::tick(node, link)?;
         crate::vxshare::tick(node, link)?;
+        crate::arcsvc::tick(node, link)?;
         crate::shares::tick(link)?;
         crate::mempoolshare::tick(node, peer, link)?;
         #[cfg(feature = "oldimport")]
@@ -384,6 +386,7 @@ fn serve_loop(
             "ka" => {} // TCP keepalive while frames go over UDP
             "cb" => crate::coreboot::on_frame(node, link, &f)?,
             "vx" => crate::vxshare::on_frame(node, link, &f)?,
+            "ac" => crate::arcsvc::on_frame(node, link, &f)?,
             #[cfg(feature = "oldimport")]
             "lx" => crate::lxfetch::on_frame(node, link, &f)?,
             #[cfg(feature = "oldimport")]
@@ -410,7 +413,9 @@ fn note_offer(node: &Node, id: &str, addr: &str, kind: &str, nets: &Value) {
     }
     let m = if kind == "bk" { &mut o.bk } else { &mut o.cr };
     for (k, v) in nets.iter().take(64) {
-        if arcade_chain::params::by_net(k).is_some() {
+        // A coin of the list, or the ARCADE chain this arcade knows (the same block 0).
+        let arc = || kind == "cr" && crate::arcsvc::defined().is_some_and(|p| p.net == k && v["g"] == p.genesis);
+        if arcade_chain::params::by_net(k).is_some() || arc() {
             if let Some(h) = v["h"].as_u64() {
                 m.insert(k.clone(), h);
             }

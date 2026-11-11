@@ -23,6 +23,7 @@ pub const MAX_ANSWER: usize = 256 << 20;
 
 /// Chains this arcade lends: the home chain, and every installed chain kept in full (blocks
 /// and coins) that has caught up. A chain still syncing, or sharing its storage, isn't offered.
+/// The ARCADE chain is lent as any other once this arcade's copy has caught up.
 pub fn lent(node: &Node) -> Vec<&'static ChainParams> {
     let mut v: Vec<&'static ChainParams> = vec![node.params];
     // Copy the runs out first: far_behind takes the same lock (holding it here deadlocked
@@ -33,6 +34,7 @@ pub fn lent(node: &Node) -> Vec<&'static ChainParams> {
             v.push(r.params);
         }
     }
+    v.extend(crate::arcsvc::lends());
     v
 }
 
@@ -40,7 +42,12 @@ pub fn offer(node: &Node) -> Option<Frame> {
     let mut nets = serde_json::Map::new();
     for p in lent(node) {
         if let Ok(Some(tip)) = node.chain.tip(p.chain_no) {
-            nets.insert(p.net.into(), json!({"h": tip.height, "b": tip.hash.to_hex(), "l": 1}));
+            let mut o = json!({"h": tip.height, "b": tip.hash.to_hex(), "l": 1});
+            // An ARCADE chain is told apart by its block 0 (a local test chain has its own).
+            if crate::arcsvc::runs(p) {
+                o["g"] = json!(p.genesis);
+            }
+            nets.insert(p.net.into(), o);
         }
     }
     (!nets.is_empty()).then(|| Frame::new(json!({"t": "cr", "op": "offer", "nets": nets})))
@@ -131,7 +138,9 @@ pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> R
         }
         "tx" if lent_net(node, &h["net"]).is_some() => {
             let p = lent_net(node, &h["net"]).unwrap();
-            if let Ok(tx) = arcade_chain::Tx::parse_with(&f.blob, &p.format) {
+            if crate::arcsvc::runs(p) {
+                let _ = crate::arcsvc::send_lent(&f.blob);
+            } else if let Ok(tx) = arcade_chain::Tx::parse_with(&f.blob, &p.format) {
                 let _ = crate::mempoolshare::add(node, p, &tx);
                 if p.chain_no == node.params.chain_no {
                     node.tx_outbox.lock().unwrap().push(f.blob.clone());

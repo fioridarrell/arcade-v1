@@ -328,6 +328,7 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
             (200, json!({"holders": hs.into_iter().map(|x| x.1).collect::<Vec<_>>()}).to_string())
         }
         ["tx", txid] => tx_status(node, txid).map(|v| (200, v.to_string())).unwrap_or_else(|| missing("this node has never heard of that transaction")),
+        ["ledgertx", txid] => ledger_tx(node, txid),
         ["profile", tag] => {
             let t = tag.trim_start_matches('@').to_lowercase();
             let Some(row) = arcade_ledger::index::tag_row(&node.chain, cc, &t).ok().flatten() else { return missing("nobody holds that name") };
@@ -830,4 +831,40 @@ pub fn pending_moves(node: &Node, address: &str) -> (Vec<Value>, Vec<Value>) {
         }
     }
     (inc, out)
+}
+
+/// The arcade ledger's record of one transaction, by txid (the original's `arcade_tx` row): what
+/// a service checks after a payout or before it credits a deposit. Read from the block's digest
+/// records, so it is there once the ledger has indexed that block.
+///   200 {txid, block, position, class, type, version, sender, reference, payload_hex, valid}
+///   404 {error, state}: state "pending" (in the mempool, or in a block the ledger hasn't reached),
+///       "none" (in a block the ledger has read, no arcade record) or "unknown" (never heard of).
+fn ledger_tx(node: &Node, txid: &str) -> (u16, String) {
+    let txid = txid.to_lowercase();
+    let no = |state: &str, e: &str| (404, json!({"error": e, "state": state}).to_string());
+    let Ok(h) = arcade_chain::Hash256::from_hex(&txid) else { return no("unknown", "a txid is 64 hex characters") };
+    let p = crate::pagechain::params(node);
+    let cc = p.chain_no;
+    let Some((b, _)) = node.chain.tx_location(p, &h).ok().flatten() else {
+        return match tx_status(node, &txid) {
+            Some(_) => no("pending", "in the mempool: not in a block yet"),
+            None => no("unknown", "this node has never heard of that transaction"),
+        };
+    };
+    let Some(height) = node.chain.block_height_of(cc, b).ok().flatten() else { return no("pending", "its block is not on the best chain") };
+    let indexed = node.chain.indexed_to(cc, "ledger.v1").ok().flatten();
+    if indexed.is_none_or(|ix| ix < height) {
+        return no("pending", "the arcade ledger has not reached its block yet");
+    }
+    let recs = led::block_records(&node.chain, cc, height).unwrap_or_default();
+    let head = format!("arcade_tx|{txid}|");
+    let Some(line) = recs.iter().find(|r| r.starts_with(&head)) else { return no("none", "no arcade ledger record for that transaction") };
+    let f: Vec<&str> = line.trim_end_matches('\n').split('|').collect();
+    if f.len() < 10 {
+        return (500, json!({"error": "a ledger record this arcade cannot read", "state": "unknown"}).to_string());
+    }
+    let n = |s: &str| s.parse::<u64>().ok();
+    (200, json!({"txid": txid, "block": height, "position": n(f[2]), "class": f[3], "type": n(f[4]), "version": n(f[5]),
+                 "sender": f[6], "reference": if f[7].is_empty() { Value::Null } else { json!(f[7]) },
+                 "payload_hex": f[8], "valid": f[9] == "1"}).to_string())
 }

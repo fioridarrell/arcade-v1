@@ -84,6 +84,45 @@ pub fn on_frame(node: &Node, head: &Value) {
     }
 }
 
+/// Check every pooled transaction again, oldest first, as a new one is checked: one the
+/// coin's network would refuse (a bad signature, a mining reward spent too early: taken in by
+/// an arcade version without those checks, or a reward whose block a reorg moved) goes, with
+/// the transactions that spend its outputs. Returns the txids dropped and why.
+pub fn recheck(node: &Node, p: &ChainParams) -> Vec<(String, String)> {
+    let c = p.chain_no;
+    let mut pooled = node.chain.mempool(c).unwrap_or_default();
+    pooled.sort_by_key(|x| x.0);
+    let mut dropped = Vec::new();
+    for (seen, raw) in pooled {
+        let Ok(tx) = Tx::parse_with(&raw, &p.format) else { continue };
+        if node.chain.mempool_remove(p, &tx.txid).ok() != Some(true) {
+            continue;
+        }
+        let why = match sort(node, p, &tx) {
+            Ok(None) => None,
+            Ok(Some((n, e))) => Some(format!("input {n} can't be checked here ({e})")),
+            Err(e) => Some(e),
+        };
+        match why {
+            None => {
+                let _ = node.chain.mempool_add(p, &tx, seen);
+            }
+            Some(e) => dropped.push((tx.txid.to_hex(), e)),
+        }
+    }
+    dropped
+}
+
+/// Whether a coin is a mining reward too young to spend at a chain height of `tip` (as the
+/// wallet's own sends count it, claims::spendable).
+pub fn immature(p: &ChainParams, coinbase: bool, height: u32, tip: u32) -> bool {
+    coinbase && height + p.coinbase_maturity > tip
+}
+
+fn tip_of(node: &Node, p: &ChainParams) -> u32 {
+    node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0)
+}
+
 /// Is `tx` fit for the pool here (see the module notes)?
 pub fn check(node: &Node, p: &ChainParams, tx: &Tx) -> Result<(), String> {
     match sort(node, p, tx)? {
@@ -118,6 +157,11 @@ pub fn sort(node: &Node, p: &ChainParams, tx: &Tx) -> Result<Option<(usize, arca
             return Err("spends a pooled coin twice".into());
         }
         let (value, script) = match node.chain.coin(p, &i.prevout).map_err(|e| e.to_string())? {
+            // A mining reward can't be spent until it is mature: the coin's network refuses
+            // such a spend (bad-txns-premature-spend-of-coinbase), so it must not wait here.
+            Some(coin) if immature(p, coin.coinbase, coin.height, tip_of(node, p)) => {
+                return Err(format!("spends a mining reward that isn't mature yet (from block {}, spendable after block {})", coin.height, coin.height + p.coinbase_maturity));
+            }
             Some(coin) => (coin.value, coin.script),
             None => {
                 let parent = node.chain.mempool_tx(c, &i.prevout.txid).map_err(|e| e.to_string())?.ok_or("spends an unknown coin")?;
@@ -230,6 +274,28 @@ pub(crate) mod tests {
             Utxo { outpoint: OutPoint { txid: fund.txid, vout: 1 }, value: 1400, script: k },
         ];
         (t, coins)
+    }
+
+    /// Pooled transactions the network would refuse (taken in without checks) go at the
+    /// re-check, with what spends them; good ones stay, with their first-seen time.
+    #[test]
+    fn a_recheck_drops_what_the_network_would_refuse() {
+        let (t, coins) = funded();
+        let mine = coins[1].script.clone();
+        let good = sign_keyhash(t.p, 1, &coins[..1], &[TxOutSpec { value: 1400, script: mine.clone() }], &key(), 0).unwrap();
+        assert!(add(&t.node, t.p, &good));
+        // Spends the other coin with no signature, and a child of it: pooled the old way.
+        let bad = tx(&[(coins[1].outpoint.txid, coins[1].outpoint.vout)], &[(1300, mine.clone())], 1);
+        let child = tx(&[(bad.txid, 0)], &[(1200, p2pkh(4))], 2);
+        assert!(t.node.chain.mempool_add(t.p, &bad, 5).unwrap() && t.node.chain.mempool_add(t.p, &child, 6).unwrap());
+        let seen_good = t.node.chain.mempool(t.p.chain_no).unwrap().into_iter().find(|x| Tx::parse_with(&x.1, &t.p.format).unwrap().txid == good.txid).unwrap().0;
+        let dropped = recheck(&t.node, t.p);
+        let ids: Vec<&str> = dropped.iter().map(|d| d.0.as_str()).collect();
+        assert_eq!(ids, vec![bad.txid.to_hex(), child.txid.to_hex()], "{dropped:?}");
+        let left = t.node.chain.mempool(t.p.chain_no).unwrap();
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].0, seen_good, "kept with its first-seen time");
+        assert!(t.node.chain.mempool_spender(t.p.chain_no, &coins[1].outpoint).unwrap().is_none(), "the coin is free again");
     }
 
     #[test]

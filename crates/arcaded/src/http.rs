@@ -548,7 +548,15 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         }
         // An app on another chain than the home chain (the chain in its pass): its reads answer
         // on that chain (crate::pagechain); this arcade's wallet sends on the home chain only.
-        let page_chain = page.as_ref().map(|p| p.0).filter(|p| p.chain_no != node.params.chain_no);
+        // A program reading for an app on another chain names it (X-Arcade-Chain: <key>): its reads answer on
+        // that chain, as an app page's pass makes them (any chain a pass may name: kept, borrowed, or asked of
+        // the mesh). Reads only (a program's requests are GET/HEAD).
+        let program_chain = if program {
+            r.headers.get("x-arcade-chain").and_then(|v| v.as_str()).and_then(|k| arcade_chain::params::by_key(k.trim()))
+        } else {
+            None
+        };
+        let page_chain = page.as_ref().map(|p| p.0).or(program_chain).filter(|p| p.chain_no != node.params.chain_no);
         if r.method == "POST" && path == "/r/send" && page_chain.is_some() {
             let msg = json!({"error": format!("this app is on {}: this arcade's wallet sends on {} only", page_chain.unwrap().name, node.params.name)});
             return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());

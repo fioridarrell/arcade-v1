@@ -4,7 +4,9 @@
 //!   q {id, net, seq, end, z} + slice              a batch [[method, params], ...] (zlib when z)
 //!   a {id, seq, end[, err][, z]} + slice          answers [{"r": result} | {"e": [code, msg]}]
 //!   tx {net} + raw tx                              relay a transaction
-//! Limits as the existing arcade: CHUNK 48 KB, MAX_CALLS 500, MAX_ASKED 8 MB.
+//! Limits as the existing arcade: CHUNK 48 KB, MAX_CALLS 500, MAX_ASKED 8 MB. Per link, at most
+//! MAX_OPEN queries may be part-sent at once (MAX_BUFFERED bytes together), and an answer
+//! past MAX_REPLY bytes is an error, so the asker asks for fewer calls at a time.
 
 use crate::node::Node;
 use arcade_mesh::link::{Frame, Link, LinkError};
@@ -20,6 +22,11 @@ pub const MAX_CALLS: usize = 500;
 pub const MAX_ASKED: usize = 8 << 20;
 /// The most an answer to our own batch may hold, compressed or inflated.
 pub const MAX_ANSWER: usize = 256 << 20;
+/// Queries one link may have part-sent at once, and the most their parts may hold together.
+pub const MAX_OPEN: usize = 4;
+pub const MAX_BUFFERED: usize = 2 * MAX_ASKED;
+/// The most an answer we give may hold (before compression).
+pub const MAX_REPLY: usize = 32 << 20;
 
 /// Chains this arcade lends: the home chain, and every installed chain kept in full (blocks
 /// and coins) that has caught up. A chain still syncing, or sharing its storage, isn't offered.
@@ -56,6 +63,28 @@ pub struct Requests {
     parts: HashMap<u64, Vec<u8>>,
 }
 
+impl Requests {
+    /// One part of query `id`: the whole body once its last part is in (None before), or why
+    /// it is refused (then its parts are dropped).
+    fn add(&mut self, id: u64, part: &[u8], end: bool) -> Result<Option<Vec<u8>>, String> {
+        if !self.parts.contains_key(&id) && !end && self.parts.len() >= MAX_OPEN {
+            return Err(format!("at most {MAX_OPEN} requests at once"));
+        }
+        let held: usize = self.parts.values().map(Vec::len).sum();
+        if held + part.len() > MAX_BUFFERED {
+            self.parts.remove(&id);
+            return Err("too much asked at once".into());
+        }
+        let buf = self.parts.entry(id).or_default();
+        buf.extend_from_slice(part);
+        if buf.len() > MAX_ASKED {
+            self.parts.remove(&id);
+            return Err("request too large".into());
+        }
+        Ok(if end { self.parts.remove(&id) } else { None })
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum InflateError {
     /// More than the cap once inflated.
@@ -87,19 +116,36 @@ fn deflate(b: &[u8]) -> Vec<u8> {
     e.finish().unwrap()
 }
 
-/// Answer the calls in a batch.
-pub fn answer_on(node: &Node, p: &'static ChainParams, calls: &[Value]) -> Vec<Value> {
-    calls
-        .iter()
-        .map(|c| {
-            let method = c.get(0).and_then(Value::as_str).unwrap_or("");
-            let params: Vec<Value> = c.get(1).and_then(Value::as_array).cloned().unwrap_or_default();
-            match crate::rpc::call_on(node, p, method, &params) {
-                Ok(r) => json!({"r": r}),
-                Err((code, m)) => json!({"e": [code, m]}),
-            }
-        })
-        .collect()
+/// Answer the calls in a batch: the answers as JSON, or an error once they pass `max` bytes.
+pub fn answer_on(node: &Node, p: &'static ChainParams, calls: &[Value], max: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![b'['];
+    for (n, c) in calls.iter().enumerate() {
+        let method = c.get(0).and_then(Value::as_str).unwrap_or("");
+        let params: Vec<Value> = c.get(1).and_then(Value::as_array).cloned().unwrap_or_default();
+        let a = match crate::rpc::call_on(node, p, method, &params) {
+            Ok(r) => json!({"r": r}),
+            Err((code, m)) => json!({"e": [code, m]}),
+        };
+        if n > 0 {
+            out.push(b',');
+        }
+        serde_json::to_writer(&mut out, &a).map_err(|e| e.to_string())?;
+        if out.len() > max {
+            return Err(format!("answer too large (over {} MB): ask for fewer calls at a time", max >> 20));
+        }
+    }
+    out.push(b']');
+    Ok(out)
+}
+
+/// A whole query's body (zlib when `z`): its answers.
+fn query(node: &Node, p: &'static ChainParams, raw: Vec<u8>, z: bool) -> Result<Vec<u8>, String> {
+    let b = if z { inflate(&raw)? } else { raw };
+    let calls: Vec<Value> = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
+    if calls.len() > MAX_CALLS {
+        return Err(format!("at most {MAX_CALLS} calls"));
+    }
+    answer_on(node, p, &calls, MAX_REPLY)
 }
 
 /// A transaction a borrower relays: pooled, shared and sent to the coin's peers only when it
@@ -121,26 +167,13 @@ pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> R
         "q" if lent_net(node, &h["net"]).is_some() => {
             let p = lent_net(node, &h["net"]).unwrap();
             let id = h["id"].as_u64().unwrap_or(0);
-            let buf = reqs.parts.entry(id).or_default();
-            buf.extend_from_slice(&f.blob);
-            if buf.len() > MAX_ASKED {
-                reqs.parts.remove(&id);
-                return send(link, id, Err("request too large".into()), true);
-            }
-            if h["end"] != true {
-                return Ok(());
-            }
-            let raw = reqs.parts.remove(&id).unwrap_or_default();
+            let raw = match reqs.add(id, &f.blob, h["end"] == true) {
+                Ok(Some(raw)) => raw,
+                Ok(None) => return Ok(()),
+                Err(e) => return send(link, id, Err(e), true),
+            };
             let z = h["z"] == 1 || h["z"] == true;
-            let body = if z { inflate(&raw) } else { Ok(raw) };
-            let res = body.and_then(|b| {
-                let calls: Vec<Value> = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
-                if calls.len() > MAX_CALLS {
-                    return Err(format!("at most {MAX_CALLS} calls"));
-                }
-                Ok(serde_json::to_vec(&answer_on(node, p, &calls)).unwrap())
-            });
-            send(link, id, res, z)
+            send(link, id, query(node, p, raw, z), z)
         }
         "tx" if lent_net(node, &h["net"]).is_some() => {
             on_tx(node, lent_net(node, &h["net"]).unwrap(), &f.blob);
@@ -186,6 +219,38 @@ mod tests {
         assert_eq!(inflate(&bomb), Err("request too large".to_string()));
         assert_eq!(inflate_max(&bomb, MAX_ANSWER).unwrap().len(), MAX_ASKED + 1);
         assert_eq!(inflate(&deflate(b"[]")).unwrap(), b"[]");
+    }
+
+    #[test]
+    fn open_requests_and_their_bytes_are_capped() {
+        let mut r = Requests::default();
+        for id in 0..MAX_OPEN as u64 {
+            assert_eq!(r.add(id, b"[", false), Ok(None));
+        }
+        assert!(r.add(99, b"[", false).is_err(), "one more part-sent query");
+        // A query in one part still goes through, and finishing an open one frees its place.
+        assert_eq!(r.add(98, b"[]", true), Ok(Some(b"[]".to_vec())));
+        assert_eq!(r.add(0, b"]", true), Ok(Some(b"[]".to_vec())));
+        assert_eq!(r.add(99, b"[", false), Ok(None));
+        // Bytes held across queries.
+        let mut r = Requests::default();
+        let big = vec![b' '; MAX_ASKED];
+        assert_eq!(r.add(1, &big, false), Ok(None));
+        assert_eq!(r.add(2, &big, false), Ok(None));
+        assert!(r.add(3, b" ", false).is_err());
+        assert!(r.add(1, b" ", true).is_err());
+        assert_eq!(r.add(4, b"[]", true), Ok(Some(b"[]".to_vec())), "room again once one is dropped");
+    }
+
+    #[test]
+    fn answers_are_capped() {
+        let t = crate::sitesvc::tests::setup();
+        let calls: Vec<Value> = (0..50).map(|_| json!(["getblockcount", []])).collect();
+        let a = answer_on(&t.node, t.p, &calls, MAX_REPLY).unwrap();
+        let a: Vec<Value> = serde_json::from_slice(&a).unwrap();
+        assert_eq!(a.len(), 50);
+        assert_eq!(a[0], json!({"r": 2}));
+        assert!(answer_on(&t.node, t.p, &calls, 200).unwrap_err().contains("too large"));
     }
 
     #[test]

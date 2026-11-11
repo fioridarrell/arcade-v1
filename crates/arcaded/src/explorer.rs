@@ -176,6 +176,12 @@ fn mesh_from(id: &str) -> Value {
 }
 
 /// The index an error says is missing here ("the ord index is not on ...").
+/// The index a question needs, whatever the error says: a borrowed chain answers "borrowed",
+/// which names no index, and these must go to an arcade keeping the chain's arcade ledger.
+fn needed_index(cmd: &str) -> Option<&'static str> {
+    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards")).then_some("ledger")
+}
+
 fn missing_index(e: &str) -> Option<String> {
     let rest = e.strip_prefix("the ")?;
     let (ix, tail) = rest.split_once(' ')?;
@@ -267,7 +273,10 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             // (Any other failure, e.g. a chain only borrowed here or not kept at all: any
             // arcade keeping the chain may know.)
             // (A site is read from the names index, whatever else is missing here.)
-            let ix = missing_index(&e).or_else(|| matches!(cmd, "explorer.site" | "explorer.sites").then(|| "names".to_string())).unwrap_or_default();
+            let ix = missing_index(&e)
+                .or_else(|| needed_index(cmd).map(String::from))
+                .or_else(|| matches!(cmd, "explorer.site" | "explorer.sites").then(|| "names".to_string()))
+                .unwrap_or_default();
             if crate::shares::index_holders(node, p.net, &ix).is_empty() {
                 return Err(e);
             }
@@ -1184,4 +1193,13 @@ fn only_public_page_reads_are_answered_for_another_arcade() {
     assert!(!page_route_ok("/r/"));
     assert!(!page_route_ok("/content/abc"));
     assert!(!page_route_ok("/r/../x"));
+}
+
+#[cfg(test)]
+#[test]
+fn ledger_questions_go_to_arcades_keeping_the_ledger() {
+    for c in ["explorer.ledger_bytes", "explorer.page", "explorer.app_cards", "explorer.ledger_inscription"] {
+        assert_eq!(needed_index(c), Some("ledger"), "{c}");
+    }
+    assert_eq!(needed_index("explorer.tx"), None);
 }

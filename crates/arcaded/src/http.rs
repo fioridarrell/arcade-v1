@@ -302,6 +302,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             "llm" => Some(include_str!("shims/llm.js")),
             "escrow" => Some(include_str!("shims/escrow.js")),
             "swap" => Some(include_str!("shims/swap.js")),
+            "market" => Some(include_str!("shims/market.js")),
             _ => None,
         };
         return match body {
@@ -323,14 +324,27 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             let msg = json!({"error": format!("this app is on {}: this arcade's wallet sends on {} only", page_chain.unwrap().name, node.params.name)});
             return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());
         }
-        if r.method == "POST" && path == "/r/send" {
+        // A market write (marketsvc.rs, docs/MARKET.md step 2) files a request like a send does.
+        let market_op = path.strip_prefix("/r/market/").filter(|op| matches!(*op, "place" | "cancel" | "take"));
+        if r.method == "POST" && (path == "/r/send" || market_op.is_some()) {
             // The page is the app frame that asked (its Referer: /app/<chain>/<txid>).
             let page = r.headers.get("referer").and_then(|v| v.as_str()).and_then(|u| u.split('?').next()).and_then(|u| u.rsplit('/').next()).filter(|t| crate::udpsvc::is_hex(t, 64)).map(String::from);
             let Some(page) = page else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
-            let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+            let mut body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
+            if let Some(op) = market_op {
+                if !body.is_object() {
+                    body = json!({});
+                }
+                body["kind"] = json!("market");
+                body["op"] = json!(op);
+            }
             let (code, v) = crate::walletsvc::file(node, &page, &body);
             let st = match code { 200 => "200 OK", 202 => "202 Accepted", _ => "400 Bad Request" };
             return respond(&mut s, st, "application/json", &cors, v.to_string().as_bytes());
+        }
+        // The market reads (marketsvc.rs, docs/MARKET.md step 1): /r/book/<id> and /r/market/*.
+        if let Some((code, body)) = crate::marketsvc::route(node, &path, &query_fields(&r.query)) {
+            return respond(&mut s, status_line(code), "application/json", &cors, body.as_bytes());
         }
         if let Some(a) = crate::namesites::route(node, &path, &query_fields(&r.query)) {
             return respond(&mut s, status_line(a.code), a.ctype, &cors, &a.body);

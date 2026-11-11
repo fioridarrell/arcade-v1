@@ -618,6 +618,8 @@ pub fn answer(node: &Node, link: &mut Link, h: &Value) -> Result<(), LinkError> 
                 req["local"] = json!(true);
                 crate::explorer::handle(node, cmd, &req)
             }
+            // A DigiDollar market question (ddmarket.rs): this arcade's own orders and fills.
+            "mk" => crate::ddmarket::answer(node, arg),
             _ => Err("unknown question".to_string()),
         }
     })();
@@ -870,13 +872,21 @@ fn linked() -> std::sync::MutexGuard<'static, Linked> {
     L.get_or_init(Default::default).lock().unwrap()
 }
 
+/// The arcades linked now, by node id.
+pub(crate) fn linked_ids(node: &Node) -> Vec<String> {
+    let mut v: Vec<String> = node.links.lock().unwrap().values().map(|l| l.node_id.clone()).filter(|id| !id.is_empty()).collect();
+    v.sort();
+    v.dedup();
+    v
+}
+
 /// Whether a mesh link to that arcade is up now.
 pub fn is_linked(node: &Node, id: &str) -> bool {
     node.links.lock().unwrap().values().any(|l| l.node_id == id)
 }
 
 /// Ask a linked arcade over its link (up to 30 s).
-fn ask_linked(peer: &str, q: Value) -> Result<Value, String> {
+pub(crate) fn ask_linked(peer: &str, q: Value) -> Result<Value, String> {
     let (tx, rx) = std::sync::mpsc::channel();
     let id = {
         let mut l = linked();

@@ -119,7 +119,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens", "explorer.ledger_token",
     "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag", "explorer.search",
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
-    "explorer.ord_outpoints",
+    "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of",
 ];
 
 /// Page routes another arcade may answer for an app on a chain it keeps: every public read
@@ -391,6 +391,29 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     let n = |d: u64, max: u64| req["n"].as_u64().unwrap_or(d).clamp(1, max);
     match cmd {
         "explorer.ord_outpoints" => crate::ordsafe::answer(node, x.p, req),
+        "explorer.collections" => {
+            x.need("collections")?;
+            crate::collsvc::list(node, x.p, req)
+        }
+        "explorer.collection" => {
+            x.need("collections")?;
+            let mut v = crate::collsvc::get(node, x.p, req)?;
+            // Each item held here: its record (n, h, ct) and a preview, as the inscriptions list.
+            for it in v["items"].as_array_mut().into_iter().flatten() {
+                let id = it["id"].as_str().unwrap_or("").to_string();
+                if let Some(rec) = ord::inscription(&x.node.chain, x.p, &id) {
+                    it["n"] = rec["n"].clone();
+                    it["h"] = rec["h"].clone();
+                    it["ct"] = rec["ct"].clone();
+                    it["content"] = image_link(&x, &rec, &id, 96 << 10).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
+                }
+            }
+            Ok(v)
+        }
+        "explorer.collection_of" => {
+            x.need("collections")?;
+            crate::collsvc::of(node, x.p, req)
+        }
         "explorer.summary" => summary(&x),
         "explorer.blocks" => {
             let tip = tip(&x);

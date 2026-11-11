@@ -5,12 +5,12 @@
   const coinEl = (c) => coinLogo(c.key, c.name, "span", "coin");
   const SECTIONS = [
     ["home", "Overview"], ["blocks", "Blocks"], ["mempool", "Mempool"], ["inscriptions", "Inscriptions", "ord"],
-    ["tokens", "Tokens", "tokens"], ["names", "Names", "names"], ["maps", "Maps", "maps"], ["ledger", "Arcade ledger", "ledger"],
+    ["collections", "Collections", "collections"], ["tokens", "Tokens", "tokens"], ["names", "Names", "names"], ["maps", "Maps", "maps"], ["ledger", "Arcade ledger", "ledger"],
     // Runes and dunes join here (with their index keys) when those indexes exist.
   ];
   // Pages and the index each needs; a page comes online only when its index is on the chain.
-  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
-  const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
+  const NEEDS = { collections: "collections", collection: "collections", inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
+  const DETAIL_PARENT = { collection: "collections", block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
 
   let chains = [], chain = null, sum = null, page = "home", arg = null, seq = 0;
 
@@ -477,10 +477,13 @@
   async function vInscription() {
     const i = await xapi("explorer.inscription", { chain: chain.key, id: arg, ...(await imgArgs()) });
     const ct = (i.ct || "").split(";")[0];
+    // "In collection: Name #k" (collections index, here or on the mesh).
+    const inColl = has("collections") ? (await xapi("explorer.collection_of", { chain: chain.key, id: i.id }).catch(() => null))?.collections || [] : [];
+    const collRow = inColl.length ? ["In collection", h("span", {}, ...inColl.flatMap((x, k) => [k ? " · " : "", link(`${x.name} #${fmt(x.number)}`, "collection", x.id)]))] : null;
     return h("div", {}, crumbs(link("Inscriptions", "inscriptions"), `#${fmt(i.n)}`),
       head(`Inscription #${fmt(i.n)}`, h("span", { class: "chip ins" }, ct || "no type"), i.burned != null ? pill("burned", false) : "", i.from_arcade || i._mesh ? "" : contentLink(`/content/${i.id}`, `Inscription #${fmt(i.n)}`)),
       h("div", { class: "x-split" }, preview(i, true),
-        kv([["Id", h("span", { class: "mono" }, i.id)], ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
+        kv([["Id", h("span", { class: "mono" }, i.id)], collRow, ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
           i.at && ["Location", link(short(i.at, 12, 10), "tx", i.at.split(":")[0], "mono")], ["Inscribed", link(`block ${fmt(i.h)}`, "block", String(i.h))],
           ["Content type", i.ct || "—"], ["Size", `${fmt(i.size)} bytes · ${i.pieces} piece${i.pieces === 1 ? "" : "s"}`], i.proto && ["Protocol", i.proto],
           i.delegate && ["Delegate", link(short(i.delegate, 12, 6), "inscription", i.delegate, "mono")], i.parent && ["Parent", link(short(i.parent, 12, 6), "inscription", i.parent, "mono")],
@@ -503,6 +506,48 @@
         table([["#", 1], ["Holder"], ["Balance", 1], ["Transferable", 1]], t.top.map((x, i) => ({ go: () => go("address", x.address), cells: [[fmt((hpage - 1) * size + i + 1), 1], [addrLink(x.address, x.tag)], [units(x.overall, t.dec), 1], [units(x.transferable, t.dec), 1]] }))),
         hpager())
         : h("div", { class: "x-empty" }, hpage > 1 ? "No holders on this page." : "Nobody holds any yet."));
+  }
+  // ---------- collections ----------
+  // A collection's cover (an inscription on this chain): its image from this arcade.
+  function cover(id, alt) {
+    const t = h("div", { class: "x-thumb" });
+    if (id && httpBase && chain) {
+      const img = h("img", { src: `${httpBase}/ord/${chain.key}/${id}`, alt, loading: "lazy", decoding: "async" });
+      img.onerror = () => img.replaceWith(h("div", { class: "x-ph" }, "no cover"));
+      t.append(img);
+    } else t.append(h("div", { class: "x-ph" }, "no cover"));
+    return t;
+  }
+  let collSort = "newest";
+  async function vCollections() {
+    const size = 24, page = pageOf();
+    const r = await xapi("explorer.collections", { chain: chain.key, sort: collSort, offset: (page - 1) * size, n: size });
+    const sorts = h("div", { class: "x-types" }, [["newest", "Newest"], ["oldest", "Oldest"], ["name", "Name"], ["size", "Size"]].map(([k, t]) =>
+      h("button", { type: "button", class: "chip-btn" + (collSort === k ? " on" : ""), onclick: () => { collSort = k; go("collections", null); } }, t)));
+    const note = r.reading ? h("p", { class: "x-note" }, `Still reading: ${r.note}`) : h("p", { class: "x-note" }, r.note || "");
+    const grid = r.items.length ? h("div", { class: "x-grid" }, r.items.map((c) => h("div", { class: "x-ins", onclick: () => go("collection", c.id) }, cover(c.cover, c.name),
+      h("div", { class: "cap" }, h("b", {}, c.name), h("span", { class: "faint" }, `${fmt(c.count)}${c.count !== c.supply ? ` of ${fmt(c.supply)}` : ""}`)))))
+      : h("div", { class: "x-empty" }, "No collections on this chain yet.");
+    return sect(`Collections · ${fmt(r.total)}`, null, h("div", {}, sorts, note, pager(r.total, size, page, "collections"), grid, pager(r.total, size, page, "collections")));
+  }
+  async function vCollection() {
+    // The arg is the collection's id, with "|p<n>" for a page of its items past the first.
+    const m = /^(.*)\|p(\d+)$/s.exec(arg || "");
+    const id = m ? m[1] : arg, size = 48, cpage = m ? Math.max(1, Number(m[2])) : 1;
+    const c = await xapi("explorer.collection", { chain: chain.key, id, offset: (cpage - 1) * size, n: size, ...(await imgArgs()) });
+    const cpager = () => pager(c.total || 0, size, cpage, "collection", null, null, (p) => (p > 1 ? `${id}|p${p}` : id));
+    const items = c.items.length ? h("div", { class: "x-grid" }, c.items.map((it) => h("div", { class: "x-ins", onclick: () => go("inscription", it.id) },
+      it.content ? preview(it) : h("div", { class: "x-thumb" }, h("div", { class: "x-ph" }, "not held here")),
+      h("div", { class: "cap" }, h("b", {}, `#${fmt(it.number)}`), h("span", { class: "faint" }, it.n != null ? `insc. ${fmt(it.n)}` : "")),
+      Object.keys(it.traits || {}).length ? h("div", { class: "cap faint", title: Object.entries(it.traits).map(([k, v]) => `${k}: ${v}`).join("\n") }, Object.values(it.traits).join(" · ")) : "")))
+      : h("div", { class: "x-empty" }, "No items on this page.");
+    const status = c.status !== "active" ? pill(c.status, false) : "";
+    return h("div", {}, crumbs(link("Collections", "collections"), c.name), head(c.name, status, h("span", { class: "chip" }, c.kind === "sub1k" ? "built in" : "on the chain")),
+      kv([c.description && ["About", c.description], ["Items", `${fmt(c.count)} of ${fmt(c.supply)}${c.missing ? ` · ${fmt(c.missing)} numbers not listed` : ""}`],
+        c.kind === "registry" && ["Published by", c.publisher ? addrLink(c.publisher) : "—"], c.kind === "registry" && ["Root", link(`inscription #${fmt(c.number)}`, "inscription", c.id)],
+        c.height != null && ["Block", link(fmt(c.height), "block", String(c.height))], c.replaces && ["Replaces", link(short(c.replaces, 12, 6), "collection", c.replaces, "mono")],
+        (c.traits || []).length && ["Traits", c.traits.join(", ")], c.reason && ["Why", c.reason]]),
+      cpager(), items, cpager());
   }
   let lastResults = null;
   async function vResults() {
@@ -532,7 +577,7 @@
     return h("div", {}, crumbs(link("Maps", "maps"), m.claim), head(m.claim),
       kv([["Winning inscription", link(`#${fmt(m.number)}`, "inscription", m.id)], ["Holder", m.owner ? addrLink(m.owner, m.owner_tag) : "—"], ["Block", link(m.claim.split(".")[0], "block", m.claim.split(".")[0])]]));
   }
-  const VIEWS = { home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, ledger: vLedger,
+  const VIEWS = { collections: vCollections, collection: vCollection, home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, ledger: vLedger,
     block: vBlock, tx: vTx, address: vAddress, inscription: vInscription, token: vToken, name: vName, map: vMap,
     ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc, tag: vTag, results: vResults };
 

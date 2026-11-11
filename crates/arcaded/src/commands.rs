@@ -151,6 +151,9 @@ cmds! {
     "explorer.inscription" Public "chain?, id" "One inscription.";
     "explorer.tokens" Public "chain?, offset?, limit?" "Tokens.";
     "explorer.token" Public "chain?, tick, offset?, n?" "One token and a page of its holders, biggest first (n: 25, at most 100; total: how many hold it).";
+    "explorer.collections" Public "chain?, q?, sort?, status?, offset?, n?" "A page of a chain's collections (sort: newest, oldest, name or size; status: active or all; n at most 60), Sub 1K first.";
+    "explorer.collection" Public "chain?, id, offset?, n?" "One collection (its root inscription id, or sub1k) and a page of its items by number (n: 48, at most 96).";
+    "explorer.collection_of" Public "chain?, id" "The collections an inscription is in.";
     "explorer.names" Public "chain?" "Names.";
     "explorer.name" Public "chain?, name" "One name.";
     "explorer.maps" Public "chain?" "Maps.";

@@ -63,6 +63,8 @@ curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scr
 | `--home DIR` | Data folder (default `~/.local/share/arcade`). |
 | `--http-port N`, `--mesh-port N`, `--stun-port N` | Ports. The defaults are 8420, 8421 and 3478. A port that's already taken (for example, by another arcade on the same PC) moves to the next free one. STUN turns off (`0`) if its port is taken. |
 
+If the web port is reached through a reverse proxy or a tunnel, add `--behind-proxy` to `arcaded`'s own options (its service's `ExecStart` line): then nothing that arrives over the web port counts as this computer, so the API and the wallet's page API answer only the local socket.
+
 To keep the service running while you're logged out, and to start it at boot: `sudo loginctl enable-linger $USER`.
 
 From a clone of this repo, `scripts/install-linux.sh` does the same build and install.

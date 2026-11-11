@@ -5,8 +5,9 @@
 //! (`dn`). When the ord index is 20,000 or more blocks behind a whole snapshot (or the operator
 //! asks), it fetches the manifest and the 1 MiB pieces, then checks the copy before taking it in:
 //! - every chunk hash in the copy, rebuilt from its own block lines, must equal what 2 or more
-//!   arcades other than its holders said for that chunk wherever they agree, and at least half
-//!   of the copy's chunks must be confirmed that way (Martin's rule: no "single" acceptance);
+//!   arcades other than its holders said for that chunk wherever they agree, and every one of
+//!   the copy's chunks must be confirmed that way, by established arcades only
+//!   (crate::vxshare::established; Martin's rule: no "single" acceptance);
 //! - up to 64 chunks' moves digests must equal another walker's answer to `q moves`.
 //! The SQLite file is converted once by arcade-oldimport (which checks every block hash against
 //! ours) and deleted. V1.0 makes no snapshots (that would mean writing SQLite) and answers no `q`.
@@ -678,9 +679,10 @@ fn step(node: &Arc<Node>, p: &'static ChainParams) {
     let j = s.jobs.get_mut(p.net).unwrap();
     let total = j.summary.as_ref().map(|v| v.len()).unwrap_or(0);
     let need = min_backers();
-    let confirmed = j.witnesses.values().filter(|w| w.len() >= need).count();
-    let one = j.witnesses.values().filter(|w| !w.is_empty()).count();
-    j.detail = format!("{confirmed} of {total} chunks backed by {need} or more other arcades ({one} by at least one)");
+    let est = crate::vxshare::established(node);
+    let confirmed = backed(&j.witnesses, &est, need);
+    let one = backed(&j.witnesses, &est, 1);
+    j.detail = format!("{confirmed} of {total} chunks backed by {need} or more other established arcades ({one} by at least one)");
     if j.ask.as_ref().is_some_and(|q| q.2.elapsed() < Duration::from_secs(15)) {
         return;
     }
@@ -719,16 +721,16 @@ fn step(node: &Arc<Node>, p: &'static ChainParams) {
             s.jobs.get_mut(p.net).unwrap().ask = Some((qid, peer, Instant::now(), chunks));
         }
         None => {
-            // Everyone reachable was asked. Enough backing: take it in; else wait for more arcades.
+            // Everyone reachable was asked. Every chunk backed: take it in; else wait for more arcades.
             let j = s.jobs.get_mut(p.net).unwrap();
-            if total > 0 && confirmed * 2 >= total {
+            if all_backed(&j.witnesses, &est, need, total) {
                 j.phase = "converting".into();
                 let check = json!({"chunks": total, "confirmed": confirmed, "backers_needed": need, "walkers_asked": j.pos.keys().map(|k| short(k)).collect::<Vec<_>>()});
                 drop(s);
                 let n2 = node.clone();
                 std::thread::Builder::new().name("dx convert".into()).spawn(move || convert_job(n2, p, dir, m, check)).unwrap();
             } else {
-                j.detail = format!("waiting for more arcades: {confirmed} of {total} chunks backed by {need} or more other arcades ({one} by at least one)");
+                j.detail = format!("waiting for more arcades: {confirmed} of {total} chunks backed by {need} or more other established arcades ({one} by at least one)");
                 if j.started + 3600 < now() {
                     j.asked_done.clear(); // ask again now and then: words and walkers come and go
                 }
@@ -765,6 +767,17 @@ pub fn check_chunks(chunks: &[(u32, String, u64)], words: &BTreeMap<u32, BTreeMa
         }
     }
     Ok(out)
+}
+
+/// Chunks backed by `need` or more arcades whose word counts (`est`, crate::vxshare::established).
+/// A snapshot is taken only when every chunk is: a chunk nobody backed is a chunk nobody checked.
+fn backed(witnesses: &BTreeMap<u32, BTreeSet<String>>, est: &BTreeSet<String>, need: usize) -> usize {
+    witnesses.values().filter(|w| w.intersection(est).count() >= need).count()
+}
+
+/// Whether all `total` chunks of a snapshot are backed so.
+fn all_backed(witnesses: &BTreeMap<u32, BTreeSet<String>>, est: &BTreeSet<String>, need: usize, total: usize) -> bool {
+    total > 0 && backed(witnesses, est, need) == total
 }
 
 /// Put the pieces together into the snapshot file (each piece is deleted as it goes in).
@@ -928,6 +941,26 @@ mod tests {
         let mut words = BTreeMap::new();
         words.insert(0, w(&[("m", "aa")]));
         assert!(check_chunks(&chunks, &words, &makers).unwrap().is_empty());
+    }
+
+    #[test]
+    fn every_chunk_backed_by_established_arcades() {
+        let id = |n: u8| hex::encode([n; 32]);
+        let est: BTreeSet<String> = [id(1), id(2), id(3)].into();
+        let w = |ns: &[u8]| ns.iter().map(|n| id(*n)).collect::<BTreeSet<String>>();
+        let mut ws: BTreeMap<u32, BTreeSet<String>> = BTreeMap::new();
+        for c in 0..4 {
+            ws.insert(c, w(&[1, 2]));
+        }
+        assert!(all_backed(&ws, &est, 2, 4));
+        // A chunk nobody said anything about.
+        assert!(!all_backed(&ws, &est, 2, 5));
+        // Half the chunks backed only by fresh keys (or one established arcade): not taken.
+        ws.insert(2, w(&[10, 11, 12]));
+        ws.insert(3, w(&[1, 10]));
+        assert_eq!((backed(&ws, &est, 2), backed(&ws, &est, 1)), (2, 3));
+        assert!(!all_backed(&ws, &est, 2, 4));
+        assert!(!all_backed(&BTreeMap::new(), &est, 2, 0));
     }
 
 }

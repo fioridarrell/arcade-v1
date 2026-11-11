@@ -231,7 +231,9 @@ pub fn broadcast(node: &Node, req: &Value) -> R {
         };
         ins += value;
     }
-    let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    let Some(outs) = tx.outputs.iter().try_fold(0u64, |t, o| t.checked_add(o.value)) else {
+        return Err("the outputs add up to more than any amount can be".into());
+    };
     if outs > ins {
         return Err(format!("the outputs ({outs}) are more than the coins spent ({ins})"));
     }
@@ -322,11 +324,17 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn setup() -> T {
+        setup_with(|_| {})
+    }
+
+    /// The same chain, with its parameters changed first (SegWit on, say).
+    pub(crate) fn setup_with(edit: impl FnOnce(&mut ChainParams)) -> T {
         let dir = tempfile::tempdir().unwrap();
         let g = block(Hash256::ZERO, vec![tx(&[], &[(50, p2pkh(0))], 0)], 1);
         let mut pp = arcade_chain::params::PEPECOIN_TEST.clone();
         pp.genesis = Box::leak(g.hash().to_hex().into_boxed_str());
         pp.genesis_header = "";
+        edit(&mut pp);
         let p: &'static ChainParams = Box::leak(Box::new(pp));
         let app = arcade_app::AppDb::open(dir.path()).unwrap();
         let chain = arcade_chaindb::ChainDb::open(dir.path().join("chain.mdbx")).unwrap();
@@ -346,7 +354,7 @@ pub(crate) mod tests {
             params: p,
             identity,
             tx_outbox: Mutex::new(Vec::new()),
-            mesh_outbox: Mutex::new(Vec::new()),
+            mesh_outbox: Mutex::new(Default::default()),
             links: Mutex::new(Default::default()),
             mesh_tips: Mutex::new(Default::default()),
             sync_state: Mutex::new("test".into()),
@@ -375,6 +383,28 @@ pub(crate) mod tests {
 
     pub(crate) fn addr(t: &T, tag: u8) -> String {
         arcade_ledger::address::address_of(&p2pkh(tag), t.p).unwrap()
+    }
+
+    /// One test arcade shared by tests that need a node but not a fresh one: each setup()
+    /// maps a chain database, and many at once run out of address space (Mdbx OutOfMemory).
+    pub(crate) struct Shared {
+        pub(crate) node: std::sync::Arc<Node>,
+        pub(crate) p: &'static ChainParams,
+        /// Addresses of tags 1 and 2 (see T).
+        pub(crate) a: [String; 2],
+    }
+
+    pub(crate) fn shared() -> &'static Shared {
+        static S: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+        S.get_or_init(|| {
+            let t = setup();
+            let a = [addr(&t, 1), addr(&t, 2)];
+            let T { _dir, node, p, .. } = t;
+            std::mem::forget(_dir); // kept for the whole test run
+            let node = std::sync::Arc::new(node);
+            let _ = node.me.set(std::sync::Arc::downgrade(&node));
+            Shared { node, p, a }
+        })
     }
 
     #[test]
@@ -459,6 +489,15 @@ pub(crate) mod tests {
         assert_eq!(v["addresses"][&addr(&t, 6)]["waiting"][0]["received"], 900);
         let all = activity(&t.node, &json!({"addresses": [a.clone()]})).unwrap();
         assert_eq!(all["addresses"][&a]["confirmed"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn outputs_that_add_past_u64_are_refused() {
+        let t = setup();
+        // u64::MAX + 2 wraps to 1, less than the 1900 spent: refused, not pooled.
+        let wraps = tx(&[(t.spend.txid, 1)], &[(u64::MAX, p2pkh(4)), (2, p2pkh(5))], 0);
+        assert!(broadcast(&t.node, &json!({"hex": hex::encode(&wraps.raw)})).unwrap_err().contains("more than any amount"));
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty());
     }
 
     #[test]

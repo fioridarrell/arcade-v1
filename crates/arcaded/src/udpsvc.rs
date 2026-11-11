@@ -37,6 +37,20 @@ const INTRO_SKEW: u64 = 600;
 const COOL_MIN: u64 = 300;
 const COOL_MAX: u64 = 6 * 3600;
 const MAX_INBOUND: usize = 64;
+/// Introductions we answered ("hi" from another arcade) that are still knocking: at most this
+/// many in all, and per link that brought them.
+const MAX_ANSWERING: usize = 6;
+const MAX_ANSWERING_PER_LINK: usize = 2;
+/// Introduced paths spraying a new-port NAT's ports at once.
+const MAX_SPRAYING: usize = 1;
+/// "ui" frames taken from one link: 10 a second, 20 at once (the rest are dropped unread).
+const UI_RATE: f64 = 10.0;
+const UI_BURST: f64 = 20.0;
+/// Arcades remembered as reachable through a link by their "ui" frames.
+const MAX_VIA: usize = 4096;
+/// An asker's room subscription must have reached us this recently for its "hi" to be
+/// answered: every arcade floods one every 30 s, rooms or none (node.py SUB_EVERY).
+const HI_HEARD: u64 = 600;
 /// A path that never carried our "go"-gated frames is dropped this long after it failed.
 const RX_GRACE: Duration = Duration::from_secs(20);
 
@@ -104,6 +118,8 @@ struct Pend {
     n: String,
     eph: x25519_dalek::StaticSecret,
     we_hi: bool,
+    /// The link the introduction came through (ours or theirs).
+    via: String,
     at: Instant,
     cell: Option<Arc<Cell>>,
     started: bool,
@@ -128,6 +144,8 @@ struct G {
     pend: HashMap<String, Pend>,
     via: HashMap<String, (String, u64)>,
     fwd_rate: HashMap<String, Instant>,
+    /// Per link: "ui" frames allowed (tokens, last refill).
+    ui_in: HashMap<String, (f64, Instant)>,
     udp_links: BTreeSet<String>,
 }
 
@@ -276,12 +294,17 @@ pub fn start(node: Arc<Node>, stun_flag: Option<u16>) {
 
 fn stun_serve(s: UdpSocket) {
     let mut buf = [0u8; 1500];
+    // Answers are counted per asking IP and in all (an answer is larger than the request).
+    let mut limit = arcade_mesh::stun::AnswerLimit::default();
     loop {
         let Ok((n, from)) = s.recv_from(&mut buf) else { continue };
         if let Some(tx) = arcade_mesh::stun::parse_request(&buf[..n]) {
+            g().lock().unwrap().stun_seen += 1;
+            if !limit.allow(from.ip(), Instant::now()) {
+                continue;
+            }
             // A dual-stack socket must answer to the address as it came (v4-mapped).
             let _ = s.send_to(&arcade_mesh::stun::response(&tx, from), from);
-            g().lock().unwrap().stun_seen += 1;
         }
         // Other STUN methods (TURN allocations) are not served.
     }
@@ -985,7 +1008,7 @@ fn hello_frame(node: &Node, op: &str, to: &str, n: &str, eph: &x25519_dalek::Sta
 }
 
 /// Start knocking toward an introduced arcade.
-fn intro_path(node: &Node, peer: &str, n: &str, eph: &x25519_dalek::StaticSecret, h: &Value) -> Option<Arc<Cell>> {
+fn intro_path(node: &Node, peer: &str, n: &str, eph: &x25519_dalek::StaticSecret, h: &Value, spray_ok: bool) -> Option<Arc<Cell>> {
     let hb = hub(node)?;
     let x: [u8; 32] = hex::decode(h["x"].as_str()?).ok()?.try_into().ok()?;
     let shared = eph.diffie_hellman(&x25519_dalek::PublicKey::from(x)).to_bytes();
@@ -993,10 +1016,45 @@ fn intro_path(node: &Node, peer: &str, n: &str, eph: &x25519_dalek::StaticSecret
     let (ko, ki) = if me(node).as_str() < peer { (low, high) } else { (high, low) };
     let targets = parse_addrs(&h["a"]);
     let mut p = Path::new(&ko, &ki, targets.clone(), Instant::now());
-    if h["nat"] == "new-port" {
+    if h["nat"] == "new-port" && spray_ok {
         p.spray = targets.first().map(|a| a.ip());
     }
     Some(hb.add(p))
+}
+
+/// May link `link` hand us another "ui" frame now?
+fn ui_allowed(st: &mut G, link: &str, now: Instant) -> bool {
+    let b = st.ui_in.entry(link.to_string()).or_insert((UI_BURST, now));
+    b.0 = (b.0 + now.saturating_duration_since(b.1).as_secs_f64() * UI_RATE).min(UI_BURST);
+    b.1 = now;
+    if b.0 < 1.0 {
+        return false;
+    }
+    b.0 -= 1.0;
+    true
+}
+
+/// Answered introductions still knocking (not yet a link).
+fn answering<'a>(pend: &'a HashMap<String, Pend>) -> impl Iterator<Item = &'a Pend> {
+    pend.values().filter(|p| !p.we_hi && p.cell.is_some() && !p.started)
+}
+
+/// May a "hi" from `from` that came through `link` be answered? Within MAX_ANSWERING in all
+/// and MAX_ANSWERING_PER_LINK per link (a new "hi" from the same asker replaces its old one).
+fn may_answer(pend: &HashMap<String, Pend>, from: &str, link: &str) -> bool {
+    let others = || answering(pend).filter(|p| pend.get(from).is_none_or(|q| !std::ptr::eq(*p, q)));
+    others().count() < MAX_ANSWERING && others().filter(|p| p.via == link).count() < MAX_ANSWERING_PER_LINK
+}
+
+/// Introduced paths spraying ports now.
+fn spraying(pend: &HashMap<String, Pend>) -> usize {
+    pend.values()
+        .filter_map(|p| p.cell.as_ref())
+        .filter(|c| {
+            let g = c.p.lock().unwrap();
+            g.spray.is_some() && !g.confirmed && g.down.is_none()
+        })
+        .count()
 }
 
 fn on_ui(node: &Node, from_link: &str, h: &Value) {
@@ -1014,13 +1072,18 @@ fn on_ui(node: &Node, from_link: &str, h: &Value) {
     }
     let hops = h["hops"].as_u64().unwrap_or(99);
     let my = me(node);
+    // A link sends only so many; then the signature, before anything is remembered.
+    let allowed = ui_allowed(&mut g().lock().unwrap(), from_link, Instant::now());
+    if !allowed || !ui_verify(h) {
+        return;
+    }
     let mut st = g().lock().unwrap();
-    if from != my {
+    if from != my && (st.via.len() < MAX_VIA || st.via.contains_key(from)) {
         st.via.insert(from.to_string(), (from_link.to_string(), now_s()));
     }
     if to != my {
         // Introduce: pass it on toward its target (hops < 8, one per sender per second).
-        if hops + 1 >= INTRO_HOPS || st.fwd_rate.get(from).is_some_and(|t| t.elapsed() < Duration::from_secs(1)) || !ui_verify(h) {
+        if hops + 1 >= INTRO_HOPS || st.fwd_rate.get(from).is_some_and(|t| t.elapsed() < Duration::from_secs(1)) {
             return;
         }
         st.fwd_rate.insert(from.to_string(), Instant::now());
@@ -1031,7 +1094,7 @@ fn on_ui(node: &Node, from_link: &str, h: &Value) {
         }
         return;
     }
-    if !ui_verify(h) || !enabled(node) || linked_st(&st, node, from) {
+    if !enabled(node) || linked_st(&st, node, from) {
         return;
     }
     drop(st);
@@ -1055,6 +1118,12 @@ fn on_ui(node: &Node, from_link: &str, h: &Value) {
             if node.links.lock().unwrap().len() >= MAX_INBOUND {
                 return;
             }
+            // Only an arcade whose own subscription reached us, and only so many at once:
+            // each answer knocks at the addresses the asker gave for 10 s or more.
+            if crate::realtime::route_to(from, HI_HEARD).is_none() || !may_answer(&st.pend, from, from_link) {
+                return;
+            }
+            let spray_ok = spraying(&st.pend) < MAX_SPRAYING;
             drop(st);
             refresh_nat(node);
             let offer = our_offer(node, None, false);
@@ -1062,7 +1131,7 @@ fn on_ui(node: &Node, from_link: &str, h: &Value) {
                 return;
             }
             let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
-            let Some(cell) = intro_path(node, from, n, &eph, h) else { return };
+            let Some(cell) = intro_path(node, from, n, &eph, h, spray_ok) else { return };
             let yes = hello_frame(node, "yes", from, n, &eph, &offer, &nat_kind());
             let mut st = g().lock().unwrap();
             if let Some(old) = st.pend.remove(from) {
@@ -1070,7 +1139,7 @@ fn on_ui(node: &Node, from_link: &str, h: &Value) {
                     hb.remove(&c);
                 }
             }
-            st.pend.insert(from.to_string(), Pend { n: n.into(), eph, we_hi: false, at: Instant::now(), cell: Some(cell), started: false });
+            st.pend.insert(from.to_string(), Pend { n: n.into(), eph, we_hi: false, via: from_link.to_string(), at: Instant::now(), cell: Some(cell), started: false });
             queue(&mut st, from_link, yes);
             let _ = node.app.event("mesh", &format!("introduced to {} (they asked); knocking", short(from)));
         }
@@ -1081,8 +1150,9 @@ fn on_ui(node: &Node, from_link: &str, h: &Value) {
                 return;
             }
             let eph = p.eph.clone();
+            let spray_ok = spraying(&st.pend) < MAX_SPRAYING;
             drop(st);
-            let cell = intro_path(node, from, n, &eph, h);
+            let cell = intro_path(node, from, n, &eph, h, spray_ok);
             let mut st = g().lock().unwrap();
             if let Some(p) = st.pend.get_mut(from) {
                 p.cell = cell;
@@ -1144,7 +1214,7 @@ fn intro_round(node: &Node) {
         let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
         let hi = hello_frame(node, "hi", &origin, &n, &eph, &offer, &nat);
         queue(&mut st, &via, hi);
-        st.pend.insert(origin.clone(), Pend { n, eph, we_hi: true, at: Instant::now(), cell: None, started: false });
+        st.pend.insert(origin.clone(), Pend { n, eph, we_hi: true, via: via.clone(), at: Instant::now(), cell: None, started: false });
         cool(&mut st, &origin);
         picked += 1;
         let _ = node.app.event("mesh", &format!("asking {} for an introduction (via {})", short(&origin), short(&via)));
@@ -1236,6 +1306,7 @@ fn housekeeping(node: Arc<Node>) {
                 let now = now_s();
                 st.via.retain(|_, (_, at)| now.saturating_sub(*at) < 3600);
                 st.fwd_rate.retain(|_, t| t.elapsed() < Duration::from_secs(10));
+                st.ui_in.retain(|_, (_, t)| t.elapsed() < Duration::from_secs(10));
                 st.cooling.retain(|_, (u, _)| *u + COOL_MAX > now);
                 st.probing.retain(|_, (_, _, t)| t.elapsed() < Duration::from_secs(120));
             }
@@ -1262,6 +1333,7 @@ pub fn status(node: &Node) -> Value {
         "socket_port": st.hub.as_ref().map(|h| h.port()),
         "socket_error": if st.hub_err.is_empty() { Value::Null } else { json!(st.hub_err) },
         "paths": st.hub.as_ref().map(|h| h.count()).unwrap_or(0),
+        "knocks_held": st.hub.as_ref().map(|h| h.knocks_held.load(std::sync::atomic::Ordering::Relaxed)).unwrap_or(0),
         "stun": {
             "listening": st.stun_bound,
             "answered": st.stun_seen,
@@ -1381,6 +1453,70 @@ mod tests {
         arcade_mesh::canon::sign_json(&k, &mut h, UI_STRIP, b"");
         assert_eq!(h["sig"], "433379b8b7a8eaa61e978b1f9db6ee9e0b9b53786755d97a615b368d1e9d62777973c821e606e3160c8ad8f69fd43a3d2400c40dea6588c013a32dc5d27c8406");
         assert!(ui_verify(&h));
+    }
+
+    #[test]
+    fn a_ui_frame_that_does_not_verify_changes_nothing() {
+        let t = crate::sitesvc::tests::shared();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
+        let from = hex::encode(sk.verifying_key().to_bytes());
+        let mut h = json!({"t": "ui", "op": "hi", "to": "ab".repeat(32), "from": from, "n": "0011223344556677",
+            "x": "cd".repeat(32), "a": [["203.0.113.5", 40000]], "nat": "same-port", "ts": now_s(), "hops": 0});
+        h["sig"] = json!("00".repeat(64));
+        on_ui(&t.node, &"ee".repeat(32), &h);
+        assert!(!g().lock().unwrap().via.contains_key(&from), "a forged sender is not routed to");
+        // Signed, it is.
+        arcade_mesh::canon::sign_json(&sk, &mut h, UI_STRIP, b"");
+        on_ui(&t.node, &"ee".repeat(32), &h);
+        assert!(g().lock().unwrap().via.contains_key(&from));
+    }
+
+    #[test]
+    fn answered_introductions_are_capped() {
+        let cell = || {
+            let k = [1u8; 32];
+            Some(Arc::new(Cell { p: Mutex::new(Path::new(&k, &k, vec![], Instant::now())), cv: std::sync::Condvar::new() }))
+        };
+        let pend = |via: &str| Pend { n: String::new(), eph: x25519_dalek::StaticSecret::from([1u8; 32]), we_hi: false, via: via.into(), at: Instant::now(), cell: cell(), started: false };
+        let mut m: HashMap<String, Pend> = HashMap::new();
+        assert!(may_answer(&m, "a1", "L1"));
+        for i in 0..MAX_ANSWERING_PER_LINK {
+            m.insert(format!("a{i}"), pend("L1"));
+        }
+        assert!(!may_answer(&m, "new", "L1"), "per link");
+        assert!(may_answer(&m, "a0", "L1"), "a new hi from the same asker replaces its old one");
+        assert!(may_answer(&m, "new", "L2"));
+        for i in MAX_ANSWERING_PER_LINK..MAX_ANSWERING {
+            m.insert(format!("a{i}"), pend(&format!("L{i}")));
+        }
+        assert!(!may_answer(&m, "new", "L99"), "in all");
+        // Ours (we asked) don't count against answers.
+        m.retain(|k, _| k == "a0");
+        m.insert("ours".into(), Pend { we_hi: true, ..pend("L1") });
+        assert!(may_answer(&m, "new", "L1"));
+        // Rate per link.
+        let mut st = G::default();
+        let t0 = Instant::now();
+        assert_eq!((0..100).filter(|_| ui_allowed(&mut st, "L1", t0)).count(), UI_BURST as usize);
+        assert!(ui_allowed(&mut st, "L2", t0));
+    }
+
+    #[test]
+    fn stun_server_answers_one_asker_at_a_limited_rate() {
+        let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = srv.local_addr().unwrap();
+        std::thread::spawn(move || stun_serve(srv));
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        for _ in 0..40 {
+            c.send_to(&arcade_mesh::stun::request().1, to).unwrap();
+        }
+        let mut got = 0;
+        let mut buf = [0u8; 200];
+        while c.recv_from(&mut buf).is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, 8);
     }
 
     #[test]

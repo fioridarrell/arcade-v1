@@ -43,6 +43,7 @@
   }
 
   window.addEventListener('message', function (e) {
+    if (e.source !== window.parent) return;          // only the arcade window that framed this page
     var m = e.data || {};
     if (m.arcade !== 'realtime') return;
     if (m.event) {                                  // pushed: something happened in a room

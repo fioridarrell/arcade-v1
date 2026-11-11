@@ -23,7 +23,88 @@ use arcade_app::now;
 /// Most mesh links we dial out to (the existing arcade links "everyone" up to 48).
 pub const MAX_OUTBOUND: usize = 48; // the original's EVERYONE_MAX
 
-/// Start a dialing thread for a mesh address unless one exists.
+/// Of those, most dialing addresses we only heard of (other arcades' "addrs", announcements
+/// on chain, peers remembered from them): seeds and --peer always have room.
+const MAX_HEARD_DIALS: usize = 32;
+/// A heard address is let go after this many failed dials in a row (heard again, it is
+/// tried again).
+const HEARD_TRIES: u32 = 3;
+/// New addresses taken from one link's "addrs" per HEARD_WINDOW seconds.
+const HEARD_PER_LINK: usize = 64;
+const HEARD_WINDOW: u64 = 600;
+/// Arcades kept in the peer list that we linked to only after hearing of them ("gossip"):
+/// at most this many, each forgotten after GOSSIP_KEEP seconds without a link.
+const MAX_GOSSIP_PEERS: usize = 256;
+const GOSSIP_KEEP: u64 = 30 * 86400;
+
+/// May this address be dialed when another arcade (or a chain record) named it? Only public
+/// ones: not loopback, private (RFC 1918), link-local, shared (CGNAT), multicast,
+/// unspecified or documentation addresses, nor IPv6 unique-local or link-local ones, nor
+/// IPv4-mapped forms of those. Seeds and --peer may be anything.
+pub fn public_ip(ip: &std::net::IpAddr) -> bool {
+    let ip = match ip {
+        std::net::IpAddr::V6(v6) => v6.to_ipv4_mapped().map(std::net::IpAddr::V4).unwrap_or(*ip),
+        v4 => *v4,
+    };
+    let reserved = matches!(ip, std::net::IpAddr::V4(a) if a.octets()[0] >= 240);
+    arcade_chain::p2p::public_ip(&ip) && !reserved
+}
+
+/// The dial address for an arcade another arcade told us of (`host`, `port` of an "addrs"
+/// entry), or None if it may not be dialed: an IP must be public, a host name is checked
+/// once it resolves (Link::dial_checked), and wss:// takes the same rules for its host.
+pub fn heard_addr(host: &str, port: u64) -> Option<String> {
+    if port == 0 || port > 65535 || host.is_empty() || host.len() > 255 {
+        return None;
+    }
+    let name_ok = |h: &str| {
+        let h = h.trim_end_matches('.').to_ascii_lowercase();
+        match h.parse::<std::net::IpAddr>() {
+            Ok(ip) => public_ip(&ip),
+            Err(_) => {
+                !h.is_empty()
+                    && h.contains('.')
+                    && h.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.')
+                    && !["localhost", ".localhost", ".local", ".internal", ".lan", ".home.arpa"].iter().any(|x| h == x.trim_start_matches('.') || h.ends_with(x))
+            }
+        }
+    };
+    if let Some(rest) = host.strip_prefix("wss://") {
+        let hostport = rest.split('/').next().unwrap_or("");
+        let h = match hostport.rsplit_once(':') {
+            Some((h, p)) if p.parse::<u16>().is_ok_and(|p| p > 0) => h,
+            Some(_) => return None,
+            None => hostport,
+        };
+        return name_ok(h).then(|| host.to_string());
+    }
+    if host.contains('/') || host.contains('[') {
+        return None;
+    }
+    if host.contains(':') {
+        let ip = host.parse::<std::net::Ipv6Addr>().ok()?;
+        return public_ip(&std::net::IpAddr::V6(ip)).then(|| format!("[{host}]:{port}"));
+    }
+    name_ok(host).then(|| format!("{host}:{port}"))
+}
+
+/// The same check for a dial address as `dial` takes it ("host:port", "[v6]:port", wss://).
+fn heard_dial_ok(addr: &str) -> bool {
+    if addr.starts_with("wss://") {
+        return heard_addr(addr, 443).is_some();
+    }
+    let Some((h, p)) = addr.rsplit_once(':') else { return false };
+    let h = h.strip_prefix('[').and_then(|x| x.strip_suffix(']')).unwrap_or(h);
+    p.parse::<u64>().ok().and_then(|p| heard_addr(h, p)).is_some()
+}
+
+/// Dialing addresses that were heard of (counted against MAX_HEARD_DIALS).
+fn heard_dials() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+    static H: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> = std::sync::OnceLock::new();
+    H.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Start a dialing thread for a mesh address unless one exists (seeds, --peer).
 pub fn dial(node: &Arc<Node>, addr: String) {
     {
         let mut d = node.dialing.lock().unwrap();
@@ -33,7 +114,27 @@ pub fn dial(node: &Arc<Node>, addr: String) {
         d.insert(addr.clone());
     }
     let n = node.clone();
-    std::thread::Builder::new().name(format!("mesh {addr}")).spawn(move || run(n, addr)).unwrap();
+    std::thread::Builder::new().name(format!("mesh {addr}")).spawn(move || run(n, addr, None)).unwrap();
+}
+
+/// Dial an address we heard of (`src`: "gossip" from another arcade, "chain" from an
+/// announcement): public addresses only, at most MAX_HEARD_DIALS at once, and let go after
+/// HEARD_TRIES failures in a row.
+pub fn dial_heard(node: &Arc<Node>, addr: String, src: &'static str) {
+    if !heard_dial_ok(&addr) {
+        return;
+    }
+    {
+        let mut d = node.dialing.lock().unwrap();
+        let mut h = heard_dials();
+        if d.contains(&addr) || d.len() >= MAX_OUTBOUND || h.len() >= MAX_HEARD_DIALS {
+            return;
+        }
+        d.insert(addr.clone());
+        h.insert(addr.clone());
+    }
+    let n = node.clone();
+    std::thread::Builder::new().name(format!("mesh {addr}")).spawn(move || run(n, addr, Some(src))).unwrap();
 }
 
 /// What we share on every link: arcades we know and coin peers that work.
@@ -70,36 +171,59 @@ fn share(node: &Node, link: &mut Link) -> Result<(), LinkError> {
     Ok(())
 }
 
-fn on_addrs(node: &Node, h: &Value) {
+/// New addresses taken from each link lately: link -> (window start, count).
+fn heard_from() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, (u64, usize)>> {
+    static H: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, (u64, usize)>>> = std::sync::OnceLock::new();
+    H.get_or_init(Default::default).lock().unwrap()
+}
+
+/// May link `from` give us another address to try? HEARD_PER_LINK per HEARD_WINDOW.
+fn heard_allowed(from: &str, t: u64) -> bool {
+    let mut m = heard_from();
+    if m.len() > 4096 {
+        m.retain(|_, (at, _)| at.saturating_add(HEARD_WINDOW) > t);
+    }
+    let e = m.entry(from.to_string()).or_insert((t, 0));
+    if e.0.saturating_add(HEARD_WINDOW) <= t {
+        *e = (t, 0);
+    }
+    if e.1 >= HEARD_PER_LINK {
+        return false;
+    }
+    e.1 += 1;
+    true
+}
+
+/// Arcades another arcade knows ("addrs"): dialed if public. They join our peer list (and
+/// what we share) only once a link to them works.
+fn on_addrs(node: &Node, from: &str, h: &Value) {
     let Some(list) = h["a"].as_array() else { return };
     let me = node.id_hex();
+    let Some(n) = node.me.get().and_then(|w| w.upgrade()) else { return };
+    let dialing = node.dialing.lock().unwrap().clone();
+    let linked: std::collections::BTreeSet<String> = node.links.lock().unwrap().values().map(|l| l.node_id.clone()).collect();
     for a in list.iter().take(50) {
         let (Some(host), Some(port), id) = (a["h"].as_str(), a["p"].as_u64(), a["id"].as_str().unwrap_or("")) else { continue };
-        if id == me || port == 0 || port > 65535 || host.len() > 255 {
+        if id == me || linked.contains(id) {
             continue;
         }
-        let addr = if host.starts_with("wss://") {
-            host.to_string()
-        } else if host.contains('/') {
+        let Some(addr) = heard_addr(host, port) else { continue };
+        if dialing.contains(&addr) || !heard_allowed(from, now()) {
             continue;
-        } else if host.contains(':') {
-            format!("[{host}]:{port}")
-        } else {
-            format!("{host}:{port}")
-        };
-        let known = node.app.peers().unwrap_or_default().iter().any(|p| p.id == id && !id.is_empty());
-        if !known {
-            let _ = node.app.put_peer(&arcade_app::Peer {
-                id: if id.is_empty() { addr.clone() } else { id.to_string() },
-                host: host.into(),
-                port: port as u16,
-                source: "gossip".into(),
-                last_seen: 0,
-                failures: 0,
-            });
         }
-        if let Some(n) = node.me.get().and_then(|w| w.upgrade()) {
-            dial(&n, addr);
+        dial_heard(&n, addr, "gossip");
+    }
+}
+
+/// Keep the arcades we know of only by hearing ("gossip") to MAX_GOSSIP_PEERS, forgetting
+/// those not linked within GOSSIP_KEEP (older entries never linked go first).
+pub fn prune_peers(node: &Node) {
+    let t = now();
+    let mut heard: Vec<arcade_app::Peer> = node.app.peers().unwrap_or_default().into_iter().filter(|p| p.source == "gossip").collect();
+    heard.sort_by_key(|p| std::cmp::Reverse(p.last_seen));
+    for (i, p) in heard.iter().enumerate() {
+        if i >= MAX_GOSSIP_PEERS || p.last_seen.saturating_add(GOSSIP_KEEP) <= t {
+            let _ = node.app.del_peer(&p.id);
         }
     }
 }
@@ -122,6 +246,9 @@ pub fn chain_announced(node: &Arc<Node>) -> usize {
         if key == me || linked.contains(&key) {
             continue;
         }
+        if !heard_dial_ok(&addr) {
+            continue;
+        }
         if !known.contains(&key) {
             let (host, port) = if addr.starts_with("wss://") {
                 (addr.clone(), 443)
@@ -134,7 +261,7 @@ pub fn chain_announced(node: &Arc<Node>) -> usize {
             let _ = node.app.put_peer(&arcade_app::Peer { id: key.clone(), host, port, source: "chain".into(), last_seen: 0, failures: 0 });
             n += 1;
         }
-        dial(node, addr);
+        dial_heard(node, addr, "chain");
     }
     n
 }
@@ -158,14 +285,29 @@ fn on_coin_peers(node: &Node, h: &Value) {
     }
 }
 
-pub fn run(node: Arc<Node>, addr: String) {
+/// How long to wait after `fails` failed dials in a row; None: let a heard address go.
+fn retry_after(fails: u32, heard: bool) -> Option<Duration> {
+    if heard && fails >= HEARD_TRIES {
+        return None;
+    }
+    Some(Duration::from_secs((5u64 << fails.min(7)).min(600)))
+}
+
+/// Keep dialing `addr`. `heard`: where we heard of it ("gossip", "chain"); such an address
+/// is dialed only while it resolves to public addresses, and let go after HEARD_TRIES
+/// failures in a row (or when the arcade is linked under another address).
+pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
     let mut fails = 0u32;
     loop {
-        match Link::dial(&addr, NET, &node.identity, None) {
+        let dialed = match heard {
+            Some(_) => Link::dial_checked(&addr, NET, &node.identity, None, &public_ip),
+            None => Link::dial(&addr, NET, &node.identity, None),
+        };
+        match dialed {
             Err(_) => {
                 fails += 1;
-                let wait = (5u64 << fails.min(7)).min(600);
-                std::thread::sleep(Duration::from_secs(wait));
+                let Some(wait) = retry_after(fails, heard.is_some()) else { break };
+                std::thread::sleep(wait);
                 continue;
             }
             Ok(mut link) => {
@@ -176,6 +318,9 @@ pub fn run(node: Arc<Node>, addr: String) {
                 // redialling; look again in half an hour.
                 if node.links.lock().unwrap().values().any(|l| l.node_id == id && l.addr != addr) {
                     drop(link);
+                    if heard.is_some() {
+                        break;
+                    }
                     std::thread::sleep(Duration::from_secs(1800));
                     continue;
                 }
@@ -184,10 +329,13 @@ pub fn run(node: Arc<Node>, addr: String) {
                     id: id.clone(),
                     host: if addr.starts_with("wss://") { addr.clone() } else { addr.rsplit_once(':').map(|x| x.0.trim_matches(|c| c == '[' || c == ']')).unwrap_or(&addr).into() },
                     port: if addr.starts_with("wss://") { 443 } else { addr.rsplit_once(':').and_then(|x| x.1.parse().ok()).unwrap_or(8421) },
-                    source: "seed".into(),
+                    source: heard.unwrap_or("seed").into(),
                     last_seen: now(),
                     failures: 0,
                 });
+                if heard == Some("gossip") {
+                    prune_peers(&node);
+                }
                 let _ = node.app.event("mesh", &format!("linked to {addr} ({})", &id[..16]));
                 let r = serve(&node, &mut link, &addr);
                 crate::node::link_remove(&node.links, &key);
@@ -195,6 +343,63 @@ pub fn run(node: Arc<Node>, addr: String) {
             }
         }
         std::thread::sleep(Duration::from_secs(5));
+    }
+    node.dialing.lock().unwrap().remove(&addr);
+    heard_dials().remove(&addr);
+}
+
+/// Inbound connections still in their handshake: at most this many in all and from one IP
+/// (each may take up to MAX_INBOUND bytes before it proves who it is), and each closed if
+/// the handshake isn't done within HANDSHAKE_FOR.
+const MAX_HANDSHAKES: usize = 64;
+const MAX_HANDSHAKES_PER_IP: usize = 4;
+const HANDSHAKE_FOR: Duration = Duration::from_secs(20);
+
+#[derive(Default)]
+struct Handshakes {
+    all: usize,
+    by_ip: std::collections::HashMap<std::net::IpAddr, usize>,
+}
+
+impl Handshakes {
+    fn take(&mut self, ip: std::net::IpAddr) -> bool {
+        let n = self.by_ip.get(&ip).copied().unwrap_or(0);
+        if self.all >= MAX_HANDSHAKES || n >= MAX_HANDSHAKES_PER_IP {
+            return false;
+        }
+        self.all += 1;
+        self.by_ip.insert(ip, n + 1);
+        true
+    }
+
+    fn give(&mut self, ip: std::net::IpAddr) {
+        self.all = self.all.saturating_sub(1);
+        if let Some(n) = self.by_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.by_ip.remove(&ip);
+            }
+        }
+    }
+}
+
+fn handshakes() -> std::sync::MutexGuard<'static, Handshakes> {
+    static H: std::sync::OnceLock<std::sync::Mutex<Handshakes>> = std::sync::OnceLock::new();
+    H.get_or_init(Default::default).lock().unwrap()
+}
+
+/// A handshake slot for `ip`, given back when dropped.
+struct Slot(std::net::IpAddr);
+
+impl Slot {
+    fn take(ip: std::net::IpAddr) -> Option<Slot> {
+        handshakes().take(ip).then_some(Slot(ip))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        handshakes().give(self.0);
     }
 }
 
@@ -207,11 +412,31 @@ pub fn listen(node: Arc<Node>, port: u16) {
             return;
         }
     };
+    accept(node, l);
+}
+
+fn accept(node: Arc<Node>, l: std::net::TcpListener) {
     for s in l.incoming().flatten() {
+        let Ok(ip) = s.peer_addr().map(|a| a.ip()) else { continue };
+        // Too many handshakes under way (from this IP or in all): close it unread.
+        let Some(slot) = Slot::take(ip) else { continue };
         let node = node.clone();
         std::thread::spawn(move || {
-            let peer_ip = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-            let Ok(mut link) = Link::handshake(s, NET, &node.identity, false, node.mesh_port) else { return };
+            let peer_ip = ip.to_string();
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Ok(w) = s.try_clone() {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(HANDSHAKE_FOR);
+                    if !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = w.shutdown(std::net::Shutdown::Both);
+                    }
+                });
+            }
+            let r = Link::handshake(s, NET, &node.identity, false, node.mesh_port);
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(slot);
+            let Ok(mut link) = r else { return };
             let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
             let key = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
             let _ = serve(&node, &mut link, &addr);
@@ -263,7 +488,11 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     crate::udpsvc::link_up(node, link);
     let mut last_me = std::time::Instant::now();
     let mut last_offer = crate::coreshare::offer(node).map(|o| o.head["nets"].clone()).unwrap_or(Value::Null);
-    let r = serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer);
+    // Core-style calls over this link (coreshare) are answered for this peer: the addresses
+    // it watches are its own.
+    let r = crate::rpc::as_caller(&peer, || {
+        serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
+    });
     crate::udpsvc::link_down(&peer);
     crate::realtime::link_down(&peer, conn);
     r
@@ -286,11 +515,10 @@ fn serve_loop(
 ) -> Result<(), LinkError> {
     let cr_reqs = &mut *cr_reqs;
     loop {
-        // Queued frames: every link sends every frame once.
+        // Queued frames: every link sends every frame once (those still in the ring).
         let pending: Vec<Value> = {
-            let ob = node.mesh_outbox.lock().unwrap();
-            let v = ob.iter().skip(*sent_outbox).cloned().collect();
-            *sent_outbox = ob.len();
+            let (v, next) = node.mesh_outbox.lock().unwrap().since(*sent_outbox);
+            *sent_outbox = next;
             v
         };
         for f in pending {
@@ -371,7 +599,7 @@ fn serve_loop(
             "wl" => crate::faucet::on_welcome(node, &f.head),
             "op" if f.head["op"] == "me" => crate::meshview::on_op_me(&link.peer_id, &f.head),
             "lk" => crate::links::on_lk(node, &f.head),
-            "addrs" => on_addrs(node, &f.head),
+            "addrs" => on_addrs(node, &link.peer_id, &f.head),
             "pp" => on_coin_peers(node, &f.head),
             "sz" => crate::sizes::on_sz(node, &link.peer_id, &f.head),
             "mp" => crate::mempoolshare::on_frame(node, &f.head),
@@ -505,4 +733,104 @@ fn operator_me(node: &Node) -> Value {
         me["name"] = json!(format!("@{tag}"));
     }
     me
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_public_addresses_are_dialed_from_gossip() {
+        for (h, p) in [
+            ("127.0.0.1", 8421), ("10.1.2.3", 8421), ("172.16.0.9", 8421), ("192.168.7.9", 8421), ("169.254.1.1", 8421),
+            ("100.64.0.1", 8421), ("224.0.0.1", 8421), ("0.0.0.0", 8421), ("255.255.255.255", 8421), ("240.0.0.1", 8421),
+            ("::1", 8421), ("::", 8421), ("fc00::1", 8421), ("fd12::1", 8421), ("fe80::1", 8421), ("::ffff:127.0.0.1", 8421),
+            ("::ffff:192.168.0.1", 8421), ("localhost", 8421), ("db.local", 8421), ("x.internal", 8421), ("box", 8421),
+            ("wss://127.0.0.1/mesh", 443), ("wss://10.0.0.1:8443/mesh", 443), ("wss://localhost/mesh", 443), ("wss://[::1]/mesh", 443),
+            ("wss://a.b:0/mesh", 443), ("8.8.8.8", 0), ("8.8.8.8", 70000), ("a/b", 1), ("[2001:4860::1]", 1),
+        ] {
+            assert_eq!(heard_addr(h, p), None, "{h} {p}");
+        }
+        assert_eq!(heard_addr("8.8.8.8", 8421).as_deref(), Some("8.8.8.8:8421"));
+        assert_eq!(heard_addr("2001:4860::1", 8421).as_deref(), Some("[2001:4860::1]:8421"));
+        assert_eq!(heard_addr("arcade.example.com", 8421).as_deref(), Some("arcade.example.com:8421"));
+        assert_eq!(heard_addr("wss://arcade.example.com/mesh", 443).as_deref(), Some("wss://arcade.example.com/mesh"));
+        assert!(heard_dial_ok("8.8.8.8:8421") && heard_dial_ok("[2001:4860::1]:8421") && heard_dial_ok("wss://arcade.example.com/mesh"));
+        assert!(!heard_dial_ok("192.168.7.9:8421") && !heard_dial_ok("[::1]:8421") && !heard_dial_ok("wss://127.0.0.1/mesh"));
+    }
+
+    #[test]
+    fn gossip_of_private_addresses_is_neither_kept_nor_dialed() {
+        let node = &crate::sitesvc::tests::shared().node;
+        let h = json!({"t": "addrs", "a": [
+            {"h": "127.0.0.1", "p": 1, "id": "aa"}, {"h": "192.168.7.9", "p": 8421, "id": "bb"},
+            {"h": "wss://10.0.0.1/mesh", "p": 443, "id": "cc"}, {"h": "fe80::1", "p": 8421, "id": ""},
+        ]});
+        on_addrs(node, &"ee".repeat(32), &h);
+        let peers = node.app.peers().unwrap();
+        assert!(!peers.iter().any(|p| ["aa", "bb", "cc"].contains(&p.id.as_str()) || p.host.contains("10.0.0.1") || p.host == "fe80::1"), "nothing kept");
+        let d = node.dialing.lock().unwrap();
+        assert!(!d.iter().any(|a| a.contains("127.0.0.1") || a.contains("192.168.7.9") || a.contains("10.0.0.1") || a.contains("fe80")), "nothing dialed");
+    }
+
+    #[test]
+    fn heard_addresses_are_let_go_and_gossip_peers_capped() {
+        assert!(retry_after(HEARD_TRIES - 1, true).is_some());
+        assert!(retry_after(HEARD_TRIES, true).is_none());
+        assert!(retry_after(100, false).is_some(), "seeds are tried for ever");
+        let node = &crate::sitesvc::tests::shared().node;
+        let t = now();
+        let peer = |id: String, source: &str, last_seen: u64| arcade_app::Peer { id, host: "8.8.8.8".into(), port: 8421, source: source.into(), last_seen, failures: 0 };
+        for i in 0..MAX_GOSSIP_PEERS + 20 {
+            node.app.put_peer(&peer(format!("g{i:04}"), "gossip", t - i as u64)).unwrap();
+        }
+        node.app.put_peer(&peer("old".into(), "gossip", 0)).unwrap();
+        node.app.put_peer(&peer("seed".into(), "seed", 0)).unwrap();
+        node.app.put_peer(&peer("chain".into(), "chain", 0)).unwrap();
+        prune_peers(&node);
+        let left = node.app.peers().unwrap();
+        assert_eq!(left.iter().filter(|p| p.source == "gossip").count(), MAX_GOSSIP_PEERS);
+        assert!(!left.iter().any(|p| p.id == "old" || p.id == "g0270"));
+        assert!(left.iter().any(|p| p.id == "seed") && left.iter().any(|p| p.id == "chain") && left.iter().any(|p| p.id == "g0000"));
+    }
+
+    #[test]
+    fn handshakes_are_capped_per_ip_and_in_all() {
+        let mut h = Handshakes::default();
+        let a: std::net::IpAddr = "203.0.113.1".parse().unwrap();
+        for _ in 0..MAX_HANDSHAKES_PER_IP {
+            assert!(h.take(a));
+        }
+        assert!(!h.take(a));
+        h.give(a);
+        assert!(h.take(a));
+        let mut n = MAX_HANDSHAKES_PER_IP;
+        for i in 2..=255u8 {
+            if h.take(std::net::IpAddr::from([203, 0, 113, i])) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, MAX_HANDSHAKES);
+    }
+
+    #[test]
+    fn inbound_beyond_the_per_ip_cap_is_closed_unread() {
+        use std::io::Read;
+        let node = crate::sitesvc::tests::shared().node.clone();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = l.local_addr().unwrap();
+        std::thread::spawn(move || accept(node, l));
+        // Connections that never speak: the first few wait in their handshake (they get our
+        // hello), the rest are closed at once.
+        let socks: Vec<std::net::TcpStream> = (0..MAX_HANDSHAKES_PER_IP + 3).map(|_| std::net::TcpStream::connect(to).unwrap()).collect();
+        let mut open = 0;
+        for mut s in socks {
+            s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let mut b = [0u8; 4096];
+            if s.read(&mut b).is_ok_and(|n| n > 0) {
+                open += 1;
+            }
+        }
+        assert_eq!(open, MAX_HANDSHAKES_PER_IP);
+    }
 }

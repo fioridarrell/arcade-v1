@@ -244,34 +244,177 @@ fn fresh_and_partial_chains_match_a_full_sync() {
     }
 }
 
+/// An output our blocks made that is spent by the tip (a coin no honest set holds).
+fn a_spent_output(e: &Env) -> ImportCoin {
+    for (h, b) in e.blocks.iter().enumerate().skip(1) {
+        for (p, t) in b.txs.iter().enumerate() {
+            for (v, o) in t.outputs.iter().enumerate() {
+                let op = arcade_chain::OutPoint { txid: t.txid, vout: v as u32 };
+                if !is_unspendable(o.value, &o.script_pubkey) && e.reference.coin(e.p, &op).unwrap().is_none() {
+                    return ImportCoin { txid: t.txid, vout: v as u32, value: o.value, height: h as u32, coinbase: p == 0, script: o.script_pubkey.clone() };
+                }
+            }
+        }
+    }
+    panic!("no spent output")
+}
+
 #[test]
 fn a_bad_coin_set_is_found_and_replaced() {
     let e = env(30);
     let c = e.p.chain_no;
+    for on_disk in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let db = partial(&e, d.path(), 10);
+        // The maker's set: one coin missing, one spent long ago still in it (both real outputs
+        // of our blocks, so they pass the check against the blocks; only the re-check sees them).
+        let mut bad = e.coins.clone();
+        bad.remove(3);
+        bad.push(a_spent_output(&e));
+        take_in(&e, &db, &d.path().join("tmp"), &bad, false);
+        assert!(table(&db, OUTPUTS) != table(&e.reference, OUTPUTS));
+        let stop = AtomicBool::new(false);
+        let tmp = d.path().join("tmp");
+        let diff = if on_disk {
+            // The re-check on disk: memory too small for Replay changes nothing.
+            assert!(!Replay::default().advance(&db, e.p, 30, 1, &stop, &mut |_| {}).unwrap());
+            let mut r = DiskReplay::new(&tmp, c).unwrap();
+            r.advance(&db, e.p, 12, &stop, &mut |_| {}).unwrap();
+            r.advance(&db, e.p, 30, &stop, &mut |_| {}).unwrap();
+            let mut rows = r.finish().unwrap();
+            let diff = db.apply_coin_diff(e.p, &mut || rows.next_kv(), true, &tmp, &stop, &mut |_| {}).unwrap();
+            assert_eq!(rows.missing, 0);
+            diff
+        } else {
+            let mut r = Replay::default();
+            r.advance(&db, e.p, 30, usize::MAX, &stop, &mut |_| {}).unwrap();
+            let rows = r.sorted(c);
+            let mut it = rows.clone().into_iter();
+            let diff = db.apply_coin_diff(e.p, &mut || Ok(it.next()), false, &tmp, &stop, &mut |_| {}).unwrap();
+            let mut it = rows.into_iter();
+            db.apply_coin_diff(e.p, &mut || Ok(it.next()), true, &tmp, &stop, &mut |_| {}).unwrap();
+            diff
+        };
+        assert_eq!((diff.added, diff.removed, diff.changed), (1, 1, 0), "on disk: {on_disk}");
+        assert!(table(&db, OUTPUTS) == table(&e.reference, OUTPUTS));
+        db.redo_addresses(c).unwrap();
+        assert!(db.build_addresses(e.p, &tmp, &AtomicBool::new(false), &mut |_| {}).unwrap());
+        for t in [SCRIPT_HIST, BY_SCRIPT, SPENDS] {
+            assert!(table(&db, t) == table(&e.reference, t), "address table {t}");
+        }
+    }
+}
+
+/// The re-check on disk derives exactly what Replay derives, wherever it is cut.
+#[test]
+fn the_re_check_on_disk_matches_replay() {
+    let e = env(45);
+    let c = e.p.chain_no;
     let d = tempfile::tempdir().unwrap();
-    let db = partial(&e, d.path(), 10);
-    // The maker's set: one coin missing, one with a wrong value, one invented.
-    let mut bad = e.coins.clone();
-    bad.remove(3);
-    bad[5].value += 1;
-    let mut fake = bad[0].clone();
-    fake.vout = 77;
-    bad.push(fake);
-    take_in(&e, &db, &d.path().join("tmp"), &bad, false);
-    assert!(table(&db, OUTPUTS) != table(&e.reference, OUTPUTS));
+    let stop = AtomicBool::new(false);
     let mut r = Replay::default();
-    r.advance(&db, e.p, 30, usize::MAX, &AtomicBool::new(false), &mut |_| {}).unwrap();
-    let rows = r.sorted(c);
-    let mut it = rows.clone().into_iter();
-    let diff = db.apply_coin_diff(e.p, &mut || Ok(it.next()), false, &d.path().join("tmp"), &AtomicBool::new(false), &mut |_| {}).unwrap();
-    assert_eq!((diff.added, diff.removed, diff.changed), (1, 1, 1));
-    let mut it = rows.into_iter();
-    db.apply_coin_diff(e.p, &mut || Ok(it.next()), true, &d.path().join("tmp"), &AtomicBool::new(false), &mut |_| {}).unwrap();
-    assert!(table(&db, OUTPUTS) == table(&e.reference, OUTPUTS));
-    db.redo_addresses(c).unwrap();
-    assert!(db.build_addresses(e.p, &d.path().join("tmp"), &AtomicBool::new(false), &mut |_| {}).unwrap());
-    for t in [SCRIPT_HIST, BY_SCRIPT, SPENDS] {
-        assert!(table(&db, t) == table(&e.reference, t), "address table {t}");
+    r.advance(&e.reference, e.p, 45, usize::MAX, &stop, &mut |_| {}).unwrap();
+    let want = r.sorted(c);
+    let mut dr = DiskReplay::new(d.path(), c).unwrap();
+    for to in [1, 7, 30, 45] {
+        dr.advance(&e.reference, e.p, to, &stop, &mut |_| {}).unwrap();
+    }
+    let mut rows = dr.finish().unwrap();
+    let mut got = Vec::new();
+    while let Some(kv) = rows.next_kv().unwrap() {
+        got.push(kv);
+    }
+    assert_eq!(rows.missing, 0);
+    assert!(got == want);
+    assert!(got == table(&e.reference, OUTPUTS));
+}
+
+/// Coins our blocks don't have as the copy says are refused before anything is written, so
+/// they never reach an address's coins or balance.
+#[test]
+fn coins_not_in_our_blocks_are_refused() {
+    let e = env(20);
+    let c = e.p.chain_no;
+    let stranger = script(250, 0);
+    let forgeries: Vec<(&str, Box<dyn Fn(&mut Vec<ImportCoin>)>)> = vec![
+        ("a higher value", Box::new(|v: &mut Vec<ImportCoin>| v[5].value += 1)),
+        ("another script", Box::new(|v: &mut Vec<ImportCoin>| v[5].script = script(250, 0))),
+        ("an output its tx doesn't have", Box::new(|v: &mut Vec<ImportCoin>| {
+            let mut f = v[0].clone();
+            f.vout = 77;
+            f.script = script(250, 0);
+            v.push(f);
+        })),
+        ("another height", Box::new(|v: &mut Vec<ImportCoin>| v[2].height += 1)),
+    ];
+    for (what, forge) in forgeries {
+        let d = tempfile::tempdir().unwrap();
+        let db = partial(&e, d.path(), 6);
+        let tmp = d.path().join("tmp");
+        let path = db.header_path(c, 7, 20).unwrap();
+        let raws: Vec<Vec<u8>> = e.blocks[7..].iter().map(|b| b.encode()).collect();
+        db.store_blocks_only(e.p, &raws).unwrap();
+        let bs: Vec<u32> = path.iter().map(|x| db.stored_b(c, x).unwrap().unwrap()).collect();
+        db.write_txs_for(e.p, &bs, &tmp, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        let before = (table(&db, OUTPUTS), db.tip(c).unwrap());
+        let mut coins = e.coins.clone();
+        forge(&mut coins);
+        let mut it = coins.into_iter();
+        let r = db.import_coins(e.p, &path, 20, &mut || Ok(it.next()), "{}", &tmp, &AtomicBool::new(false), &mut |_| {});
+        assert!(r.is_err(), "{what}");
+        assert_eq!((table(&db, OUTPUTS), db.tip(c).unwrap()), before, "{what}: nothing written");
+        assert!(db.state_text(c, TRUSTED).unwrap().is_none() && db.import_pending(c).unwrap().is_none(), "{what}");
+        assert!(db.coins_for_script(e.p, &stranger).unwrap().is_empty() && db.balance_for_script(c, &stranger).unwrap() == 0, "{what}");
+        // The honest set goes in.
+        let mut it = e.coins.clone().into_iter();
+        db.import_coins(e.p, &path, 20, &mut || Ok(it.next()), "{}", &tmp, &AtomicBool::new(false), &mut |_| {}).unwrap();
+        assert!(table(&db, OUTPUTS) == table(&e.reference, OUTPUTS), "{what}");
+    }
+}
+
+/// A V1.0 copy's coins (by position) are checked against our blocks the same way.
+#[test]
+fn coins_by_position_are_checked_against_their_blocks() {
+    let e = env(25);
+    let c = e.p.chain_no;
+    // The reference's coin set as a V1.0 copy lists it: height, tx position, vout, ...
+    let mut recs = Vec::new();
+    for (h, b) in e.blocks.iter().enumerate() {
+        for (p, t) in b.txs.iter().enumerate() {
+            for v in 0..t.outputs.len() as u32 {
+                if let Some(k) = e.reference.coin(e.p, &arcade_chain::OutPoint { txid: t.txid, vout: v }).unwrap() {
+                    recs.push((h as u32, p as u32, v, k.value, k.coinbase, k.script));
+                }
+            }
+        }
+    }
+    let stranger = script(251, 0);
+    let mut fake_value = recs.clone();
+    fake_value[4].3 *= 1000;
+    let mut fake_script = recs.clone();
+    fake_script[4].5 = stranger.clone();
+    let mut fake_vout = recs.clone();
+    fake_vout.push((3, 0, 9, 5_000_000, true, stranger.clone()));
+    let mut spendable_return = recs.clone();
+    spendable_return.push((4, 0, 0, 0, false, vec![0x6a]));
+    for (what, set, ok) in [("honest", &recs, true), ("value", &fake_value, false), ("script", &fake_script, false), ("vout", &fake_vout, false), ("op_return", &spendable_return, false)] {
+        let d = tempfile::tempdir().unwrap();
+        let db = partial(&e, d.path(), 8);
+        let tmp = d.path().join("tmp");
+        let path = db.header_path(c, 9, 25).unwrap();
+        let raws: Vec<Vec<u8>> = e.blocks[9..].iter().map(|b| b.encode()).collect();
+        db.store_blocks_only(e.p, &raws).unwrap();
+        let before = table(&db, OUTPUTS);
+        let mut it = set.clone().into_iter();
+        let r = db.import_coins_at(e.p, &path, 25, &mut || Ok(it.next()), "{}", &tmp, &AtomicBool::new(false), &mut |_| {});
+        assert_eq!(r.is_ok(), ok, "{what}: {r:?}");
+        if ok {
+            assert!(table(&db, OUTPUTS) == table(&e.reference, OUTPUTS));
+            assert!(db.state_text(c, TRUSTED).unwrap().is_some(), "unspent is still the copy's word until re-checked");
+        } else {
+            assert!(table(&db, OUTPUTS) == before, "{what}: nothing written");
+            assert!(db.coins_for_script(e.p, &stranger).unwrap().is_empty() && db.balance_for_script(c, &stranger).unwrap() == 0);
+        }
     }
 }
 

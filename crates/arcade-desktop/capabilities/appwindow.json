@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "appwindow",
+  "description": "App windows (our wrapper; the app itself is a sandboxed frame inside) may call the arcade API and save a file the app hands over.",
+  "windows": ["app-*"],
+  "permissions": ["core:default", "allow-api", "allow-save-file"]
+}

@@ -17,7 +17,7 @@
 //! rows built); until then its borrowed copy keeps running and answers balances and sends.
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, by_net, check_block_work, check_header, ChainParams, PowCheck, ALL_CHAINS};
+use arcade_chain::params::{by_key, by_net, check_block_work, check_context, check_header, ChainParams, PowCheck, ALL_CHAINS, MEDIAN_TIME_SPAN};
 use arcade_chain::pow::{meets_target, pow_hash, PowAlgo};
 use arcade_chain::{Block, Hash256, Header, OutPoint, Tx};
 use arcade_ledger::address::script_for_address;
@@ -438,13 +438,17 @@ fn call_any(node: &Node, p: &ChainParams, calls: Value) -> Result<(String, Vec<V
 
 /// A block as a lender sent it, checked against our own params: hash, merkle root, and proof of
 /// work (AuxPoW included) on top of `parent` (our stored header, or one the lender gave when
-/// there is none: then only the work is checked, not that it is the best chain).
-fn check_block(p: &ChainParams, raw: &[u8], want: &Hash256, parent: &Header, height: u32) -> Result<Block, String> {
+/// there is none: then only the work is checked, not that it is the best chain). `below` is
+/// the chain under it, parent first, as far as we store it: its time (and, where the chain
+/// has the rule, its difficulty) is checked against those. Borrowing follows the lender's
+/// tip and adds up no work, so a header whose work can't be checked weighs nothing here.
+fn check_block(p: &ChainParams, raw: &[u8], want: &Hash256, parent: &Header, height: u32, below: &[Header]) -> Result<Block, String> {
     let b = Block::parse_with(raw, &p.format).map_err(e)?;
     if b.id != *want || p.block_id(&b.header) != *want {
         return Err(format!("block {want}: the lender sent another block"));
     }
     b.check().map_err(|x| format!("block {want}: {x}"))?;
+    check_context(p, &b.header, height, below, arcade_app::now()).map_err(|x| format!("block {want}: {x}"))?;
     match check_header(p, &b.header, parent, height).map_err(|x| format!("block {want}: {x}"))? {
         PowCheck::AuxPow => {
             let a = b.auxpow.as_ref().ok_or("AuxPoW flag without data")?;
@@ -462,6 +466,22 @@ fn check_block(p: &ChainParams, raw: &[u8], want: &Hash256, parent: &Header, hei
     Ok(b)
 }
 
+/// Our stored headers under `height`, parent first: up to MEDIAN_TIME_SPAN, stopping at the
+/// floor or a break in the links.
+fn stored_below(node: &Node, p: &ChainParams, height: u32) -> Vec<Header> {
+    let mut v: Vec<Header> = Vec::with_capacity(MEDIAN_TIME_SPAN);
+    let mut want_hash: Option<Hash256> = None;
+    for h in (height.saturating_sub(MEDIAN_TIME_SPAN as u32)..height).rev() {
+        let Some((hash, hdr)) = stored_header(node, p, h) else { break };
+        if want_hash.is_some_and(|w| w != hash) {
+            break;
+        }
+        want_hash = Some(hdr.prev);
+        v.push(hdr);
+    }
+    v
+}
+
 fn header_from_hex(s: &str) -> Result<Header, String> {
     let b = hex::decode(s).map_err(e)?;
     let a: [u8; 80] = b.get(..80).ok_or("short header")?.try_into().unwrap();
@@ -476,12 +496,13 @@ fn fetch_checked(node: &Node, p: &ChainParams, hash: &Hash256) -> Result<(Block,
     let raw = hex::decode(r(&a[0])?.as_str().ok_or("bad block")?).map_err(e)?;
     let height = r(&a[1])?["height"].as_u64().ok_or("bad header")? as u32;
     let b0 = Block::parse_with(&raw, &p.format).map_err(e)?;
-    let parent = match height.checked_sub(1).and_then(|h| stored_header(node, p, h)) {
-        Some((ph, hdr)) if ph == b0.header.prev => hdr,
-        _ if height == 0 => b0.header,
+    let (parent, below) = match height.checked_sub(1).and_then(|h| stored_header(node, p, h)) {
+        Some((ph, hdr)) if ph == b0.header.prev => (hdr, stored_below(node, p, height)),
+        _ if height == 0 => (b0.header, vec![]),
         _ => {
             let pa = call(node, &addr, p, json!([["getblockheader", [b0.header.prev.to_hex(), false]]]))?;
-            header_from_hex(r(&pa[0])?.as_str().ok_or("bad header")?)?
+            let hdr = header_from_hex(r(&pa[0])?.as_str().ok_or("bad header")?)?;
+            (hdr, vec![hdr])
         }
     };
     if height == 0 {
@@ -490,7 +511,7 @@ fn fetch_checked(node: &Node, p: &ChainParams, hash: &Hash256) -> Result<(Block,
         }
         return Ok((b0, 0, addr));
     }
-    Ok((check_block(p, &raw, hash, &parent, height)?, height, addr))
+    Ok((check_block(p, &raw, hash, &parent, height, &below)?, height, addr))
 }
 
 // ---------------- storage ----------------
@@ -923,7 +944,7 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
             if undone > 0 { let _ = node.app.event("borrow", &format!("{}: reorg, {undone} block{} taken back", p.name, if undone == 1 { "" } else { "s" })); }
             return Ok(true);
         }
-        let b = check_block(p, &raw, hash, &phdr, h + 1)?;
+        let b = check_block(p, &raw, hash, &phdr, h + 1, &stored_below(node, p, h + 1))?;
         connect(node, p, h + 1, &b, watch, false)?;
         h += 1;
     }

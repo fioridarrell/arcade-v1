@@ -276,12 +276,17 @@ pub fn start(node: Arc<Node>, stun_flag: Option<u16>) {
 
 fn stun_serve(s: UdpSocket) {
     let mut buf = [0u8; 1500];
+    // Answers are counted per asking IP and in all (an answer is larger than the request).
+    let mut limit = arcade_mesh::stun::AnswerLimit::default();
     loop {
         let Ok((n, from)) = s.recv_from(&mut buf) else { continue };
         if let Some(tx) = arcade_mesh::stun::parse_request(&buf[..n]) {
+            g().lock().unwrap().stun_seen += 1;
+            if !limit.allow(from.ip(), Instant::now()) {
+                continue;
+            }
             // A dual-stack socket must answer to the address as it came (v4-mapped).
             let _ = s.send_to(&arcade_mesh::stun::response(&tx, from), from);
-            g().lock().unwrap().stun_seen += 1;
         }
         // Other STUN methods (TURN allocations) are not served.
     }
@@ -1381,6 +1386,24 @@ mod tests {
         arcade_mesh::canon::sign_json(&k, &mut h, UI_STRIP, b"");
         assert_eq!(h["sig"], "433379b8b7a8eaa61e978b1f9db6ee9e0b9b53786755d97a615b368d1e9d62777973c821e606e3160c8ad8f69fd43a3d2400c40dea6588c013a32dc5d27c8406");
         assert!(ui_verify(&h));
+    }
+
+    #[test]
+    fn stun_server_answers_one_asker_at_a_limited_rate() {
+        let srv = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let to = srv.local_addr().unwrap();
+        std::thread::spawn(move || stun_serve(srv));
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        for _ in 0..40 {
+            c.send_to(&arcade_mesh::stun::request().1, to).unwrap();
+        }
+        let mut got = 0;
+        let mut buf = [0u8; 200];
+        while c.recv_from(&mut buf).is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, 8);
     }
 
     #[test]

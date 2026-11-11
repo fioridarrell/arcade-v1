@@ -591,13 +591,15 @@ pub struct Hub {
     stun: Mutex<HashMap<[u8; 12], mpsc::Sender<SocketAddr>>>,
     /// STUN requests that reach this socket (when it doubles as a server; normally unused).
     pub stuns_seen: std::sync::atomic::AtomicU64,
+    /// How often those are answered (crate::stun::AnswerLimit).
+    stun_limit: Mutex<crate::stun::AnswerLimit>,
 }
 
 impl Hub {
     /// Serve paths on `sock` (one thread reads it and ticks every path every 5 ms).
     pub fn start(sock: UdpSocket) -> io::Result<Arc<Hub>> {
         sock.set_read_timeout(Some(Duration::from_millis(5)))?;
-        let h = Arc::new(Hub { sock, paths: Mutex::new(HashMap::new()), stun: Mutex::new(HashMap::new()), stuns_seen: Default::default() });
+        let h = Arc::new(Hub { sock, paths: Mutex::new(HashMap::new()), stun: Mutex::new(HashMap::new()), stuns_seen: Default::default(), stun_limit: Default::default() });
         let hub = h.clone();
         std::thread::Builder::new().name("mesh udp".into()).spawn(move || hub.run())?;
         Ok(h)
@@ -691,7 +693,9 @@ impl Hub {
                         }
                     } else if let Some(tx) = crate::stun::parse_request(p) {
                         self.stuns_seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                        let _ = self.sock.send_to(&crate::stun::response(&tx, from), from);
+                        if self.stun_limit.lock().unwrap().allow(from.ip(), Instant::now()) {
+                            let _ = self.sock.send_to(&crate::stun::response(&tx, from), from);
+                        }
                     }
                 }
                 Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut) => {}
@@ -1058,6 +1062,23 @@ mod tests {
         let mut c = Path::new(&[1; 32], &[2; 32], vec![ba], t0);
         c.tick(t0 + Duration::from_secs(11));
         assert_eq!(c.down.as_deref(), Some("no answer"));
+    }
+
+    #[test]
+    fn hub_answers_stun_at_a_limited_rate() {
+        let hub = Hub::start(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+        let c = UdpSocket::bind("127.0.0.1:0").unwrap();
+        c.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let to: SocketAddr = format!("127.0.0.1:{}", hub.port()).parse().unwrap();
+        for _ in 0..40 {
+            c.send_to(&crate::stun::request().1, to).unwrap();
+        }
+        let mut got = 0;
+        let mut buf = [0u8; 200];
+        while c.recv_from(&mut buf).is_ok() {
+            got += 1;
+        }
+        assert_eq!(got, crate::stun::ANSWER_IP_BURST as usize);
     }
 
     #[test]

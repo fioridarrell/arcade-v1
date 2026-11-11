@@ -5,6 +5,10 @@
 //! Indexes: ledger, profiles, ord, and riding on ord (same commit, need ord): names, maps,
 //! tokens (PRC-20 / DRC-20). Adding a rider to a chain whose ord index exists rebuilds ord
 //! from its start; removing a rider only deletes that rider's rows.
+//!
+//! collections (on-chain collection roots, arcade_ledger::collreg) also needs ord but is not a
+//! rider: it is read from ord's records in the background (crate::collsvc), so adding it never
+//! rebuilds ord. Removing ord removes it too.
 
 use crate::node::Node;
 use arcade_chain::p2p::Peer;
@@ -17,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 pub const MODES: &[&str] = &["light", "chain", "index", "full", "shared"];
-pub const INDEXES: &[&str] = &["addresses", "messages", "ledger", "profiles", "ord", "names", "maps", "tokens", "runes", "dunes"];
+pub const INDEXES: &[&str] = &["addresses", "messages", "ledger", "profiles", "ord", "names", "maps", "tokens", "collections", "runes", "dunes"];
 pub const COMING: &[&str] = &["runes", "dunes"];
 const HOME_DEFAULT: &[&str] = &["ledger", "profiles"];
 
@@ -66,6 +70,7 @@ pub(crate) fn tables_of(index: &str) -> Vec<String> {
         "names" => s(&[arcade_ledger::names::CLAIM, arcade_ledger::names::WIN]),
         "maps" => s(&[arcade_ledger::maps::MAP]),
         "tokens" => s(&[arcade_ledger::tokens::TICK, arcade_ledger::tokens::BAL, arcade_ledger::tokens::HOLDER, arcade_ledger::tokens::XFER]),
+        "collections" => s(arcade_ledger::collreg::TABLES),
         _ => vec![],
     }
 }
@@ -94,10 +99,10 @@ fn normalize(p: &ChainParams, indexes: &[String], home: bool) -> Result<Vec<Stri
         if ix == "tokens" && arcade_ledger::tokens::protocol(p).is_none() {
             return Err(format!("no token protocol is known on {} yet (PRC-20 is Pepecoin's, DRC-20 is Dogecoin's)", p.name));
         }
-        if (ix == "ord" || is_rider(ix)) && ord_start(p).is_none() {
+        if (ix == "ord" || is_rider(ix) || ix == "collections") && ord_start(p).is_none() {
             return Err(format!("the {ix} index is not available on {} yet", p.name));
         }
-        if is_rider(ix) && !indexes.iter().any(|i| i == "ord") && !out.iter().any(|i| i == "ord") {
+        if (is_rider(ix) || ix == "collections") && !indexes.iter().any(|i| i == "ord") && !out.iter().any(|i| i == "ord") {
             out.push("ord".into());
         }
         if !out.contains(ix) {
@@ -515,6 +520,20 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
         crate::addrsvc::clear_in_background(node.clone(), p);
         return Ok(json!({"removed": index, "chain": key}));
     }
+    if index == "collections" {
+        if !cur.iter().any(|i| i == index) {
+            return Err(format!("{index} is not on {key}"));
+        }
+        let set: Vec<String> = cur.iter().filter(|i| *i != index).cloned().collect();
+        apply_set(node, key, home, run, set)?;
+        let (n, c, name) = (node.clone(), p.chain_no, p.name);
+        std::thread::spawn(move || {
+            let _ = arcade_ledger::collreg::wipe(&n.chain, c);
+            crate::knowncoll::wipe(&n, c);
+            let _ = n.app.event("chains", &format!("removed the collections index on {name}"));
+        });
+        return Ok(json!({"removed": index, "chain": key}));
+    }
     if indexer_name(index).is_empty() {
         return Err(format!("unknown index {index}"));
     }
@@ -523,12 +542,13 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
     }
     let c = p.chain_no;
     let gone: Vec<String> = if index == "ord" {
-        cur.iter().filter(|i| *i == "ord" || is_rider(i)).cloned().collect()
+        cur.iter().filter(|i| *i == "ord" || is_rider(i) || *i == "collections").cloned().collect()
     } else {
         vec![index.to_string()]
     };
     let set: Vec<String> = cur.iter().filter(|i| !gone.contains(i)).cloned().collect();
-    let tables: Vec<String> = gone.iter().flat_map(|g| tables_of(g)).collect();
+    let tables: Vec<String> = gone.iter().filter(|g| *g != "collections").flat_map(|g| tables_of(g)).collect();
+    let coll = gone.iter().any(|g| g == "collections");
     let rider = is_rider(index);
     let name = indexer_name(index);
     if !rider {
@@ -542,6 +562,10 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
             while n.chain.clear_rows_batch(c, &tables, 20_000).map(|x| x > 0).unwrap_or(false) {}
         } else {
             while n.chain.remove_index_batch(c, name, &tables, 20_000).map(|x| x > 0).unwrap_or(false) {}
+        }
+        if coll {
+            let _ = arcade_ledger::collreg::wipe(&n.chain, c);
+            crate::knowncoll::wipe(&n, c);
         }
         let _ = n.app.event("chains", &format!("removed the {label}"));
     });
@@ -590,6 +614,7 @@ fn label(p: &ChainParams, ix: &str) -> String {
         "names" => "Names".into(),
         "maps" => "Maps".into(),
         "tokens" => format!("{} tokens", arcade_ledger::tokens::protocol(p).map(|x| x.0).unwrap_or("Token").to_uppercase()),
+        "collections" => "Collections".into(),
         _ => ix.into(),
     }
 }
@@ -706,6 +731,11 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
             } else {
                 stages.push(json!({"name": "Addresses", "index": ix, "detail": detail, "overall_pct": blocks_pct, "pct": p_, "at": tip, "of": peer}));
             }
+            continue;
+        }
+        if ix == "collections" {
+            let (detail, done) = crate::collsvc::note(c);
+            stages.push(json!({"name": label(p, ix), "index": ix, "detail": detail, "pct": if done { 100.0 } else { 0.0 }, "at": null}));
             continue;
         }
         let name = indexer_name(ix);

@@ -4,6 +4,7 @@
 pub mod address;
 pub mod amount;
 pub mod collections;
+pub mod collreg;
 pub mod cards;
 pub mod content;
 pub mod digidollar;

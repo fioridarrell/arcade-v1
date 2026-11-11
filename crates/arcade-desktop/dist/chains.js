@@ -7,7 +7,8 @@
     ["index", "Index only", "Coming: chosen indexes, blocks borrowed from the mesh.", false],
     ["light", "Light", "Coming: headers only; everything else borrowed.", false],
   ];
-  // Every index is opt-in. Names, maps and tokens ride on the ord index (ticking one ticks ord).
+  // Every index is opt-in. Names, maps and tokens ride on the ord index (ticking one ticks ord);
+  // collections needs ord too but is read from it afterwards.
   const INDEXES = [
     ["addresses", "Addresses", "every address's history and balance, and where each coin went (address pages, balances); built after catching up", true],
     ["ledger", "Arcade ledger", "arcade tokens, exchange, arcade NFTs, @tags", true],
@@ -16,10 +17,13 @@
     ["names", "Names", ".pepe / .doge names and \"p\":\"dns\" claims (needs ord)", true, "ord"],
     ["maps", "Maps", "block maps: <block>.pepemap, .dogemap, .bitmap (needs ord)", true, "ord"],
     ["tokens", "Tokens", "PRC-20 on Pepecoin, DRC-20 on Dogecoin: deploys, mints, transfers, balances (needs ord)", true, "ord"],
+    ["collections", "Collections", "NFT collections published on the chain, and Sub 1K (needs ord; read from it, no rebuild)", true, "ord"],
     ["runes", "Runes", "coming: Bitcoin's fungible tokens", false, "runes"],
     ["dunes", "Dunes", "coming: Dogecoin's runes-style tokens", false, "dunes"],
   ];
   const RIDERS = ["names", "maps", "tokens"];
+  // Indexes that need ord: ticking one ticks ord, unticking ord unticks them.
+  const NEEDS_ORD = [...RIDERS, "collections"];
   let chains = [], open = null, mode = "full", watching = null, poll = null;
 
   const msg = (text, bad) => say("c-msg", text, bad);
@@ -168,8 +172,8 @@
       const box = l.querySelector("input");
       box.onchange = () => {
         const all = $("c-idx");
-        if (box.checked && RIDERS.includes(k)) all.querySelector('input[data-k="ord"]').checked = true;
-        if (!box.checked && k === "ord") RIDERS.forEach((r) => { const x = all.querySelector(`input[data-k="${r}"]`); if (x) x.checked = false; });
+        if (box.checked && NEEDS_ORD.includes(k)) all.querySelector('input[data-k="ord"]').checked = true;
+        if (!box.checked && k === "ord") NEEDS_ORD.forEach((r) => { const x = all.querySelector(`input[data-k="${r}"]`); if (x) x.checked = false; });
         $("c-total").textContent = total(c);
         $("c-total").hidden = !$("c-total").textContent;
       };

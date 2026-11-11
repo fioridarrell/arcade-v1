@@ -7,6 +7,8 @@
 
 mod accountsvc;
 mod addrsvc;
+mod collsvc;
+mod knowncoll;
 mod announce;
 mod api;
 mod apikeys;
@@ -334,6 +336,14 @@ fn main() {
     {
         let n = node.clone();
         std::thread::Builder::new().name("ord types".into()).spawn(move || ordtypes::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("collections".into()).spawn(move || collsvc::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("known collections".into()).spawn(move || knowncoll::run(n)).unwrap();
     }
     {
         let n = node.clone();

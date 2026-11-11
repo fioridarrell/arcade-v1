@@ -202,12 +202,6 @@ pub fn answer(node: &Node, arg: &str) -> Result<Value, String> {
     if q["op"].as_str().is_some_and(|o| o.starts_with('s')) {
         return crate::swaps::answer(node, &q); // any leg for any leg (swaps.rs)
     }
-    if q["op"].as_str().is_some_and(|o| o.starts_with('t')) {
-        return crate::t20swap::answer(node, &q); // DRC-20 / PRC-20 for DGB (t20swap.rs)
-    }
-    if q["op"].as_str().is_some_and(|o| o.starts_with('x')) {
-        return crate::xswap::answer(node, &q); // cross-chain swaps (xswap.rs)
-    }
     match q["op"].as_str().unwrap_or("") {
         "book" => Ok(json!({"node": node.id_hex(), "orders": orders(node, Some(p.key), false).iter().map(public).collect::<Vec<_>>()})),
         "fill" => lay_out(node, p, &q),

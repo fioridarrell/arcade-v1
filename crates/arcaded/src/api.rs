@@ -486,15 +486,6 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
         c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
-        // Cross-chain DigiDollar swaps (xswap.rs), driven from the socket while the page API comes.
-        "xswap.place" => crate::xswap::place(node, &s("dd").unwrap_or_else(|| "dgbtest".into()), req["cents"].as_i64().ok_or("cents required")?, req["price"].as_u64().ok_or("price required")?),
-        "xswap.book" => Ok(json!(crate::xswap::book(node))),
-        "xswap.take" => crate::xswap::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?, req["cents"].as_i64().ok_or("cents required")?),
-        "xswap.list" => Ok(json!(crate::xswap::swaps(node))),
-        "t20swap.place" => crate::t20swap::place(node, &s("tick").ok_or("tick required")?, &s("amount").ok_or("amount required")?, &s("dgb").unwrap_or_else(|| "dgbtest".into()), req["price"].as_u64().ok_or("price required")?),
-        "t20swap.book" => Ok(json!(crate::t20swap::book(node))),
-        "t20swap.take" => crate::t20swap::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?),
-        "t20swap.list" => Ok(json!(crate::t20swap::swaps(node))),
         "swap.place" => crate::swaps::place(node, &req["give"], &req["get"]),
         "swap.book" => Ok(json!(crate::swaps::book(node))),
         "swap.take" => crate::swaps::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?),

@@ -1,6 +1,6 @@
 # The market and atomic swaps — PLAN
 
-Status: **plan only, nothing built.** Written 2026-11-10 on the GX10 from a read-only audit of the
+Status: **being built** (see "Built and tested" at the end). Written 2026-11-10 on the GX10 from a read-only audit of the
 original arcade's code and of one live original arcade. Asked for by Martin: the token market of the
 original arcade on V1.0, usable from an inscribed app, with cross-chain swaps that stay trustless and
 work with the original arcades.
@@ -496,3 +496,25 @@ V1.0 with the source file's SHA-256.
 | PEP | `ea060e94568de806493cdc76f5f590dd9d06e4521a873aa7c025540641e571ab` |
 | PEP testnet | `5c94ebc6f08ea85d0480ee5ecf91617218b143d9cf27fbc13e7e5b7b247cb7f4` |
 | WJK | `e1d07b7f8d6e25f784c0d6551c8145be0987e4f709225479db5ee8dc04a896b9` |
+
+## Built and tested (2026-11-10 / 11)
+
+On test chains only, between two test arcades in a private network, from test accounts.
+
+- **Reads (step 1):** the ledger's books, trades and markets equal the original's on Pepecoin testnet
+  (7 coin books, 2 pair books, 10 pair trades, 107 takes at 1,565,408).
+- **Ledger orders, cancels and takes (step 2)** through the approval card; payload bytes equal the
+  original's encoders; a take, a coin bid and its cancel settled, and the original's ledger agrees.
+- **DigiDollar for DGB in one transaction**, whole dollars only, both directions, on DigiByte testnet.
+- **DigiDollar locks:** the script-only Taproot lock (tree checked against BIP341's vectors), $1 claimed by
+  its hash leaf and $1 refunded by its time leaf on DigiByte testnet.
+- **The P2SH lock** byte for byte with the original's htlc.py (vectors made with it).
+- **Swaps of any leg for any leg** (`swaps.rs`): coin, dd, token20 (the three-step note lock), token (ledger)
+  and ord legs. Live: PEP for DGB, DD for PEP, SWPT (a test PRC-20) for DGB, an inscription for PEP; refunds
+  of each side after its time, a token lock and a ledger-token lock each returned to their owner.
+- **One taker at a time:** an order is held for the taker who asked for its terms; a second is refused.
+- **Relay:** a swap transaction is sent again, unconfirmed parents first, until a block holds it; outputs
+  under the Dogecoin family's 0.01 soft-dust line pay its extra 0.01 each, or peers drop them.
+
+Not yet: partial fills of lock swaps, mesh-wide order rooms (step 6), the operator fee, fee coins,
+history for swaps and DigiDollar trades, original-arcade interop for lock swaps.

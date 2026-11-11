@@ -198,6 +198,61 @@ pub fn run(node: Arc<Node>, addr: String) {
     }
 }
 
+/// Inbound connections still in their handshake: at most this many in all and from one IP
+/// (each may take up to MAX_INBOUND bytes before it proves who it is), and each closed if
+/// the handshake isn't done within HANDSHAKE_FOR.
+const MAX_HANDSHAKES: usize = 64;
+const MAX_HANDSHAKES_PER_IP: usize = 4;
+const HANDSHAKE_FOR: Duration = Duration::from_secs(20);
+
+#[derive(Default)]
+struct Handshakes {
+    all: usize,
+    by_ip: std::collections::HashMap<std::net::IpAddr, usize>,
+}
+
+impl Handshakes {
+    fn take(&mut self, ip: std::net::IpAddr) -> bool {
+        let n = self.by_ip.get(&ip).copied().unwrap_or(0);
+        if self.all >= MAX_HANDSHAKES || n >= MAX_HANDSHAKES_PER_IP {
+            return false;
+        }
+        self.all += 1;
+        self.by_ip.insert(ip, n + 1);
+        true
+    }
+
+    fn give(&mut self, ip: std::net::IpAddr) {
+        self.all = self.all.saturating_sub(1);
+        if let Some(n) = self.by_ip.get_mut(&ip) {
+            *n -= 1;
+            if *n == 0 {
+                self.by_ip.remove(&ip);
+            }
+        }
+    }
+}
+
+fn handshakes() -> std::sync::MutexGuard<'static, Handshakes> {
+    static H: std::sync::OnceLock<std::sync::Mutex<Handshakes>> = std::sync::OnceLock::new();
+    H.get_or_init(Default::default).lock().unwrap()
+}
+
+/// A handshake slot for `ip`, given back when dropped.
+struct Slot(std::net::IpAddr);
+
+impl Slot {
+    fn take(ip: std::net::IpAddr) -> Option<Slot> {
+        handshakes().take(ip).then_some(Slot(ip))
+    }
+}
+
+impl Drop for Slot {
+    fn drop(&mut self) {
+        handshakes().give(self.0);
+    }
+}
+
 /// Accept inbound mesh links (other V1.0 arcades, and existing arcades dialing us).
 pub fn listen(node: Arc<Node>, port: u16) {
     let l = match std::net::TcpListener::bind(("0.0.0.0", port)) {
@@ -207,11 +262,31 @@ pub fn listen(node: Arc<Node>, port: u16) {
             return;
         }
     };
+    accept(node, l);
+}
+
+fn accept(node: Arc<Node>, l: std::net::TcpListener) {
     for s in l.incoming().flatten() {
+        let Ok(ip) = s.peer_addr().map(|a| a.ip()) else { continue };
+        // Too many handshakes under way (from this IP or in all): close it unread.
+        let Some(slot) = Slot::take(ip) else { continue };
         let node = node.clone();
         std::thread::spawn(move || {
-            let peer_ip = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
-            let Ok(mut link) = Link::handshake(s, NET, &node.identity, false, node.mesh_port) else { return };
+            let peer_ip = ip.to_string();
+            let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            if let Ok(w) = s.try_clone() {
+                let done = done.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(HANDSHAKE_FOR);
+                    if !done.load(std::sync::atomic::Ordering::Relaxed) {
+                        let _ = w.shutdown(std::net::Shutdown::Both);
+                    }
+                });
+            }
+            let r = Link::handshake(s, NET, &node.identity, false, node.mesh_port);
+            done.store(true, std::sync::atomic::Ordering::Relaxed);
+            drop(slot);
+            let Ok(mut link) = r else { return };
             let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
             let key = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
             let _ = serve(&node, &mut link, &addr);
@@ -509,4 +584,50 @@ fn operator_me(node: &Node) -> Value {
         me["name"] = json!(format!("@{tag}"));
     }
     me
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn handshakes_are_capped_per_ip_and_in_all() {
+        let mut h = Handshakes::default();
+        let a: std::net::IpAddr = "203.0.113.1".parse().unwrap();
+        for _ in 0..MAX_HANDSHAKES_PER_IP {
+            assert!(h.take(a));
+        }
+        assert!(!h.take(a));
+        h.give(a);
+        assert!(h.take(a));
+        let mut n = MAX_HANDSHAKES_PER_IP;
+        for i in 2..=255u8 {
+            if h.take(std::net::IpAddr::from([203, 0, 113, i])) {
+                n += 1;
+            }
+        }
+        assert_eq!(n, MAX_HANDSHAKES);
+    }
+
+    #[test]
+    fn inbound_beyond_the_per_ip_cap_is_closed_unread() {
+        use std::io::Read;
+        let crate::sitesvc::tests::T { node, .. } = crate::sitesvc::tests::setup();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let to = l.local_addr().unwrap();
+        let node = Arc::new(node);
+        std::thread::spawn(move || accept(node, l));
+        // Connections that never speak: the first few wait in their handshake (they get our
+        // hello), the rest are closed at once.
+        let socks: Vec<std::net::TcpStream> = (0..MAX_HANDSHAKES_PER_IP + 3).map(|_| std::net::TcpStream::connect(to).unwrap()).collect();
+        let mut open = 0;
+        for mut s in socks {
+            s.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            let mut b = [0u8; 4096];
+            if s.read(&mut b).is_ok_and(|n| n > 0) {
+                open += 1;
+            }
+        }
+        assert_eq!(open, MAX_HANDSHAKES_PER_IP);
+    }
 }

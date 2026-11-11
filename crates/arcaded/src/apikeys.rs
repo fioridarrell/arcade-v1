@@ -57,6 +57,13 @@ pub fn revoke(node: &Node, id: &str) -> Result<Value, String> {
     Ok(json!({"revoked": id}))
 }
 
+/// Whether `key` is a key made here and not revoked (before a large body is read for it).
+pub fn known(node: &Node, key: &str) -> bool {
+    let Some((id, secret)) = key.strip_prefix("ak_").and_then(|k| k.split_once('_')) else { return false };
+    let rec: Option<Value> = node.app.store.read(|r| r.get(arcade_app::META, &key_of(id))).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok());
+    rec.is_some_and(|rec| rec["hash"] == hex::encode(sha2::Sha256::digest(secret.as_bytes())).as_str())
+}
+
 /// May this request run? `key` is the bearer token, if any. Records use (and tip spending).
 pub fn allow(node: &Node, key: Option<&str>, req: &Value) -> Result<(), (u16, String)> {
     let cmd = req["cmd"].as_str().unwrap_or("");

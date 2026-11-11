@@ -19,14 +19,43 @@ use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+/// A body sent with the cookie or a known API key.
 const MAX_BODY: usize = 64 << 20;
+/// A body sent with neither (the page API, public commands).
+const MAX_OPEN_BODY: usize = 64 << 10;
+/// A program's room door message (crate::realtime keeps at most 60 KB of one, in base64 here).
+const MAX_DOOR_BODY: usize = 256 << 10;
+/// Connections served at once; more wait for one to close.
+const MAX_CONNS: usize = 128;
+/// One header line, and the whole head (request line and headers).
+const MAX_LINE: usize = 8 << 10;
+const MAX_HEAD: usize = 32 << 10;
+/// Time to send the head, and then the body.
+const HEAD_TIME: Duration = Duration::from_secs(10);
+const BODY_TIME: Duration = Duration::from_secs(60);
 
 pub struct Opts {
     pub bind: String,
     pub port: u16,
     pub site: Option<PathBuf>,
+}
+
+/// What each connection needs from the options.
+struct Conf {
+    site: Option<PathBuf>,
+}
+
+/// One connection being served (counted while it lives).
+struct Served(Arc<AtomicUsize>);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub fn serve(node: Arc<Node>, o: Opts) {
@@ -37,10 +66,19 @@ pub fn serve(node: Arc<Node>, o: Opts) {
             return;
         }
     };
-    let site = Arc::new(o.site);
+    let conf = Arc::new(Conf { site: o.site });
+    let open = Arc::new(AtomicUsize::new(0));
     for s in l.incoming().flatten() {
-        let (node, site) = (node.clone(), site.clone());
-        std::thread::spawn(move || handle(&node, s, site.as_ref().as_ref()));
+        // At most MAX_CONNS at once: the next connection waits until one closes.
+        while open.load(Ordering::SeqCst) >= MAX_CONNS {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        open.fetch_add(1, Ordering::SeqCst);
+        let (node, conf, served) = (node.clone(), conf.clone(), Served(open.clone()));
+        std::thread::spawn(move || {
+            let _served = served;
+            handle(&node, s, &conf)
+        });
     }
 }
 
@@ -63,16 +101,47 @@ struct Req {
     body: Vec<u8>,
 }
 
-fn read_req(s: &TcpStream) -> Option<Req> {
-    let mut r = BufReader::new(s);
-    let mut line = String::new();
-    r.read_line(&mut line).ok()?;
+/// Reads a connection until a deadline, so a slow sender can't hold its thread for long.
+struct Timed {
+    s: TcpStream,
+    until: Instant,
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.s.set_read_timeout(Some(left))?;
+        self.s.read(buf)
+    }
+}
+
+/// One line of at most `max` bytes ("" at the end of the stream); None when longer.
+fn read_line_max(r: &mut impl BufRead, max: usize) -> Option<String> {
+    let mut b = Vec::new();
+    r.by_ref().take(max as u64 + 1).read_until(b'\n', &mut b).ok()?;
+    if b.len() > max {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// The request line and headers (the body is read once it is known who sends it).
+fn read_head(r: &mut impl BufRead) -> Option<Req> {
+    let line = read_line_max(r, MAX_LINE)?;
+    let mut size = line.len();
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next()?.to_string(), parts.next()?.to_string());
     let mut headers = Map::new();
     loop {
-        let mut h = String::new();
-        if r.read_line(&mut h).ok()? == 0 || h == "\r\n" || h == "\n" {
+        let h = read_line_max(r, MAX_LINE)?;
+        size += h.len();
+        if size > MAX_HEAD {
+            return None;
+        }
+        if h.is_empty() || h == "\r\n" || h == "\n" {
             break;
         }
         if let Some((k, v)) = h.split_once(':') {
@@ -82,17 +151,33 @@ fn read_req(s: &TcpStream) -> Option<Req> {
             return None;
         }
     }
-    let n: usize = headers.get("content-length").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()).unwrap_or(0);
-    if n > MAX_BODY {
-        return None;
-    }
-    let mut body = vec![0u8; n];
-    r.read_exact(&mut body).ok()?;
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target, String::new()),
     };
-    Some(Req { method, path, query, headers, body })
+    Some(Req { method, path, query, headers, body: Vec::new() })
+}
+
+fn content_length(r: &Req) -> usize {
+    r.headers.get("content-length").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// The largest body this request may send: a big one only with the cookie or a known API key,
+/// and none from elsewhere (nothing that takes a body answers it).
+fn body_cap(node: &Node, r: &Req, is_local: bool) -> usize {
+    if !is_local {
+        return 0;
+    }
+    let p = r.path.as_str();
+    let rpc = p == "/rpc" || r.method == "POST" && (p == "/" || p.starts_with("/chain/"));
+    let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
+    if rpc && cookie_ok(node, r) || p.starts_with("/api/v1/") && key.is_some_and(|k| crate::apikeys::known(node, k)) {
+        MAX_BODY
+    } else if p.starts_with("/realtime/") {
+        MAX_DOOR_BODY
+    } else {
+        MAX_OPEN_BODY
+    }
 }
 
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) {
@@ -122,6 +207,7 @@ fn status_line(code: u16) -> &'static str {
         400 => "400 Bad Request",
         403 => "403 Forbidden",
         404 => "404 Not Found",
+        413 => "413 Payload Too Large",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     }
@@ -193,10 +279,23 @@ pub(crate) fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    let Some(r) = read_req(&s) else { return };
+fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
+    let site = conf.site.as_ref();
+    let Ok(rs) = s.try_clone() else { return };
+    let mut rd = BufReader::new(Timed { s: rs, until: Instant::now() + HEAD_TIME });
+    let Some(mut r) = read_head(&mut rd) else { return };
     let is_local = local(&s, &r);
+    let n = content_length(&r);
+    if n > body_cap(node, &r, is_local) {
+        return respond(&mut s, status_line(413), "text/plain", &[], b"the body is too large for this request\n");
+    }
+    if n > 0 {
+        rd.get_mut().until = Instant::now() + BODY_TIME;
+        r.body = vec![0u8; n];
+        if rd.read_exact(&mut r.body).is_err() {
+            return;
+        }
+    }
     if r.method == "OPTIONS" {
         return respond(&mut s, "204 No Content", "text/plain", &cors(), b"");
     }
@@ -676,4 +775,87 @@ fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
         c => call(c).unwrap_or(Value::Null),
     };
     respond(s, "200 OK", "application/json", &[], out.to_string().as_bytes());
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A test arcade (crate::sitesvc's), one at a time across these tests: each maps a database,
+    /// and many at once run out of address space. The guard is dropped after the arcade.
+    pub(crate) fn node() -> (std::sync::MutexGuard<'static, ()>, crate::sitesvc::tests::T) {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        (ONE.lock().unwrap_or_else(|e| e.into_inner()), crate::sitesvc::tests::setup())
+    }
+
+    /// Send `raw` to handle() over a loopback connection; the answer as text ("" if closed).
+    fn ask(node: &Node, conf: &Conf, raw: &[u8]) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let raw = raw.to_vec();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            let _ = c.write_all(&raw);
+            let mut out = Vec::new();
+            let _ = c.read_to_end(&mut out);
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        let (s, _) = l.accept().unwrap();
+        handle(node, s, conf);
+        client.join().unwrap()
+    }
+
+    fn conf() -> Conf {
+        Conf { site: None }
+    }
+
+    fn get(path: &str, extra: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8420\r\n{extra}\r\n").into_bytes()
+    }
+
+    fn status(answer: &str) -> &str {
+        answer.split(' ').nth(1).unwrap_or("")
+    }
+
+    #[test]
+    fn heads_and_bodies_have_limits() {
+        let (_one, t) = crate::http::tests::node();
+        // A header line past MAX_LINE, or a head past MAX_HEAD: closed unanswered.
+        let long = format!("X-Long: {}\r\n", "a".repeat(MAX_LINE + 1));
+        assert_eq!(ask(&t.node, &conf(), &get("/api/v1/routes", &long)), "");
+        let many: String = (0..40).map(|i| format!("X-H{i}: {}\r\n", "a".repeat(1000))).collect();
+        assert_eq!(ask(&t.node, &conf(), &get("/api/v1/routes", &many)), "");
+        // A body larger than an unauthenticated request may send: refused before it is read.
+        let big = format!("POST /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Length: {}\r\n\r\n", MAX_OPEN_BODY + 1);
+        assert_eq!(status(&ask(&t.node, &conf(), big.as_bytes())), "413");
+        let big = format!("POST /api/v1/msg/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nAuthorization: Bearer ak_x_y\r\nContent-Length: {}\r\n\r\n", MAX_OPEN_BODY + 1);
+        assert_eq!(status(&ask(&t.node, &conf(), big.as_bytes())), "413");
+        let big = format!("POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Length: {}\r\n\r\n", MAX_OPEN_BODY + 1);
+        assert_eq!(status(&ask(&t.node, &conf(), big.as_bytes())), "413", "no cookie");
+        // From elsewhere (a proxy's request): no body at all.
+        let small = "POST /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nX-Forwarded-For: 1.2.3.4\r\nContent-Length: 10\r\n\r\n";
+        assert_eq!(status(&ask(&t.node, &conf(), small.as_bytes())), "413");
+    }
+
+    #[test]
+    fn a_slow_sender_is_cut_off() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            // A byte at a time, never finishing the line.
+            for _ in 0..50 {
+                if c.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let (s, _) = l.accept().unwrap();
+        let started = Instant::now();
+        let mut rd = BufReader::new(Timed { s, until: Instant::now() + Duration::from_millis(200) });
+        assert!(read_head(&mut rd).is_none());
+        assert!(started.elapsed() < Duration::from_millis(600), "{:?}", started.elapsed());
+        client.join().unwrap();
+    }
 }

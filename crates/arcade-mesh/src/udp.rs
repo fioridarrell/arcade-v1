@@ -32,6 +32,10 @@ pub const KNOCK_EVERY: Duration = Duration::from_millis(200);
 pub const KNOCK_FOR: Duration = Duration::from_secs(10);
 pub const SPRAY_FOR: Duration = Duration::from_secs(22);
 pub const SPRAY_PORTS: usize = 8;
+/// Knock packets (hellos of paths not yet answered) the socket sends: 400 a second, 800 at
+/// once, over all paths. Beyond that a round's knocks are left out (later ones still go).
+pub const KNOCKS_PER_SEC: f64 = 400.0;
+pub const KNOCK_BURST: f64 = 800.0;
 pub const KEEPALIVE: Duration = Duration::from_millis(1500);
 pub const DEAD_BUSY: Duration = Duration::from_secs(6);
 pub const DEAD_IDLE: Duration = Duration::from_secs(20);
@@ -593,13 +597,17 @@ pub struct Hub {
     pub stuns_seen: std::sync::atomic::AtomicU64,
     /// How often those are answered (crate::stun::AnswerLimit).
     stun_limit: Mutex<crate::stun::AnswerLimit>,
+    /// Knock packets allowed (tokens, last refill); see KNOCKS_PER_SEC.
+    knocks: Mutex<(f64, Instant)>,
+    /// Knock packets left out for being over that.
+    pub knocks_held: std::sync::atomic::AtomicU64,
 }
 
 impl Hub {
     /// Serve paths on `sock` (one thread reads it and ticks every path every 5 ms).
     pub fn start(sock: UdpSocket) -> io::Result<Arc<Hub>> {
         sock.set_read_timeout(Some(Duration::from_millis(5)))?;
-        let h = Arc::new(Hub { sock, paths: Mutex::new(HashMap::new()), stun: Mutex::new(HashMap::new()), stuns_seen: Default::default(), stun_limit: Default::default() });
+        let h = Arc::new(Hub { sock, paths: Mutex::new(HashMap::new()), stun: Mutex::new(HashMap::new()), stuns_seen: Default::default(), stun_limit: Default::default(), knocks: Mutex::new((KNOCK_BURST, Instant::now())), knocks_held: Default::default() });
         let hub = h.clone();
         std::thread::Builder::new().name("mesh udp".into()).spawn(move || hub.run())?;
         Ok(h)
@@ -612,8 +620,12 @@ impl Hub {
     pub fn add(&self, p: Path) -> Arc<Cell> {
         let c = Arc::new(Cell { p: Mutex::new(p), cv: Condvar::new() });
         let mut g = c.p.lock().unwrap();
-        g.tick(Instant::now());
-        let out = std::mem::take(&mut g.outbox);
+        let now = Instant::now();
+        g.tick(now);
+        let mut out = std::mem::take(&mut g.outbox);
+        if !g.confirmed {
+            self.knock_budget(&mut out, now);
+        }
         let cid = g.cid_in;
         drop(g);
         self.paths.lock().unwrap().insert(cid, c.clone());
@@ -632,6 +644,23 @@ impl Hub {
 
     pub fn count(&self) -> usize {
         self.paths.lock().unwrap().len()
+    }
+
+    /// Keep only as many of a not-yet-answered path's packets (its knocks) as the budget allows.
+    fn knock_budget(&self, out: &mut Vec<(SocketAddr, Vec<u8>)>, now: Instant) {
+        if out.is_empty() {
+            return;
+        }
+        let mut b = self.knocks.lock().unwrap();
+        b.0 = (b.0 + now.saturating_duration_since(b.1).as_secs_f64() * KNOCKS_PER_SEC).min(KNOCK_BURST);
+        b.1 = now;
+        let n = (b.0.max(0.0) as usize).min(out.len());
+        b.0 -= n as f64;
+        drop(b);
+        if n < out.len() {
+            self.knocks_held.fetch_add((out.len() - n) as u64, std::sync::atomic::Ordering::Relaxed);
+            out.truncate(n);
+        }
     }
 
     fn put(&self, out: Vec<(SocketAddr, Vec<u8>)>) {
@@ -707,8 +736,12 @@ impl Hub {
                 for c in cells {
                     let mut g = c.p.lock().unwrap();
                     let was_down = g.down.is_some();
+                    let knocking = !g.confirmed;
                     g.tick(last_tick);
-                    let out = std::mem::take(&mut g.outbox);
+                    let mut out = std::mem::take(&mut g.outbox);
+                    if knocking {
+                        self.knock_budget(&mut out, last_tick);
+                    }
                     let wake = g.down.is_some() != was_down;
                     drop(g);
                     self.put(out);
@@ -1079,6 +1112,23 @@ mod tests {
             got += 1;
         }
         assert_eq!(got, crate::stun::ANSWER_IP_BURST as usize);
+    }
+
+    #[test]
+    fn knocks_over_the_budget_are_left_out() {
+        let hub = Hub::start(UdpSocket::bind("127.0.0.1:0").unwrap()).unwrap();
+        // 300 paths knocking at 4 addresses each want 1200 hellos at once: 800 go.
+        let to: Vec<SocketAddr> = (1..=4).map(|p| SocketAddr::from(([127, 0, 0, 1], p))).collect();
+        let cells: Vec<Arc<Cell>> = (0..300u32).map(|i| {
+            let mut k = [0u8; 32];
+            k[..4].copy_from_slice(&i.to_be_bytes());
+            hub.add(Path::new(&k, &k, to.clone(), Instant::now()))
+        }).collect();
+        let held = hub.knocks_held.load(std::sync::atomic::Ordering::Relaxed);
+        assert!((300..=1200).contains(&held), "held {held}");
+        for c in &cells {
+            hub.remove(c);
+        }
     }
 
     #[test]

@@ -254,7 +254,9 @@
       has("maps") && sect("Maps", "maps", (sum.map_rows || []).length ? table([["Claim"], ["Inscription", 1]], sum.map_rows.map((r) => ({ go: () => go("map", r.claim), cells: [[h("span", { class: "mono" }, r.claim)], [`#${fmt(r.number)}`, 1]] }))) : h("div", { class: "x-empty" }, "No block maps claimed yet.")),
     ].filter(Boolean);
     return h("div", {},
-      sum.borrowed ? h("p", { class: "x-note" }, `This arcade is still catching up on ${chain.name} (block ${fmt(sum.syncing_at)}): the newest blocks and the mempool come from a lender meanwhile.`) : "",
+      sum.borrowed ? h("p", { class: "x-note" }, chain.installed
+        ? `This arcade is still catching up on ${chain.name} (block ${fmt(sum.syncing_at)}): the newest blocks and the mempool come from a lender meanwhile.`
+        : `${chain.name} is borrowed here, not installed: its blocks and the mempool come from a lender.`) : "",
       h("div", { class: "x-stats" }, st.map(([k, v, s]) => h("div", { class: "x-stat" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), h("div", { class: "s" }, s)))),
       h("div", { class: has("ord") ? "x-cols" : "x-cols one" },
         sect("Latest blocks", "blocks", blockRows(sum.blocks)),
@@ -426,7 +428,10 @@
       kv([["Hash", h("span", { class: "mono" }, b.hash)], ["Time", `${new Date(b.time * 1000).toLocaleString()} · ${ago(b.time)}`],
         ["Transactions", fmt(b.tx_count)], ["Size", `${fmt(b.size)} bytes`], b.inscriptions != null && ["New inscription pieces", fmt(b.inscriptions)],
         ["Previous", link(short(b.prev, 16, 8), "block", b.prev, "mono")], b.next && ["Next", link(short(b.next, 16, 8), "block", b.next, "mono")],
-        ["Bits · nonce · version", h("span", { class: "mono" }, `${b.bits} · ${b.nonce} · ${b.version}`)], ["Merkle root", h("span", { class: "mono" }, b.merkle_root)]]),
+        // An ARCADE block has a writer and a proof of time where a coin's has proof of work.
+        ...(b.arcade ? [["Written by", h("span", { class: "mono" }, b.arcade.writer)], ["Difficulty", h("span", { class: "mono" }, b.arcade.difficulty)],
+          ["Proof of time", `${fmt(b.arcade.steps)} steps`]]
+          : [["Bits · nonce · version", h("span", { class: "mono" }, `${b.bits} · ${b.nonce} · ${b.version}`)], ["Merkle root", h("span", { class: "mono" }, b.merkle_root)]])]),
       h("h2", { class: "x-h2" }, "Transactions"),
       table([["Txid"], [""], ["In · out"], ["Output", 1]], b.txs.map((t) => ({ go: () => go("tx", t.txid), cells: [[h("span", { class: "mono" }, short(t.txid, 18, 8))],
         [t.coinbase ? h("span", { class: "chip" }, "coinbase") : t.inscription ? h("span", { class: "chip ins" }, "inscription") : ""], [`${t.inputs} · ${t.outputs}`], [coins(t.out), 1]] }))),

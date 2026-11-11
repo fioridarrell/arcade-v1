@@ -40,13 +40,36 @@ fn coins(sats: u64) -> f64 {
     sats as f64 / 1e8
 }
 
+/// The most coins one `arcade_coinscan` answer names.
+const SCAN_COINS: usize = 5_000;
+
 /// The same Core-style calls for any chain this arcade stores (lending installed chains).
+///
+/// The ARCADE chain is lent the same way (docs/ARCADECHAIN.md §14.14). Its copy in the chain
+/// store answers most calls as any coin's does. Three things are its own: a block or a header
+/// asked for as it is (`getblock` 0, `getblockheader` false) comes in the chain's own form, so
+/// a borrower can check it by the chain's rules; `arcade_headers` hands over a run of headers;
+/// and the waiting transactions are the chain's pool.
 pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, method: &str, params: &[Value]) -> RpcResult {
     let c = p.chain_no;
     let db = &node.chain;
     let e = |x: arcade_store::StoreError| err(-1, x.to_string());
     let tip = db.tip(c).map_err(e)?.ok_or_else(|| err(-28, "chain is not loaded yet"))?;
     let param = |i: usize| params.get(i).cloned().unwrap_or(Value::Null);
+    let arc = crate::arcsvc::runs(p);
+    // The waiting transactions (when seen, as it is) and what spends a coin among them.
+    let pool = || -> Result<Vec<(u64, Vec<u8>)>, (i64, String)> {
+        if arc {
+            return Ok(crate::arcsvc::waiting(5_000).into_iter().map(|raw| (0, raw)).collect());
+        }
+        db.mempool(c).map_err(e)
+    };
+    let spender = |op: &OutPoint| -> Result<Option<Hash256>, (i64, String)> {
+        if arc {
+            return Ok(crate::arcsvc::spender(op));
+        }
+        db.mempool_spender(c, op).map_err(e)
+    };
     let header_json = |hash: &Hash256| -> RpcResult {
         let rec = db.header(c, hash).map_err(e)?.ok_or_else(|| err(-5, "Block not found"))?;
         let on_main = db.hash_at(c, rec.height).map_err(e)? == Some(*hash);
@@ -81,6 +104,9 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
         "getblockheader" => {
             let hash = hash_param(&param(0))?;
             if verbose(&param(1), 1) == 0 {
+                if arc {
+                    return crate::arcsvc::raw_header(&hash).map(|h| json!(hex::encode(h))).ok_or_else(|| err(-5, "Block not found"));
+                }
                 // Serialized header as Core does for this chain (with AuxPoW where present).
                 let raw = db.block_raw(c, &hash).map_err(e)?.ok_or_else(|| err(-5, "Block not found"))?;
                 let b = Block::parse_with(&raw, &p.format).map_err(|x| err(-22, x.to_string()))?;
@@ -95,6 +121,9 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
         }
         "getblock" => {
             let hash = hash_param(&param(0))?;
+            if arc && verbose(&param(1), 1) == 0 {
+                return crate::arcsvc::raw_block(&hash).map(|b| json!(hex::encode(b))).ok_or_else(|| err(-5, "Block not found"));
+            }
             let raw = db.block_raw(c, &hash).map_err(e)?.ok_or_else(|| err(-5, "Block not found"))?;
             match verbose(&param(1), 1) {
                 0 => Ok(json!(hex::encode(raw))),
@@ -114,9 +143,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             let (raw, b) = match db.tx_raw(p, &txid).map_err(e)? {
                 Some((raw, b)) => (raw, Some(b)),
                 None => {
-                    let pooled = db
-                        .mempool(c)
-                        .map_err(e)?
+                    let pooled = pool()?
                         .into_iter()
                         .map(|(_, r)| r)
                         .find(|r| Tx::parse_with(r, &p.format).map(|t| t.txid == txid).unwrap_or(false));
@@ -149,7 +176,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             let txid = hash_param(&param(0))?;
             let n = param(1).as_u64().ok_or_else(|| err(-8, "n must be a number"))? as u32;
             let op = OutPoint { txid, vout: n };
-            if param(2) != Value::Bool(false) && db.mempool_spender(c, &op).map_err(e)?.is_some() {
+            if param(2) != Value::Bool(false) && spender(&op)?.is_some() {
                 return Ok(Value::Null);
             }
             match db.coin(p, &op).map_err(e)? {
@@ -164,7 +191,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             }
         }
         "getrawmempool" => {
-            let pool = db.mempool(c).map_err(e)?;
+            let pool = pool()?;
             Ok(json!(pool
                 .iter()
                 .filter_map(|(_, r)| Tx::parse_with(r, &p.format).ok().map(|t| t.txid.to_hex()))
@@ -172,8 +199,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
         }
         "getmempoolentry" => {
             let txid = hash_param(&param(0))?;
-            let pool = db.mempool(c).map_err(e)?;
-            for (seen, r) in pool {
+            for (seen, r) in pool()? {
                 if let Ok(t) = Tx::parse_with(&r, &p.format) {
                     if t.txid == txid {
                         return Ok(json!({"size": r.len(), "vsize": r.len(), "time": seen, "height": tip.height}));
@@ -183,7 +209,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             Err(err(-5, "Transaction not in mempool"))
         }
         "getmempoolinfo" => {
-            let pool = db.mempool(c).map_err(e)?;
+            let pool = pool()?;
             Ok(json!({"size": pool.len(), "bytes": pool.iter().map(|(_, r)| r.len()).sum::<usize>(), "loaded": true}))
         }
         "sendrawtransaction" => {
@@ -191,6 +217,10 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             let tx = Tx::parse_with(&raw, &p.format).map_err(|_| err(-22, "TX decode failed"))?;
             if db.tx_raw(p, &tx.txid).map_err(e)?.is_some() {
                 return Err(err(-27, "transaction already in block chain"));
+            }
+            if arc {
+                // Into the chain's own pool, by its own rules; the arcades tell one another.
+                return crate::arcsvc::send_lent(&raw).map(|id| json!(id.to_hex())).map_err(|why| err(-26, why));
             }
             if db.mempool_tx(c, &tx.txid).map_err(e)?.is_some() {
                 return Ok(json!(tx.txid.to_hex()));
@@ -227,11 +257,10 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             "version": 10000, "subversion": "/arcade:1.0.0/", "protocolversion": p.protocol_version,
             "relayfee": coins(crate::claims::FEE_PER_KB), "incrementalfee": coins(crate::claims::FEE_PER_KB),
         })),
-        "estimatefee" | "estimatesmartfee" => Ok(if method == "estimatefee" {
-            json!(coins(crate::claims::FEE_PER_KB))
-        } else {
-            json!({"feerate": coins(crate::claims::FEE_PER_KB), "blocks": 2})
-        }),
+        "estimatefee" | "estimatesmartfee" => {
+            let rate = if arc { crate::coinsend::fee_policy(p).fallback_per_kb } else { crate::claims::FEE_PER_KB };
+            Ok(if method == "estimatefee" { json!(coins(rate)) } else { json!({"feerate": coins(rate), "blocks": 2}) })
+        }
         "decoderawtransaction" => {
             let raw = param(0).as_str().and_then(|s| hex::decode(s).ok()).ok_or_else(|| err(-22, "TX decode failed"))?;
             let t = Tx::parse_with(&raw, &p.format).map_err(|_| err(-22, "TX decode failed"))?;
@@ -271,7 +300,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
                 watch_add(&caller(), c, &a, now());
                 for (op, value, height) in db.coins_for_script(p, &sc).map_err(e)? {
                     let conf = (tip.height + 1).saturating_sub(height) as u64;
-                    if conf < minconf || conf > maxconf || db.mempool_spender(c, &op).map_err(e)?.is_some() {
+                    if conf < minconf || conf > maxconf || spender(&op)?.is_some() {
                         continue;
                     }
                     out.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "address": a, "scriptPubKey": hex::encode(&sc),
@@ -315,6 +344,40 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             let mut page: Vec<Value> = rows.into_iter().skip(skip).take(count).map(|r| r.1).collect();
             page.reverse();
             Ok(json!(page))
+        }
+        // The headers of the ARCADE chain's best branch from a height on, each as the chain
+        // writes it: [from, count]. What a borrowed copy follows the chain by.
+        "arcade_headers" if arc => {
+            let from = param(0).as_u64().ok_or_else(|| err(-8, "height must be a number"))?;
+            let count = param(1).as_u64().unwrap_or(crate::arcsvc::LENT_HEADERS as u64) as usize;
+            Ok(json!(crate::arcsvc::raw_headers(from, count).iter().map(hex::encode).collect::<Vec<_>>()))
+        }
+        // The unspent coins of up to 100 addresses, for a borrower's coins older than the
+        // block it started at: [{"addresses": [...]}]. Answered as an older arcade answers
+        // (arcade/coinscan.py), but at once from the address index, so nothing ever waits:
+        //   {"coins": {address: [[txid, vout, sats, height], ...]}, "height": {address: tip},
+        //    "waiting": [], "next": 0}
+        "arcade_coinscan" => {
+            if !db.addresses_on(c).map_err(e)? || db.addresses_pending(c).map_err(e)? {
+                return Err(err(-1, "this arcade has no address index for this chain"));
+            }
+            let asked = param(0);
+            let addrs: Vec<&str> = asked["addresses"].as_array().ok_or_else(|| err(-8, "addresses required"))?.iter().filter_map(Value::as_str).collect();
+            if addrs.len() > 100 {
+                return Err(err(-8, "at most 100 addresses"));
+            }
+            let (mut found, mut heights, mut left) = (serde_json::Map::new(), serde_json::Map::new(), SCAN_COINS);
+            for a in addrs {
+                let Some(sc) = arcade_ledger::address::script_for_address(p, a) else { continue };
+                let mut list = db.coins_for_script(p, &sc).map_err(e)?;
+                // Over the limit, the oldest coins are named: the newest a borrower reads itself.
+                list.sort_by_key(|(_, _, height)| *height);
+                list.truncate(left);
+                left -= list.len();
+                found.insert(a.into(), json!(list.iter().map(|(op, value, height)| json!([op.txid.to_hex(), op.vout, value, height])).collect::<Vec<_>>()));
+                heights.insert(a.into(), json!(tip.height));
+            }
+            Ok(json!({"coins": found, "height": heights, "waiting": [], "next": 0}))
         }
         _ => Err(err(-32601, format!("Method not found: {method}"))),
     }

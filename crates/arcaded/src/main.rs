@@ -10,6 +10,8 @@ mod addrsvc;
 mod announce;
 mod api;
 mod apikeys;
+mod arcborrow;
+mod arcsvc;
 mod borrow;
 mod appsvc;
 mod walletsvc;
@@ -289,6 +291,14 @@ fn main() {
     });
     let _ = node.me.set(Arc::downgrade(&node));
     chains::start_home(&node).expect("home indexes");
+    // A local ARCADE test chain (stand-in rules; closed test networks only), which this
+    // arcade can then install in Chains & Coins: crate::arcsvc.
+    if let Some(settings) = opt("--arc-local") {
+        if let Err(e) = arcsvc::define(&node, std::path::Path::new(&settings)) {
+            eprintln!("arcaded: --arc-local: {e}");
+            std::process::exit(1);
+        }
+    }
     chains::start_saved(&node);
     borrow::start(node.clone());
     swaps::start(node.clone());

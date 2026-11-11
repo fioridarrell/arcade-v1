@@ -325,8 +325,8 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
-    // Same rule as the testnet, but not yet compared with the mainnet's headers: Some(2)
-    // once examples/rpcheaders has walked the whole chain clean.
+    // Same rule as the testnet. examples/rpcheaders against a Pepecoin Core node: the rule
+    // gives the bits of every mainnet header from 1 to 1,288,000.
     digishield_from: Some(2),
     auxpow_chain_id: Some(0x3f),
     auxpow_strict_chain_id: false,
@@ -698,6 +698,7 @@ pub static SHIBACOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: Some(0x4a),
     auxpow_strict_chain_id: true,
     bech32_hrp: None,
@@ -752,6 +753,7 @@ pub static BELLSCOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: Some(16),
     auxpow_strict_chain_id: true,
     bech32_hrp: Some("bel"),
@@ -800,6 +802,7 @@ pub static LUCKYCOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: Some(0x2013),
     auxpow_strict_chain_id: true,
     bech32_hrp: None,
@@ -843,6 +846,7 @@ pub static JUNKCOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: Some(0x2020),
     auxpow_strict_chain_id: true,
     bech32_hrp: Some("jc"),
@@ -883,6 +887,12 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &LUCKYCOIN_MAIN,
         &JUNKCOIN_MAIN,
     ];
+
+/// The ARCADE chain's two networks (crates/arcade-arc): chain number and key. They are not in
+/// [`ALL_CHAINS`]: nothing about them is followed over a coin's P2P network, and the service
+/// that runs one makes its parameters when it starts (its block 0 comes from its settings).
+/// The coins count up from 1; these numbers are far from theirs, so a new coin never meets one.
+pub const ARCADE_CHAINS: &[(u16, &str)] = &[(1000, "arc"), (1001, "arctest")];
 
 /// A chain by its mesh name (what the existing arcades call it).
 impl ChainParams {
@@ -941,6 +951,13 @@ mod tests {
                 };
                 assert!(!private, "{}: fixed peer {a} is a private address", p.name);
             }
+        }
+    }
+
+    #[test]
+    fn the_arcade_chain_shares_no_number_or_key_with_a_coin() {
+        for (c, key) in ARCADE_CHAINS {
+            assert!(ALL_CHAINS.iter().all(|p| p.chain_no != *c && p.key != *key && p.net != *key));
         }
     }
 
@@ -1105,7 +1122,9 @@ mod tests {
         // The old step rule alone let the gapless powLimit block through.
         assert!(!too_easy(p, 0x1e0fffff, 0x1d00ffff));
         // Chains without the rule (it is off until checked against their headers) skip it.
-        assert_eq!(check_context(&PEPECOIN_MAIN, &child(&PEPECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Ok(()));
+        assert_eq!(check_context(&DOGECOIN_MAIN, &child(&DOGECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Ok(()));
+        // Pepecoin's mainnet has it on, as its testnet.
+        assert_eq!(check_context(&PEPECOIN_MAIN, &child(&PEPECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Err(HeaderError::BadDifficulty));
         // Before digishield_from, or without a grandparent, nothing to compare.
         assert_eq!(check_context(p, &child(p, &g, g.time + 1, 0x1c00ffff), 1, &[g], now), Ok(()));
     }

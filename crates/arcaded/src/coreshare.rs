@@ -30,6 +30,7 @@ pub const MAX_REPLY: usize = 32 << 20;
 
 /// Chains this arcade lends: the home chain, and every installed chain kept in full (blocks
 /// and coins) that has caught up. A chain still syncing, or sharing its storage, isn't offered.
+/// The ARCADE chain is lent as any other once this arcade's copy has caught up.
 pub fn lent(node: &Node) -> Vec<&'static ChainParams> {
     let mut v: Vec<&'static ChainParams> = vec![node.params];
     // Copy the runs out first: far_behind takes the same lock (holding it here deadlocked
@@ -40,6 +41,7 @@ pub fn lent(node: &Node) -> Vec<&'static ChainParams> {
             v.push(r.params);
         }
     }
+    v.extend(crate::arcsvc::lends());
     v
 }
 
@@ -47,16 +49,26 @@ pub fn offer(node: &Node) -> Option<Frame> {
     let mut nets = serde_json::Map::new();
     for p in lent(node) {
         if let Ok(Some(tip)) = node.chain.tip(p.chain_no) {
-            nets.insert(p.net.into(), json!({"h": tip.height, "b": tip.hash.to_hex(), "l": 1}));
+            let mut o = json!({"h": tip.height, "b": tip.hash.to_hex(), "l": 1});
+            // An ARCADE chain is told apart by its block 0 (a local test chain has its own).
+            if crate::arcsvc::runs(p) {
+                o["g"] = json!(p.genesis);
+            }
+            nets.insert(p.net.into(), o);
         }
     }
     (!nets.is_empty()).then(|| Frame::new(json!({"t": "cr", "op": "offer", "nets": nets})))
 }
 
+/// The chain a borrower's question or transaction is for, if this arcade answers for it: one
+/// it lends, or the ARCADE chain a moment after its copy was last caught up.
 fn lent_net(node: &Node, net: &Value) -> Option<&'static ChainParams> {
     let net = net.as_str()?;
-    lent(node).into_iter().find(|p| p.net == net)
+    lent(node).into_iter().find(|p| p.net == net).or_else(|| crate::arcsvc::answers().filter(|p| p.net == net))
 }
+
+/// What a borrower is told when it asks about a chain this arcade doesn't lend just now.
+pub const NOT_LENT: &str = "not lent here just now";
 
 #[derive(Default)]
 pub struct Requests {
@@ -151,6 +163,10 @@ fn query(node: &Node, p: &'static ChainParams, raw: Vec<u8>, z: bool) -> Result<
 /// A transaction a borrower relays: pooled, shared and sent to the coin's peers only when it
 /// passes the same checks as one from the mesh. Returns whether it was taken.
 fn on_tx(node: &Node, p: &'static ChainParams, raw: &[u8]) -> bool {
+    // The ARCADE chain has a pool of its own, with its own checks.
+    if crate::arcsvc::runs(p) {
+        return crate::arcsvc::send_lent(raw).is_ok();
+    }
     let Ok(tx) = arcade_chain::Tx::parse_with(raw, &p.format) else { return false };
     match crate::mempoolshare::sort(node, p, &tx) {
         Ok(None) => {
@@ -189,6 +205,10 @@ pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> R
             on_tx(node, lent_net(node, &h["net"]).unwrap(), &f.blob);
             Ok(())
         }
+        // A question about a chain not lent here (any more, or just now) is answered with an
+        // error, once, at its last part: left unanswered, the borrower would wait out its
+        // time limit before trying another lender.
+        "q" if h["end"] == true => send(link, h["id"].as_u64().unwrap_or(0), Err(NOT_LENT.into()), false),
         _ => Ok(()), // offers and subs from others: not needed by a node that has its own chain
     }
 }
@@ -278,6 +298,36 @@ mod tests {
         assert!(t.node.tx_outbox.lock().unwrap().is_empty(), "not sent on");
         assert!(on_tx(&t.node, t.p, &good.raw));
         assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[good.raw.clone()]);
+    }
+
+    /// A borrower that asks about a chain not lent here is told so at once (it then tries
+    /// another lender), not left to wait out its time limit.
+    #[test]
+    fn a_question_about_a_chain_not_lent_is_answered_with_an_error() {
+        use ed25519_dalek::SigningKey;
+        let t = crate::sitesvc::tests::setup();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let (s, _) = l.accept().unwrap();
+                let mut link = Link::handshake(s, "arcade-test", &SigningKey::from_bytes(&[2; 32]), false, None).unwrap();
+                let mut reqs = Requests::default();
+                // Two questions: one for a chain not lent, then one for the home chain.
+                for _ in 0..2 {
+                    let f = link.recv().unwrap();
+                    handle(&t.node, &mut link, &mut reqs, &f).unwrap();
+                }
+            });
+            let mut link = Link::dial(&addr, "arcade-test", &SigningKey::from_bytes(&[1; 32]), None).unwrap();
+            let calls = json!([["getblockcount", []]]);
+            let t0 = std::time::Instant::now();
+            let err = crate::crsource::ask(&mut link, &addr, "nosuchnet", 1, &calls, &mut |_| {}).unwrap_err();
+            assert!(err.contains(NOT_LENT), "{err}");
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+            // The link is still good for a chain that is lent.
+            assert_eq!(crate::crsource::ask(&mut link, &addr, t.p.net, 2, &calls, &mut |_| {}).unwrap(), vec![json!({"r": 2})]);
+        });
     }
 
     /// A spend of a P2SH coin whose script this arcade can't check (an inscription reveal, say)

@@ -44,7 +44,15 @@
     const d = document.createElement("div"); d.className = "bd";
     const l = document.createElement("div"); l.className = "bl";
     info.append(nm, d);
-    if (c.installed) {
+    if (c.arcade && c.installed) {
+      // The ARCADE chain: installed, removed and borrowed as any coin; its blocks come over
+      // the arcade mesh, so there is no storage mode or index to choose.
+      d.textContent = `Installed · block ${(c.tip || 0).toLocaleString()}`;
+      if (borrowed) {
+        l.textContent = `Until it catches up, the borrowed copy answers balances and sends (${String(bc.state || "").replace(/^Borrowed · /, "")}).`;
+        info.append(l);
+      }
+    } else if (c.installed) {
       const pct = Math.floor(c.overall || 0);
       d.textContent = c.home ? `Installed · home chain · ${c.mode} · ${(c.indexes || []).join(", ")}` : `Installed · ${pct}% · ${String(c.state || "").split(" [")[0]} · ${c.mode}`;
       if (!c.home && pct < 100) { const bar = document.createElement("div"); bar.className = "bar"; const i = document.createElement("i"); i.style.width = pct + "%"; bar.append(i); info.append(bar); }
@@ -60,6 +68,7 @@
     } else {
       d.textContent = "Not installed" + (bc.on === false || !globalOn ? " · borrowing off" : bc.lendable ? " · borrowing starts soon" : " · no arcade lends it right now");
     }
+    if (c.arcade && c.local) d.textContent += " · local test chain";
     if (bc.mismatch) { const w = document.createElement("div"); w.className = "bw"; w.textContent = bc.mismatch; info.append(w); }
     const bal = document.createElement("div"); bal.className = "bb"; bal.textContent = borrowed ? coinAmt(bc.balance, c.key) : "";
     const act = document.createElement("div"); act.className = "ba";
@@ -128,6 +137,15 @@
     open = c; watching = null;
     $("c-installer").hidden = false; $("c-choose").hidden = false; $("c-progress").hidden = true; msg("");
     $("c-title").textContent = `Install ${c.name}`;
+    // The ARCADE chain is kept whole and comes over the mesh: nothing to choose.
+    for (const id of ["c-modes", "c-idx"]) { $(id).hidden = !!c.arcade; $(id).previousElementSibling.hidden = !!c.arcade; }
+    if (c.arcade) {
+      $("c-modes").replaceChildren(); $("c-idx").replaceChildren();
+      $("c-from").textContent = "From the arcades this one is linked to: ARCADE blocks travel over the arcade mesh itself.";
+      $("c-est").textContent = "The whole chain is kept: its blocks and coins, with every address's history. Removing it later deletes its blocks from this arcade; coins stay on the chain and your wallet keeps its keys.";
+      $("c-total").hidden = true;
+      return;
+    }
     $("c-modes").replaceChildren(...MODES.map(([k, t, d, ok]) => {
       const l = document.createElement("label");
       l.className = "mode" + (k === mode ? " sel" : "") + (ok ? "" : " off");
@@ -175,7 +193,7 @@
   async function install() {
     const withIdx = [...$("c-idx").querySelectorAll("input:checked")].map((i) => i.dataset.k);
     try {
-      const st = await api("chains.add", { key: open.key, mode, with: withIdx });
+      const st = await api("chains.add", open.arcade ? { key: open.key } : { key: open.key, mode, with: withIdx });
       if (st.queued) {
         // Another chain is still being installed: this one starts by itself after it.
         $("c-installer").hidden = true;
@@ -236,7 +254,7 @@
 
   function showProgress(st) {
     $("c-progress").hidden = false;
-    $("c-title").textContent = `${st.name} · ${st.mode} · ${st.state}`;
+    $("c-title").textContent = st.arcade ? `${st.name} · ${st.state}` : `${st.name} · ${st.mode} · ${st.state}`;
     $("c-stages").replaceChildren(...st.stages.map((s) => {
       const li = document.createElement("li");
       const p = s.pct || 0;
@@ -263,7 +281,7 @@
     if (!add) { add = document.createElement("div"); add.id = "c-addix"; add.className = "addix"; $("c-stages").before(add); }
     const info = chains.find((x) => x.key === st.key) || {};
     const have = st.indexes || [];
-    const can = st.mode === "chain" ? INDEXES.filter(([k]) => k === "addresses" && !have.includes(k))
+    const can = st.arcade ? [] : st.mode === "chain" ? INDEXES.filter(([k]) => k === "addresses" && !have.includes(k))
       : st.mode === "full" || st.mode === "shared"
       ? INDEXES.filter(([k, , , ok, needs]) => ok && !have.includes(k) && (needs !== "ord" || info.ord) && (k !== "tokens" || info.tokens)
           && (needs !== "runes" || info.runes) && (needs !== "dunes" || info.dunes)) : [];
@@ -288,7 +306,7 @@
         row.append(txt, b);
         return row;
       }));
-    $("c-pause").hidden = !!st.home; $("c-stop").hidden = !!st.home;
+    $("c-pause").hidden = !!st.home || !!st.arcade; $("c-stop").hidden = !!st.home;
     $("c-pause").textContent = st.state === "paused" ? "Resume" : "Pause";
   }
 

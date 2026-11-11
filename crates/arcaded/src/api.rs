@@ -86,7 +86,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "wallet.keys" => {
             // Any chain: the same 12 words derive each chain's own addresses (its BIP44 coin type).
             let cp = match s("chain") {
-                Some(k) => arcade_chain::params::by_key(&k).ok_or_else(|| format!("unknown chain {k}"))?,
+                Some(k) => crate::chains::find(&k).ok_or_else(|| format!("unknown chain {k}"))?,
                 None => p,
             };
             let mut keys = node.app.tag_keys(cp.chain_no).map_err(|e| e.to_string())?;
@@ -94,7 +94,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 keys.push(node.app.tag_key(cp, 0).map_err(|e| e.to_string())?.0);
             }
             // A borrowed copy answers while the installed one catches up.
-            let installed = !crate::borrow::is_borrowed(cp.key) && (cp.chain_no == p.chain_no || node.extra.lock().unwrap().contains_key(cp.key)) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
+            let installed = !crate::borrow::is_borrowed(cp.key) && crate::chains::kept(node, cp) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
             Ok(json!(keys.iter().map(|k| {
                 let pk = arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap();
                 // Every address of the key (DigiByte: dgb1... to receive, its D... still counted).
@@ -130,7 +130,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let chain = s("chain").ok_or("chain required")?;
             let mut v = crate::links::mine(node, &chain)?;
             // Borrowed chains: balances from the borrowed coins.
-            if let Some(cp) = arcade_chain::params::by_key(&chain).filter(|cp| crate::borrow::is_borrowed(cp.key)) {
+            if let Some(cp) = crate::chains::find(&chain).filter(|cp| crate::borrow::is_borrowed(cp.key)) {
                 for l in v.iter_mut() {
                     if let Some(sc) = l["address"].as_str().and_then(|a| arcade_ledger::address::script_for_address(cp, a)) {
                         l["balance"] = json!(crate::borrow::balance(node, cp, &sc));
@@ -505,6 +505,10 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!({"measured": m, "chains": crate::chains::list(node)}))
         }
         "chains.status" => crate::chains::status(node, &s("key").ok_or("key required")?),
+        "arc.status" => crate::arcsvc::status(node),
+        "arc.block" => crate::arcsvc::block(req),
+        "arc.submit" => crate::arcsvc::submit(req),
+        "arc.pool" => crate::arcsvc::pool(req),
         "chains.add" => {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::chains::add(&node.self_arc(), &s("key").ok_or("key required")?, &s("mode").unwrap_or_else(|| "full".into()), with)

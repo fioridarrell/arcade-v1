@@ -5,8 +5,7 @@
 //! A website has many users, each holding their own keys in the browser. The rest of the API
 //! works for this arcade's own wallet; these commands work for ANY address instead:
 //!   tx.coins     the spendable coins of up to 500 addresses (confirmed and unconfirmed),
-//!                so the site can build a transaction for a browser to sign; coins that carry
-//!                an inscription, or may (coinsend::ord_hold), are listed apart as "held";
+//!                so the site can build a transaction for a browser to sign;
 //!   tx.activity  what changed for up to 500 addresses since a height: confirmed history rows
 //!                and waiting transactions (the site's notifications);
 //!   tx.fee       the fee rate and dust limit transactions here are built with;
@@ -17,6 +16,7 @@
 use crate::node::Node;
 use arcade_chain::params::{by_key, ChainParams};
 use arcade_chain::{OutPoint, Tx};
+use arcade_wallet::tx::Utxo;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -98,36 +98,41 @@ pub fn coins(node: &Node, req: &Value) -> R {
     let mut out = serde_json::Map::new();
     for (a, script) in &want {
         let mut confirmed = Vec::new();
-        let mut held = Vec::new();
         let mut total = 0u64;
         for (op, value, height) in node.chain.coins_for_script(p, script).map_err(|e| e.to_string())? {
             if spent_in_pool.contains(&op) {
                 continue; // a waiting transaction spends it already
             }
-            let c = json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": tip.saturating_sub(height) + 1});
-            if let Some(why) = crate::coinsend::ord_hold(node, p, &op, value, Some(height))? {
-                held.push(json!({"coin": c, "why": why}));
-                continue;
-            }
             total += value;
-            confirmed.push(c);
+            confirmed.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": tip.saturating_sub(height) + 1}));
         }
         let mut unconfirmed = Vec::new();
         for (_, t) in &pooled {
             for (vout, o) in t.outputs.iter().enumerate() {
                 let op = OutPoint { txid: t.txid, vout: vout as u32 };
                 if o.script_pubkey == *script && !spent_in_pool.contains(&op) {
-                    let c = json!({"txid": t.txid.to_hex(), "vout": vout, "value": o.value, "rbf": crate::claims::signals_rbf(t)});
-                    if let Some(why) = crate::coinsend::ord_hold(node, p, &op, o.value, None)? {
-                        held.push(json!({"coin": c, "why": why}));
-                        continue;
-                    }
                     total += o.value;
-                    unconfirmed.push(c);
+                    unconfirmed.push(json!({"txid": t.txid.to_hex(), "vout": vout, "value": o.value, "rbf": crate::claims::signals_rbf(t)}));
                 }
             }
         }
-        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "held": held, "total": total}));
+        // Coins carrying an inscription (or small ones nobody can read) are held back, so a
+        // browser wallet building a payment from this list doesn't spend them (crate::ordsafe).
+        let op_of = |c: &Value| OutPoint { txid: arcade_chain::Hash256::from_hex(c["txid"].as_str().unwrap_or("")).unwrap_or_default(), vout: c["vout"].as_u64().unwrap_or(0) as u32 };
+        let listed: Vec<Utxo> = confirmed.iter().chain(&unconfirmed).map(|c| Utxo { outpoint: op_of(c), value: c["value"].as_u64().unwrap_or(0), script: script.clone() }).collect();
+        let free: HashSet<OutPoint> = crate::ordsafe::keep_free(node, p, listed).into_iter().map(|u| u.outpoint).collect();
+        let mut held_back = Vec::new();
+        for list in [&mut confirmed, &mut unconfirmed] {
+            list.retain(|c| {
+                let keep = free.contains(&op_of(c));
+                if !keep {
+                    total -= c["value"].as_u64().unwrap_or(0);
+                    held_back.push(c.clone());
+                }
+                keep
+            });
+        }
+        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total, "held_back": held_back}));
     }
     Ok(json!({"chain": p.key, "height": tip, "addresses": out}))
 }

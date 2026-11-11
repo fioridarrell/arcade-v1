@@ -60,7 +60,7 @@ pub fn op_return(data: &[u8]) -> Vec<u8> {
 }
 
 /// Serialize with the given per-input scriptSigs (legacy, no witness).
-fn serialize(p: &ChainParams, version: i32, time: u32, ins: &[(OutPoint, Vec<u8>)], outs: &[TxOutSpec]) -> Vec<u8> {
+pub(crate) fn serialize(p: &ChainParams, version: i32, time: u32, ins: &[(OutPoint, Vec<u8>)], outs: &[TxOutSpec]) -> Vec<u8> {
     let mut o = Vec::new();
     o.extend_from_slice(&version.to_le_bytes());
     if p.format.tx_time {
@@ -157,7 +157,7 @@ fn outputs_bytes(outs: &[TxOutSpec]) -> Vec<u8> {
 
 /// BIP143 signature hash of input `i` (a P2WPKH coin) with SIGHASH_ALL, as this module builds
 /// txs: every nSequence 0xffffffff, locktime 0.
-fn bip143_digest(version: i32, utxos: &[Utxo], outs: &[TxOutSpec], i: usize) -> [u8; 32] {
+pub(crate) fn bip143_digest(version: i32, utxos: &[Utxo], outs: &[TxOutSpec], i: usize) -> [u8; 32] {
     bip143_digest_with(version, utxos, &vec![u32::MAX; utxos.len()], 0, outs, i)
 }
 

@@ -174,6 +174,8 @@ pub fn send(node: &Node, chain: Option<&str>, to: &str, cents: i64, broadcast: b
             }
         }
     }
+    // Fee coins that carry an inscription stay where they are.
+    let dgb = crate::ordsafe::keep_free(node, p, dgb);
     let held: Vec<Held> = w.held.iter().map(|(u, c, _)| Held { coin: u.clone(), cents: *c }).collect();
     let b = arcade_wallet::dd::build_send(p, &sk, &held, &dgb, &scripts[0].1, &to_key, cents)?;
     let mut out = json!({"chain": p.key, "txid": b.tx.txid.to_hex(), "from": w.address, "to": to, "cents": cents,
@@ -219,4 +221,28 @@ mod tests {
         assert!(parse_address(&DIGIBYTE_TEST, "DD1siytB6xVXUwsd6NGSJgD5KV57WPp9Q2sKXxbLGbR3ARXN7ezm").unwrap_err().contains("other chain"));
         assert!(parse_address(&DIGIBYTE_MAIN, "DSLs2dis7txD4Y1VeZzcZAvxsyaj2ZFNDo").is_err());
     }
+}
+
+/// What a DigiDollar trade needs of this wallet on a DigiByte chain (marketsvc / ddmarket.rs): the tag key,
+/// its DigiDollar coins, its DGB coins (P2PKH and P2WPKH, none spent in the mempool), its DigiDollar output
+/// script, and the script DGB change goes to. Installed chains only: a trade's coins are read here.
+pub(crate) fn trade_coins(node: &Node, p: &'static ChainParams) -> Result<(arcade_wallet::SecretKey, Vec<Held>, Vec<Utxo>, Vec<u8>, Vec<u8>), String> {
+    let w = load(node, p)?;
+    if w.borrowed {
+        return Err(format!("{} is borrowed here: a DigiDollar trade needs it installed", p.name));
+    }
+    let sk = node.app.tag_key(p, w.key_index).map_err(|e| e.to_string())?.1;
+    let scripts = crate::coinsend::key_scripts(p, &w.pk);
+    let mut dgb: Vec<Utxo> = Vec::new();
+    for (_, sc) in &scripts {
+        for (op, value, _) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
+            if node.chain.mempool_spender(p.chain_no, &op).map_err(|e| e.to_string())?.is_none() {
+                dgb.push(Utxo { outpoint: op, value, script: sc.clone() });
+            }
+        }
+    }
+    let dgb = crate::ordsafe::keep_free(node, p, dgb);
+    let held: Vec<Held> = w.held.iter().map(|(u, c, _)| Held { coin: u.clone(), cents: *c }).collect();
+    let (_, _, dd_script) = dd_address(p, &w.pk).ok_or("no DigiDollar address for this key")?;
+    Ok((sk, held, dgb, dd_script, scripts[0].1.clone()))
 }

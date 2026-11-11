@@ -263,29 +263,70 @@ fn a_spent_output(e: &Env) -> ImportCoin {
 fn a_bad_coin_set_is_found_and_replaced() {
     let e = env(30);
     let c = e.p.chain_no;
-    let d = tempfile::tempdir().unwrap();
-    let db = partial(&e, d.path(), 10);
-    // The maker's set: one coin missing, one spent long ago still in it (both real outputs
-    // of our blocks, so they pass the check against the blocks; only the re-check sees them).
-    let mut bad = e.coins.clone();
-    bad.remove(3);
-    bad.push(a_spent_output(&e));
-    take_in(&e, &db, &d.path().join("tmp"), &bad, false);
-    assert!(table(&db, OUTPUTS) != table(&e.reference, OUTPUTS));
-    let mut r = Replay::default();
-    r.advance(&db, e.p, 30, usize::MAX, &AtomicBool::new(false), &mut |_| {}).unwrap();
-    let rows = r.sorted(c);
-    let mut it = rows.clone().into_iter();
-    let diff = db.apply_coin_diff(e.p, &mut || Ok(it.next()), false, &d.path().join("tmp"), &AtomicBool::new(false), &mut |_| {}).unwrap();
-    assert_eq!((diff.added, diff.removed, diff.changed), (1, 1, 0));
-    let mut it = rows.into_iter();
-    db.apply_coin_diff(e.p, &mut || Ok(it.next()), true, &d.path().join("tmp"), &AtomicBool::new(false), &mut |_| {}).unwrap();
-    assert!(table(&db, OUTPUTS) == table(&e.reference, OUTPUTS));
-    db.redo_addresses(c).unwrap();
-    assert!(db.build_addresses(e.p, &d.path().join("tmp"), &AtomicBool::new(false), &mut |_| {}).unwrap());
-    for t in [SCRIPT_HIST, BY_SCRIPT, SPENDS] {
-        assert!(table(&db, t) == table(&e.reference, t), "address table {t}");
+    for on_disk in [false, true] {
+        let d = tempfile::tempdir().unwrap();
+        let db = partial(&e, d.path(), 10);
+        // The maker's set: one coin missing, one spent long ago still in it (both real outputs
+        // of our blocks, so they pass the check against the blocks; only the re-check sees them).
+        let mut bad = e.coins.clone();
+        bad.remove(3);
+        bad.push(a_spent_output(&e));
+        take_in(&e, &db, &d.path().join("tmp"), &bad, false);
+        assert!(table(&db, OUTPUTS) != table(&e.reference, OUTPUTS));
+        let stop = AtomicBool::new(false);
+        let tmp = d.path().join("tmp");
+        let diff = if on_disk {
+            // The re-check on disk: memory too small for Replay changes nothing.
+            assert!(!Replay::default().advance(&db, e.p, 30, 1, &stop, &mut |_| {}).unwrap());
+            let mut r = DiskReplay::new(&tmp, c).unwrap();
+            r.advance(&db, e.p, 12, &stop, &mut |_| {}).unwrap();
+            r.advance(&db, e.p, 30, &stop, &mut |_| {}).unwrap();
+            let mut rows = r.finish().unwrap();
+            let diff = db.apply_coin_diff(e.p, &mut || rows.next_kv(), true, &tmp, &stop, &mut |_| {}).unwrap();
+            assert_eq!(rows.missing, 0);
+            diff
+        } else {
+            let mut r = Replay::default();
+            r.advance(&db, e.p, 30, usize::MAX, &stop, &mut |_| {}).unwrap();
+            let rows = r.sorted(c);
+            let mut it = rows.clone().into_iter();
+            let diff = db.apply_coin_diff(e.p, &mut || Ok(it.next()), false, &tmp, &stop, &mut |_| {}).unwrap();
+            let mut it = rows.into_iter();
+            db.apply_coin_diff(e.p, &mut || Ok(it.next()), true, &tmp, &stop, &mut |_| {}).unwrap();
+            diff
+        };
+        assert_eq!((diff.added, diff.removed, diff.changed), (1, 1, 0), "on disk: {on_disk}");
+        assert!(table(&db, OUTPUTS) == table(&e.reference, OUTPUTS));
+        db.redo_addresses(c).unwrap();
+        assert!(db.build_addresses(e.p, &tmp, &AtomicBool::new(false), &mut |_| {}).unwrap());
+        for t in [SCRIPT_HIST, BY_SCRIPT, SPENDS] {
+            assert!(table(&db, t) == table(&e.reference, t), "address table {t}");
+        }
     }
+}
+
+/// The re-check on disk derives exactly what Replay derives, wherever it is cut.
+#[test]
+fn the_re_check_on_disk_matches_replay() {
+    let e = env(45);
+    let c = e.p.chain_no;
+    let d = tempfile::tempdir().unwrap();
+    let stop = AtomicBool::new(false);
+    let mut r = Replay::default();
+    r.advance(&e.reference, e.p, 45, usize::MAX, &stop, &mut |_| {}).unwrap();
+    let want = r.sorted(c);
+    let mut dr = DiskReplay::new(d.path(), c).unwrap();
+    for to in [1, 7, 30, 45] {
+        dr.advance(&e.reference, e.p, to, &stop, &mut |_| {}).unwrap();
+    }
+    let mut rows = dr.finish().unwrap();
+    let mut got = Vec::new();
+    while let Some(kv) = rows.next_kv().unwrap() {
+        got.push(kv);
+    }
+    assert_eq!(rows.missing, 0);
+    assert!(got == want);
+    assert!(got == table(&e.reference, OUTPUTS));
 }
 
 /// Coins our blocks don't have as the copy says are refused before anything is written, so

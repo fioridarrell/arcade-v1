@@ -15,8 +15,9 @@
 //!    Address rows are built afterwards from the stored blocks (addrbuild, from t+1), the
 //!    protocol indexes walk the blocks as after any catch-up.
 //! 4. The coin set is marked trusted (STATE "coins_trusted": who made it, at what height)
-//!    until `Replay` has derived the coin set from the blocks the normal way and it matched.
-//!    On a mismatch, `apply_coin_diff` puts our own derivation in place.
+//!    until `Replay` (or `DiskReplay`, for a set too big for memory) has derived the coin set
+//!    from the blocks the normal way and it matched. On a mismatch, `apply_coin_diff` puts our
+//!    own derivation in place.
 //!
 //! STATE "cb_import" is set while step 3 runs: the coins are half old, half new then. The
 //! arcade keeps the chain held while it is set and runs the import again (it is idempotent).
@@ -901,3 +902,117 @@ impl Replay {
     }
 }
 
+// ---------------- the re-check on disk ----------------
+
+/// The same derivation as Replay, in sorted runs on disk instead of memory: every output the
+/// main chain made and every output its inputs spent, merged at the end. Memory stays small
+/// (two Sorters) whatever the size of the coin set, so a chain too big for Replay's budget is
+/// still re-checked coin by coin. Temporary disk: about 60 bytes per output and per input.
+pub struct DiskReplay {
+    made: Sorter,
+    spent: Sorter,
+    pub height: u32,
+    missing: u64,
+}
+
+impl DiskReplay {
+    pub fn new(tmp: &Path, c: u16) -> Result<DiskReplay> {
+        Ok(DiskReplay { made: Sorter::new(tmp, &format!("made-{c}"))?, spent: Sorter::new(tmp, &format!("spent-{c}"))?, height: 0, missing: 0 })
+    }
+
+    /// Read blocks height+1..=to (main chain).
+    pub fn advance(&mut self, db: &ChainDb, params: &ChainParams, to: u32, stop: &AtomicBool, note: Note) -> Result<()> {
+        let c = params.chain_no;
+        while self.height < to {
+            if stop.load(Ordering::Relaxed) {
+                return Err(err("stopped"));
+            }
+            let end = to.min(self.height + 1000);
+            db.store(c).read(|r| {
+                for h in self.height + 1..=end {
+                    let hv = r.get(HEIGHT, &k_height(c, h))?.ok_or_else(|| err(format!("height {h} is not on the main chain")))?;
+                    let b = be_u32(&hv, 32);
+                    for (k, raw) in r.scan_prefix(BLOCK_TX, &k_block(c, b))? {
+                        if is_pruned(&raw) {
+                            return Err(err("a block's transactions are held by other arcades (Shared storage)"));
+                        }
+                        let p = be_u32(&k, k.len() - 4);
+                        let tx = Tx::parse_with(&raw, &params.format).map_err(err)?;
+                        if !tx.is_coinbase() {
+                            for i in &tx.inputs {
+                                match crate::db::locate(r, params, &i.prevout.txid)? {
+                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &h.to_be_bytes())?,
+                                    None => self.missing += 1,
+                                }
+                            }
+                        }
+                        let coinbase = tx.is_coinbase() || tx.is_coinstake();
+                        for (vout, o) in tx.outputs.iter().enumerate() {
+                            if is_unspendable(o.value, &o.script_pubkey) {
+                                continue;
+                            }
+                            let mut v = h.to_be_bytes().to_vec();
+                            v.extend_from_slice(&encode_coin(o.value, h, coinbase, &o.script_pubkey));
+                            self.made.push(&k_pos(c, b, p, vout as u32), &v)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            self.height = end;
+            note(format!("re-checking the coin set on disk: block {end} of {to}"));
+        }
+        Ok(())
+    }
+
+    /// The derived set, read in key order from `DiskRows::next_kv`.
+    pub fn finish(self) -> Result<DiskRows> {
+        let mut spent = self.spent.finish()?;
+        let next_spend = spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        Ok(DiskRows { made: self.made.finish()?, spent, next_spend, missing: self.missing })
+    }
+}
+
+/// The coin set a DiskReplay derived: outputs made and not spent by a later input, as OUTPUTS
+/// rows in key order.
+pub struct DiskRows {
+    made: Sorted,
+    spent: Sorted,
+    next_spend: Option<(Vec<u8>, u32)>,
+    /// Inputs that spent a coin not made before them (a broken chain: never expected); complete
+    /// once `next_kv` returned None.
+    pub missing: u64,
+}
+
+impl DiskRows {
+    fn pull(&mut self) -> Result<()> {
+        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        Ok(())
+    }
+
+    pub fn next_kv(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            let Some((k, v)) = self.made.next_kv()? else {
+                while self.next_spend.is_some() {
+                    self.missing += 1;
+                    self.pull()?;
+                }
+                return Ok(None);
+            };
+            let made_at = be_u32(&v, 0);
+            let mut spent = false;
+            while let Some((sk, at)) = &self.next_spend {
+                match sk.as_slice().cmp(k.as_slice()) {
+                    std::cmp::Ordering::Greater => break,
+                    // Spent once, at or after it was made; any other spend of it finds nothing (as Replay).
+                    std::cmp::Ordering::Equal if !spent && *at >= made_at => spent = true,
+                    _ => self.missing += 1,
+                }
+                self.pull()?;
+            }
+            if !spent {
+                return Ok(Some((k, v[4..].to_vec())));
+            }
+        }
+    }
+}

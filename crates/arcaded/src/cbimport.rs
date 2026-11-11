@@ -12,14 +12,15 @@
 //!    against the transaction at its position in our own blocks. That they are unspent is the
 //!    maker's word ("trusted from <maker>") until step 3.
 //! 3. verify (afterwards, in the background): the coin set derived from the blocks again,
-//!    the normal way; equal -> "verified"; different -> ours replaces the copy's, the address
+//!    the normal way (in memory, or on disk when that is too big for ARCADE_VERIFY_MB, so every
+//!    coin is covered); equal -> "verified"; different -> ours replaces the copy's, the address
 //!    rows are built again, and an event names the maker.
 
 use crate::corecoins::Chainstate;
 use crate::node::Node;
 use arcade_chain::params::ChainParams;
 use arcade_chain::Hash256;
-use arcade_chaindb::coreimport::{ImportCoin, Replay, TRUSTED, VERIFIED};
+use arcade_chaindb::coreimport::{DiskReplay, ImportCoin, Replay, TRUSTED, VERIFIED};
 use arcade_chaindb::sync::{BlockSource, Syncer};
 use serde_json::{json, Value};
 use std::collections::{HashMap, VecDeque};
@@ -545,7 +546,8 @@ pub fn start_verify(node: Arc<Node>, key: String) -> bool {
     true
 }
 
-/// Memory the re-check may use (ARCADE_VERIFY_MB, default 4096).
+/// Memory the re-check may use in memory (ARCADE_VERIFY_MB, default 4096); past it, the
+/// re-check goes on on disk instead (DiskReplay).
 fn verify_budget() -> usize {
     std::env::var("ARCADE_VERIFY_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096) << 20
 }
@@ -560,51 +562,111 @@ fn verify(node: &Arc<Node>, key: &str) -> Result<(), String> {
         None => return Ok(()),
     };
     let tv: Value = serde_json::from_str(&trusted).unwrap_or(json!({}));
-    let maker = tv["maker"].as_str().unwrap_or("").to_string();
-    let stop = AtomicBool::new(false);
-    let mut replay = Replay::default();
-    let budget = verify_budget();
-    // Most of it while the chain carries on; the last blocks with the chain held.
-    let tip = node.chain.tip(c).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
-    let mut note = |s: String| set_verify(key, Some(s));
-    if !replay.advance(&node.chain, p, tip, budget, &stop, &mut note).map_err(|e| e.to_string())? {
-        let _ = node.app.event("chains", &format!("{}: the coin set's re-check needs more memory than ARCADE_VERIFY_MB allows ({} MB); it stays trusted from arcade {}", p.name, budget >> 20, crate::coreboot::short(&maker)));
-        return Ok(());
-    }
-    crate::coreboot::hold(key, true);
-    if !crate::coreboot::wait_parked(key, node, Duration::from_secs(1800)) {
-        return Err("the chain's sync did not stop".into());
-    }
-    let tip = node.chain.tip(c).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
-    node.chain.flush_coins(c).map_err(|e| e.to_string())?;
-    if !replay.advance(&node.chain, p, tip, budget, &stop, &mut note).map_err(|e| e.to_string())? {
-        return Err("out of memory budget".into());
-    }
-    let rows = replay.sorted(c);
+    let maker = tv["maker"].as_str().or(tv["from"].as_str()).unwrap_or("").to_string();
     let tmp = node.home.join("coreboot").join(format!("{key}-verify"));
-    let mut it = rows.iter().cloned();
-    let d = node.chain.apply_coin_diff(p, &mut || Ok(it.next()), false, &tmp, &stop, &mut note).map_err(|e| e.to_string())?;
-    if d.matches() && replay.missing == 0 && !interrupted {
-        let v = json!({"height": tip, "coins": d.same, "at": arcade_app::now(), "maker": maker}).to_string();
-        node.chain.set_state_text(c, VERIFIED, Some(&v)).map_err(|e| e.to_string())?;
-        node.chain.set_state_text(c, TRUSTED, None).map_err(|e| e.to_string())?;
-        let _ = node.app.event("chains", &format!("{}: the coin set from arcade {} re-checked from the blocks up to {tip}: it matches ({} coins). Verified.", p.name, crate::coreboot::short(&maker), d.same));
+    let mut note = |s: String| set_verify(key, Some(s));
+    // Most of it while the chain carries on; the last blocks with the chain held.
+    let mut hold = || -> Result<(), String> {
+        crate::coreboot::hold(key, true);
+        if !crate::coreboot::wait_parked(key, node, Duration::from_secs(1800)) {
+            return Err("the chain's sync did not stop".into());
+        }
+        Ok(())
+    };
+    let r = recheck(&node.chain, p, verify_budget(), &tmp, interrupted, &maker, &mut note, &mut hold);
+    let _ = std::fs::remove_dir_all(&tmp);
+    let r = r?;
+    let how = if r.on_disk { format!(" (on disk: more than ARCADE_VERIFY_MB, {} MB, in memory)", verify_budget() >> 20) } else { String::new() };
+    if !r.replaced {
+        let _ = node.app.event("chains", &format!("{}: the coin set from arcade {} re-checked from the blocks up to {}{how}: it matches ({} coins). Verified.", p.name, crate::coreboot::short(&maker), r.tip, r.diff.same));
         return Ok(());
     }
-    // Different: our own derivation replaces it.
-    let mut it = rows.iter().cloned();
-    let fixed = node.chain.apply_coin_diff(p, &mut || Ok(it.next()), true, &tmp, &stop, &mut note).map_err(|e| e.to_string())?;
-    node.chain.redo_addresses(c).map_err(|e| e.to_string())?;
-    node.chain.set_state_text(c, arcade_chaindb::coreimport::IMPORTING, None).map_err(|e| e.to_string())?;
-    let v = json!({"height": tip, "coins": replay.len(), "at": arcade_app::now(), "maker": maker, "replaced": true,
-                   "added": fixed.added, "removed": fixed.removed, "changed": fixed.changed, "missing_spends": replay.missing}).to_string();
-    node.chain.set_state_text(c, VERIFIED, Some(&v)).map_err(|e| e.to_string())?;
-    node.chain.set_state_text(c, TRUSTED, None).map_err(|e| e.to_string())?;
     let _ = node.app.event("chains", &format!(
-        "{}: the coin set from arcade {} does NOT match the blocks ({} missing, {} extra, {} different coins); it was replaced by this arcade's own, and the address rows are built again",
-        p.name, maker, d.added, d.removed, d.changed
+        "{}: the coin set from arcade {} does NOT match the blocks ({} missing, {} extra, {} different coins){how}; it was replaced by this arcade's own, and the address rows are built again",
+        p.name, maker, r.diff.added, r.diff.removed, r.diff.changed
     ));
     Ok(())
+}
+
+/// What a re-check found.
+struct Recheck {
+    tip: u32,
+    diff: arcade_chaindb::coreimport::CoinDiff,
+    replaced: bool,
+    on_disk: bool,
+}
+
+/// Derive the coin set from the stored blocks again and compare it with the one taken in: equal
+/// -> "verified"; different -> ours replaces it and the address rows are built again. In memory
+/// while it fits `budget`; past that on disk (DiskReplay), so every coin is re-checked whatever
+/// the chain's size and none stays "trusted" for good. `hold` stands the chain still before the
+/// last blocks.
+#[allow(clippy::too_many_arguments)]
+fn recheck(
+    db: &arcade_chaindb::ChainDb,
+    p: &'static ChainParams,
+    budget: usize,
+    tmp: &Path,
+    force: bool,
+    maker: &str,
+    note: &mut dyn FnMut(String),
+    hold: &mut dyn FnMut() -> Result<(), String>,
+) -> Result<Recheck, String> {
+    let c = p.chain_no;
+    let stop = AtomicBool::new(false);
+    let e = |x: arcade_store::StoreError| x.to_string();
+    let mut mem = Some(Replay::default());
+    let mut disk: Option<DiskReplay> = None;
+    let derive = |to: u32, mem: &mut Option<Replay>, disk: &mut Option<DiskReplay>, note: &mut dyn FnMut(String)| -> Result<(), String> {
+        if let Some(r) = mem.as_mut() {
+            if r.advance(db, p, to, budget, &stop, note).map_err(e)? {
+                return Ok(());
+            }
+            // Past the memory budget: derived on disk instead, from the start.
+            *mem = None;
+            *disk = Some(DiskReplay::new(tmp, c).map_err(e)?);
+        }
+        disk.as_mut().unwrap().advance(db, p, to, &stop, note).map_err(e)
+    };
+    let tip = db.tip(c).map_err(e)?.map(|t| t.height).unwrap_or(0);
+    derive(tip, &mut mem, &mut disk, note)?;
+    hold()?;
+    let tip = db.tip(c).map_err(e)?.map(|t| t.height).unwrap_or(0);
+    db.flush_coins(c).map_err(e)?;
+    derive(tip, &mut mem, &mut disk, note)?;
+    let on_disk = mem.is_none();
+    let (diff, missing, coins) = match (mem, disk) {
+        (Some(r), _) => {
+            let rows = r.sorted(c);
+            let mut it = rows.iter().cloned();
+            let d = db.apply_coin_diff(p, &mut || Ok(it.next()), false, tmp, &stop, note).map_err(e)?;
+            if !d.matches() || r.missing > 0 || force {
+                let mut it = rows.iter().cloned();
+                db.apply_coin_diff(p, &mut || Ok(it.next()), true, tmp, &stop, note).map_err(e)?;
+            }
+            (d, r.missing, r.len() as u64)
+        }
+        (None, Some(dr)) => {
+            // One pass: where the sets are equal nothing is written.
+            let mut rows = dr.finish().map_err(e)?;
+            let d = db.apply_coin_diff(p, &mut || rows.next_kv(), true, tmp, &stop, note).map_err(e)?;
+            let n = d.same + d.added + d.changed;
+            (d, rows.missing, n)
+        }
+        (None, None) => unreachable!(),
+    };
+    let replaced = !diff.matches() || missing > 0 || force;
+    let v = if replaced {
+        db.redo_addresses(c).map_err(e)?;
+        db.set_state_text(c, arcade_chaindb::coreimport::IMPORTING, None).map_err(e)?;
+        json!({"height": tip, "coins": coins, "at": arcade_app::now(), "maker": maker, "replaced": true,
+               "added": diff.added, "removed": diff.removed, "changed": diff.changed, "missing_spends": missing, "on_disk": on_disk})
+    } else {
+        json!({"height": tip, "coins": diff.same, "at": arcade_app::now(), "maker": maker, "on_disk": on_disk})
+    };
+    db.set_state_text(c, VERIFIED, Some(&v.to_string())).map_err(e)?;
+    db.set_state_text(c, TRUSTED, None).map_err(e)?;
+    Ok(Recheck { tip, diff, replaced, on_disk })
 }
 
 #[cfg(test)]
@@ -784,6 +846,79 @@ mod tests {
                     assert_eq!(db.balance_for_script(c, &s).unwrap(), reference.balance_for_script(c, &s).unwrap());
                 }
             }
+        }
+    }
+
+    /// A chain's coin set taken in at its tip from `coins` (Core's view), as take_in does.
+    fn taken_in(dir: &std::path::Path, p: &'static ChainParams, blocks: &[Block], coins: &[ImportCoin]) -> ChainDb {
+        let c = p.chain_no;
+        std::fs::create_dir_all(dir).unwrap();
+        let db = ChainDb::open(dir.join("x.mdbx")).unwrap();
+        db.connect_blocks(p, &blocks[..=5]).unwrap();
+        let mut parent = db.header(c, &blocks[5].hash()).unwrap().unwrap();
+        let mut recs = Vec::new();
+        for (h, b) in blocks.iter().enumerate().skip(6) {
+            let rec = arcade_chaindb::HeaderRec { b: 0, height: h as u32, status: 0, work: ChainDb::child_work(&parent, b.header.bits), header: b.header, auxpow: vec![] };
+            parent = rec.clone();
+            recs.push((b.hash(), rec));
+        }
+        db.put_headers(c, &recs).unwrap();
+        let to = blocks.len() as u32 - 1;
+        let path = db.header_path(c, 6, to).unwrap();
+        let raws: Vec<Vec<u8>> = blocks[6..].iter().map(|b| b.encode()).collect();
+        let bs = db.store_blocks_only(p, &raws).unwrap();
+        let stop = AtomicBool::new(false);
+        db.write_txs_for(p, &bs, &dir.join("tmp"), &stop, &mut |_| {}).unwrap();
+        let mut it = coins.iter().cloned();
+        db.import_coins(p, &path, to, &mut || Ok(it.next()), r#"{"maker":"m"}"#, &dir.join("tmp"), &stop, &mut |_| {}).unwrap();
+        db
+    }
+
+    /// With little memory for the re-check (ARCADE_VERIFY_MB) it goes on on disk: every coin is
+    /// still re-checked, a set that keeps a spent coin is replaced, an honest one verified, and
+    /// neither stays trusted.
+    #[test]
+    fn little_memory_still_rechecks_every_coin() {
+        let d = tempfile::tempdir().unwrap();
+        let blocks = chain(30);
+        let mut pp = arcade_chain::params::PEPECOIN_TEST.clone();
+        pp.genesis = Box::leak(blocks[0].hash().to_hex().into_boxed_str());
+        pp.genesis_header = "";
+        let p: &'static ChainParams = Box::leak(Box::new(pp));
+        let c = p.chain_no;
+        let reference = ChainDb::open(d.path().join("ref.mdbx")).unwrap();
+        reference.connect_blocks(p, &blocks).unwrap();
+        let (mut honest, mut spent) = (Vec::new(), None);
+        for (h, b) in blocks.iter().enumerate() {
+            for t in &b.txs {
+                for (v, o) in t.outputs.iter().enumerate() {
+                    let op = arcade_chain::OutPoint { txid: t.txid, vout: v as u32 };
+                    let coin = ImportCoin { txid: t.txid, vout: v as u32, value: o.value, height: h as u32, coinbase: t.is_coinbase(), script: o.script_pubkey.clone() };
+                    match reference.coin(p, &op).unwrap() {
+                        Some(_) => honest.push(coin),
+                        None if h > 0 && !arcade_chaindb::db::is_unspendable(o.value, &o.script_pubkey) => spent = Some(coin),
+                        None => {}
+                    }
+                }
+            }
+        }
+        let mut bad = honest.clone();
+        bad.push(spent.unwrap());
+        for (set, replaced) in [(&honest, false), (&bad, true)] {
+            let dir = d.path().join(format!("x{replaced}"));
+            let db = taken_in(&dir, p, &blocks, set);
+            assert!(db.state_text(c, TRUSTED).unwrap().is_some());
+            let mut held = 0;
+            let r = recheck(&db, p, 1, &dir.join("verify"), false, "m", &mut |_| {}, &mut || {
+                held += 1;
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!((r.on_disk, r.replaced, held), (true, replaced, 1));
+            assert!(db.state_text(c, TRUSTED).unwrap().is_none(), "not trusted for good");
+            let v: Value = serde_json::from_str(&db.state_text(c, VERIFIED).unwrap().unwrap()).unwrap();
+            assert_eq!(v["replaced"] == true, replaced);
+            assert!(db.scan_all(arcade_chaindb::schema::OUTPUTS).unwrap() == reference.scan_all(arcade_chaindb::schema::OUTPUTS).unwrap());
         }
     }
 

@@ -3,7 +3,7 @@
 //! from every arcade holding it and taken in WHILE it comes (§5.0): rows in order, blocks
 //! checked against our headers, no scripts run, pieces deleted once used. Each coin is checked
 //! against the transaction at its position in those blocks as it is taken in; that the coins
-//! are unspent is the makers' word ("trusted") until the background re-check.
+//! are unspent is the makers' word ("trusted") until the re-check, started right after.
 
 use crate::node::Node;
 use crate::vxshare;
@@ -34,6 +34,11 @@ fn set(key: &str, phase: &str, detail: String) {
         j.phase = phase.to_string();
         j.detail = detail;
     }
+}
+
+/// Is a chain being installed from copies right now?
+pub fn running(key: &str) -> bool {
+    jobs().get(key).is_some_and(|x| x.phase != "done" && x.phase != "failed")
 }
 
 pub fn status() -> Value {
@@ -105,6 +110,8 @@ fn start_with(node: Arc<Node>, key: &str, wait_secs: u64) -> Result<Value, Strin
                 Ok(note) => {
                     set(p.key, "done", note.clone());
                     let _ = node.app.event("chain", &format!("{} installed from V1.0 copies: {note}", p.name));
+                    // That the coins are unspent is the makers' word until re-derived here.
+                    crate::cbimport::start_verify(node.clone(), p.key.to_string());
                 }
                 Err(e) => {
                     set(p.key, "failed", e.clone());

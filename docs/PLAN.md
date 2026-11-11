@@ -288,7 +288,8 @@ A fifth storage mode, **Shared**, chosen per chain in Chains & Coins (`arcade ch
   orphan stretch that both neighbours restore, meeting in the middle. A lane's first arcade starts at lane/3 of the
   line (offset markers); positions are nudged off the other lanes' edges so no two lanes break at the same block.
   More arcades = smaller shares, never more than 3 copies.
-- Blocks are dropped only when at least 3 other arcades announce holding them, and only after every index on the chain
+- Blocks are dropped only when at least 3 other arcades announce holding them (in announcements signed by each of
+  them; unsigned ones from older arcades are shown but never counted), and only after every index on the chain
   has walked past them. A dropped block keeps header, txids, coins and address history; an index added later fetches
   the bodies it needs back from the holders and drops them again afterwards.
 - Ord records split in 64 groups by inscription number (the location map stays whole); PRC-20/DRC-20 ticks in 64

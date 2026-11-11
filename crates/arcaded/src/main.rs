@@ -249,7 +249,7 @@ fn main() {
         params: &arcade_chain::params::PEPECOIN_TEST,
         identity,
         tx_outbox: Mutex::new(Vec::new()),
-        mesh_outbox: Mutex::new(Vec::new()),
+        mesh_outbox: Mutex::new(Default::default()),
         links: Mutex::new(Default::default()),
         mesh_tips: Mutex::new(Default::default()),
         sync_state: Mutex::new("starting".into()),

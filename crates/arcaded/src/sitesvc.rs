@@ -5,7 +5,8 @@
 //! A website has many users, each holding their own keys in the browser. The rest of the API
 //! works for this arcade's own wallet; these commands work for ANY address instead:
 //!   tx.coins     the spendable coins of up to 500 addresses (confirmed and unconfirmed),
-//!                so the site can build a transaction for a browser to sign;
+//!                so the site can build a transaction for a browser to sign; coins that carry
+//!                an inscription, or may (coinsend::ord_hold), are listed apart as "held";
 //!   tx.activity  what changed for up to 500 addresses since a height: confirmed history rows
 //!                and waiting transactions (the site's notifications);
 //!   tx.fee       the fee rate and dust limit transactions here are built with;
@@ -97,25 +98,36 @@ pub fn coins(node: &Node, req: &Value) -> R {
     let mut out = serde_json::Map::new();
     for (a, script) in &want {
         let mut confirmed = Vec::new();
+        let mut held = Vec::new();
         let mut total = 0u64;
         for (op, value, height) in node.chain.coins_for_script(p, script).map_err(|e| e.to_string())? {
             if spent_in_pool.contains(&op) {
                 continue; // a waiting transaction spends it already
             }
+            let c = json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": tip.saturating_sub(height) + 1});
+            if let Some(why) = crate::coinsend::ord_hold(node, p, &op, value, Some(height))? {
+                held.push(json!({"coin": c, "why": why}));
+                continue;
+            }
             total += value;
-            confirmed.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": tip.saturating_sub(height) + 1}));
+            confirmed.push(c);
         }
         let mut unconfirmed = Vec::new();
         for (_, t) in &pooled {
             for (vout, o) in t.outputs.iter().enumerate() {
                 let op = OutPoint { txid: t.txid, vout: vout as u32 };
                 if o.script_pubkey == *script && !spent_in_pool.contains(&op) {
+                    let c = json!({"txid": t.txid.to_hex(), "vout": vout, "value": o.value, "rbf": crate::claims::signals_rbf(t)});
+                    if let Some(why) = crate::coinsend::ord_hold(node, p, &op, o.value, None)? {
+                        held.push(json!({"coin": c, "why": why}));
+                        continue;
+                    }
                     total += o.value;
-                    unconfirmed.push(json!({"txid": t.txid.to_hex(), "vout": vout, "value": o.value, "rbf": crate::claims::signals_rbf(t)}));
+                    unconfirmed.push(c);
                 }
             }
         }
-        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total}));
+        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "held": held, "total": total}));
     }
     Ok(json!({"chain": p.key, "height": tip, "addresses": out}))
 }
@@ -335,7 +347,7 @@ pub(crate) mod tests {
             params: p,
             identity,
             tx_outbox: Mutex::new(Vec::new()),
-            mesh_outbox: Mutex::new(Vec::new()),
+            mesh_outbox: Mutex::new(Default::default()),
             links: Mutex::new(Default::default()),
             mesh_tips: Mutex::new(Default::default()),
             sync_state: Mutex::new("test".into()),

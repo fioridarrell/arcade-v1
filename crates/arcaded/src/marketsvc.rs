@@ -308,6 +308,8 @@ fn pair_of(node: &Node, q: &Map<String, Value>) -> Result<(u32, u32), String> {
 /// A chain's coin icon (docs/MARKET.md "Coin icons", inscribed on Pepecoin testnet).
 fn coin_icon(key: &str) -> Option<&'static str> {
     Some(match key {
+        "arc" => "698fa4a636e90278ef6ca3f1b26806e634b9ee323d0350003f2a472a2fa50455",
+        "arctest" => "e2982d87007506fab2380fbc5cd2003c6ac09b304a670772063affb2a8abf49f",
         "bel" => "aeb761003d131b0ec643713b9663e00034345bbb4bf9d40744867892b5425ec2",
         "dgb" => "5796bfe950c32aed2a3ad848eb0afe23ded4f62dabc7b85b50154c0762999d9a",
         "dgbtest" => "807c7cdb64000a3e67f5f34bdc64e883d034ad7c26c106cbc5b5323dde79b682",
@@ -413,15 +415,17 @@ fn holdings(node: &Node) -> Value {
                             "amount": (free / 10u128.pow(18)).to_string()}));
         }
     }
-    // The coin of every other installed chain.
-    let extra: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+    // The coin of every other installed chain, the ARCADE chain's too when it runs here.
+    let mut extra: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+    extra.extend(crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).map(|p| p.key.to_string()));
     for key in &extra {
-        let Some(p) = arcade_chain::params::by_key(key) else { continue };
+        let Some(p) = crate::chains::find(key) else { continue };
         if let Ok((_, pk)) = node.app.tag_key(p, 0).map(|(k, sk)| (k, arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk))) {
             let mut sum = 0u64;
             for (_, script) in crate::coinsend::key_scripts(p, &pk) {
                 for (op, value, _) in node.chain.coins_for_script(p, &script).unwrap_or_default() {
-                    if node.chain.mempool_spender(p.chain_no, &op).ok().flatten().is_none() {
+                    let waiting = if crate::arcsvc::runs(p) { crate::arcsvc::spender(&op) } else { node.chain.mempool_spender(p.chain_no, &op).ok().flatten() };
+                    if waiting.is_none() {
                         sum += value;
                     }
                 }

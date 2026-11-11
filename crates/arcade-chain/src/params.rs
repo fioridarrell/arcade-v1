@@ -863,6 +863,10 @@ pub static JUNKCOIN_MAIN: ChainParams = ChainParams {
         (69240, "c34f5d113fe92f3206ef8855caf51cd6252286e3381b253bbc1237211198c22b"),
         (168312, "deea2bcecb1146ae9cd74d67b29b4d0161e9bb63beb9022ca10f3625dda6c0e6"),
         (172000, "6208026838cd18d3f401f3c5c2305105a3aafeb63164827d3e341f356cb3529a"),
+        // Synced live 2026-11-11 through SegWit, Taproot and MWEB; equal to explorer.junk-coin.com.
+        (1145000, "db41f2d85032d8318f5c6b19ee6917570b1dd4213110cce51aeb2fb4ceaf6154"),
+        (1165000, "82ecdb2d2704b95a9d7b647a38897b366af74abc7f677374e3d82feb2caeedee"),
+        (1200000, "e93c0573552bd263d6ed8419272cc6a3aa9383a90b593a026c5ff4f9355ae0b1"),
     ],
     coinbase_maturity: 70,
     // No original-arcade floor: indexes start near the tip when it was added (2026-11-11, tip 1,215,059).

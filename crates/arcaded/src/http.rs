@@ -322,6 +322,10 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             let st = match code { 200 => "200 OK", 202 => "202 Accepted", _ => "400 Bad Request" };
             return respond(&mut s, st, "application/json", &cors, v.to_string().as_bytes());
         }
+        // The market reads (marketsvc.rs, docs/MARKET.md step 1): /r/book/<id> and /r/market/*.
+        if let Some((code, body)) = crate::marketsvc::route(node, &path, &query_fields(&r.query)) {
+            return respond(&mut s, status_line(code), "application/json", &cors, body.as_bytes());
+        }
         if let Some(a) = crate::namesites::route(node, &path, &query_fields(&r.query)) {
             return respond(&mut s, status_line(a.code), a.ctype, &cors, &a.body);
         }

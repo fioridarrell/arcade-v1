@@ -11,6 +11,7 @@ pub mod engine;
 pub mod extract;
 pub mod index;
 pub mod maps;
+pub mod market;
 pub mod messages;
 pub mod names;
 pub mod ord;

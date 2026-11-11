@@ -38,6 +38,7 @@ mod lxfetch;
 mod meshsource;
 mod miner;
 mod meshsvc;
+mod marketsvc;
 mod meshview;
 mod mempoolshare;
 mod msgsvc;

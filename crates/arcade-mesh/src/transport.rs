@@ -105,6 +105,11 @@ fn bad(m: &str) -> io::Error {
 impl Wss {
     /// Connect to `wss://host[:port]/path`.
     pub fn connect(url: &str, timeout: Duration) -> io::Result<Wss> {
+        Self::connect_checked(url, timeout, &|_| true)
+    }
+
+    /// Connect as `connect` does, only if every address the host resolves to passes `ok`.
+    pub fn connect_checked(url: &str, timeout: Duration, ok: &dyn Fn(&std::net::IpAddr) -> bool) -> io::Result<Wss> {
         let rest = url.strip_prefix("wss://").ok_or_else(|| bad("not a wss:// URL"))?;
         let (hostport, path) = match rest.find('/') {
             Some(i) => (&rest[..i], &rest[i..]),
@@ -114,7 +119,11 @@ impl Wss {
             Some((h, p)) if p.parse::<u16>().is_ok() => (h, p.parse().unwrap()),
             _ => (hostport, 443u16),
         };
-        let sa = (host, port).to_socket_addrs()?.next().ok_or_else(|| bad("cannot resolve host"))?;
+        let all: Vec<std::net::SocketAddr> = (host, port).to_socket_addrs()?.collect();
+        if all.iter().any(|a| !ok(&a.ip())) {
+            return Err(bad(&format!("{host} resolves to an address not to dial")));
+        }
+        let sa = all.first().copied().ok_or_else(|| bad("cannot resolve host"))?;
         let tcp = TcpStream::connect_timeout(&sa, timeout)?;
         tcp.set_read_timeout(Some(timeout))?;
         tcp.set_write_timeout(Some(timeout))?;

@@ -267,15 +267,22 @@ impl Link {
 
     /// Dial `host:port` (TCP) or `wss://host/mesh` (WebSocket over TLS).
     pub fn dial(addr: &str, net: &str, identity: &SigningKey, listen: Option<u16>) -> Result<Link> {
+        Self::dial_checked(addr, net, identity, listen, &|_| true)
+    }
+
+    /// Dial as `dial` does, only if every address the name resolves to passes `ok`; the
+    /// connection goes to one of the addresses checked (no second lookup).
+    pub fn dial_checked(addr: &str, net: &str, identity: &SigningKey, listen: Option<u16>, ok: &dyn Fn(&std::net::IpAddr) -> bool) -> Result<Link> {
         if addr.starts_with("wss://") {
-            let t = crate::transport::Wss::connect(addr, Duration::from_secs(15))?;
+            let t = crate::transport::Wss::connect_checked(addr, Duration::from_secs(15), ok)?;
             return Self::handshake_over(Box::new(t), net, identity, true, listen);
         }
         use std::net::ToSocketAddrs;
-        let sa = addr
-            .to_socket_addrs()?
-            .next()
-            .ok_or_else(|| LinkError::Handshake(format!("cannot resolve {addr}")))?;
+        let all: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+        if all.iter().any(|a| !ok(&a.ip())) {
+            return Err(LinkError::Handshake(format!("{addr} is not an address to dial")));
+        }
+        let sa = all.first().copied().ok_or_else(|| LinkError::Handshake(format!("cannot resolve {addr}")))?;
         let s = TcpStream::connect_timeout(&sa, Duration::from_secs(10))?;
         s.set_nodelay(true)?;
         Self::handshake(s, net, identity, true, listen)
@@ -437,6 +444,20 @@ mod tests {
         assert_eq!(f.kind(), "pong");
         assert_eq!(f.blob, vec![9, 9]);
         assert_eq!(t.join().unwrap(), hex::encode(a.verifying_key().to_bytes()));
+    }
+
+    #[test]
+    fn a_checked_dial_refuses_names_that_resolve_to_refused_addresses() {
+        let id = SigningKey::from_bytes(&[1u8; 32]);
+        let public = |ip: &std::net::IpAddr| !ip.is_loopback();
+        for a in ["localhost:1", "127.0.0.1:1", "wss://localhost/mesh", "wss://127.0.0.1:1/mesh"] {
+            match Link::dial_checked(a, "n", &id, None, &public) {
+                Err(LinkError::Handshake(m)) => assert!(m.contains("not an address to dial") || m.contains("not to dial"), "{a}: {m}"),
+                Err(LinkError::Io(e)) => assert!(e.to_string().contains("not to dial"), "{a}: {e}"),
+                Err(e) => panic!("{a}: {e}"),
+                Ok(_) => panic!("{a} was dialed"),
+            }
+        }
     }
 
     #[test]

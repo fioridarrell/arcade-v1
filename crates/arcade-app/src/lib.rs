@@ -437,6 +437,11 @@ impl AppDb {
         Ok(())
     }
 
+    pub fn del_peer(&self, id: &str) -> Result<()> {
+        self.store.write(|w| w.del(PEERS, id.as_bytes()).map(|_| ()))?;
+        Ok(())
+    }
+
     pub fn peers(&self) -> Result<Vec<Peer>> {
         self.store.read(|r| r.scan_prefix(PEERS, b""))?.into_iter().map(|(_, v)| dec(PEERS, &v)).collect()
     }

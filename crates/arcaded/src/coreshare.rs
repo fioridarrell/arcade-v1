@@ -60,10 +60,15 @@ pub fn offer(node: &Node) -> Option<Frame> {
     (!nets.is_empty()).then(|| Frame::new(json!({"t": "cr", "op": "offer", "nets": nets})))
 }
 
+/// The chain a borrower's question or transaction is for, if this arcade answers for it: one
+/// it lends, or the ARCADE chain a moment after its copy was last caught up.
 fn lent_net(node: &Node, net: &Value) -> Option<&'static ChainParams> {
     let net = net.as_str()?;
-    lent(node).into_iter().find(|p| p.net == net)
+    lent(node).into_iter().find(|p| p.net == net).or_else(|| crate::arcsvc::answers().filter(|p| p.net == net))
 }
+
+/// What a borrower is told when it asks about a chain this arcade doesn't lend just now.
+pub const NOT_LENT: &str = "not lent here just now";
 
 #[derive(Default)]
 pub struct Requests {
@@ -200,6 +205,10 @@ pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> R
             on_tx(node, lent_net(node, &h["net"]).unwrap(), &f.blob);
             Ok(())
         }
+        // A question about a chain not lent here (any more, or just now) is answered with an
+        // error, once, at its last part: left unanswered, the borrower would wait out its
+        // time limit before trying another lender.
+        "q" if h["end"] == true => send(link, h["id"].as_u64().unwrap_or(0), Err(NOT_LENT.into()), false),
         _ => Ok(()), // offers and subs from others: not needed by a node that has its own chain
     }
 }
@@ -289,6 +298,36 @@ mod tests {
         assert!(t.node.tx_outbox.lock().unwrap().is_empty(), "not sent on");
         assert!(on_tx(&t.node, t.p, &good.raw));
         assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[good.raw.clone()]);
+    }
+
+    /// A borrower that asks about a chain not lent here is told so at once (it then tries
+    /// another lender), not left to wait out its time limit.
+    #[test]
+    fn a_question_about_a_chain_not_lent_is_answered_with_an_error() {
+        use ed25519_dalek::SigningKey;
+        let t = crate::sitesvc::tests::setup();
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::scope(|sc| {
+            sc.spawn(|| {
+                let (s, _) = l.accept().unwrap();
+                let mut link = Link::handshake(s, "arcade-test", &SigningKey::from_bytes(&[2; 32]), false, None).unwrap();
+                let mut reqs = Requests::default();
+                // Two questions: one for a chain not lent, then one for the home chain.
+                for _ in 0..2 {
+                    let f = link.recv().unwrap();
+                    handle(&t.node, &mut link, &mut reqs, &f).unwrap();
+                }
+            });
+            let mut link = Link::dial(&addr, "arcade-test", &SigningKey::from_bytes(&[1; 32]), None).unwrap();
+            let calls = json!([["getblockcount", []]]);
+            let t0 = std::time::Instant::now();
+            let err = crate::crsource::ask(&mut link, &addr, "nosuchnet", 1, &calls, &mut |_| {}).unwrap_err();
+            assert!(err.contains(NOT_LENT), "{err}");
+            assert!(t0.elapsed() < std::time::Duration::from_secs(5));
+            // The link is still good for a chain that is lent.
+            assert_eq!(crate::crsource::ask(&mut link, &addr, t.p.net, 2, &calls, &mut |_| {}).unwrap(), vec![json!({"r": 2})]);
+        });
     }
 
     /// A spend of a P2SH coin whose script this arcade can't check (an inscription reveal, say)

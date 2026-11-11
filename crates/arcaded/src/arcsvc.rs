@@ -71,6 +71,11 @@ const LINKED: Duration = Duration::from_secs(30);
 /// With no other arcade heard from for this long after the start, this arcade's copy is
 /// taken to be the chain (it may be the only one on it) and can be lent.
 const ALONE_AFTER: Duration = Duration::from_secs(60);
+/// A lender goes on answering its borrowers for this long after it was last caught up. Each
+/// new block leaves a copy a moment behind (a peer has named it, it isn't fetched yet), and a
+/// borrower checks every header itself and follows the branch with the most work, so an
+/// answer from a copy a block behind does it no harm.
+const ANSWERS_AFTER: Duration = Duration::from_secs(30);
 /// The most headers in one shared-core answer.
 pub const LENT_HEADERS: usize = 500;
 
@@ -183,6 +188,8 @@ pub struct Svc {
     /// Set (under `st`) when the chain is removed: nothing is taken in or written after.
     stop: AtomicBool,
     started: Instant,
+    /// When this copy was last seen caught up.
+    last_up: Mutex<Option<Instant>>,
 }
 
 impl Svc {
@@ -191,8 +198,23 @@ impl Svc {
     fn caught_up(&self) -> bool {
         let peers = self.peers.lock().unwrap();
         let behind = peers.values().any(|p| p.wants.is_some() && p.seen.is_some_and(|t| t.elapsed() < LINKED));
-        !behind && (peers.values().any(|p| p.heard) || self.started.elapsed() > ALONE_AFTER)
+        let up = !behind && (peers.values().any(|p| p.heard) || self.started.elapsed() > ALONE_AFTER);
+        drop(peers);
+        if up {
+            *self.last_up.lock().unwrap() = Some(Instant::now());
+        }
+        up
     }
+
+    /// Whether borrowers are answered: caught up, or was a moment ago ([`ANSWERS_AFTER`]).
+    fn answers(&self) -> bool {
+        self.caught_up() || still_answers(*self.last_up.lock().unwrap(), Instant::now())
+    }
+}
+
+/// Whether a copy last caught up at `last_up` still answers its borrowers at `now`.
+fn still_answers(last_up: Option<Instant>, now: Instant) -> bool {
+    last_up.is_some_and(|t| now.saturating_duration_since(t) < ANSWERS_AFTER)
 }
 
 /// The chain this arcade can install: what its settings say.
@@ -494,6 +516,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         peers: Default::default(),
         stop: AtomicBool::new(false),
         started: Instant::now(),
+        last_up: Mutex::new(None),
     });
     *SVC.write().unwrap() = Some(svc.clone());
     if weight > 0 {
@@ -958,6 +981,14 @@ pub fn lends() -> Option<&'static ChainParams> {
     svc.caught_up().then_some(svc.params)
 }
 
+/// The chain, while this arcade answers the borrowers it has: caught up, or was a moment ago.
+/// Longer than [`lends`] says, so a question that arrives just as a new block is told isn't
+/// turned away.
+pub fn answers() -> Option<&'static ChainParams> {
+    let svc = svc()?;
+    svc.answers().then_some(svc.params)
+}
+
 /// A block this arcade holds (on any branch), as the chain writes it. Block 0 has none.
 pub fn raw_block(id: &Hash256) -> Option<Vec<u8>> {
     svc()?.st.lock().unwrap().chain.block(id).map(Block::encode)
@@ -1127,6 +1158,16 @@ mod tests {
     const NET: Net = params::TESTNET;
     const START: u64 = 1_797_000_000;
     const LATE: u64 = START + 10_000_000;
+
+    /// A lender answers its borrowers through a moment's lag, and no longer.
+    #[test]
+    fn a_lender_a_moment_behind_still_answers() {
+        let now = Instant::now();
+        assert!(!still_answers(None, now), "never caught up: a copy still being made");
+        assert!(still_answers(Some(now), now));
+        assert!(still_answers(Some(now), now + ANSWERS_AFTER - Duration::from_secs(1)));
+        assert!(!still_answers(Some(now), now + ANSWERS_AFTER));
+    }
 
     fn secret(who: u8) -> [u8; 32] {
         [who; 32]

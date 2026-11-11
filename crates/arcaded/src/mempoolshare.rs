@@ -7,9 +7,10 @@
 //!   {"t": "mp", "net": <net>, "tx": <raw hex>}
 //!
 //! Checks before pooling (a peer can't fill others' pools with junk): parses on that chain, not
-//! a coinbase, at most MAX_TX bytes, not already known, every input spends an unspent coin or a
-//! pooled output, no input already spent in the pool, inputs cover the outputs, and every
-//! P2PKH input's signature verifies. The pool itself still drops what blocks confirm or replace.
+//! a coinbase, at most MAX_TX bytes, not already known, room in the pool (POOL_TXS, POOL_BYTES),
+//! every input spends an unspent coin or a pooled output, no input already spent in the pool, at
+//! most MAX_ANCESTORS waiting ancestors, inputs cover the outputs, and every input's signature
+//! verifies (arcade_wallet::verify). The pool itself still drops what blocks confirm or replace.
 
 use crate::node::Node;
 use arcade_chain::params::{by_net, ChainParams};
@@ -20,6 +21,13 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Mutex;
 
 const MAX_TX: usize = 100_000;
+/// The most transactions, and bytes, a pool takes from others (the coin's own peers and this
+/// arcade's own transactions are not held to it).
+pub const POOL_TXS: u64 = 5_000;
+pub const POOL_BYTES: u64 = 20 << 20;
+/// Waiting ancestors a transaction from others may have (as a coin node's default limit), so
+/// a chain of children can't grow without end.
+pub const MAX_ANCESTORS: usize = 25;
 /// Frames kept for links to send (oldest dropped; a slow link resends its pool instead).
 const RING: usize = 4000;
 /// Transactions a new link gets from our pool, per chain.
@@ -82,10 +90,18 @@ pub fn check(node: &Node, p: &ChainParams, tx: &Tx) -> Result<(), String> {
     if tx.is_coinbase() {
         return Err("coinbase".into());
     }
+    if tx.raw.len() > MAX_TX {
+        return Err(format!("larger than {MAX_TX} bytes"));
+    }
     if node.chain.mempool_tx(c, &tx.txid).map_err(|e| e.to_string())?.is_some() || node.chain.tx_raw(p, &tx.txid).map_err(|e| e.to_string())?.is_some() {
         return Err("known".into());
     }
+    let (n, bytes) = node.chain.mempool_size(c).map_err(|e| e.to_string())?;
+    if n >= POOL_TXS || bytes + tx.raw.len() as u64 > POOL_BYTES {
+        return Err("the pool is full".into());
+    }
     let mut utxos = Vec::with_capacity(tx.inputs.len());
+    let mut parents = Vec::new();
     for i in &tx.inputs {
         if node.chain.mempool_spender(c, &i.prevout).map_err(|e| e.to_string())?.is_some() {
             return Err("spends a pooled coin twice".into());
@@ -99,26 +115,53 @@ pub fn check(node: &Node, p: &ChainParams, tx: &Tx) -> Result<(), String> {
                     return Err("spends an unknown coin".into());
                 }
                 let o = t.outputs.get(i.prevout.vout as usize).ok_or("spends an unknown output")?;
+                parents.push(t.txid);
                 (o.value, o.script_pubkey.clone())
             }
         };
         utxos.push(arcade_wallet::tx::Utxo { outpoint: OutPoint { txid: i.prevout.txid, vout: i.prevout.vout }, value, script });
     }
-    let ins: u64 = utxos.iter().map(|u| u.value).sum();
-    let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    if ancestors(node, p, parents)? > MAX_ANCESTORS {
+        return Err(format!("more than {MAX_ANCESTORS} waiting ancestors"));
+    }
+    let ins = utxos.iter().try_fold(0u64, |a, u| a.checked_add(u.value)).ok_or("inputs overflow")?;
+    let outs = tx.outputs.iter().try_fold(0u64, |a, o| a.checked_add(o.value)).ok_or("outputs overflow")?;
     if ins < outs {
         return Err("outputs exceed inputs".into());
     }
-    for (n, u) in utxos.iter().enumerate() {
-        if is_p2pkh(&u.script) && !arcade_wallet::tx::verify_p2pkh_input(p, tx, &utxos, n) {
-            return Err(format!("input {n}: bad signature"));
-        }
+    // Every input must verify, and an input whose kind of coin can't be checked here (another
+    // P2SH script, bare multisig, P2WSH, a Taproot script path) is refused too. A pooled spend
+    // is first-seen: it hides the coin from this arcade's own sends, shows as a pending payment
+    // and makes a tag claim look taken, so an unchecked one must not get in. Such
+    // transactions still reach every arcade once a block confirms them, or through the coin's
+    // own peers (whose nodes check every script), just not from other arcades.
+    if let Err((n, e)) = arcade_wallet::verify::all(p, tx, &utxos) {
+        return Err(format!("input {n}: {e}"));
     }
     Ok(())
 }
 
-fn is_p2pkh(s: &[u8]) -> bool {
-    s.len() == 25 && s[0] == 0x76 && s[1] == 0xa9 && s[2] == 0x14 && s[23] == 0x88 && s[24] == 0xac
+/// How many distinct waiting ancestors a transaction with these pooled parents has (counting
+/// stops just past MAX_ANCESTORS).
+fn ancestors(node: &Node, p: &ChainParams, parents: Vec<arcade_chain::Hash256>) -> Result<usize, String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut todo = parents;
+    while let Some(t) = todo.pop() {
+        if !seen.insert(t) {
+            continue;
+        }
+        if seen.len() > MAX_ANCESTORS {
+            break;
+        }
+        let Some(raw) = node.chain.mempool_tx(p.chain_no, &t).map_err(|e| e.to_string())? else { continue };
+        let Ok(tx) = Tx::parse_with(&raw, &p.format) else { continue };
+        for i in &tx.inputs {
+            if !seen.contains(&i.prevout.txid) && node.chain.mempool_tx(p.chain_no, &i.prevout.txid).map_err(|e| e.to_string())?.is_some() {
+                todo.push(i.prevout.txid);
+            }
+        }
+    }
+    Ok(seen.len())
 }
 
 /// Per link, each round: new pooled transactions; a link new to us (or back after a gap) gets
@@ -151,4 +194,84 @@ pub fn tick(node: &Node, peer: &str, link: &mut Link) -> Result<(), LinkError> {
         link.send(&Frame::new(f))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::sitesvc::tests::{block, p2pkh, setup_with, tx, T};
+    use arcade_chain::Hash256;
+    use arcade_wallet::secp256k1::{PublicKey, SecretKey, SECP256K1};
+    use arcade_wallet::tx::{sign_keyhash, sign_p2pkh, TxOutSpec, Utxo};
+
+    pub(crate) fn key() -> SecretKey {
+        SecretKey::from_slice(&[0x31; 32]).unwrap()
+    }
+
+    /// The test chain with SegWit on, where block 3 pays our key 1500 at its P2WPKH script
+    /// (vout 0) and 1400 at its P2PKH one (vout 1).
+    pub(crate) fn funded() -> (T, Vec<Utxo>) {
+        let t = setup_with(|p| p.format.segwit = true);
+        let h = arcade_ledger::address::hash160(&PublicKey::from_secret_key(SECP256K1, &key()).serialize());
+        let (w, k) = (arcade_ledger::address::p2wpkh_script(&h), arcade_ledger::address::p2pkh_script(&h));
+        let fund = tx(&[(t.spend.txid, 0)], &[(1500, w.clone()), (1400, k.clone())], 0);
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap();
+        t.node.chain.connect_blocks(t.p, &[block(tip.hash, vec![tx(&[], &[(5000, p2pkh(3))], 3), fund.clone()], 4)]).unwrap();
+        let coins = vec![
+            Utxo { outpoint: OutPoint { txid: fund.txid, vout: 0 }, value: 1500, script: w },
+            Utxo { outpoint: OutPoint { txid: fund.txid, vout: 1 }, value: 1400, script: k },
+        ];
+        (t, coins)
+    }
+
+    #[test]
+    fn every_input_is_verified() {
+        let (t, coins) = funded();
+        let outs = vec![TxOutSpec { value: 2800, script: p2pkh(5) }];
+        let good = sign_keyhash(t.p, 1, &coins, &outs, &key(), 0).unwrap();
+        assert!(good.has_witness());
+        assert_eq!(check(&t.node, t.p, &good), Ok(()));
+        // A garbage signature on the P2WPKH input: refused (only P2PKH inputs were checked).
+        let mut bad = good.clone();
+        bad.inputs[0].witness[0][10] ^= 1;
+        assert!(check(&t.node, t.p, &bad).unwrap_err().starts_with("input 0: bad signature"));
+        // No witness at all.
+        let mut bare = good.clone();
+        bare.inputs[0].witness.clear();
+        assert!(check(&t.node, t.p, &bare).unwrap_err().starts_with("input 0"));
+        // Another key's signature on the P2PKH input.
+        let other = SecretKey::from_slice(&[0x32; 32]).unwrap();
+        let theirs = sign_p2pkh(t.p, &coins[1..], &[TxOutSpec { value: 1000, script: p2pkh(5) }], &other, 0);
+        assert!(check(&t.node, t.p, &theirs).unwrap_err().starts_with("input 0: bad signature"));
+        assert!(add(&t.node, t.p, &good));
+    }
+
+    #[test]
+    fn waiting_ancestors_are_capped() {
+        let (t, coins) = funded();
+        let child_of = |u: &Utxo| sign_p2pkh(t.p, &[u.clone()], &[TxOutSpec { value: u.value - 1, script: u.script.clone() }], &key(), 0);
+        let mut prev = coins[1].clone();
+        for n in 0..=MAX_ANCESTORS {
+            let child = child_of(&prev);
+            assert_eq!(check(&t.node, t.p, &child), Ok(()), "child {n} has {n} waiting ancestors");
+            assert!(add(&t.node, t.p, &child));
+            prev = Utxo { outpoint: OutPoint { txid: child.txid, vout: 0 }, value: prev.value - 1, script: prev.script };
+        }
+        assert!(check(&t.node, t.p, &child_of(&prev)).unwrap_err().contains("ancestors"));
+        // The other coin is unrelated: still fine.
+        let other = sign_keyhash(t.p, 1, &coins[..1], &[TxOutSpec { value: 1000, script: p2pkh(6) }], &key(), 0).unwrap();
+        assert_eq!(check(&t.node, t.p, &other), Ok(()));
+    }
+
+    #[test]
+    fn a_full_pool_takes_nothing_more_from_others() {
+        let (t, coins) = funded();
+        for n in 0..POOL_TXS as u32 {
+            let mut h = [0xeeu8; 32];
+            h[..4].copy_from_slice(&n.to_le_bytes());
+            assert!(t.node.chain.mempool_add(t.p, &tx(&[(Hash256(h), 0)], &[(1, p2pkh(7))], 0), 1).unwrap());
+        }
+        let good = sign_keyhash(t.p, 1, &coins, &[TxOutSpec { value: 2800, script: p2pkh(5) }], &key(), 0).unwrap();
+        assert_eq!(check(&t.node, t.p, &good), Err("the pool is full".into()));
+    }
 }

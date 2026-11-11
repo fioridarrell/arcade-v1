@@ -305,11 +305,17 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn setup() -> T {
+        setup_with(|_| {})
+    }
+
+    /// The same chain, with its parameters changed first (SegWit on, say).
+    pub(crate) fn setup_with(edit: impl FnOnce(&mut ChainParams)) -> T {
         let dir = tempfile::tempdir().unwrap();
         let g = block(Hash256::ZERO, vec![tx(&[], &[(50, p2pkh(0))], 0)], 1);
         let mut pp = arcade_chain::params::PEPECOIN_TEST.clone();
         pp.genesis = Box::leak(g.hash().to_hex().into_boxed_str());
         pp.genesis_header = "";
+        edit(&mut pp);
         let p: &'static ChainParams = Box::leak(Box::new(pp));
         let app = arcade_app::AppDb::open(dir.path()).unwrap();
         let chain = arcade_chaindb::ChainDb::open(dir.path().join("chain.mdbx")).unwrap();

@@ -1433,6 +1433,19 @@ impl ChainDb {
             .collect())
     }
 
+    /// How many transactions are pooled for a chain, and their bytes (no copies made).
+    pub fn mempool_size(&self, c: u16) -> Result<(u64, u64)> {
+        let (mut n, mut bytes) = (0u64, 0u64);
+        self.store(c).read(|r| {
+            r.for_each_prefix(MEMPOOL, &k_chain(c), |_, v| {
+                n += 1;
+                bytes += v.len().saturating_sub(8) as u64;
+                Ok(true)
+            })
+        })?;
+        Ok((n, bytes))
+    }
+
     /// A pooled transaction's raw bytes by txid.
     pub fn mempool_tx(&self, c: u16, txid: &Hash256) -> Result<Option<Vec<u8>>> {
         Ok(self.store(c).read(|r| r.get(MEMPOOL, &k_txs(c, &txid.t12())))?.map(|v| v[8..].to_vec()))

@@ -119,7 +119,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens", "explorer.ledger_token",
     "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag", "explorer.search",
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
-    "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of",
+    "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
 ];
 
 /// Page routes another arcade may answer for an app on a chain it keeps: every public read
@@ -431,7 +431,11 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         }
         "explorer.block" => block(&x, &s("id").ok_or("give a height or block hash")?),
         "explorer.tx" => tx(&x, &s("txid").ok_or("give a txid")?),
-        "explorer.address" => addr(&x, &s("address").ok_or("give an address")?),
+        "explorer.address" => addr(&x, &s("address").ok_or("give an address")?, req),
+        "explorer.held" => {
+            x.need("ord")?;
+            held(&x, &s("address").ok_or("give an address")?, req)
+        }
         "explorer.inscriptions" => {
             x.need("ord")?;
             let total = ord::count(&x.node.chain, x.c());
@@ -1040,12 +1044,50 @@ fn tx(x: &Ctx, id: &str) -> R {
               "inputs": inputs, "outputs": outputs, "genesis": born, "unit": unit(x.p)}))
 }
 
-fn addr(x: &Ctx, a: &str) -> R {
+/// `explorer.held {address, offset?, limit?, order?}`: the ord inscriptions an address holds, a
+/// page at a time by inscription number (order old, the default, or new), without content: what
+/// a wallet lists. limit 100 by default, at most 500.
+fn held(x: &Ctx, a: &str, req: &Value) -> R {
+    let c = x.c();
+    let a = a.trim();
+    let script = address::script_for_address(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
+    let mut all: Vec<(u64, String)> = ord::held_by(&x.node.chain, x.p, &script)
+        .map_err(e)?
+        .into_iter()
+        .map(|id| (ord::parse_iid(&id).and_then(|b| ord::number_of(&x.node.chain, c, &b)).unwrap_or(u64::MAX), id))
+        .collect();
+    match req["order"].as_str().unwrap_or("old") {
+        "old" => all.sort(),
+        "new" => all.sort_by(|p, q| q.cmp(p)),
+        o => return Err(format!("order is old or new, not {o}")),
+    }
+    let off = req["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = req["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize;
+    let items: Vec<Value> = all
+        .iter()
+        .skip(off)
+        .take(limit)
+        .map(|(n, id)| match ord::inscription(&x.node.chain, x.p, id) {
+            Some(i) => json!({"id": id, "n": i["n"], "h": i["h"], "ct": i["ct"], "size": i["size"], "at": i["at"], "p": i["proto"]}),
+            // Shared storage: the record is held by other arcades; the number is known here.
+            None => json!({"id": id, "n": (*n != u64::MAX).then_some(*n), "h": null, "ct": null, "size": null, "at": null, "p": null}),
+        })
+        .collect();
+    Ok(json!({"address": a, "chain": x.p.key, "total": all.len(), "offset": off, "limit": limit, "items": items}))
+}
+
+/// `explorer.address {address, history?, inscriptions?, content?}`: false for `history` or
+/// `inscriptions` leaves that part out (a wallet asking only for token balances); `content:
+/// false` lists the first 60 inscriptions without their previews.
+fn addr(x: &Ctx, a: &str, req: &Value) -> R {
     let c = x.c();
     let a = a.trim();
     let script = address::script_for_address(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
     let mut v = json!({"address": a, "tag": tag_of(x, a), "unit": unit(x.p)});
-    if x.has("addresses") {
+    let want = |k: &str| req[k] != false;
+    if !want("history") {
+        // Asked without its history (a wallet reading token balances).
+    } else if x.has("addresses") {
         let hist = x.node.chain.history_for_script(c, &script).map_err(e)?;
         let rows: Vec<Value> = hist.iter().rev().take(50).map(|(h, t12, recv, sent)| {
             let txid = x.node.chain.txids_by_t12(x.p, t12).ok().and_then(|v| v.first().copied());
@@ -1060,11 +1102,14 @@ fn addr(x: &Ctx, a: &str) -> R {
     } else {
         v["note"] = json!(format!("Balance and history need the Addresses index for {}; add it in Chains & Coins.", x.p.name));
     }
-    if x.has("ord") {
+    if x.has("ord") && want("inscriptions") {
         let held = ord::held_by(&x.node.chain, x.p, &script).map_err(e)?;
+        let previews = want("content");
         v["inscriptions"] = json!(held.iter().take(60).filter_map(|id| {
             let mut i = ord::inscription(&x.node.chain, x.p, id)?;
-            i["content"] = content(x, id, 64 << 10);
+            if previews {
+                i["content"] = content(x, id, 64 << 10);
+            }
             i.as_object_mut()?.remove("txs");
             Some(i)
         }).collect::<Vec<_>>());
@@ -1323,6 +1368,47 @@ fn ledger_questions_go_to_arcades_keeping_the_ledger() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// explorer.held: every inscription an address holds, by number, a page at a time, no content.
+    #[test]
+    fn an_address_lists_all_it_holds_a_page_at_a_time() {
+        use crate::sitesvc::tests::{addr as address_of, setup};
+        use arcade_store::KeyBuf;
+        let t = setup();
+        let c = t.p.chain_no;
+        t.node.app.store.write(|w| w.put(arcade_app::META, b"home_indexes", br#"["addresses","messages","ord"]"#)).unwrap();
+        t.node.chain.add_indexer(c, std::sync::Arc::new(ord::OrdIndexer::new(&[]))).unwrap();
+        // Five inscriptions on address 1's coin (block 2's change), numbered out of order.
+        let numbers = [40u64, 7, 300, 12, 99];
+        for (i, n) in numbers.iter().enumerate() {
+            let iid = [i as u8 + 1; 36];
+            let id = ord::iid_str(&iid);
+            t.node.chain.store(c).write(|w| {
+                w.put(ord::LOC, &KeyBuf::new().u16(c).bytes(&t.spend.txid.0).u32(1).u64(0).bytes(&iid).done(), &[])?;
+                w.put(ord::IDS, &KeyBuf::new().u16(c).bytes(&iid).done(), &n.to_be_bytes())?;
+                w.put(ord::INSC, &KeyBuf::new().u16(c).bytes(&iid).done(), json!({"n": n, "h": 2, "p": 0, "ct": "image/png", "size": 10, "pieces": 1, "txs": [], "proto": if *n == 12 { json!("drc-20") } else { Value::Null }}).to_string().as_bytes())
+            }).unwrap();
+            let _ = id;
+        }
+        let a = address_of(&t, 1);
+        let page = |q: Value| handle_here(&t.node, "explorer.held", &q, false).unwrap();
+        let v = page(json!({"address": a, "limit": 2}));
+        assert_eq!(v["total"], 5);
+        assert_eq!(v["items"].as_array().unwrap().iter().map(|i| i["n"].as_u64().unwrap()).collect::<Vec<_>>(), vec![7, 12]);
+        assert_eq!(v["items"][1]["p"], "drc-20");
+        assert!(v["items"][0].get("content").is_none(), "no content");
+        let rest: Vec<u64> = page(json!({"address": a, "offset": 2, "limit": 10}))["items"].as_array().unwrap().iter().map(|i| i["n"].as_u64().unwrap()).collect();
+        assert_eq!(rest, vec![40, 99, 300]);
+        let newest: Vec<u64> = page(json!({"address": a, "order": "new", "limit": 2}))["items"].as_array().unwrap().iter().map(|i| i["n"].as_u64().unwrap()).collect();
+        assert_eq!(newest, vec![300, 99]);
+        assert!(handle_here(&t.node, "explorer.held", &json!({"address": a, "order": "sideways"}), false).is_err());
+        // explorer.address without history or previews, and without inscriptions.
+        let lean = handle_here(&t.node, "explorer.address", &json!({"address": a, "history": false, "content": false}), false).unwrap();
+        assert!(lean.get("history").is_none() && lean["inscription_count"] == 5);
+        assert!(lean["inscriptions"][0].get("content").is_none());
+        let bare = handle_here(&t.node, "explorer.address", &json!({"address": a, "history": false, "inscriptions": false}), false).unwrap();
+        assert!(bare.get("inscriptions").is_none() && bare.get("inscription_count").is_none());
+    }
 
     /// Every holder can be read, a page at a time, biggest first; none twice, none left out
     /// (the Explorer showed only the 25 biggest).

@@ -233,8 +233,23 @@ fn get_known(node: &Node, p: &ChainParams, slug: &str, req: &Value) -> Result<Va
     Ok(v)
 }
 
-/// `explorer.collection_of {chain, id}`: the collections an inscription (id or number) is in here.
+/// `explorer.collection_of {chain, id}` or `{chain, ids: [...]}` (at most 500): the collections an
+/// inscription (id or number) is in here; with `ids`, {items: [one answer per id]} in their order
+/// (an id not found answers {id, error}).
 pub fn of(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
+    if let Some(ids) = req["ids"].as_array() {
+        if ids.len() > 500 {
+            return Err("at most 500 ids at once".into());
+        }
+        let items: Vec<Value> = ids
+            .iter()
+            .map(|id| match of(node, p, &json!({"id": id})) {
+                Ok(v) => v,
+                Err(e) => json!({"id": id, "error": e}),
+            })
+            .collect();
+        return Ok(json!({"items": items}));
+    }
     let id = req["id"].as_str().map(String::from).or_else(|| req["id"].as_u64().map(|n| n.to_string())).ok_or("give an inscription id or number")?;
     let c = p.chain_no;
     let iid = ord::resolve(&node.chain, c, id.trim()).ok_or_else(|| format!("no inscription {id} on {}", p.name))?;

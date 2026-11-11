@@ -146,14 +146,15 @@ cmds! {
     "explorer.blocks" Public "chain?, offset?, limit?" "Recent blocks.";
     "explorer.block" Public "chain?, id" "One block (height or hash).";
     "explorer.tx" Public "chain?, txid" "One transaction.";
-    "explorer.address" Public "chain?, address" "An address: balance, history, inscriptions, tokens.";
+    "explorer.address" Public "chain?, address, history?, inscriptions?, content?" "An address: balance, history, inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews.";
     "explorer.inscriptions" Public "chain?, offset?, limit?" "Inscriptions, newest first.";
     "explorer.inscription" Public "chain?, id" "One inscription.";
     "explorer.tokens" Public "chain?, offset?, limit?" "Tokens.";
     "explorer.token" Public "chain?, tick, offset?, n?" "One token and a page of its holders, biggest first (n: 25, at most 100; total: how many hold it).";
     "explorer.collections" Public "chain?, q?, sort?, status?, source?, offset?, n?" "A page of a chain's collections, on-chain (kind registry) and Nintondo's known ones (kind known; id = slug): sort newest, oldest, name, size or holders; status active or all; source all, registry or known; n at most 60. Sub 1K first.";
     "explorer.collection" Public "chain?, id | slug, offset?, n?" "One collection (a root inscription id, sub1k, or a known collection's slug) and a page of its items by number (n: 48, at most 96). A known one not held yet is asked for and answers loading {state, have, of}.";
-    "explorer.collection_of" Public "chain?, id" "The collections an inscription is in.";
+    "explorer.collection_of" Public "chain?, id | ids" "The collections an inscription is in (ids: up to 500 at once, answered as items in order).";
+    "explorer.held" Public "chain?, address, offset?, limit?, order?" "The ord inscriptions an address holds, a page at a time by number (order old or new; limit 100, at most 500), without content: {total, items: [{id, n, h, ct, size, at, p}]}.";
     "explorer.names" Public "chain?" "Names.";
     "explorer.name" Public "chain?, name" "One name.";
     "explorer.maps" Public "chain?" "Maps.";

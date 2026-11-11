@@ -284,15 +284,45 @@ function Build-Source([string]$Root) {
 
 function Try-Download {
     $name = 'arcade-v1-windows-x86_64'
-    $url = "https://github.com/$OwnerRepo/releases/latest/download/$name.zip"
+    # /releases/latest skips pre-releases. Walk the release list (newest first, drafts
+    # excluded, pre-releases included) and take the first one that has the Windows zip.
+    $url = $null
+    $sumUrl = $null
+    $tag = $null
+    try {
+        $headers = @{ 'User-Agent' = 'arcade-v1-install'; 'Accept' = 'application/vnd.github+json' }
+        $rels = @(Invoke-RestMethod -Uri "https://api.github.com/repos/$OwnerRepo/releases?per_page=30" -Headers $headers)
+        foreach ($rel in $rels) {
+            if (-not $rel -or $rel.draft) { continue }
+            $z = $null
+            $s = $null
+            foreach ($asset in @($rel.assets)) {
+                if (-not $asset) { continue }
+                if ($asset.name -eq "$name.zip") { $z = [string]$asset.browser_download_url }
+                if ($asset.name -eq "$name.zip.sha256") { $s = [string]$asset.browser_download_url }
+            }
+            if ($z -and $s) {
+                $url = $z
+                $sumUrl = $s
+                $tag = [string]$rel.tag_name
+                break
+            }
+        }
+    } catch {
+        Say "Could not list releases ($($_.Exception.Message))."
+    }
+    if (-not $url) {
+        $url = "https://github.com/$OwnerRepo/releases/latest/download/$name.zip"
+        $sumUrl = "$url.sha256"
+    }
     $cache = Join-Path (LocalAppData) 'arcade-v1-cache'
     if (Test-Path $cache) { Remove-Item -LiteralPath $cache -Recurse -Force }
     New-Item -ItemType Directory -Path $cache | Out-Null
     $zip = Join-Path $cache "$name.zip"
-    Say "Downloading Arcade V1.0 for Windows x64..."
+    if ($tag) { Say "Downloading Arcade V1.0 for Windows x64 ($tag)..." } else { Say "Downloading Arcade V1.0 for Windows x64..." }
     try {
         Invoke-WebRequest -Uri $url -OutFile $zip -UseBasicParsing
-        Invoke-WebRequest -Uri "$url.sha256" -OutFile "$zip.sha256" -UseBasicParsing
+        Invoke-WebRequest -Uri $sumUrl -OutFile "$zip.sha256" -UseBasicParsing
     } catch {
         Say "No prebuilt download for this PC yet."
         return $false

@@ -97,7 +97,7 @@ Windows 10 or 11, 64-bit. Paste this into PowerShell:
 powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fioridarrell/arcade-v1/windows/scripts/install.ps1'))"
 ```
 
-That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release of this fork, checks its sha256, and installs it for your user. Nothing is compiled, and it does not ask for an administrator password. It installs:
+That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release of this fork that has that file, including a pre-release such as `v0.1.0-windows`, checks its sha256, and installs it for your user. Nothing is compiled, and it does not ask for an administrator password. It installs:
 
 - **arcaded**, the arcade service, started now and at every login (Task Scheduler → **Arcade V1.0**);
 - **arcade**, the command line (`arcade status`, `arcade setup`, ...);

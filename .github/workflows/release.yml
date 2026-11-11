@@ -129,6 +129,7 @@ jobs:
 
   release:
     needs: [build, windows]
+    if: ${{ always() && (needs.windows.result == 'success' || needs.build.result == 'success') }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -140,10 +141,25 @@ jobs:
           TAG: ${{ github.event.inputs.version || github.ref_name }}
         run: |
           ls -la
+          shopt -s nullglob
+          files=(arcade-v1-linux-* arcade-v1-windows-*)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No release artifacts were built." >&2
+            exit 1
+          fi
+          # A hyphen in the tag (v0.1.0-windows) is a pre-release. Plain tags stay releases.
+          pre=()
+          case "$TAG" in
+            *-*) pre=(--prerelease) ;;
+          esac
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" arcade-v1-linux-* arcade-v1-windows-* --clobber -R "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" "${files[@]}" --clobber -R "$GITHUB_REPOSITORY"
+            if [ ${#pre[@]} -gt 0 ]; then
+              gh release edit "$TAG" --prerelease -R "$GITHUB_REPOSITORY"
+            fi
           else
-            gh release create "$TAG" arcade-v1-linux-* arcade-v1-windows-* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            gh release create "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+              "${pre[@]}" \
               --title "Arcade V1.0 $TAG" \
               --notes "Prebuilt downloads: Linux (x86_64, aarch64) and Windows 10/11 x64. Linux: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash  —  Windows: see README, Install on Windows."
           fi

@@ -164,7 +164,7 @@
   // An arcade-ledger inscription's HTML runs from /app/<chain>/<txid> (its sandboxed page).
   const ledgerItem = (i) => {
     const c = { ...(i.content || {}) };
-    if (c.kind === "html" && chain) c.src = `/app/${chain.key}/${i.txid}`;
+    if (c.kind === "html" && chain) c.src = `/app/${chain.key}/${i.txid}?pass=1`;
     return { content: c, ct: i.content_type, n: i.number };
   };
   function table(head, rows) {

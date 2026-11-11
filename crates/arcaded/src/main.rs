@@ -176,6 +176,8 @@ usage: arcaded [options]
   --http-port N|0       local web port for the app (0: none)
   --http-bind ADDR      address the web port listens on
   --site DIR            serve this folder as the app
+  --behind-proxy        the web port is reached through a reverse proxy or tunnel: nothing
+                        over it counts as this computer (the API answers the socket only)
   --mesh-port N|0       mesh port (default 8421; 0: none)
   --mesh-peer HOST:PORT also link to this arcade (repeatable)
   --no-mesh             no mesh links at all
@@ -442,6 +444,7 @@ fn main() {
             bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),
             port: http_port,
             site: opt("--site").map(std::path::PathBuf::from),
+            behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         };
         let n = node.clone();
         std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, o)).unwrap();

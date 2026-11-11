@@ -214,7 +214,9 @@ pub fn broadcast(node: &Node, req: &Value) -> R {
         };
         ins += value;
     }
-    let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    let Some(outs) = tx.outputs.iter().try_fold(0u64, |t, o| t.checked_add(o.value)) else {
+        return Err("the outputs add up to more than any amount can be".into());
+    };
     if outs > ins {
         return Err(format!("the outputs ({outs}) are more than the coins spent ({ins})"));
     }
@@ -464,6 +466,15 @@ pub(crate) mod tests {
         assert_eq!(v["addresses"][&addr(&t, 6)]["waiting"][0]["received"], 900);
         let all = activity(&t.node, &json!({"addresses": [a.clone()]})).unwrap();
         assert_eq!(all["addresses"][&a]["confirmed"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn outputs_that_add_past_u64_are_refused() {
+        let t = setup();
+        // u64::MAX + 2 wraps to 1, less than the 1900 spent: refused, not pooled.
+        let wraps = tx(&[(t.spend.txid, 1)], &[(u64::MAX, p2pkh(4)), (2, p2pkh(5))], 0);
+        assert!(broadcast(&t.node, &json!({"hex": hex::encode(&wraps.raw)})).unwrap_err().contains("more than any amount"));
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty());
     }
 
     #[test]

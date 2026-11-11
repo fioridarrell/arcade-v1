@@ -6,12 +6,15 @@
 //!   GET /ord/<chain>/<id>            an ord inscription's image bytes (the Explorer's previews)
 //!   GET /inscription/<txid|number>   its details (JSON)
 //!   GET /<file>                      the operator's website (--site DIR), if any
-//! Only from this computer (and never through a proxy, which adds X-Forwarded-For):
+//! Only from this computer (asked for by its loopback name, and never through a proxy, which adds
+//! X-Forwarded-For; with --behind-proxy, nothing over TCP counts as this computer):
 //!   POST /rpc                        JSON-RPC 2.0 for sidecar apps; Basic auth with the cookie
 //!                                    file (<home>/.cookie: "__cookie__:<secret>"), every command
 //!   GET|POST /api/v1/<group>/<name>  the web API: public reads need nothing; the rest an API key
 //!                                    (Authorization: Bearer ak_...) with the right permission
 //!   GET /api/v1/routes               every command, its parameters and what it needs
+//!   GET|POST /r/...                  the page API for app pages: each request carries its page's
+//!                                    pass (X-Arcade-Page), given to the page when /app/ serves it
 //! Content is from strangers: served with a sandbox CSP and nosniff so it can't reach the API.
 
 use crate::node::Node;
@@ -19,14 +22,47 @@ use serde_json::{json, Map, Value};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
+/// A body sent with the cookie or a known API key.
 const MAX_BODY: usize = 64 << 20;
+/// A body sent with neither (the page API, public commands).
+const MAX_OPEN_BODY: usize = 64 << 10;
+/// A program's room door message (crate::realtime keeps at most 60 KB of one, in base64 here).
+const MAX_DOOR_BODY: usize = 256 << 10;
+/// Connections served at once; more wait for one to close.
+const MAX_CONNS: usize = 128;
+/// One header line, and the whole head (request line and headers).
+const MAX_LINE: usize = 8 << 10;
+const MAX_HEAD: usize = 32 << 10;
+/// Time to send the head, and then the body.
+const HEAD_TIME: Duration = Duration::from_secs(10);
+const BODY_TIME: Duration = Duration::from_secs(60);
 
 pub struct Opts {
     pub bind: String,
     pub port: u16,
     pub site: Option<PathBuf>,
+    /// Behind a reverse proxy or a tunnel (which may add no X-Forwarded-For): no request over
+    /// TCP counts as this computer's, so /rpc, /api/v1, /r/ and the rest answer only the socket.
+    pub behind_proxy: bool,
+}
+
+/// What each connection needs from the options.
+struct Conf {
+    site: Option<PathBuf>,
+    behind_proxy: bool,
+}
+
+/// One connection being served (counted while it lives).
+struct Served(Arc<AtomicUsize>);
+
+impl Drop for Served {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 pub fn serve(node: Arc<Node>, o: Opts) {
@@ -37,10 +73,19 @@ pub fn serve(node: Arc<Node>, o: Opts) {
             return;
         }
     };
-    let site = Arc::new(o.site);
+    let conf = Arc::new(Conf { site: o.site, behind_proxy: o.behind_proxy });
+    let open = Arc::new(AtomicUsize::new(0));
     for s in l.incoming().flatten() {
-        let (node, site) = (node.clone(), site.clone());
-        std::thread::spawn(move || handle(&node, s, site.as_ref().as_ref()));
+        // At most MAX_CONNS at once: the next connection waits until one closes.
+        while open.load(Ordering::SeqCst) >= MAX_CONNS {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        open.fetch_add(1, Ordering::SeqCst);
+        let (node, conf, served) = (node.clone(), conf.clone(), Served(open.clone()));
+        std::thread::spawn(move || {
+            let _served = served;
+            handle(&node, s, &conf)
+        });
     }
 }
 
@@ -63,16 +108,47 @@ struct Req {
     body: Vec<u8>,
 }
 
-fn read_req(s: &TcpStream) -> Option<Req> {
-    let mut r = BufReader::new(s);
-    let mut line = String::new();
-    r.read_line(&mut line).ok()?;
+/// Reads a connection until a deadline, so a slow sender can't hold its thread for long.
+struct Timed {
+    s: TcpStream,
+    until: Instant,
+}
+
+impl Read for Timed {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let left = self.until.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(std::io::ErrorKind::TimedOut.into());
+        }
+        self.s.set_read_timeout(Some(left))?;
+        self.s.read(buf)
+    }
+}
+
+/// One line of at most `max` bytes ("" at the end of the stream); None when longer.
+fn read_line_max(r: &mut impl BufRead, max: usize) -> Option<String> {
+    let mut b = Vec::new();
+    r.by_ref().take(max as u64 + 1).read_until(b'\n', &mut b).ok()?;
+    if b.len() > max {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&b).into_owned())
+}
+
+/// The request line and headers (the body is read once it is known who sends it).
+fn read_head(r: &mut impl BufRead) -> Option<Req> {
+    let line = read_line_max(r, MAX_LINE)?;
+    let mut size = line.len();
     let mut parts = line.split_whitespace();
     let (method, target) = (parts.next()?.to_string(), parts.next()?.to_string());
     let mut headers = Map::new();
     loop {
-        let mut h = String::new();
-        if r.read_line(&mut h).ok()? == 0 || h == "\r\n" || h == "\n" {
+        let h = read_line_max(r, MAX_LINE)?;
+        size += h.len();
+        if size > MAX_HEAD {
+            return None;
+        }
+        if h.is_empty() || h == "\r\n" || h == "\n" {
             break;
         }
         if let Some((k, v)) = h.split_once(':') {
@@ -82,17 +158,33 @@ fn read_req(s: &TcpStream) -> Option<Req> {
             return None;
         }
     }
-    let n: usize = headers.get("content-length").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()).unwrap_or(0);
-    if n > MAX_BODY {
-        return None;
-    }
-    let mut body = vec![0u8; n];
-    r.read_exact(&mut body).ok()?;
     let (path, query) = match target.split_once('?') {
         Some((p, q)) => (p.to_string(), q.to_string()),
         None => (target, String::new()),
     };
-    Some(Req { method, path, query, headers, body })
+    Some(Req { method, path, query, headers, body: Vec::new() })
+}
+
+fn content_length(r: &Req) -> usize {
+    r.headers.get("content-length").and_then(|v| v.as_str()).and_then(|v| v.parse().ok()).unwrap_or(0)
+}
+
+/// The largest body this request may send: a big one only with the cookie or a known API key,
+/// and none from elsewhere (nothing that takes a body answers it).
+fn body_cap(node: &Node, r: &Req, is_local: bool) -> usize {
+    if !is_local {
+        return 0;
+    }
+    let p = r.path.as_str();
+    let rpc = p == "/rpc" || r.method == "POST" && (p == "/" || p.starts_with("/chain/"));
+    let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
+    if rpc && cookie_ok(node, r) || p.starts_with("/api/v1/") && key.is_some_and(|k| crate::apikeys::known(node, k)) {
+        MAX_BODY
+    } else if p.starts_with("/realtime/") {
+        MAX_DOOR_BODY
+    } else {
+        MAX_OPEN_BODY
+    }
 }
 
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) {
@@ -105,12 +197,6 @@ fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)
     let _ = s.write_all(body);
 }
 
-const CORS: [(&str, &str); 3] = [
-    ("Access-Control-Allow-Origin", "*"),
-    ("Access-Control-Allow-Headers", "Authorization, Content-Type"),
-    ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
-];
-
 /// Inscription content is served as a page of its own: an opaque origin that reaches nothing.
 const CONTENT_CSP: &str = "sandbox allow-scripts; default-src 'self' data: blob:; connect-src 'none'";
 
@@ -122,13 +208,10 @@ fn status_line(code: u16) -> &'static str {
         400 => "400 Bad Request",
         403 => "403 Forbidden",
         404 => "404 Not Found",
+        413 => "413 Payload Too Large",
         503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     }
-}
-
-fn cors() -> Vec<(&'static str, String)> {
-    CORS.iter().map(|(k, v)| (*k, v.to_string())).collect()
 }
 
 fn json_out(s: &mut TcpStream, code: u16, v: &Value) {
@@ -140,16 +223,122 @@ fn json_out(s: &mut TcpStream, code: u16, v: &Value) {
         404 => "404 Not Found",
         _ => "500 Internal Server Error",
     };
-    respond(s, status, "application/json", &cors(), v.to_string().as_bytes());
+    respond(s, status, "application/json", &[], v.to_string().as_bytes());
 }
 
-/// From this computer, and not relayed by a proxy (a proxy would make the internet look local).
-fn local(s: &TcpStream, r: &Req) -> bool {
+fn port(node: &Node) -> u16 {
+    node.http_port.get().copied().unwrap_or(8420)
+}
+
+/// From this computer, and not relayed by a proxy (a proxy would make the internet look local):
+/// a loopback peer, asking for this port by a loopback name (a website whose name was pointed
+/// at 127.0.0.1 asks with its own name), with no proxy's headers. Never with --behind-proxy.
+fn local(node: &Node, s: &TcpStream, r: &Req, behind_proxy: bool) -> bool {
+    if behind_proxy {
+        return false;
+    }
     let ip_local = s.peer_addr().map(|a| match a.ip() {
         std::net::IpAddr::V4(v) => v.is_loopback(),
         std::net::IpAddr::V6(v) => v.is_loopback() || v.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
     }).unwrap_or(false);
-    ip_local && !r.headers.contains_key("x-forwarded-for") && !r.headers.contains_key("forwarded") && !r.headers.contains_key("x-real-ip")
+    ip_local
+        && loopback_host(r.headers.get("host").and_then(|v| v.as_str()), port(node))
+        && !r.headers.contains_key("x-forwarded-for")
+        && !r.headers.contains_key("forwarded")
+        && !r.headers.contains_key("x-real-ip")
+}
+
+/// A Host header naming this computer and this port: 127.0.0.1, localhost or [::1].
+fn loopback_host(host: Option<&str>, port: u16) -> bool {
+    let Some(h) = host.map(|h| h.trim().to_ascii_lowercase()) else { return false };
+    let (name, p) = match h.strip_prefix('[') {
+        Some(v6) => match v6.split_once(']') {
+            Some((a, rest)) => (format!("[{a}]"), rest.strip_prefix(':').map(String::from).or(rest.is_empty().then(String::new))),
+            None => return false,
+        },
+        None => match h.split_once(':') {
+            Some((a, p)) => (a.to_string(), Some(p.to_string())),
+            None => (h.clone(), Some(String::new())),
+        },
+    };
+    let port_ok = match p.as_deref() {
+        Some("") => port == 80,
+        Some(p) => p.parse::<u16>().ok() == Some(port),
+        None => false,
+    };
+    matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]") && port_ok
+}
+
+/// The origins of this arcade's own pages.
+fn own_origins(node: &Node) -> [String; 3] {
+    let p = port(node);
+    [format!("http://127.0.0.1:{p}"), format!("http://localhost:{p}"), format!("http://[::1]:{p}")]
+}
+
+/// The page API's answer may be read by the asking frame: app pages are sandboxed (an opaque
+/// origin, "null"); this arcade's own pages need nothing; other websites get nothing.
+fn page_cors(r: &Req) -> Vec<(&'static str, String)> {
+    let mut v = vec![("Vary", "Origin".to_string())];
+    if r.headers.get("origin").and_then(|v| v.as_str()) == Some("null") {
+        v.push(("Access-Control-Allow-Origin", "null".into()));
+    }
+    v
+}
+
+/// An app page's pass for the page API: "<chain>:<txid>:<mac>", the mac keyed by this arcade's
+/// identity, so only the page /app/<chain>/<txid> served here has it.
+pub(crate) fn page_pass(node: &Node, chain: &str, txid: &str) -> String {
+    format!("{chain}:{txid}:{}", page_mac(node, chain, txid))
+}
+
+fn page_mac(node: &Node, chain: &str, txid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    // HMAC-SHA256 under a key of its own, made from the identity key.
+    let key = Sha256::digest([b"arcade page pass\0".as_slice(), node.identity.to_bytes().as_slice()].concat());
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(&key);
+    let (mut inner, mut outer) = (Sha256::new(), Sha256::new());
+    inner.update(k.map(|b| b ^ 0x36));
+    outer.update(k.map(|b| b ^ 0x5c));
+    inner.update(format!("{chain}/{txid}").as_bytes());
+    outer.update(inner.finalize());
+    hex::encode(&outer.finalize()[..16])
+}
+
+/// The app page a request comes from, by its pass (never by its Referer, which any website can
+/// make up): its chain and txid.
+fn page_of(node: &Node, r: &Req) -> Option<(&'static arcade_chain::params::ChainParams, String)> {
+    let pass = r.headers.get("x-arcade-page")?.as_str()?;
+    let mut parts = pass.trim().splitn(3, ':');
+    let (chain, txid, mac) = (parts.next()?, parts.next()?, parts.next()?);
+    let cp = arcade_chain::params::by_key(chain)?;
+    if !crate::udpsvc::is_hex(txid, 64) || txid.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let want = page_mac(node, chain, txid);
+    let same = want.len() == mac.len() && want.bytes().zip(mac.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
+    same.then(|| (cp, txid.to_string()))
+}
+
+/// The pass as the first thing in an app's HTML page (after its doctype, so the page keeps its
+/// mode): a script that adds it to the page's own requests to /r/ here (shims/page.js).
+fn with_pass(html: &[u8], pass: &str) -> Vec<u8> {
+    let script = format!("<script>{}</script>", include_str!("shims/page.js").replace("__PASS__", pass));
+    let mut at = if html.starts_with(b"\xEF\xBB\xBF") { 3 } else { 0 };
+    let rest = &html[at..];
+    let lead = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    if rest[lead..].len() >= 9 && rest[lead..lead + 9].eq_ignore_ascii_case(b"<!doctype") {
+        if let Some(end) = rest[lead..].iter().position(|b| *b == b'>') {
+            at += lead + end + 1;
+        }
+    }
+    [&html[..at], script.as_bytes(), &html[at..]].concat()
+}
+
+/// Who may frame an app page: this arcade's own pages and the desktop app's windows.
+fn frame_ancestors(node: &Node) -> String {
+    let [a, b, c] = own_origins(node);
+    format!("frame-ancestors {a} {b} {c} tauri:")
 }
 
 /// Query string to request fields (numbers and true/false as such).
@@ -193,12 +382,33 @@ pub(crate) fn pct_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
-    let _ = s.set_read_timeout(Some(std::time::Duration::from_secs(30)));
-    let Some(r) = read_req(&s) else { return };
-    let is_local = local(&s, &r);
+fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
+    let site = conf.site.as_ref();
+    let Ok(rs) = s.try_clone() else { return };
+    let mut rd = BufReader::new(Timed { s: rs, until: Instant::now() + HEAD_TIME });
+    let Some(mut r) = read_head(&mut rd) else { return };
+    let is_local = local(node, &s, &r, conf.behind_proxy);
+    let n = content_length(&r);
+    if n > body_cap(node, &r, is_local) {
+        return respond(&mut s, status_line(413), "text/plain", &[], b"the body is too large for this request\n");
+    }
+    if n > 0 {
+        rd.get_mut().until = Instant::now() + BODY_TIME;
+        r.body = vec![0u8; n];
+        if rd.read_exact(&mut r.body).is_err() {
+            return;
+        }
+    }
     if r.method == "OPTIONS" {
-        return respond(&mut s, "204 No Content", "text/plain", &cors(), b"");
+        // The page API's preflight: an app frame sends its pass as a header (see page_of).
+        if r.path.starts_with("/r/") {
+            let mut h = page_cors(&r);
+            h.push(("Access-Control-Allow-Headers", "Content-Type, X-Arcade-Page".into()));
+            h.push(("Access-Control-Allow-Methods", "GET, POST".into()));
+            h.push(("Access-Control-Max-Age", "600".into()));
+            return respond(&mut s, "204 No Content", "text/plain", &h, b"");
+        }
+        return respond(&mut s, "204 No Content", "text/plain", &[], b"");
     }
     let path = r.path.clone();
     // Core's JSON-RPC (what programs written for a coin node ask: getrawtransaction,
@@ -247,23 +457,28 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
         let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
-        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
+        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'; {}", frame_ancestors(node));
         // From this arcade's ledger of that chain, or (a chain it only borrows) from an arcade on
-        // the mesh that keeps it.
+        // the mesh that keeps it. Not readable by other websites (no CORS): an HTML page carries
+        // its pass for the page API, asked for again each time (the pass is this arcade's).
         return match crate::pagechain::content(node, cp, id) {
-            Ok(c) => respond(
-                &mut s,
-                "200 OK",
-                if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
-                &[
-                    ("ETag", format!("\"{}\"", c.1)),
-                    ("Cache-Control", "public, max-age=31536000, immutable".into()),
-                    ("Content-Security-Policy", csp),
-                    ("Access-Control-Allow-Origin", "*".into()),
-                    ("Referrer-Policy", "unsafe-url".into()),
-                ],
-                if r.method == "HEAD" { &[] } else { &c.2 },
-            ),
+            Ok(c) => {
+                let html = c.0.trim_start().to_ascii_lowercase().starts_with("text/html") && crate::udpsvc::is_hex(id, 64);
+                let with = if html { with_pass(&c.2, &page_pass(node, cp.key, &id.to_ascii_lowercase())) } else { Vec::new() };
+                let body: &[u8] = if html { &with } else { &c.2 };
+                respond(
+                    &mut s,
+                    "200 OK",
+                    if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
+                    &[
+                        ("ETag", format!("\"{}\"", c.1)),
+                        ("Cache-Control", if html { "private, no-cache".into() } else { "public, max-age=31536000, immutable".into() }),
+                        ("Content-Security-Policy", csp),
+                        ("Referrer-Policy", "unsafe-url".into()),
+                    ],
+                    if r.method == "HEAD" { &[] } else { body },
+                )
+            }
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         };
     }
@@ -305,28 +520,37 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             _ => None,
         };
         return match body {
-            Some(b) => respond(&mut s, "200 OK", "application/javascript", &[("Access-Control-Allow-Origin", "*".into()), ("Cache-Control", "public, max-age=3600".into())], b.as_bytes()),
-            None => respond(&mut s, "404 Not Found", "application/javascript", &[("Access-Control-Allow-Origin", "*".into())], b"/* not in this arcade yet */\n"),
+            Some(b) => respond(&mut s, "200 OK", "application/javascript", &[("Cache-Control", "public, max-age=3600".into())], b.as_bytes()),
+            None => respond(&mut s, "404 Not Found", "application/javascript", &[], b"/* not in this arcade yet */\n"),
         };
     }
-    // The page API (reads, and asking the wallet to send): pages run on this computer.
+    // The page API (reads, and asking the wallet to send): app pages on this computer, each
+    // request with its page's pass (page_of). The chain's height and time (what ord pages ask)
+    // need none.
     if path.starts_with("/r/") {
-        let cors = [("Access-Control-Allow-Origin", "*".to_string()), ("Cache-Control", "no-store".to_string())];
+        let mut cors = page_cors(&r);
+        cors.push(("Cache-Control", "no-store".to_string()));
         if !is_local {
             return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"this arcade's page API answers only this computer"}"#);
         }
-        // An app on another chain than the home chain (its frame's address, the Referer): its
-        // reads answer on that chain (crate::pagechain); this arcade's wallet sends on the home
-        // chain only.
-        let page_chain = r.headers.get("referer").and_then(|v| v.as_str()).and_then(crate::pagechain::of_referer).filter(|p| p.chain_no != node.params.chain_no);
+        let origin = r.headers.get("origin").and_then(|v| v.as_str());
+        if origin.is_some_and(|o| o != "null" && !own_origins(node).iter().any(|x| x == o)) {
+            return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"this arcade's page API answers only its own pages"}"#);
+        }
+        let page = page_of(node, &r);
+        if page.is_none() && !matches!(path.as_str(), "/r/blockheight" | "/r/blocktime") {
+            return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page pass"}"#);
+        }
+        // An app on another chain than the home chain (the chain in its pass): its reads answer
+        // on that chain (crate::pagechain); this arcade's wallet sends on the home chain only.
+        let page_chain = page.as_ref().map(|p| p.0).filter(|p| p.chain_no != node.params.chain_no);
         if r.method == "POST" && path == "/r/send" && page_chain.is_some() {
             let msg = json!({"error": format!("this app is on {}: this arcade's wallet sends on {} only", page_chain.unwrap().name, node.params.name)});
             return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());
         }
         if r.method == "POST" && path == "/r/send" {
-            // The page is the app frame that asked (its Referer: /app/<chain>/<txid>).
-            let page = r.headers.get("referer").and_then(|v| v.as_str()).and_then(|u| u.split('?').next()).and_then(|u| u.rsplit('/').next()).filter(|t| crate::udpsvc::is_hex(t, 64)).map(String::from);
-            let Some(page) = page else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
+            // The page is the app page whose pass came with the request.
+            let Some((_, page)) = page else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
             let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
             let (code, v) = crate::walletsvc::file(node, &page, &body);
             let st = match code { 200 => "200 OK", 202 => "202 Accepted", _ => "400 Bad Request" };
@@ -354,7 +578,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             return respond(&mut s, "403 Forbidden", "text/plain", &[], b"this arcade's pages answer only this computer\n");
         }
         if let Some(a) = crate::namesites::route(node, &path, &query_fields(&r.query)) {
-            let mut extra = vec![("Content-Security-Policy", CONTENT_CSP.to_string()), ("Cache-Control", "no-store".to_string()), ("Access-Control-Allow-Origin", "*".to_string())];
+            let mut extra = vec![("Content-Security-Policy", CONTENT_CSP.to_string()), ("Cache-Control", "no-store".to_string())];
             if let Some(to) = a.location {
                 extra.push(("Location", to));
             }
@@ -676,4 +900,197 @@ fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
         c => call(c).unwrap_or(Value::Null),
     };
     respond(s, "200 OK", "application/json", &[], out.to_string().as_bytes());
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+
+    /// A test arcade (crate::sitesvc's), one at a time across these tests: each maps a database,
+    /// and many at once run out of address space. The guard is dropped after the arcade.
+    pub(crate) fn node() -> (std::sync::MutexGuard<'static, ()>, crate::sitesvc::tests::T) {
+        static ONE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        (ONE.lock().unwrap_or_else(|e| e.into_inner()), crate::sitesvc::tests::setup())
+    }
+
+    /// Send `raw` to handle() over a loopback connection; the answer as text ("" if closed).
+    fn ask(node: &Node, conf: &Conf, raw: &[u8]) -> String {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let raw = raw.to_vec();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            let _ = c.write_all(&raw);
+            let mut out = Vec::new();
+            let _ = c.read_to_end(&mut out);
+            String::from_utf8_lossy(&out).into_owned()
+        });
+        let (s, _) = l.accept().unwrap();
+        handle(node, s, conf);
+        client.join().unwrap()
+    }
+
+    fn conf() -> Conf {
+        Conf { site: None, behind_proxy: false }
+    }
+
+    fn get(path: &str, extra: &str) -> Vec<u8> {
+        format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:8420\r\n{extra}\r\n").into_bytes()
+    }
+
+    fn status(answer: &str) -> &str {
+        answer.split(' ').nth(1).unwrap_or("")
+    }
+
+    #[test]
+    fn loopback_names_only() {
+        for h in ["127.0.0.1:8420", "localhost:8420", "LOCALHOST:8420", "[::1]:8420"] {
+            assert!(loopback_host(Some(h), 8420), "{h}");
+        }
+        for h in ["127.0.0.1:8421", "127.0.0.1", "evil.example:8420", "127.0.0.1.evil.example:8420", "[::1]", "[::2]:8420", ""] {
+            assert!(!loopback_host(Some(h), 8420), "{h}");
+        }
+        assert!(!loopback_host(None, 8420));
+        assert!(loopback_host(Some("localhost"), 80));
+    }
+
+    #[test]
+    fn the_page_api_answers_only_its_own_name() {
+        let (_one, t) = crate::http::tests::node();
+        // A website whose name points at 127.0.0.1 asks with its own name.
+        let a = ask(&t.node, &conf(), b"GET /r/blockheight HTTP/1.1\r\nHost: rebind.example:8420\r\n\r\n");
+        assert_eq!(status(&a), "403", "{a}");
+        let a = ask(&t.node, &conf(), b"GET /api/v1/routes HTTP/1.1\r\nHost: rebind.example:8420\r\n\r\n");
+        assert_eq!(status(&a), "403", "{a}");
+        let a = ask(&t.node, &conf(), &get("/r/blockheight", ""));
+        assert_eq!(status(&a), "200", "{a}");
+        let a = ask(&t.node, &conf(), &get("/api/v1/routes", ""));
+        assert_eq!(status(&a), "200");
+    }
+
+    #[test]
+    fn no_cors_for_other_websites() {
+        let (_one, t) = crate::http::tests::node();
+        let pass = page_pass(&t.node, t.p.key, &"a".repeat(64));
+        let a = ask(&t.node, &conf(), &get("/r/wallet", &format!("Origin: https://evil.example\r\nX-Arcade-Page: {pass}\r\n")));
+        assert_eq!(status(&a), "403", "{a}");
+        assert!(!a.contains("Access-Control-Allow-Origin"), "{a}");
+        let a = ask(&t.node, &conf(), b"OPTIONS /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nOrigin: https://evil.example\r\n\r\n");
+        assert!(!a.contains("Access-Control-Allow-Origin"), "{a}");
+        let a = ask(&t.node, &conf(), &get("/api/v1/routes", "Origin: https://evil.example\r\n"));
+        assert!(!a.contains("Access-Control-Allow-Origin"), "{a}");
+        // An app frame (sandboxed: origin "null") with its pass may read the answer.
+        let a = ask(&t.node, &conf(), b"OPTIONS /r/wallet HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nOrigin: null\r\n\r\n");
+        assert!(a.contains("Access-Control-Allow-Origin: null") && a.contains("X-Arcade-Page"), "{a}");
+        let a = ask(&t.node, &conf(), &get("/r/wallet", &format!("Origin: null\r\nX-Arcade-Page: {pass}\r\n")));
+        assert_eq!(status(&a), "200", "{a}");
+        assert!(a.contains("Access-Control-Allow-Origin: null") && !a.contains("Access-Control-Allow-Origin: *"), "{a}");
+    }
+
+    #[test]
+    fn the_page_api_needs_the_pages_pass_not_its_referer() {
+        let (_one, t) = crate::http::tests::node();
+        let (mine, other) = ("a".repeat(64), "b".repeat(64));
+        let to = crate::sitesvc::tests::addr(&t, 2);
+        let body = json!({"kind": "coins", "to": to, "amount": "1"}).to_string();
+        let send = |extra: &str| {
+            format!("POST /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).into_bytes()
+        };
+        // A website at a path ending in an app's txid: its Referer names the app, but it has no pass.
+        let a = ask(&t.node, &conf(), &send(&format!("Referer: https://evil.example/{other}\r\n")));
+        assert_eq!(status(&a), "403", "{a}");
+        let a = ask(&t.node, &conf(), &send(&format!("Referer: http://127.0.0.1:8420/app/{}/{other}\r\n", t.p.key)));
+        assert_eq!(status(&a), "403", "{a}");
+        assert_eq!(crate::walletsvc::requests(&t.node, None).as_array().unwrap().len(), 0, "nothing filed");
+        // A pass made up, or another page's: refused.
+        let a = ask(&t.node, &conf(), &send(&format!("X-Arcade-Page: {}:{other}:{}\r\n", t.p.key, "0".repeat(32))));
+        assert_eq!(status(&a), "403", "{a}");
+        // The page's pass: filed as that page, whatever the Referer says.
+        let pass = page_pass(&t.node, t.p.key, &mine);
+        let a = ask(&t.node, &conf(), &send(&format!("X-Arcade-Page: {pass}\r\nReferer: http://127.0.0.1:8420/app/{}/{other}\r\n", t.p.key)));
+        assert_eq!(status(&a), "202", "{a}");
+        assert_eq!(crate::walletsvc::requests(&t.node, Some(&mine)).as_array().unwrap().len(), 1);
+        assert_eq!(crate::walletsvc::requests(&t.node, Some(&other)).as_array().unwrap().len(), 0);
+        // Reads need it too, except the chain's height and time.
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/wallet", ""))), "403");
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/blockheight", ""))), "200");
+    }
+
+    #[test]
+    fn a_pass_is_for_one_page() {
+        let (_one, t) = crate::http::tests::node();
+        let tx = "c".repeat(64);
+        let pass = page_pass(&t.node, t.p.key, &tx);
+        let req = |p: &str| Req { method: "GET".into(), path: "/r/wallet".into(), query: String::new(), headers: [("x-arcade-page".to_string(), json!(p))].into_iter().collect(), body: vec![] };
+        assert_eq!(page_of(&t.node, &req(&pass)).map(|p| p.1), Some(tx.clone()));
+        assert!(page_of(&t.node, &req(&pass.replace(&tx, &"d".repeat(64)))).is_none(), "another txid");
+        assert!(page_of(&t.node, &req(&pass.to_uppercase())).is_none());
+        assert!(page_of(&t.node, &req(&pass[..pass.len() - 1])).is_none());
+        assert!(page_of(&t.node, &req("")).is_none());
+    }
+
+    #[test]
+    fn an_app_page_gets_its_pass_first() {
+        let pass = "peptest:aa:bb";
+        let out = String::from_utf8(with_pass(b"<!DOCTYPE html>\n<html><script>go()</script>", pass)).unwrap();
+        assert!(out.starts_with("<!DOCTYPE html><script>"), "{out}");
+        assert!(out.contains("'peptest:aa:bb'") && out.ends_with("\n<html><script>go()</script>"));
+        let out = String::from_utf8(with_pass(b"<p>hi", pass)).unwrap();
+        assert!(out.starts_with("<script>") && out.ends_with("</script><p>hi"));
+        let out = with_pass(b"\xEF\xBB\xBF <!doctype html><p>", pass);
+        assert!(out.starts_with(b"\xEF\xBB\xBF <!doctype html><script>"));
+        assert!(!include_str!("shims/page.js").contains("</script"));
+    }
+
+    #[test]
+    fn behind_a_proxy_nothing_is_local() {
+        let (_one, t) = crate::http::tests::node();
+        let proxied = Conf { site: None, behind_proxy: true };
+        assert_eq!(status(&ask(&t.node, &proxied, &get("/api/v1/routes", ""))), "403");
+        assert_eq!(status(&ask(&t.node, &proxied, &get("/r/blockheight", ""))), "403");
+        assert_eq!(status(&ask(&t.node, &proxied, b"POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:8420\r\n\r\n")), "403");
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/api/v1/routes", ""))), "200");
+    }
+
+    #[test]
+    fn heads_and_bodies_have_limits() {
+        let (_one, t) = crate::http::tests::node();
+        // A header line past MAX_LINE, or a head past MAX_HEAD: closed unanswered.
+        let long = format!("X-Long: {}\r\n", "a".repeat(MAX_LINE + 1));
+        assert_eq!(ask(&t.node, &conf(), &get("/api/v1/routes", &long)), "");
+        let many: String = (0..40).map(|i| format!("X-H{i}: {}\r\n", "a".repeat(1000))).collect();
+        assert_eq!(ask(&t.node, &conf(), &get("/api/v1/routes", &many)), "");
+        // A body larger than an unauthenticated request may send: refused before it is read.
+        let big = format!("POST /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Length: {}\r\n\r\n", MAX_OPEN_BODY + 1);
+        assert_eq!(status(&ask(&t.node, &conf(), big.as_bytes())), "413");
+        let big = format!("POST /api/v1/msg/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nAuthorization: Bearer ak_x_y\r\nContent-Length: {}\r\n\r\n", MAX_OPEN_BODY + 1);
+        assert_eq!(status(&ask(&t.node, &conf(), big.as_bytes())), "413");
+        let big = format!("POST /rpc HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Length: {}\r\n\r\n", MAX_OPEN_BODY + 1);
+        assert_eq!(status(&ask(&t.node, &conf(), big.as_bytes())), "413", "no cookie");
+        // From elsewhere (a proxy's request): no body at all.
+        let small = "POST /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nX-Forwarded-For: 1.2.3.4\r\nContent-Length: 10\r\n\r\n";
+        assert_eq!(status(&ask(&t.node, &conf(), small.as_bytes())), "413");
+    }
+
+    #[test]
+    fn a_slow_sender_is_cut_off() {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap();
+        let client = std::thread::spawn(move || {
+            let mut c = TcpStream::connect(addr).unwrap();
+            // A byte at a time, never finishing the line.
+            for _ in 0..50 {
+                if c.write_all(b"G").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let (s, _) = l.accept().unwrap();
+        let started = Instant::now();
+        let mut rd = BufReader::new(Timed { s, until: Instant::now() + Duration::from_millis(200) });
+        assert!(read_head(&mut rd).is_none());
+        assert!(started.elapsed() < Duration::from_millis(600), "{:?}", started.elapsed());
+        client.join().unwrap();
+    }
 }

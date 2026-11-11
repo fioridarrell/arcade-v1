@@ -8,8 +8,12 @@ Everything the desktop app does goes through one set of commands. Programs reach
 | JSON-RPC 2.0 | sidecar apps on this computer | `POST http://127.0.0.1:8420/rpc` | Basic auth with the cookie file `<home>/.cookie` (`__cookie__:<secret>`, new each start) | every command |
 | Web API | websites (their server code) and other programs | `http://127.0.0.1:8420/api/v1/<group>/<name>` | none for **public**; otherwise `Authorization: Bearer ak_...` (keys made in the app's API tab) | commands allowed by the key |
 
-**Only this computer.** `/rpc` and `/api/v1` answer only requests from this computer that didn't come
-through a proxy (requests carrying `X-Forwarded-For`, `Forwarded` or `X-Real-IP` are refused). The
+**Only this computer.** `/rpc` and `/api/v1` answer only requests from this computer, addressed to
+`127.0.0.1`, `localhost` or `[::1]` with the arcade's port (the `Host` header), that didn't come
+through a proxy (requests carrying `X-Forwarded-For`, `Forwarded` or `X-Real-IP` are refused). A
+reverse proxy or tunnel that adds none of those (a plain `proxy_pass`, `ssh -L`, `socat`) would make
+its visitors look like this computer: run arcaded with `--behind-proxy` there, and nothing over the
+web port counts as this computer (programs then use the socket). Answers carry no CORS headers. The
 operator can open the HTTP port (`arcaded --http-bind 0.0.0.0`) and serve a website from it
 (`--site DIR`): visitors then get the site's pages and inscription content (`/content/<id>`,
 `/inscription/<id>`), never the API. A public website calls the API from its own server code.

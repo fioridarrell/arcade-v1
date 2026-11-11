@@ -42,6 +42,8 @@ impl Format {
     pub const LITECOIN: Format = Format { mweb: true, ..Format::BITCOIN };
     /// AuxPoW and SegWit together (Bellscoin 3: both from block 144,000).
     pub const AUXPOW_SEGWIT: Format = Format { auxpow: true, ..Format::BITCOIN };
+    /// AuxPoW with Litecoin's SegWit and MWEB (Junkcoin 4: AuxPoW from 173,000, MWEB from 1,165,000).
+    pub const AUXPOW_MWEB: Format = Format { auxpow: true, mweb: true, ..Format::BITCOIN };
     /// Dogecoin-family: AuxPoW, no SegWit.
     pub const AUXPOW: Format = Format { auxpow: true, segwit: false, ..Format::BITCOIN };
     /// Blackcoin/PPCoin-style proof of stake (Kotia).

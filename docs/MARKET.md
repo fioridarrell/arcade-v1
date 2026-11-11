@@ -476,7 +476,8 @@ lock offered below the Thaw Day height, refused.
 
 ## Coin icons
 
-Inscribed on Pepecoin testnet, 2026-11-10, PNG 96 x 96, by a test account (none of Martin's addresses).
+Inscribed on Pepecoin testnet, 2026-11-10 (JKC and SHIC 2026-11-11, each from its project's own logo in its
+core repo), PNG 96 x 96, by a test account (none of Martin's addresses).
 `assets` gives these as `icon` for a chain's coin. Each was read back from an original arcade and from
 V1.0 with the source file's SHA-256.
 
@@ -489,12 +490,14 @@ V1.0 with the source file's SHA-256.
 | DGB testnet | `807c7cdb64000a3e67f5f34bdc64e883d034ad7c26c106cbc5b5323dde79b682` |
 | DOGE | `8c6f3bb878b2ab9cf80837020576b5eeb770279be60fd471299f2b84482fb91a` |
 | FLOP | `9ad22450724ed29cce47782b8911a288cebd62af68a1bac894a142c5ffb928fd` |
+| JKC | `ef865a7894b24cca72b2ef39e915064bbccdca1a9fc403f569a3292460eab753` |
 | KOT | `0ee77138d2e23272db4d84c9d440cb55e2e8d9c5bdb1b80bf6c44045dd2fb33a` |
 | LKY | `5502e6b46f64756b88441d536d014bcd991abc63705671569162dde6514aa29f` |
 | LTC | `d8bff4aa74cabfabe238b89ba7cd8fc5ca11ce6b5d351ab4133996c941d22a3a` |
 | LTC testnet | `8ba15b7c8c09dfdc06155db2acf587dc7d4d1b37dc00341c39ee4dc5c7a17f0f` |
 | PEP | `ea060e94568de806493cdc76f5f590dd9d06e4521a873aa7c025540641e571ab` |
 | PEP testnet | `5c94ebc6f08ea85d0480ee5ecf91617218b143d9cf27fbc13e7e5b7b247cb7f4` |
+| SHIC | `82a7b197839d65058df00c98d29c09ca51c114bcece22b021051352294eb12f5` |
 | WJK | `e1d07b7f8d6e25f784c0d6551c8145be0987e4f709225479db5ee8dc04a896b9` |
 
 ## Built and tested (2026-11-10 / 11)

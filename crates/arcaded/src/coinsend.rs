@@ -28,7 +28,7 @@ pub fn fee_policy(p: &ChainParams) -> FeePolicy {
         // output under (34 + 148) x 30 = 5,460 sat is dust.
         "dgb" | "dgbtest" => FeePolicy { fallback_per_kb: 1_000_000, floor_per_kb: 100_000, dust: 5_460 },
         // The Dogecoin family (1 coin/kB rules), as the arcade's claims use them.
-        "peptest" | "pep" | "doge" | "flop" | "wjk" | "kot" | "shic" => {
+        "peptest" | "pep" | "doge" | "flop" | "wjk" | "kot" | "shic" | "lky" => {
             FeePolicy { fallback_per_kb: crate::claims::FEE_PER_KB, floor_per_kb: 1_000, dust: crate::claims::DUST }
         }
         // The ARCADE chain: its pool's floor and the chain's own smallest output (a rule
@@ -37,6 +37,10 @@ pub fn fee_policy(p: &ChainParams) -> FeePolicy {
         // Bells 3 (the original arcade's settings): 0.0001 BEL/kB, ten times its minimum relay fee; no soft dust;
         // change from 0.0001 BEL.
         "bel" => FeePolicy { fallback_per_kb: 10_000, floor_per_kb: 1_000, dust: 10_000 },
+        // Junkcoin Core 4.0.3 (Litecoin 0.21's policy, per byte): minimum relay fee 1,000 sat/kB, the wallet's minimum
+        // 10,000 and fallback 200,000 sat/kB (wallet.h); dust relay fee 30,000 sat/kB, so a P2PKH output under
+        // (34 + 148) x 30 = 5,460 sat is dust.
+        "jkc" => FeePolicy { fallback_per_kb: 200_000, floor_per_kb: 10_000, dust: 5_460 },
         _ => FeePolicy { fallback_per_kb: 20_000, floor_per_kb: 1_000, dust: 1_000 },
     }
 }

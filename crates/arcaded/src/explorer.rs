@@ -93,6 +93,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens", "explorer.ledger_token",
     "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag", "explorer.search",
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
+    "explorer.ord_outpoints",
 ];
 
 /// Page routes another arcade may answer for an app on a chain it keeps: every public read
@@ -179,6 +180,9 @@ fn mesh_from(id: &str) -> Value {
 /// The index a question needs, whatever the error says: a borrowed chain answers "borrowed",
 /// which names no index, and these must go to an arcade keeping the chain's arcade ledger.
 fn needed_index(cmd: &str) -> Option<&'static str> {
+    if cmd == "explorer.ord_outpoints" {
+        return Some("ord");
+    }
     (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards")).then_some("ledger")
 }
 
@@ -360,6 +364,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     let s = |k: &str| req[k].as_str().map(String::from);
     let n = |d: u64, max: u64| req["n"].as_u64().unwrap_or(d).clamp(1, max);
     match cmd {
+        "explorer.ord_outpoints" => crate::ordsafe::answer(node, x.p, req),
         "explorer.summary" => summary(&x),
         "explorer.blocks" => {
             let tip = tip(&x);

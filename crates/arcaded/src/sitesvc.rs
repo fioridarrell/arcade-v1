@@ -16,6 +16,7 @@
 use crate::node::Node;
 use arcade_chain::params::{by_key, ChainParams};
 use arcade_chain::{OutPoint, Tx};
+use arcade_wallet::tx::Utxo;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -115,7 +116,23 @@ pub fn coins(node: &Node, req: &Value) -> R {
                 }
             }
         }
-        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total}));
+        // Coins carrying an inscription (or small ones nobody can read) are held back, so a
+        // browser wallet building a payment from this list doesn't spend them (crate::ordsafe).
+        let op_of = |c: &Value| OutPoint { txid: arcade_chain::Hash256::from_hex(c["txid"].as_str().unwrap_or("")).unwrap_or_default(), vout: c["vout"].as_u64().unwrap_or(0) as u32 };
+        let listed: Vec<Utxo> = confirmed.iter().chain(&unconfirmed).map(|c| Utxo { outpoint: op_of(c), value: c["value"].as_u64().unwrap_or(0), script: script.clone() }).collect();
+        let free: HashSet<OutPoint> = crate::ordsafe::keep_free(node, p, listed).into_iter().map(|u| u.outpoint).collect();
+        let mut held_back = Vec::new();
+        for list in [&mut confirmed, &mut unconfirmed] {
+            list.retain(|c| {
+                let keep = free.contains(&op_of(c));
+                if !keep {
+                    total -= c["value"].as_u64().unwrap_or(0);
+                    held_back.push(c.clone());
+                }
+                keep
+            });
+        }
+        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total, "held_back": held_back}));
     }
     Ok(json!({"chain": p.key, "height": tip, "addresses": out}))
 }

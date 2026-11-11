@@ -495,7 +495,69 @@ pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     }
 }
 
-/// `D:P(A;;FA;;;CU)` — protected DACL, full access for the current user only.
+/// Protected DACL, full access for this process's user only.
+/// `CU` is not a real SDDL alias (Windows returns error 1337, invalid SID), so the
+/// SID is read from the process token.
+#[cfg(windows)]
+fn user_only_sddl() -> std::io::Result<Vec<u16>> {
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn OpenProcessToken(process: *mut std::ffi::c_void, access: u32, token: *mut *mut std::ffi::c_void) -> i32;
+        fn GetTokenInformation(
+            token: *mut std::ffi::c_void,
+            class: u32,
+            info: *mut std::ffi::c_void,
+            len: u32,
+            ret: *mut u32,
+        ) -> i32;
+        fn ConvertSidToStringSidW(sid: *mut std::ffi::c_void, string: *mut *mut u16) -> i32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn CloseHandle(handle: *mut std::ffi::c_void) -> i32;
+        fn LocalFree(p: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+    const TOKEN_QUERY: u32 = 0x0008;
+    const TOKEN_USER: u32 = 1;
+    unsafe {
+        let mut token = std::ptr::null_mut();
+        if OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut needed = 0u32;
+        GetTokenInformation(token, TOKEN_USER, std::ptr::null_mut(), 0, &mut needed);
+        if needed == 0 {
+            CloseHandle(token);
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut buf = vec![0u8; needed as usize];
+        if GetTokenInformation(token, TOKEN_USER, buf.as_mut_ptr() as *mut _, needed, &mut needed) == 0 {
+            let e = std::io::Error::last_os_error();
+            CloseHandle(token);
+            return Err(e);
+        }
+        CloseHandle(token);
+        // TOKEN_USER starts with the user's SID pointer.
+        let sid = *(buf.as_ptr() as *const *mut std::ffi::c_void);
+        let mut raw = std::ptr::null_mut();
+        if ConvertSidToStringSidW(sid, &mut raw) == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut sid_chars = Vec::new();
+        let mut p = raw;
+        while *p != 0 {
+            sid_chars.push(*p);
+            p = p.add(1);
+        }
+        LocalFree(raw as *mut _);
+        let mut sddl: Vec<u16> = "D:P(A;;FA;;;".encode_utf16().collect();
+        sddl.extend(sid_chars);
+        sddl.extend(")\0".encode_utf16());
+        Ok(sddl)
+    }
+}
+
 #[cfg(windows)]
 fn restrict_to_current_user(path: &Path) -> std::io::Result<()> {
     use std::os::windows::ffi::OsStrExt;
@@ -527,7 +589,7 @@ fn restrict_to_current_user(path: &Path) -> std::io::Result<()> {
     extern "system" {
         fn LocalFree(p: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
     }
-    let sddl: Vec<u16> = "D:P(A;;FA;;;CU)\0".encode_utf16().collect();
+    let sddl = user_only_sddl()?;
     let mut sd = std::ptr::null_mut();
     let ok = unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut())

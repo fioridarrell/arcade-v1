@@ -54,6 +54,12 @@ pub struct SpentInput<'a> {
 /// TapSighash(0x00 || hash_type 0x00 || version || locktime || sha_prevouts || sha_amounts ||
 /// sha_scriptpubkeys || sha_sequences || sha_outputs || spend_type 0x00 || input index).
 pub fn sighash_default(version: i32, lock_time: u32, inputs: &[SpentInput], outputs: &[(u64, Vec<u8>)], index: usize) -> [u8; 32] {
+    sighash_all(0x00, version, lock_time, inputs, outputs, index)
+}
+
+/// The same for a key-path spend signed SIGHASH_DEFAULT (0x00) or SIGHASH_ALL (0x01): both
+/// commit to every input and output, and differ only in the hash type byte.
+pub fn sighash_all(hash_type: u8, version: i32, lock_time: u32, inputs: &[SpentInput], outputs: &[(u64, Vec<u8>)], index: usize) -> [u8; 32] {
     let (mut prevouts, mut amounts, mut scripts, mut seqs, mut outs) = (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
     for i in inputs {
         prevouts.extend_from_slice(&i.outpoint.txid.0);
@@ -68,7 +74,7 @@ pub fn sighash_default(version: i32, lock_time: u32, inputs: &[SpentInput], outp
         write_varint(&mut outs, s.len() as u64);
         outs.extend_from_slice(s);
     }
-    let mut m = vec![0u8, 0u8];
+    let mut m = vec![0u8, hash_type];
     m.extend_from_slice(&version.to_le_bytes());
     m.extend_from_slice(&lock_time.to_le_bytes());
     for part in [&prevouts, &amounts, &scripts, &seqs, &outs] {

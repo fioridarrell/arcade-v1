@@ -25,7 +25,10 @@
 //! against our own headers and can also come from the coin's P2P network.
 //!
 //! Mesh (V1.0 only; existing arcades ignore unknown kinds):
-//!   sh hold {chains:{key:{mode, h, blocks:[[from,to],...]|"all", ord:[g...]|"all", tok:[g...]|"all"}}}
+//!   sh hold {chains:{key:{mode, h, blocks:[[from,to],...]|"all", ord:[g...]|"all", tok:[g...]|"all"}}, o, at, sig}
+//!     signed by its origin o (Ed25519, canonical JSON without sig), so it can be passed on.
+//!     An unsigned one (older V1.0 arcades) is taken only from the linked arcade itself, is not
+//!     passed on, and never counts when deciding what to drop here.
 //!   sh q {id, net, what:"insc"|"tick"|"block", arg}  ->  sh a {id, ok, result | err} [+ raw block]
 
 use crate::node::Node;
@@ -86,7 +89,7 @@ pub fn places(node: &Node, chain: &str) -> Vec<Place> {
         .lock()
         .unwrap()
         .iter()
-        .filter(|(id, (t, c))| *t >= cutoff && **id != mine && c[chain]["mode"] == "shared")
+        .filter(|(id, (t, c))| *t >= cutoff && **id != mine && signed(c) && c[chain]["mode"] == "shared")
         .filter_map(|(id, (_, c))| Some((id.clone(), c[chain]["lane"].as_u64()? as usize, c[chain]["pos"].as_f64()?)))
         .collect();
     let key = format!("place:{chain}");
@@ -211,6 +214,21 @@ fn holds_unit(v: &Value, kind: &str, unit: u64) -> bool {
     }
 }
 
+/// Whether a kept hold came signed by its arcade (see on_hold); only those decide what we drop.
+fn signed(c: &Value) -> bool {
+    c["_unsigned"] != true
+}
+
+/// Other arcades whose signed holds count towards range `r` being held enough elsewhere:
+/// those owning it in the lanes (their own copy is never dropped), or keeping everything (Full).
+fn counted_holders(node: &Node, chain: &str, r: u32, owners: &[String]) -> usize {
+    let holds = node.holds.lock().unwrap().clone();
+    holders(node, chain, "blocks", r as u64)
+        .into_iter()
+        .filter(|id| holds.get(id).is_some_and(|(_, c)| signed(c) && (owners.contains(id) || c[chain]["mode"] != "shared")))
+        .count()
+}
+
 /// Other arcades announcing they hold `unit` of `kind` on a chain: their node ids.
 pub fn holders(node: &Node, chain: &str, kind: &str, unit: u64) -> Vec<String> {
     let cutoff = arcade_app::now().saturating_sub(3600);
@@ -283,8 +301,11 @@ pub fn hold_frame(node: &Node) -> Frame {
         };
         chains.insert(p.net.into(), v);
     }
-    // o/at: whose hold this is and when, so it can be passed on across the mesh (on_hold).
-    Frame::new(json!({"t": "sh", "op": "hold", "chains": chains, "o": node.id_hex(), "at": arcade_app::now()}))
+    // o/at/sig: whose hold this is and when, signed, so it can be passed on across the mesh
+    // (on_hold).
+    let mut h = json!({"t": "sh", "op": "hold", "chains": chains, "o": node.id_hex(), "at": arcade_app::now()});
+    arcade_mesh::canon::sign_json(&node.identity, &mut h, &["sig"], b"");
+    Frame::new(h)
 }
 
 /// Groups to keep when a chain is installed in shared mode: the least-held first, until we
@@ -397,12 +418,9 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
         }
         let owners = lane_holders(&pl, r, last_full);
         let mine = owners.contains(&mine_id);
-        // Count only holders that own the range in the lanes (their own copy is never dropped)
-        // or keep everything (Full); a stale announcement from another sharer doesn't count.
-        let full_or_owner = |id: &String| {
-            owners.contains(id) || node.holds.lock().unwrap().get(id).is_some_and(|(_, c)| c[p.net]["mode"] != "shared")
-        };
-        let others = holders(node, p.net, "blocks", r as u64).into_iter().filter(|id| full_or_owner(id)).count();
+        // Count only holders that own the range in the lanes or keep everything (Full); a
+        // stale announcement from another sharer, or an unsigned one, doesn't count.
+        let others = counted_holders(node, p.net, r, &owners);
         let (from, to) = (r * RANGE, (r + 1) * RANGE - 1);
         if !mine && !gone.contains(&r) && others >= copies() && to <= walked {
             let mut bs = Vec::with_capacity(RANGE as usize);
@@ -653,10 +671,18 @@ pub fn answer(node: &Node, link: &mut Link, h: &Value) -> Result<(), LinkError> 
 
 /// Another arcade's hold announcement, from a link or passed on by one: kept under its
 /// origin, and passed on once more when it is newer than what we had (so every arcade knows
-/// which indexes each V1.0 arcade keeps, linked or not; the mesh explorer uses it).
+/// which indexes each V1.0 arcade keeps, linked or not; the mesh explorer uses it). Only a
+/// signed one is kept under another arcade's id or passed on; an unsigned one is the linked
+/// arcade's own (`from`) or nothing, and is marked so it never counts towards dropping blocks.
 pub fn on_hold(node: &Node, from: &str, h: &Value) {
     let Some(c) = h["chains"].as_object() else { return };
-    let origin = h["o"].as_str().filter(|o| crate::udpsvc::is_hex(o, 64)).unwrap_or(from).to_string();
+    let o = h["o"].as_str().filter(|o| crate::udpsvc::is_hex(o, 64));
+    let signed = o.is_some() && arcade_mesh::canon::verify_json(h, &["sig"], "o", b"");
+    let origin = match o {
+        Some(o) if signed => o.to_string(),
+        Some(o) if o != from => return, // someone else's, unsigned (or not by them)
+        _ => from.to_string(),
+    };
     if origin == node.id_hex() {
         return;
     }
@@ -670,7 +696,9 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
         if at <= seen {
             return;
         }
-        node.mesh_outbox.lock().unwrap().push(h.clone());
+        if signed {
+            node.mesh_outbox.lock().unwrap().push(h.clone());
+        }
     }
     let from = origin.as_str();
     let mut clean = Map::new();
@@ -683,12 +711,61 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
     if at > 0 {
         clean.insert("_at".into(), json!(at));
     }
+    if !signed {
+        clean.insert("_unsigned".into(), json!(true));
+    }
     node.holds.lock().unwrap().insert(from.to_string(), (arcade_app::now(), Value::Object(clean)));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn holds_count_only_when_signed_by_their_arcade() {
+        let t = crate::sitesvc::tests::setup();
+        let net = t.p.net;
+        let k = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
+        let kid = hex::encode(k.verifying_key().to_bytes());
+        let link = "ab".repeat(32);
+        let now = arcade_app::now();
+        let full = json!({net: {"mode": "full", "h": 100, "blocks": "all", "ord": "all", "tok": "all"}});
+        // Another arcade's hold, unsigned, from a link: dropped, not passed on.
+        let forged = json!({"t": "sh", "op": "hold", "chains": full, "o": kid, "at": now});
+        on_hold(&t.node, &link, &forged);
+        assert!(t.node.holds.lock().unwrap().is_empty());
+        assert!(t.node.mesh_outbox.lock().unwrap().is_empty());
+        // Signed by it: kept under its id, passed on, and counted.
+        let mut good = forged.clone();
+        arcade_mesh::canon::sign_json(&k, &mut good, &["sig"], b"");
+        on_hold(&t.node, &link, &good);
+        assert!(t.node.holds.lock().unwrap().contains_key(&kid));
+        assert_eq!(t.node.mesh_outbox.lock().unwrap().len(), 1);
+        assert_eq!(counted_holders(&t.node, net, 0, &[]), 1);
+        // Changed after signing: dropped.
+        let mut changed = good.clone();
+        changed["at"] = json!(now + 1);
+        on_hold(&t.node, &link, &changed);
+        assert_eq!(t.node.mesh_outbox.lock().unwrap().len(), 1);
+        assert_eq!(t.node.holds.lock().unwrap()[&kid].1["_at"], now);
+        // The linked arcade's own, unsigned (an older V1.0 arcade): kept to show, never passed
+        // on, never counted towards dropping blocks, and not given a place in the lanes.
+        on_hold(&t.node, &link, &json!({"t": "sh", "op": "hold", "chains": full, "o": link, "at": now}));
+        let shared = json!({net: {"mode": "shared", "h": 100, "blocks": [[0, 0]], "lane": 0, "pos": 0.5}});
+        let link2 = "cd".repeat(32);
+        on_hold(&t.node, &link2, &json!({"t": "sh", "op": "hold", "chains": shared}));
+        assert!(t.node.holds.lock().unwrap().contains_key(&link));
+        assert!(t.node.holds.lock().unwrap().contains_key(&link2));
+        assert_eq!(t.node.mesh_outbox.lock().unwrap().len(), 1);
+        assert_eq!(counted_holders(&t.node, net, 0, &[link.clone(), link2.clone()]), 1);
+        assert!(places(&t.node, net).iter().all(|p| p.0 != link2));
+        // Ours verify, also after a trip through JSON text with a position in it.
+        assert!(arcade_mesh::canon::verify_json(&hold_frame(&t.node).head, &["sig"], "o", b""));
+        let mut pos = json!({"t": "sh", "op": "hold", "chains": {net: {"pos": 0.1 + 0.2, "lane": 1}}, "o": kid, "at": now});
+        arcade_mesh::canon::sign_json(&k, &mut pos, &["sig"], b"");
+        let back: Value = serde_json::from_str(&pos.to_string()).unwrap();
+        assert!(arcade_mesh::canon::verify_json(&back, &["sig"], "o", b""));
+    }
 
     /// Arcades joining one by one, each choosing its place from those already there.
     fn join(n: usize) -> Vec<Place> {

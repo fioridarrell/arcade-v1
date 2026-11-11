@@ -4,7 +4,9 @@
 //!   q {id, net, seq, end, z} + slice              a batch [[method, params], ...] (zlib when z)
 //!   a {id, seq, end[, err][, z]} + slice          answers [{"r": result} | {"e": [code, msg]}]
 //!   tx {net} + raw tx                              relay a transaction
-//! Limits as the existing arcade: CHUNK 48 KB, MAX_CALLS 500, MAX_ASKED 8 MB.
+//! Limits as the existing arcade: CHUNK 48 KB, MAX_CALLS 500, MAX_ASKED 8 MB. Per link, at most
+//! MAX_OPEN queries may be part-sent at once (MAX_BUFFERED bytes together), and an answer
+//! past MAX_REPLY bytes is an error, so the asker asks for fewer calls at a time.
 
 use crate::node::Node;
 use arcade_mesh::link::{Frame, Link, LinkError};
@@ -20,6 +22,11 @@ pub const MAX_CALLS: usize = 500;
 pub const MAX_ASKED: usize = 8 << 20;
 /// The most an answer to our own batch may hold, compressed or inflated.
 pub const MAX_ANSWER: usize = 256 << 20;
+/// Queries one link may have part-sent at once, and the most their parts may hold together.
+pub const MAX_OPEN: usize = 4;
+pub const MAX_BUFFERED: usize = 2 * MAX_ASKED;
+/// The most an answer we give may hold (before compression).
+pub const MAX_REPLY: usize = 32 << 20;
 
 /// Chains this arcade lends: the home chain, and every installed chain kept in full (blocks
 /// and coins) that has caught up. A chain still syncing, or sharing its storage, isn't offered.
@@ -63,6 +70,28 @@ pub struct Requests {
     parts: HashMap<u64, Vec<u8>>,
 }
 
+impl Requests {
+    /// One part of query `id`: the whole body once its last part is in (None before), or why
+    /// it is refused (then its parts are dropped).
+    fn add(&mut self, id: u64, part: &[u8], end: bool) -> Result<Option<Vec<u8>>, String> {
+        if !self.parts.contains_key(&id) && !end && self.parts.len() >= MAX_OPEN {
+            return Err(format!("at most {MAX_OPEN} requests at once"));
+        }
+        let held: usize = self.parts.values().map(Vec::len).sum();
+        if held + part.len() > MAX_BUFFERED {
+            self.parts.remove(&id);
+            return Err("too much asked at once".into());
+        }
+        let buf = self.parts.entry(id).or_default();
+        buf.extend_from_slice(part);
+        if buf.len() > MAX_ASKED {
+            self.parts.remove(&id);
+            return Err("request too large".into());
+        }
+        Ok(if end { self.parts.remove(&id) } else { None })
+    }
+}
+
 #[derive(Debug, PartialEq)]
 pub enum InflateError {
     /// More than the cap once inflated.
@@ -94,19 +123,63 @@ fn deflate(b: &[u8]) -> Vec<u8> {
     e.finish().unwrap()
 }
 
-/// Answer the calls in a batch.
-pub fn answer_on(node: &Node, p: &'static ChainParams, calls: &[Value]) -> Vec<Value> {
-    calls
-        .iter()
-        .map(|c| {
-            let method = c.get(0).and_then(Value::as_str).unwrap_or("");
-            let params: Vec<Value> = c.get(1).and_then(Value::as_array).cloned().unwrap_or_default();
-            match crate::rpc::call_on(node, p, method, &params) {
-                Ok(r) => json!({"r": r}),
-                Err((code, m)) => json!({"e": [code, m]}),
+/// Answer the calls in a batch: the answers as JSON, or an error once they pass `max` bytes.
+pub fn answer_on(node: &Node, p: &'static ChainParams, calls: &[Value], max: usize) -> Result<Vec<u8>, String> {
+    let mut out = vec![b'['];
+    for (n, c) in calls.iter().enumerate() {
+        let method = c.get(0).and_then(Value::as_str).unwrap_or("");
+        let params: Vec<Value> = c.get(1).and_then(Value::as_array).cloned().unwrap_or_default();
+        let a = match crate::rpc::call_on(node, p, method, &params) {
+            Ok(r) => json!({"r": r}),
+            Err((code, m)) => json!({"e": [code, m]}),
+        };
+        if n > 0 {
+            out.push(b',');
+        }
+        serde_json::to_writer(&mut out, &a).map_err(|e| e.to_string())?;
+        if out.len() > max {
+            return Err(format!("answer too large (over {} MB): ask for fewer calls at a time", max >> 20));
+        }
+    }
+    out.push(b']');
+    Ok(out)
+}
+
+/// A whole query's body (zlib when `z`): its answers.
+fn query(node: &Node, p: &'static ChainParams, raw: Vec<u8>, z: bool) -> Result<Vec<u8>, String> {
+    let b = if z { inflate(&raw)? } else { raw };
+    let calls: Vec<Value> = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
+    if calls.len() > MAX_CALLS {
+        return Err(format!("at most {MAX_CALLS} calls"));
+    }
+    answer_on(node, p, &calls, MAX_REPLY)
+}
+
+/// A transaction a borrower relays: pooled, shared and sent to the coin's peers only when it
+/// passes the same checks as one from the mesh. Returns whether it was taken.
+fn on_tx(node: &Node, p: &'static ChainParams, raw: &[u8]) -> bool {
+    // The ARCADE chain has a pool of its own, with its own checks.
+    if crate::arcsvc::runs(p) {
+        return crate::arcsvc::send_lent(raw).is_ok();
+    }
+    let Ok(tx) = arcade_chain::Tx::parse_with(raw, &p.format) else { return false };
+    match crate::mempoolshare::sort(node, p, &tx) {
+        Ok(None) => {
+            if !crate::mempoolshare::add(node, p, &tx) {
+                return false;
             }
-        })
-        .collect()
+            if p.chain_no == node.params.chain_no {
+                node.tx_outbox.lock().unwrap().push(raw.to_vec());
+            }
+            true
+        }
+        // A borrower's inscription reveal and the like: on to the coin's own peers, not into the pool.
+        Ok(Some(_)) => {
+            crate::mempoolshare::pass_on(node, p, raw.to_vec());
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> Result<(), LinkError> {
@@ -115,37 +188,16 @@ pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> R
         "q" if lent_net(node, &h["net"]).is_some() => {
             let p = lent_net(node, &h["net"]).unwrap();
             let id = h["id"].as_u64().unwrap_or(0);
-            let buf = reqs.parts.entry(id).or_default();
-            buf.extend_from_slice(&f.blob);
-            if buf.len() > MAX_ASKED {
-                reqs.parts.remove(&id);
-                return send(link, id, Err("request too large".into()), true);
-            }
-            if h["end"] != true {
-                return Ok(());
-            }
-            let raw = reqs.parts.remove(&id).unwrap_or_default();
+            let raw = match reqs.add(id, &f.blob, h["end"] == true) {
+                Ok(Some(raw)) => raw,
+                Ok(None) => return Ok(()),
+                Err(e) => return send(link, id, Err(e), true),
+            };
             let z = h["z"] == 1 || h["z"] == true;
-            let body = if z { inflate(&raw) } else { Ok(raw) };
-            let res = body.and_then(|b| {
-                let calls: Vec<Value> = serde_json::from_slice(&b).map_err(|e| e.to_string())?;
-                if calls.len() > MAX_CALLS {
-                    return Err(format!("at most {MAX_CALLS} calls"));
-                }
-                Ok(serde_json::to_vec(&answer_on(node, p, &calls)).unwrap())
-            });
-            send(link, id, res, z)
+            send(link, id, query(node, p, raw, z), z)
         }
         "tx" if lent_net(node, &h["net"]).is_some() => {
-            let p = lent_net(node, &h["net"]).unwrap();
-            if crate::arcsvc::runs(p) {
-                let _ = crate::arcsvc::send_lent(&f.blob);
-            } else if let Ok(tx) = arcade_chain::Tx::parse_with(&f.blob, &p.format) {
-                let _ = crate::mempoolshare::add(node, p, &tx);
-                if p.chain_no == node.params.chain_no {
-                    node.tx_outbox.lock().unwrap().push(f.blob.clone());
-                }
-            }
+            on_tx(node, lent_net(node, &h["net"]).unwrap(), &f.blob);
             Ok(())
         }
         _ => Ok(()), // offers and subs from others: not needed by a node that has its own chain
@@ -188,5 +240,91 @@ mod tests {
         assert_eq!(inflate(&bomb), Err("request too large".to_string()));
         assert_eq!(inflate_max(&bomb, MAX_ANSWER).unwrap().len(), MAX_ASKED + 1);
         assert_eq!(inflate(&deflate(b"[]")).unwrap(), b"[]");
+    }
+
+    #[test]
+    fn open_requests_and_their_bytes_are_capped() {
+        let mut r = Requests::default();
+        for id in 0..MAX_OPEN as u64 {
+            assert_eq!(r.add(id, b"[", false), Ok(None));
+        }
+        assert!(r.add(99, b"[", false).is_err(), "one more part-sent query");
+        // A query in one part still goes through, and finishing an open one frees its place.
+        assert_eq!(r.add(98, b"[]", true), Ok(Some(b"[]".to_vec())));
+        assert_eq!(r.add(0, b"]", true), Ok(Some(b"[]".to_vec())));
+        assert_eq!(r.add(99, b"[", false), Ok(None));
+        // Bytes held across queries.
+        let mut r = Requests::default();
+        let big = vec![b' '; MAX_ASKED];
+        assert_eq!(r.add(1, &big, false), Ok(None));
+        assert_eq!(r.add(2, &big, false), Ok(None));
+        assert!(r.add(3, b" ", false).is_err());
+        assert!(r.add(1, b" ", true).is_err());
+        assert_eq!(r.add(4, b"[]", true), Ok(Some(b"[]".to_vec())), "room again once one is dropped");
+    }
+
+    #[test]
+    fn answers_are_capped() {
+        let t = crate::sitesvc::tests::setup();
+        let calls: Vec<Value> = (0..50).map(|_| json!(["getblockcount", []])).collect();
+        let a = answer_on(&t.node, t.p, &calls, MAX_REPLY).unwrap();
+        let a: Vec<Value> = serde_json::from_slice(&a).unwrap();
+        assert_eq!(a.len(), 50);
+        assert_eq!(a[0], json!({"r": 2}));
+        assert!(answer_on(&t.node, t.p, &calls, 200).unwrap_err().contains("too large"));
+    }
+
+    #[test]
+    fn a_relayed_transaction_is_checked_first() {
+        use arcade_wallet::tx::{sign_keyhash, TxOutSpec};
+        let (t, coins) = crate::mempoolshare::tests::funded();
+        let outs = vec![TxOutSpec { value: 1400, script: crate::sitesvc::tests::p2pkh(5) }];
+        let good = sign_keyhash(t.p, 1, &coins[..1], &outs, &crate::mempoolshare::tests::key(), 0).unwrap();
+        // The same transaction with one byte of its witness signature changed.
+        let mut raw = good.raw.clone();
+        let at = raw.len() - 4 - 34 - 20;
+        raw[at] ^= 1;
+        assert!(!on_tx(&t.node, t.p, &raw));
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty());
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty(), "not sent on");
+        assert!(on_tx(&t.node, t.p, &good.raw));
+        assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[good.raw.clone()]);
+    }
+
+    /// A spend of a P2SH coin whose script this arcade can't check (an inscription reveal, say)
+    /// goes on to the coin's own peers but never into the pool; one with the wrong script doesn't.
+    #[test]
+    fn a_relayed_transaction_it_cannot_check_is_passed_on_not_pooled() {
+        use crate::sitesvc::tests::{block, p2pkh, tx};
+        let (t, _) = crate::mempoolshare::tests::funded();
+        let redeem = [0x51u8, 0x75, 0x51]; // a script other than wrapped SegWit or a prize pool
+        let sh = arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(&redeem));
+        let fund = tx(&[(t.spend.txid, 1)], &[(1800, sh)], 7);
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap();
+        t.node.chain.connect_blocks(t.p, &[block(tip.hash, vec![tx(&[], &[(5000, p2pkh(3))], 8), fund.clone()], 5)]).unwrap();
+        let spend = |script_sig: &[u8]| {
+            let mut o = 1i32.to_le_bytes().to_vec();
+            o.push(1);
+            o.extend_from_slice(&fund.txid.0);
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.push(script_sig.len() as u8);
+            o.extend_from_slice(script_sig);
+            o.extend_from_slice(&u32::MAX.to_le_bytes());
+            o.push(1);
+            o.extend_from_slice(&1500u64.to_le_bytes());
+            let out = p2pkh(5);
+            o.push(out.len() as u8);
+            o.extend_from_slice(&out);
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o
+        };
+        let reveal = spend(&[3, 0x51, 0x75, 0x51]);
+        assert!(on_tx(&t.node, t.p, &reveal));
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty(), "not pooled");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[reveal.clone()], "passed on");
+        // The wrong redeem script for the coin: a failed check, not passed on.
+        t.node.tx_outbox.lock().unwrap().clear();
+        assert!(!on_tx(&t.node, t.p, &spend(&[1, 0x52])));
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty());
     }
 }

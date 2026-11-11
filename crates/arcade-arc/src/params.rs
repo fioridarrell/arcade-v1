@@ -84,7 +84,7 @@ pub struct Net {
 
 pub const MAINNET: Net = Net {
     key: "arc",
-    chain_no: 12,
+    chain_no: 1000,
     p2pkh_version: 0x17,
     p2sh_version: 0x1c,
     wif_version: 0x97,
@@ -96,7 +96,7 @@ pub const MAINNET: Net = Net {
 
 pub const TESTNET: Net = Net {
     key: "arctest",
-    chain_no: 13,
+    chain_no: 1001,
     p2pkh_version: 0x53,
     p2sh_version: 0x57,
     wif_version: 0xd3,

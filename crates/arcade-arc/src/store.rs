@@ -42,6 +42,7 @@ pub fn chain_params(net: &Net, genesis: &Hash256) -> &'static ChainParams {
         max_easier: false,
         pow_limit_bits: NO_WORK_BITS,
         min_difficulty_blocks: true,
+        digishield_from: None,
         auxpow_chain_id: None,
         auxpow_strict_chain_id: false,
         bech32_hrp: None,

@@ -182,6 +182,8 @@ usage: arcaded [options]
   --http-port N|0       local web port for the app (0: none)
   --http-bind ADDR      address the web port listens on
   --site DIR            serve this folder as the app
+  --behind-proxy        the web port is reached through a reverse proxy or tunnel: nothing
+                        over it counts as this computer (the API answers the socket only)
   --mesh-port N|0       mesh port (default 8421; 0: none)
   --mesh-peer HOST:PORT also link to this arcade (repeatable)
   --no-mesh             no mesh links at all
@@ -233,7 +235,15 @@ fn main() {
     let extra_peers: Vec<String> =
         args.iter().enumerate().filter(|(_, a)| *a == "--mesh-peer").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
     let no_seeds = args.iter().any(|a| a == "--no-seeds");
+    let fresh = !home.exists();
     std::fs::create_dir_all(&home).expect("create home");
+    // A home made here holds the wallet and its key file: this user only. One made by the package (StateDirectory,
+    // shared with the arcade group) keeps its mode.
+    #[cfg(unix)]
+    if fresh {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    }
     // One arcaded per home: a second one would fight over the databases and the socket.
     let _lock = match lock_home(&home) {
         Ok(f) => f,
@@ -255,7 +265,7 @@ fn main() {
         params: &arcade_chain::params::PEPECOIN_TEST,
         identity,
         tx_outbox: Mutex::new(Vec::new()),
-        mesh_outbox: Mutex::new(Vec::new()),
+        mesh_outbox: Mutex::new(Default::default()),
         links: Mutex::new(Default::default()),
         mesh_tips: Mutex::new(Default::default()),
         sync_state: Mutex::new("starting".into()),
@@ -397,18 +407,24 @@ fn main() {
             .unwrap();
     }
     if mesh {
-        let mut seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
-        // Every arcade we learned of before is a seed too.
+        let seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
+        // Every arcade we learned of before is tried too, as an address we heard of (public
+        // addresses only; seeds and --peer may be anything).
+        let mut heard: Vec<(String, &'static str)> = Vec::new();
         if !no_seeds {
+            meshsvc::prune_peers(&node);
             for p in node.app.peers().unwrap_or_default() {
                 let a = if p.host.starts_with("wss://") { p.host.clone() } else if p.host.contains(':') { format!("[{}]:{}", p.host, p.port) } else { format!("{}:{}", p.host, p.port) };
-                if !seeds.contains(&a) {
-                    seeds.push(a);
+                if !seeds.contains(&a) && !extra_peers.contains(&a) && !heard.iter().any(|(x, _)| *x == a) {
+                    heard.push((a, if p.source == "chain" { "chain" } else { "gossip" }));
                 }
             }
         }
         for a in seeds.into_iter().chain(extra_peers) {
             meshsvc::dial(&node, a);
+        }
+        for (a, src) in heard {
+            meshsvc::dial_heard(&node, a, src);
         }
         // Arcades that announce themselves on chain (MESH records), checked every 10 minutes.
         if !no_seeds {
@@ -443,6 +459,7 @@ fn main() {
             bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),
             port: http_port,
             site: opt("--site").map(std::path::PathBuf::from),
+            behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         };
         let n = node.clone();
         std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, o)).unwrap();

@@ -33,6 +33,7 @@
   }
 
   window.addEventListener('message', function (e) {
+    if (e.source !== window.parent) return;          // only the arcade window that framed this page
     var m = e.data || {};
     if (m.arcade === 'swap' && m.event && m.event.type === 'trade') {
       onTrade.forEach(function (fn) { try { fn(m.event); } catch (err) { setTimeout(function () { throw err; }); } });

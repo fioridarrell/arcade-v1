@@ -36,9 +36,61 @@ const MAX_MANIFEST: usize = 64 << 20;
 const WINDOW: u64 = 64;
 
 /// Makers (arcades that made the copy from their own rows) needed before a copy is used:
-/// Martin's rule, 2 or more. Tests may lower it (ARCADE_COPY_MAKERS).
+/// Martin's rule, 2 or more, each an established arcade (`established`). Tests may lower it
+/// (ARCADE_COPY_MAKERS).
 fn min_makers() -> usize {
     std::env::var("ARCADE_COPY_MAKERS").ok().and_then(|v| v.parse().ok()).filter(|n: &usize| *n >= 1).unwrap_or(2)
+}
+
+/// How deep an arcade's mesh announcement on the home chain must be before its word counts for
+/// a copy: about a day of one-minute blocks (crate::announce).
+pub const SETTLED: u32 = 24 * 60;
+
+/// Arcades whose word counts when copies or snapshots are vouched for: those the operator names
+/// (ARCADE_COPY_TRUSTED: node ids, comma-separated) and those announced on the home chain (a
+/// mesh message naming their node id, crate::announce) at least SETTLED blocks deep. A node id
+/// is a key anyone makes for nothing, so one only seen on links counts for nothing here. Read
+/// from the home chain at most once a minute.
+pub fn established(node: &Node) -> BTreeSet<String> {
+    static C: OnceLock<Mutex<Option<(Instant, BTreeSet<String>)>>> = OnceLock::new();
+    let mut c = C.get_or_init(Default::default).lock().unwrap();
+    if let Some((t, v)) = c.as_ref() {
+        if t.elapsed() < Duration::from_secs(60) {
+            return v.clone();
+        }
+    }
+    let hc = node.params.chain_no;
+    let tip = node.chain.tip(hc).ok().flatten().map(|t| t.height).unwrap_or(0);
+    let rows = node.chain.store(hc).read(|r| r.scan_prefix(arcade_ledger::messages::MACHINE, &hc.to_be_bytes())).unwrap_or_default();
+    let announced: Vec<(u32, String)> = rows
+        .iter()
+        .filter(|(k, _)| k.len() >= 6)
+        .filter_map(|(k, v)| {
+            let v: Value = serde_json::from_slice(v).ok()?;
+            v["mesh"].as_str()?;
+            Some((u32::from_be_bytes(k[2..6].try_into().unwrap()), v["key"].as_str()?.to_string()))
+        })
+        .collect();
+    let trusted: Vec<String> = std::env::var("ARCADE_COPY_TRUSTED").unwrap_or_default().split(',').map(String::from).collect();
+    let v = settled(&announced, tip, &trusted);
+    *c = Some((Instant::now(), v.clone()));
+    v
+}
+
+/// Are enough arcades known whose word counts for a copy to be taken at all?
+pub fn enough_established(node: &Node) -> bool {
+    established(node).len() >= min_makers()
+}
+
+/// The established arcades from (height, node id) mesh announcements and the operator's list.
+pub fn settled(announced: &[(u32, String)], tip: u32, trusted: &[String]) -> BTreeSet<String> {
+    let norm = |k: &str| {
+        let k = k.trim().to_lowercase();
+        (k.len() == 64 && k.chars().all(|c| c.is_ascii_hexdigit())).then_some(k)
+    };
+    let mut out: BTreeSet<String> = trusted.iter().filter_map(|k| norm(k)).collect();
+    out.extend(announced.iter().filter(|(h, _)| *h + SETTLED <= tip).filter_map(|(_, k)| norm(k)));
+    out
 }
 
 #[derive(Default)]
@@ -237,7 +289,7 @@ fn serve(node: &Node, link: &mut Link, h: &Value) -> Result<(), LinkError> {
 // ---------------- fetching ----------------
 
 /// The copies other arcades announce for a chain's family: id -> (makers, holders, cp, fmt).
-fn offers(net: &str, fam: &str) -> BTreeMap<String, (BTreeSet<String>, BTreeSet<String>, u64, u64)> {
+fn offers(net: &str, fam: &str) -> Offers {
     let s = st();
     let now = arcade_app::now();
     let mut out: BTreeMap<String, (BTreeSet<String>, BTreeSet<String>, u64, u64)> = BTreeMap::new();
@@ -261,14 +313,14 @@ fn offers(net: &str, fam: &str) -> BTreeMap<String, (BTreeSet<String>, BTreeSet<
 /// share.offers: what the mesh's V1.0 arcades hold for a chain, per family.
 pub fn offers_json(node: &Node, key: &str) -> Result<Value, String> {
     let p = arcade_chain::params::by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
-    let _ = node;
+    let est = established(node);
     let mut out = json!({});
     for fam in v1copy::FAMILIES {
         let o = offers(p.net, fam);
         if o.is_empty() {
             continue;
         }
-        out[*fam] = json!(o.iter().map(|(id, (m, h, cp, fmt))| json!({"id": id, "cp": cp, "fmt": fmt, "makers": m.len(), "holders": h.len()})).collect::<Vec<_>>());
+        out[*fam] = json!(o.iter().map(|(id, (m, h, cp, fmt))| json!({"id": id, "cp": cp, "fmt": fmt, "makers": m.len(), "established_makers": m.intersection(&est).count(), "holders": h.len()})).collect::<Vec<_>>());
     }
     Ok(json!({"net": p.net, "offers": out, "min_makers": min_makers()}))
 }
@@ -277,8 +329,8 @@ fn job_dir(node: &Node, net: &str, fam: &str, id: &str) -> PathBuf {
     v1copy::copies_dir(node, net, fam).join(format!(".fetch-{id}"))
 }
 
-/// share.fetch: fetch a family's copy from every arcade holding it: the newest one at least
-/// min_makers arcades made themselves (or the id given).
+/// share.fetch: fetch a family's copy from every arcade holding it: the one the most established
+/// arcades made themselves, min_makers or more (or the id given, if they made it).
 pub fn start(node: &Node, key: &str, fam: &str, id: Option<String>) -> Result<Value, String> {
     start_job(node, key, fam, id, true)
 }
@@ -289,18 +341,15 @@ pub fn start_job(node: &Node, key: &str, fam: &str, id: Option<String>, keep: bo
         return Err(format!("family is one of {}", v1copy::FAMILIES.join(", ")));
     }
     let o = offers(p.net, fam);
-    let pick = match id {
-        Some(id) => o.get(&id).map(|x| (id.clone(), x.clone())).ok_or("no arcade on the mesh holds that copy")?,
-        None => o
-            .iter()
-            .filter(|(_, (m, _, _, fmt))| m.len() >= min_makers() && *fmt == v1copy::FMT as u64)
-            .max_by_key(|(_, (m, h, cp, _))| (*cp, m.len(), h.len()))
-            .map(|(id, x)| (id.clone(), x.clone()))
-            .ok_or_else(|| format!("no {fam} copy of {} made by {} or more arcades is offered yet", p.name, min_makers()))?,
+    let est = established(node);
+    let id = match id {
+        Some(id) => id,
+        None => pick(&o, &est, min_makers()).map(|x| x.0).ok_or_else(|| format!("no {fam} copy of {} made by {} or more established arcades is offered yet", p.name, min_makers()))?,
     };
-    let (id, (makers, holders, cp, _)) = pick;
-    if makers.len() < min_makers() {
-        return Err(format!("only {} arcade{} made that copy; {} must agree", makers.len(), if makers.len() == 1 { "" } else { "s" }, min_makers()));
+    let (makers, holders, cp, _) = o.get(&id).cloned().ok_or("no arcade on the mesh holds that copy")?;
+    let makers = makers.intersection(&est).count();
+    if makers < min_makers() {
+        return Err(format!("only {makers} established arcade{} made that copy; {} must agree", if makers == 1 { "" } else { "s" }, min_makers()));
     }
     let jk = format!("{}/{fam}", p.net);
     let dir = job_dir(node, p.net, fam, &id);
@@ -325,7 +374,7 @@ pub fn start_job(node: &Node, key: &str, fam: &str, id: Option<String>, keep: bo
         net: p.net.to_string(), fam: fam.to_string(), id: id.clone(), dir, manifest, done, inflight: HashMap::new(), holders: HashMap::new(),
         phase: "fetching".into(), detail: String::new(), started: arcade_app::now(), got: 0, rate: VecDeque::new(), keep, used: 0,
     });
-    Ok(json!({"fetching": true, "net": p.net, "fam": fam, "id": id, "cp": cp, "makers": makers.len(), "holders": holders.len()}))
+    Ok(json!({"fetching": true, "net": p.net, "fam": fam, "id": id, "cp": cp, "makers": makers, "holders": holders.len()}))
 }
 
 pub fn cancel(node: &Node, key: &str, fam: &str) -> Result<Value, String> {
@@ -576,13 +625,23 @@ pub fn finish(jk: &str) {
     }
 }
 
-/// The copy an import would take for a family: (id, cp, makers).
-pub fn best(net: &str, fam: &str) -> Option<(String, u64, usize)> {
-    offers(net, fam)
-        .into_iter()
-        .filter(|(_, (m, _, _, fmt))| m.len() >= min_makers() && *fmt == v1copy::FMT as u64)
-        .max_by_key(|(_, (m, h, cp, _))| (*cp, m.len(), h.len()))
-        .map(|(id, (m, _, cp, _))| (id, cp, m.len()))
+/// The copy an import would take for a family: (id, cp, established makers).
+pub fn best(node: &Node, net: &str, fam: &str) -> Option<(String, u64, usize)> {
+    pick(&offers(net, fam), &established(node), min_makers())
+}
+
+type Offers = BTreeMap<String, (BTreeSet<String>, BTreeSet<String>, u64, u64)>;
+
+/// Of the copies offered, the one made by the most established arcades (`need` or more), then
+/// the newest: (id, cp, established makers). Makers whose word doesn't count (`est`) are left
+/// out, however many say they made it.
+fn pick(o: &Offers, est: &BTreeSet<String>, need: usize) -> Option<(String, u64, usize)> {
+    o.iter()
+        .filter(|(_, (_, _, _, fmt))| *fmt == v1copy::FMT as u64)
+        .map(|(id, (m, h, cp, _))| (id, *cp, m.intersection(est).count(), h.len()))
+        .filter(|x| x.2 >= need)
+        .max_by_key(|x| (x.2, x.1, x.3))
+        .map(|(id, cp, n, _)| (id.clone(), cp, n))
 }
 
 /// Ask every V1.0 arcade we hear from to make copies of `fams` at height `h`.
@@ -594,4 +653,50 @@ pub fn ask(net: &str, h: u32, fams: &[&str]) -> usize {
         s.outq.entry(p.clone()).or_default().push(Frame::new(json!({"t": "vx", "op": "sq", "net": net, "h": h, "fams": fams})));
     }
     peers.len()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u8) -> String {
+        hex::encode([n; 32])
+    }
+
+    #[test]
+    fn only_established_makers_count() {
+        let fmt = v1copy::FMT as u64;
+        let set = |ns: &[u8]| ns.iter().map(|n| id(*n)).collect::<BTreeSet<String>>();
+        let est = set(&[1, 2, 3]);
+        let mut o: Offers = BTreeMap::new();
+        // Two (or many) fresh keys saying they made a copy: no copy.
+        o.insert("a".into(), (set(&[10, 11]), set(&[10, 11]), 200, fmt));
+        assert_eq!(pick(&o, &est, 2), None);
+        o.insert("a".into(), (set(&[10, 11, 12, 13, 14]), set(&[10, 11]), 200, fmt));
+        assert_eq!(pick(&o, &est, 2), None);
+        // One established maker and a fresh key: still no copy.
+        o.insert("c".into(), (set(&[1, 10]), set(&[1, 10]), 300, fmt));
+        assert_eq!(pick(&o, &est, 2), None);
+        // Two established makers: that copy, though older than the others.
+        o.insert("b".into(), (set(&[1, 2, 10]), set(&[1, 2]), 100, fmt));
+        assert_eq!(pick(&o, &est, 2), Some(("b".into(), 100, 2)));
+        // The most established makers wins over the newest.
+        o.insert("e".into(), (set(&[1, 2]), set(&[1, 2]), 250, fmt));
+        o.insert("d".into(), (set(&[1, 2, 3]), set(&[1, 2, 3]), 150, fmt));
+        assert_eq!(pick(&o, &est, 2), Some(("d".into(), 150, 3)));
+        // Another format is never taken.
+        o.insert("f".into(), (set(&[1, 2, 3]), set(&[1, 2, 3]), 400, fmt + 1));
+        assert_eq!(pick(&o, &est, 2).unwrap().0, "d");
+    }
+
+    #[test]
+    fn established_arcades() {
+        let ann = vec![(1000, id(1).to_uppercase()), (2000, id(2)), (1000, "not a key".to_string())];
+        // Announced a day deep counts; announced lately doesn't yet.
+        assert_eq!(settled(&ann, 1000 + SETTLED, &[]), [id(1)].into());
+        assert_eq!(settled(&ann, 2000 + SETTLED, &[]), [id(1), id(2)].into());
+        assert!(settled(&ann, 999 + SETTLED, &[]).is_empty());
+        // The operator's list counts at once.
+        assert_eq!(settled(&[], 0, &[format!(" {} ", id(7)), String::new(), "zz".into()]), [id(7)].into());
+    }
 }

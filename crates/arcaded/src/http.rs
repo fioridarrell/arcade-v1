@@ -13,6 +13,8 @@
 //!   GET|POST /api/v1/<group>/<name>  the web API: public reads need nothing; the rest an API key
 //!                                    (Authorization: Bearer ak_...) with the right permission
 //!   GET /api/v1/routes               every command, its parameters and what it needs
+//!   GET|POST /r/...                  the page API for app pages: each request carries its page's
+//!                                    pass (X-Arcade-Page), given to the page when /app/ serves it
 //! Content is from strangers: served with a sandbox CSP and nosniff so it can't reach the API.
 
 use crate::node::Node;
@@ -195,12 +197,6 @@ fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)
     let _ = s.write_all(body);
 }
 
-const CORS: [(&str, &str); 3] = [
-    ("Access-Control-Allow-Origin", "*"),
-    ("Access-Control-Allow-Headers", "Authorization, Content-Type"),
-    ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
-];
-
 /// Inscription content is served as a page of its own: an opaque origin that reaches nothing.
 const CONTENT_CSP: &str = "sandbox allow-scripts; default-src 'self' data: blob:; connect-src 'none'";
 
@@ -218,10 +214,6 @@ fn status_line(code: u16) -> &'static str {
     }
 }
 
-fn cors() -> Vec<(&'static str, String)> {
-    CORS.iter().map(|(k, v)| (*k, v.to_string())).collect()
-}
-
 fn json_out(s: &mut TcpStream, code: u16, v: &Value) {
     let status = match code {
         200 => "200 OK",
@@ -231,7 +223,7 @@ fn json_out(s: &mut TcpStream, code: u16, v: &Value) {
         404 => "404 Not Found",
         _ => "500 Internal Server Error",
     };
-    respond(s, status, "application/json", &cors(), v.to_string().as_bytes());
+    respond(s, status, "application/json", &[], v.to_string().as_bytes());
 }
 
 fn port(node: &Node) -> u16 {
@@ -275,6 +267,78 @@ fn loopback_host(host: Option<&str>, port: u16) -> bool {
         None => false,
     };
     matches!(name.as_str(), "127.0.0.1" | "localhost" | "[::1]") && port_ok
+}
+
+/// The origins of this arcade's own pages.
+fn own_origins(node: &Node) -> [String; 3] {
+    let p = port(node);
+    [format!("http://127.0.0.1:{p}"), format!("http://localhost:{p}"), format!("http://[::1]:{p}")]
+}
+
+/// The page API's answer may be read by the asking frame: app pages are sandboxed (an opaque
+/// origin, "null"); this arcade's own pages need nothing; other websites get nothing.
+fn page_cors(r: &Req) -> Vec<(&'static str, String)> {
+    let mut v = vec![("Vary", "Origin".to_string())];
+    if r.headers.get("origin").and_then(|v| v.as_str()) == Some("null") {
+        v.push(("Access-Control-Allow-Origin", "null".into()));
+    }
+    v
+}
+
+/// An app page's pass for the page API: "<chain>:<txid>:<mac>", the mac keyed by this arcade's
+/// identity, so only the page /app/<chain>/<txid> served here has it.
+pub(crate) fn page_pass(node: &Node, chain: &str, txid: &str) -> String {
+    format!("{chain}:{txid}:{}", page_mac(node, chain, txid))
+}
+
+fn page_mac(node: &Node, chain: &str, txid: &str) -> String {
+    use sha2::{Digest, Sha256};
+    // HMAC-SHA256 under a key of its own, made from the identity key.
+    let key = Sha256::digest([b"arcade page pass\0".as_slice(), node.identity.to_bytes().as_slice()].concat());
+    let mut k = [0u8; 64];
+    k[..32].copy_from_slice(&key);
+    let (mut inner, mut outer) = (Sha256::new(), Sha256::new());
+    inner.update(k.map(|b| b ^ 0x36));
+    outer.update(k.map(|b| b ^ 0x5c));
+    inner.update(format!("{chain}/{txid}").as_bytes());
+    outer.update(inner.finalize());
+    hex::encode(&outer.finalize()[..16])
+}
+
+/// The app page a request comes from, by its pass (never by its Referer, which any website can
+/// make up): its chain and txid.
+fn page_of(node: &Node, r: &Req) -> Option<(&'static arcade_chain::params::ChainParams, String)> {
+    let pass = r.headers.get("x-arcade-page")?.as_str()?;
+    let mut parts = pass.trim().splitn(3, ':');
+    let (chain, txid, mac) = (parts.next()?, parts.next()?, parts.next()?);
+    let cp = arcade_chain::params::by_key(chain)?;
+    if !crate::udpsvc::is_hex(txid, 64) || txid.bytes().any(|b| b.is_ascii_uppercase()) {
+        return None;
+    }
+    let want = page_mac(node, chain, txid);
+    let same = want.len() == mac.len() && want.bytes().zip(mac.bytes()).fold(0u8, |d, (a, b)| d | (a ^ b)) == 0;
+    same.then(|| (cp, txid.to_string()))
+}
+
+/// The pass as the first thing in an app's HTML page (after its doctype, so the page keeps its
+/// mode): a script that adds it to the page's own requests to /r/ here (shims/page.js).
+fn with_pass(html: &[u8], pass: &str) -> Vec<u8> {
+    let script = format!("<script>{}</script>", include_str!("shims/page.js").replace("__PASS__", pass));
+    let mut at = if html.starts_with(b"\xEF\xBB\xBF") { 3 } else { 0 };
+    let rest = &html[at..];
+    let lead = rest.iter().take_while(|b| b.is_ascii_whitespace()).count();
+    if rest[lead..].len() >= 9 && rest[lead..lead + 9].eq_ignore_ascii_case(b"<!doctype") {
+        if let Some(end) = rest[lead..].iter().position(|b| *b == b'>') {
+            at += lead + end + 1;
+        }
+    }
+    [&html[..at], script.as_bytes(), &html[at..]].concat()
+}
+
+/// Who may frame an app page: this arcade's own pages and the desktop app's windows.
+fn frame_ancestors(node: &Node) -> String {
+    let [a, b, c] = own_origins(node);
+    format!("frame-ancestors {a} {b} {c} tauri:")
 }
 
 /// Query string to request fields (numbers and true/false as such).
@@ -336,7 +400,15 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         }
     }
     if r.method == "OPTIONS" {
-        return respond(&mut s, "204 No Content", "text/plain", &cors(), b"");
+        // The page API's preflight: an app frame sends its pass as a header (see page_of).
+        if r.path.starts_with("/r/") {
+            let mut h = page_cors(&r);
+            h.push(("Access-Control-Allow-Headers", "Content-Type, X-Arcade-Page".into()));
+            h.push(("Access-Control-Allow-Methods", "GET, POST".into()));
+            h.push(("Access-Control-Max-Age", "600".into()));
+            return respond(&mut s, "204 No Content", "text/plain", &h, b"");
+        }
+        return respond(&mut s, "204 No Content", "text/plain", &[], b"");
     }
     let path = r.path.clone();
     // Core's JSON-RPC (what programs written for a coin node ask: getrawtransaction,
@@ -385,23 +457,28 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
         let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
-        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
+        let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'; {}", frame_ancestors(node));
         // From this arcade's ledger of that chain, or (a chain it only borrows) from an arcade on
-        // the mesh that keeps it.
+        // the mesh that keeps it. Not readable by other websites (no CORS): an HTML page carries
+        // its pass for the page API, asked for again each time (the pass is this arcade's).
         return match crate::pagechain::content(node, cp, id) {
-            Ok(c) => respond(
-                &mut s,
-                "200 OK",
-                if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
-                &[
-                    ("ETag", format!("\"{}\"", c.1)),
-                    ("Cache-Control", "public, max-age=31536000, immutable".into()),
-                    ("Content-Security-Policy", csp),
-                    ("Access-Control-Allow-Origin", "*".into()),
-                    ("Referrer-Policy", "unsafe-url".into()),
-                ],
-                if r.method == "HEAD" { &[] } else { &c.2 },
-            ),
+            Ok(c) => {
+                let html = c.0.trim_start().to_ascii_lowercase().starts_with("text/html") && crate::udpsvc::is_hex(id, 64);
+                let with = if html { with_pass(&c.2, &page_pass(node, cp.key, &id.to_ascii_lowercase())) } else { Vec::new() };
+                let body: &[u8] = if html { &with } else { &c.2 };
+                respond(
+                    &mut s,
+                    "200 OK",
+                    if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
+                    &[
+                        ("ETag", format!("\"{}\"", c.1)),
+                        ("Cache-Control", if html { "private, no-cache".into() } else { "public, max-age=31536000, immutable".into() }),
+                        ("Content-Security-Policy", csp),
+                        ("Referrer-Policy", "unsafe-url".into()),
+                    ],
+                    if r.method == "HEAD" { &[] } else { body },
+                )
+            }
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         };
     }
@@ -443,28 +520,37 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             _ => None,
         };
         return match body {
-            Some(b) => respond(&mut s, "200 OK", "application/javascript", &[("Access-Control-Allow-Origin", "*".into()), ("Cache-Control", "public, max-age=3600".into())], b.as_bytes()),
-            None => respond(&mut s, "404 Not Found", "application/javascript", &[("Access-Control-Allow-Origin", "*".into())], b"/* not in this arcade yet */\n"),
+            Some(b) => respond(&mut s, "200 OK", "application/javascript", &[("Cache-Control", "public, max-age=3600".into())], b.as_bytes()),
+            None => respond(&mut s, "404 Not Found", "application/javascript", &[], b"/* not in this arcade yet */\n"),
         };
     }
-    // The page API (reads, and asking the wallet to send): pages run on this computer.
+    // The page API (reads, and asking the wallet to send): app pages on this computer, each
+    // request with its page's pass (page_of). The chain's height and time (what ord pages ask)
+    // need none.
     if path.starts_with("/r/") {
-        let cors = [("Access-Control-Allow-Origin", "*".to_string()), ("Cache-Control", "no-store".to_string())];
+        let mut cors = page_cors(&r);
+        cors.push(("Cache-Control", "no-store".to_string()));
         if !is_local {
             return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"this arcade's page API answers only this computer"}"#);
         }
-        // An app on another chain than the home chain (its frame's address, the Referer): its
-        // reads answer on that chain (crate::pagechain); this arcade's wallet sends on the home
-        // chain only.
-        let page_chain = r.headers.get("referer").and_then(|v| v.as_str()).and_then(crate::pagechain::of_referer).filter(|p| p.chain_no != node.params.chain_no);
+        let origin = r.headers.get("origin").and_then(|v| v.as_str());
+        if origin.is_some_and(|o| o != "null" && !own_origins(node).iter().any(|x| x == o)) {
+            return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"this arcade's page API answers only its own pages"}"#);
+        }
+        let page = page_of(node, &r);
+        if page.is_none() && !matches!(path.as_str(), "/r/blockheight" | "/r/blocktime") {
+            return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page pass"}"#);
+        }
+        // An app on another chain than the home chain (the chain in its pass): its reads answer
+        // on that chain (crate::pagechain); this arcade's wallet sends on the home chain only.
+        let page_chain = page.as_ref().map(|p| p.0).filter(|p| p.chain_no != node.params.chain_no);
         if r.method == "POST" && path == "/r/send" && page_chain.is_some() {
             let msg = json!({"error": format!("this app is on {}: this arcade's wallet sends on {} only", page_chain.unwrap().name, node.params.name)});
             return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());
         }
         if r.method == "POST" && path == "/r/send" {
-            // The page is the app frame that asked (its Referer: /app/<chain>/<txid>).
-            let page = r.headers.get("referer").and_then(|v| v.as_str()).and_then(|u| u.split('?').next()).and_then(|u| u.rsplit('/').next()).filter(|t| crate::udpsvc::is_hex(t, 64)).map(String::from);
-            let Some(page) = page else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
+            // The page is the app page whose pass came with the request.
+            let Some((_, page)) = page else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
             let body: Value = serde_json::from_slice(&r.body).unwrap_or(Value::Null);
             let (code, v) = crate::walletsvc::file(node, &page, &body);
             let st = match code { 200 => "200 OK", 202 => "202 Accepted", _ => "400 Bad Request" };
@@ -492,7 +578,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             return respond(&mut s, "403 Forbidden", "text/plain", &[], b"this arcade's pages answer only this computer\n");
         }
         if let Some(a) = crate::namesites::route(node, &path, &query_fields(&r.query)) {
-            let mut extra = vec![("Content-Security-Policy", CONTENT_CSP.to_string()), ("Cache-Control", "no-store".to_string()), ("Access-Control-Allow-Origin", "*".to_string())];
+            let mut extra = vec![("Content-Security-Policy", CONTENT_CSP.to_string()), ("Cache-Control", "no-store".to_string())];
             if let Some(to) = a.location {
                 extra.push(("Location", to));
             }
@@ -880,6 +966,80 @@ pub(crate) mod tests {
         assert_eq!(status(&a), "200", "{a}");
         let a = ask(&t.node, &conf(), &get("/api/v1/routes", ""));
         assert_eq!(status(&a), "200");
+    }
+
+    #[test]
+    fn no_cors_for_other_websites() {
+        let (_one, t) = crate::http::tests::node();
+        let pass = page_pass(&t.node, t.p.key, &"a".repeat(64));
+        let a = ask(&t.node, &conf(), &get("/r/wallet", &format!("Origin: https://evil.example\r\nX-Arcade-Page: {pass}\r\n")));
+        assert_eq!(status(&a), "403", "{a}");
+        assert!(!a.contains("Access-Control-Allow-Origin"), "{a}");
+        let a = ask(&t.node, &conf(), b"OPTIONS /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nOrigin: https://evil.example\r\n\r\n");
+        assert!(!a.contains("Access-Control-Allow-Origin"), "{a}");
+        let a = ask(&t.node, &conf(), &get("/api/v1/routes", "Origin: https://evil.example\r\n"));
+        assert!(!a.contains("Access-Control-Allow-Origin"), "{a}");
+        // An app frame (sandboxed: origin "null") with its pass may read the answer.
+        let a = ask(&t.node, &conf(), b"OPTIONS /r/wallet HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nOrigin: null\r\n\r\n");
+        assert!(a.contains("Access-Control-Allow-Origin: null") && a.contains("X-Arcade-Page"), "{a}");
+        let a = ask(&t.node, &conf(), &get("/r/wallet", &format!("Origin: null\r\nX-Arcade-Page: {pass}\r\n")));
+        assert_eq!(status(&a), "200", "{a}");
+        assert!(a.contains("Access-Control-Allow-Origin: null") && !a.contains("Access-Control-Allow-Origin: *"), "{a}");
+    }
+
+    #[test]
+    fn the_page_api_needs_the_pages_pass_not_its_referer() {
+        let (_one, t) = crate::http::tests::node();
+        let (mine, other) = ("a".repeat(64), "b".repeat(64));
+        let to = crate::sitesvc::tests::addr(&t, 2);
+        let body = json!({"kind": "coins", "to": to, "amount": "1"}).to_string();
+        let send = |extra: &str| {
+            format!("POST /r/send HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).into_bytes()
+        };
+        // A website at a path ending in an app's txid: its Referer names the app, but it has no pass.
+        let a = ask(&t.node, &conf(), &send(&format!("Referer: https://evil.example/{other}\r\n")));
+        assert_eq!(status(&a), "403", "{a}");
+        let a = ask(&t.node, &conf(), &send(&format!("Referer: http://127.0.0.1:8420/app/{}/{other}\r\n", t.p.key)));
+        assert_eq!(status(&a), "403", "{a}");
+        assert_eq!(crate::walletsvc::requests(&t.node, None).as_array().unwrap().len(), 0, "nothing filed");
+        // A pass made up, or another page's: refused.
+        let a = ask(&t.node, &conf(), &send(&format!("X-Arcade-Page: {}:{other}:{}\r\n", t.p.key, "0".repeat(32))));
+        assert_eq!(status(&a), "403", "{a}");
+        // The page's pass: filed as that page, whatever the Referer says.
+        let pass = page_pass(&t.node, t.p.key, &mine);
+        let a = ask(&t.node, &conf(), &send(&format!("X-Arcade-Page: {pass}\r\nReferer: http://127.0.0.1:8420/app/{}/{other}\r\n", t.p.key)));
+        assert_eq!(status(&a), "202", "{a}");
+        assert_eq!(crate::walletsvc::requests(&t.node, Some(&mine)).as_array().unwrap().len(), 1);
+        assert_eq!(crate::walletsvc::requests(&t.node, Some(&other)).as_array().unwrap().len(), 0);
+        // Reads need it too, except the chain's height and time.
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/wallet", ""))), "403");
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/blockheight", ""))), "200");
+    }
+
+    #[test]
+    fn a_pass_is_for_one_page() {
+        let (_one, t) = crate::http::tests::node();
+        let tx = "c".repeat(64);
+        let pass = page_pass(&t.node, t.p.key, &tx);
+        let req = |p: &str| Req { method: "GET".into(), path: "/r/wallet".into(), query: String::new(), headers: [("x-arcade-page".to_string(), json!(p))].into_iter().collect(), body: vec![] };
+        assert_eq!(page_of(&t.node, &req(&pass)).map(|p| p.1), Some(tx.clone()));
+        assert!(page_of(&t.node, &req(&pass.replace(&tx, &"d".repeat(64)))).is_none(), "another txid");
+        assert!(page_of(&t.node, &req(&pass.to_uppercase())).is_none());
+        assert!(page_of(&t.node, &req(&pass[..pass.len() - 1])).is_none());
+        assert!(page_of(&t.node, &req("")).is_none());
+    }
+
+    #[test]
+    fn an_app_page_gets_its_pass_first() {
+        let pass = "peptest:aa:bb";
+        let out = String::from_utf8(with_pass(b"<!DOCTYPE html>\n<html><script>go()</script>", pass)).unwrap();
+        assert!(out.starts_with("<!DOCTYPE html><script>"), "{out}");
+        assert!(out.contains("'peptest:aa:bb'") && out.ends_with("\n<html><script>go()</script>"));
+        let out = String::from_utf8(with_pass(b"<p>hi", pass)).unwrap();
+        assert!(out.starts_with("<script>") && out.ends_with("</script><p>hi"));
+        let out = with_pass(b"\xEF\xBB\xBF <!doctype html><p>", pass);
+        assert!(out.starts_with(b"\xEF\xBB\xBF <!doctype html><script>"));
+        assert!(!include_str!("shims/page.js").contains("</script"));
     }
 
     #[test]

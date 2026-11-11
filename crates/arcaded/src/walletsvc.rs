@@ -11,6 +11,8 @@ use serde_json::{json, Value};
 
 const REQ_LIFE: u64 = 3600;
 const MAX_WAITING: usize = 20;
+/// Of those, from one page (so one page can't fill the queue for the others).
+const MAX_WAITING_PAGE: usize = 5;
 
 /// The chain a page read is on (crate::pagechain: the app frame's chain, else the home chain).
 fn c(node: &Node) -> u16 {
@@ -526,6 +528,9 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
     if requests(node, None).as_array().map(|a| a.len()).unwrap_or(0) >= MAX_WAITING {
         return refuse("more than twenty requests are already waiting".into());
     }
+    if requests(node, Some(page)).as_array().map(|a| a.len()).unwrap_or(0) >= MAX_WAITING_PAGE {
+        return refuse("this page already has five requests waiting for an answer".into());
+    }
     let id = arcade_mesh::random::hex(8);
     let r = json!({"id": id, "page": page, "kind": kind, "to": to, "to_tag": tag_of(node, &to), "units": units, "what": what,
                    "propertyid": body["propertyid"], "inscription": body["inscription"], "from": body["from"],
@@ -807,4 +812,21 @@ pub fn pending_moves(node: &Node, address: &str) -> (Vec<Value>, Vec<Value>) {
         }
     }
     (inc, out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_page_cannot_fill_the_queue() {
+        let (_one, t) = crate::http::tests::node();
+        let body = json!({"kind": "coins", "to": crate::sitesvc::tests::addr(&t, 2), "amount": "1"});
+        let (a, b) = ("a".repeat(64), "b".repeat(64));
+        for _ in 0..MAX_WAITING_PAGE {
+            assert_eq!(file(&t.node, &a, &body).0, 202);
+        }
+        assert_eq!(file(&t.node, &a, &body).0, 400, "a sixth from the same page");
+        assert_eq!(file(&t.node, &b, &body).0, 202, "another page still may ask");
+    }
 }

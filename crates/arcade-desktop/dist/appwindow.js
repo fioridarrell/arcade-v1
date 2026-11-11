@@ -619,6 +619,7 @@
     finally { showing = null; }
   }, 1500);
 
-  el.src = frame;
+  // The page with its pass for the page API (a new address, so a copy cached before passes isn't used).
+  el.src = frame + "?pass=1";
   window.arcadeApp = { id, frame, el };
 })();

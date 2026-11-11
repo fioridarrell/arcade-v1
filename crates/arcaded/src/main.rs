@@ -13,6 +13,7 @@ mod announce;
 mod api;
 mod apikeys;
 mod arcborrow;
+mod arcseal;
 mod arcseg;
 mod arcsvc;
 mod borrow;
@@ -301,6 +302,8 @@ fn main() {
             eprintln!("arcaded: --arc-local: {e}");
             std::process::exit(1);
         }
+    } else if let Err(e) = arcsvc::define_text(&node, arcsvc::TESTNET_SETTINGS) {
+        eprintln!("arcaded: the built-in ARCADE testnet: {e}");
     }
     chains::start_saved(&node);
     borrow::start(node.clone());

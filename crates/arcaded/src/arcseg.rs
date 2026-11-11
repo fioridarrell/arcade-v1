@@ -16,7 +16,8 @@
 //!   behind two entries for the same heights (the catalog refuses that anyway).
 
 use crate::node::Node;
-use arcade_arc::block::{self, Attest, CatalogEntry, Item};
+use arcade_arc::block::{self, Attest, CatalogEntry, Item, RegCommit, RegProof};
+use arcade_arc::registry::{self, Registry};
 use arcade_arc::catalog::Catalog;
 use arcade_arc::merkle::Hash;
 use arcade_arc::params::{Net, RANGE};
@@ -96,6 +97,9 @@ pub fn on_items(net: &Net, blob: &[u8]) -> usize {
         let signed = match &item {
             Item::CatalogEntry(e) => block::verify(&e.poster, &e.message(net), &e.sig),
             Item::Attest(a) => block::verify(&a.attester, &a.message(net), &a.sig),
+            // Checked by the chain (a commit's signature covers its anchor block's id): a writer
+            // carries only what the next block can.
+            Item::RegCommit(_) | Item::RegProof(_) => true,
             _ => false, // the chain takes nothing else yet
         };
         if signed && add(item) {
@@ -234,6 +238,69 @@ pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64) {
         add(Item::CatalogEntry(e));
     }
     BUSY.store(more, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Registration (§4): every sealed replica of this arcade that isn't registered gets a commit
+/// (anchored to the tip, its work stamp mined here), then, once the block `CHALLENGE_DELAY`
+/// after the commit's is in, its proof. Paid to this arcade's wallet on the chain.
+pub fn register(node: &Node, net: &Net, p: &ChainParams, reg: &Registry, tip: u64) {
+    let me = node.identity.verifying_key().to_bytes();
+    let Some(payout) = payout_of(node, net, p) else { return };
+    // Registration items the chain is past go.
+    let stale: Vec<Item> = waiting()
+        .into_iter()
+        .filter(|i| match i {
+            Item::RegCommit(c) => reg.registered(&c.replica(net)) || reg.commit(&c.replica(net)).is_some() || tip > c.anchor + registry::ANCHOR_AGE,
+            Item::RegProof(pr) => reg.registered(&pr.replica) || reg.commit(&pr.replica).is_none_or(|c| tip > c.3 + arcade_arc::params::CHALLENGE_DELAY + arcade_arc::params::ANSWER_WINDOW),
+            _ => false,
+        })
+        .collect();
+    forget(&stale);
+    for r in crate::arcseal::replicas(node, net) {
+        let id = block::replica_id(net, &r.segment, &me);
+        if reg.registered(&id) || reg.catalog().get(&r.segment).is_none() {
+            continue;
+        }
+        let waiting_here = waiting();
+        match reg.commit(&id) {
+            Some((_, _, _, hc)) if tip <= hc + arcade_arc::params::CHALLENGE_DELAY + arcade_arc::params::ANSWER_WINDOW => {
+                let challenge = hc + arcade_arc::params::CHALLENGE_DELAY;
+                if tip < challenge || waiting_here.iter().any(|i| matches!(i, Item::RegProof(x) if x.replica == id)) {
+                    continue;
+                }
+                let Some((_, seed)) = reg.block_at(challenge) else { continue };
+                let picks = registry::picks(net, &seed, &id, r.leaves);
+                match r.open(&me, &picks) {
+                    Ok(leaves) => {
+                        add(Item::RegProof(RegProof { replica: id, leaves }));
+                    }
+                    Err(e) => eprintln!("arc: opening replica {}: {e}", hex::encode(id)),
+                }
+            }
+            _ => {
+                if waiting_here.iter().any(|i| matches!(i, Item::RegCommit(c) if c.replica(net) == id)) || tip == 0 {
+                    continue;
+                }
+                let Some((anchor_id, _)) = reg.block_at(tip) else { continue };
+                let mut c = RegCommit { segment: r.segment, owner: me, payout, replica_root: r.replica_root, anchor: tip, nonce: 0, sig: [0; 64] };
+                while block::work_bits(&c.stamp(net, &anchor_id)) < registry::STAMP_BITS {
+                    c.nonce += 1;
+                }
+                c.sig = block::sign(&node.identity, &c.message(net, &anchor_id));
+                add(Item::RegCommit(c));
+            }
+        }
+    }
+}
+
+/// This arcade's address on the chain (its wallet's first key), as a payout.
+fn payout_of(node: &Node, net: &Net, p: &ChainParams) -> Option<block::Payout> {
+    let (k, _) = node.app.tag_key(p, 0).ok()?;
+    let pk = hex::decode(&k.pubkey).ok()?;
+    let mut out = [0u8; 21];
+    out[0] = net.p2pkh_version;
+    out[1..].copy_from_slice(&arcade_chain::hash::hash160(&pk));
+    Some(out)
 }
 
 /// What the Chains & Coins row and arc.status say about it.

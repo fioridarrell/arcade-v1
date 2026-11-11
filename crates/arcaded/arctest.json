@@ -1,0 +1,27 @@
+{
+ "net": "arctest",
+ "_note": "The ARCADE testnet built into V1.0 (Martin 2026-11-11). Genesis writers: the GX10 and the JB20B; anyone else joins by sealing a listed segment and registering it. The lists and beacons are placeholders until the genesis list (docs/ARCADECHAIN.md \u00a710) exists.",
+ "genesis": {
+  "time": 1794435060,
+  "closed_list": "9d2129f082fcbf9dc431d0f924d6643d68f906abf140459456f8327913006c5c",
+  "final_list": "65f88bb715c6baa4efdfcc4fdd106c087ea1475bdff9301c417a53bca1d45e0d",
+  "beacon_1": "61f17a562dd36624d26654276663e2b79b7f7e060bb77081ff92f44d5f8f3245",
+  "beacon_2": "71c8f77c955ad45664d9fd176c9d3a2bc71f454f51ad517eaa3737e22f84c7b0",
+  "difficulty": "223277567893532960"
+ },
+ "holders": [
+  {
+   "key": "b2c3efb8060c4ec479dffa1353f97ad1cf575fac558d72dc1cfa20a6092e634d",
+   "bytes": 1073741824,
+   "pay": "aRiSc8VhEManoNumdVhVyyg4LFAqaCKQya",
+   "_who": "GX10"
+  },
+  {
+   "key": "da506e1f9dcf0cb8bb227472dce65f44f4f78af10da641a493e9e5d6b39f3942",
+   "bytes": 1073741824,
+   "pay": "aXeV2c4YTSXLHVHRP5EdfYqeRX9oU4et2e",
+   "_who": "JB20B"
+  }
+ ],
+ "steps_per_second": 1000000
+}

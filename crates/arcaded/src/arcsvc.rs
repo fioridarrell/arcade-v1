@@ -32,7 +32,8 @@
 
 use crate::node::Node;
 use arcade_arc::block::{Block, Payout, TimeProof, TX_FORMAT};
-use arcade_arc::chain::{Accepted, Chain, ChainError, Entry, FixedHolders, Genesis, Storage, Ticket};
+use arcade_arc::chain::{Accepted, Chain, ChainError, Entry, Genesis, Storage, Ticket};
+use arcade_arc::registry::Registry;
 use arcade_arc::light::Headers;
 use arcade_arc::log::{self, BlockLog};
 use arcade_arc::coins::TxError;
@@ -79,7 +80,7 @@ const ANSWERS_AFTER: Duration = Duration::from_secs(30);
 /// The most headers in one shared-core answer.
 pub const LENT_HEADERS: usize = 500;
 
-type LocalChain = Chain<StandIn, FixedHolders>;
+type LocalChain = Chain<StandIn, Registry>;
 
 /// What `--arc-local` reads: block 0, who holds how much, and how fast this arcade's
 /// stand-in "calculates" (steps of proof of time per second).
@@ -419,12 +420,22 @@ fn installed_key(net: &Net) -> Vec<u8> {
     format!("arc:{}", net.key).into_bytes()
 }
 
+/// The ARCADE testnet every arcade knows (Martin 2026-11-11: "add test arcade coin to the
+/// main"): its block 0 and genesis list, built in. `--arc-local <settings>` replaces it with a
+/// local test chain (closed test networks only).
+pub const TESTNET_SETTINGS: &str = include_str!("../arctest.json");
+
 /// Read the settings of the chain this arcade can install, and start it if it is installed.
 pub fn define(node: &Arc<Node>, settings: &std::path::Path) -> Result<(), String> {
-    let net = params::TESTNET;
     let text = std::fs::read_to_string(settings).map_err(|e| format!("{}: {e}", settings.display()))?;
-    let s = Settings::parse(&net, &text)?;
-    FixedHolders::new(&net, &s.holders).ok_or("settings: the holders list doesn't hold (empty, a key twice, nothing held, or an address of another network)")?;
+    define_text(node, &text)
+}
+
+/// [`define`] from the settings' text (the built-in testnet's, or a file's).
+pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
+    let net = params::TESTNET;
+    let s = Settings::parse(&net, text)?;
+    Registry::new(&net, &s.holders, s.segment_bytes).ok_or("settings: the holders list doesn't hold (a key twice, nothing held, or an address of another network)")?;
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
     let def = DEF.get_or_init(|| def);
@@ -490,7 +501,7 @@ pub fn remove(node: &Arc<Node>) -> Result<(), String> {
 /// Bring the chain up from its block log and start its writer. The caller holds `CHANGING`.
 fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let (net, s, genesis, p) = (def.net, &def.settings, def.genesis, def.params);
-    let holders = FixedHolders::new(&net, &s.holders).ok_or("settings: the holders list doesn't hold")?.with_segment_bytes(s.segment_bytes);
+    let holders = Registry::new(&net, &s.holders, s.segment_bytes).ok_or("settings: the holders list doesn't hold")?;
     let mut chain = Chain::new(net, &s.genesis, StandIn, holders, &[]);
 
     let dir = node.home.join("arc").join(net.key);
@@ -504,12 +515,12 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let weight = chain.storage().weight(&me);
     let pay = s.holders.iter().find(|(key, ..)| *key == me).and_then(|(_, _, pay)| script::pay_to(&net, pay));
     eprintln!(
-        "arc: LOCAL TEST CHAIN {} (stand-ins for the proof of time and the storage records; never for a public network). Block 0 {genesis}, height {} from {held} logged blocks in {:.1}s{}; this arcade {}",
+        "arc: ARCADE test chain {} (test coins: a stand-in proof of time; registered replicas count from their registration proof, before audits exist). Block 0 {genesis}, height {} from {held} logged blocks in {:.1}s{}; this arcade {}",
         net.key,
         chain.tip().height,
         t0.elapsed().as_secs_f64(),
         if refused > 0 { format!(" ({refused} no longer taken)") } else { String::new() },
-        if weight > 0 { format!("writes with {weight} bytes") } else { "holds nothing and only follows".into() },
+        if weight > 0 { format!("writes with {weight} bytes") } else { "holds nothing yet: it writes once a sealed replica of it is registered".into() },
     );
     let svc = Arc::new(Svc {
         net,
@@ -533,16 +544,19 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
                 if s2.stop.load(Ordering::Relaxed) {
                     return;
                 }
-                let (catalog, weight) = {
+                let (reg, weight, tip) = {
                     let st = s2.st.lock().unwrap();
-                    (st.chain.storage().catalog().clone(), st.chain.storage().weight(&me))
+                    (st.chain.storage().clone(), st.chain.storage().weight(&me), st.chain.tip().height)
                 };
-                crate::arcseg::round(&n, &s2.net, &catalog, weight);
+                crate::arcseg::round(&n, &s2.net, reg.catalog(), weight);
+                crate::arcseg::register(&n, &s2.net, s2.params, &reg, tip);
                 std::thread::sleep(Duration::from_secs(if crate::arcseg::busy() { 2 } else { 60 }));
             })
             .map_err(|e| e.to_string())?;
     }
-    if weight > 0 {
+    // The writer runs on every arcade: one without weight now may register a replica later
+    // (its ticket is None while it has none).
+    {
         let n = node.clone();
         std::thread::Builder::new().name("arc writer".into()).spawn(move || run_writer(n, svc)).map_err(|e| e.to_string())?;
     }
@@ -1078,9 +1092,14 @@ pub fn light_from(entries: Vec<Entry>) -> Option<Headers<StandIn>> {
     Headers::resume(d.net, &d.settings.genesis, StandIn, entries)
 }
 
-/// The draw weight of a writer.
+/// The draw weight of a writer, as a borrowed copy can tell it: a genesis holder's from the
+/// list; anyone else's is a registered replica's, which a borrowed copy can't check
+/// (`light::UNKNOWN_WEIGHT`: the header's claim is taken).
 pub fn writer_weight(key: &[u8; 32]) -> u64 {
-    DEF.get().and_then(|d| d.settings.holders.iter().find(|(k, ..)| k == key)).map_or(0, |(_, bytes, _)| *bytes)
+    match DEF.get().and_then(|d| d.settings.holders.iter().find(|(k, ..)| k == key)) {
+        Some((_, bytes, _)) => *bytes,
+        None => arcade_arc::light::UNKNOWN_WEIGHT,
+    }
 }
 
 /// The defined chain's network, block 0's id and block 0's time.
@@ -1189,6 +1208,85 @@ pub fn catalog(node: &Node) -> Result<Value, String> {
     Ok(json!({"segment_bytes": cat.segment_bytes(), "listed": listed, "waiting": waiting, "here": crate::arcseg::status(node, &svc.net, cat.segment_bytes())}))
 }
 
+/// `arc.seal {segment?}`: seal a confirmed segment (its id; else the first listed one of a
+/// chain kept here that isn't sealed yet) under this arcade's key, in the background.
+pub fn seal(node: &Arc<Node>, req: &Value) -> Result<Value, String> {
+    let svc = svc().ok_or("the ARCADE chain isn't running here")?;
+    let have: Vec<arcade_arc::merkle::Hash> = crate::arcseal::replicas(node, &svc.net).iter().map(|r| r.segment).collect();
+    let listed = {
+        let st = svc.st.lock().unwrap();
+        let cat = st.chain.storage().catalog();
+        match req["segment"].as_str() {
+            Some(h) => {
+                let id: arcade_arc::merkle::Hash = hex::decode(h).ok().and_then(|b| b.try_into().ok()).ok_or("segment: 64 hex characters")?;
+                cat.get(&id).cloned().ok_or("no such segment is listed")?
+            }
+            None => crate::arcseg::kept(node, &svc.net)
+                .iter()
+                .find_map(|p| cat.spans(p.key, arcade_arc::segment::FAMILY_BLOCKS).find_map(|(_, _, l)| l.filter(|l| !have.contains(&l.id)).cloned()))
+                .ok_or("no listed segment of a chain kept here is left to seal")?,
+        }
+    };
+    let e = listed.entry.clone();
+    let p = node.chain_params(&e.chain).ok_or_else(|| format!("{} isn't kept here", e.chain))?;
+    if let Some((id, _, _)) = crate::arcseal::sealing() {
+        return Err(format!("segment {id} is being sealed"));
+    }
+    let (n, net, id) = (node.clone(), svc.net, listed.id);
+    std::thread::Builder::new()
+        .name("arc sealing".into())
+        .spawn(move || {
+            let t0 = Instant::now();
+            match crate::arcseal::seal(&n, &net, p, id, e.first, e.last, e.bytes, e.root) {
+                Ok(r) => eprintln!("arc: sealed {} {}..={} ({} leaves) in {:.0} s; replica root {}", r.chain, r.first, r.last, r.leaves, t0.elapsed().as_secs_f64(), hex::encode(r.replica_root)),
+                Err(why) => eprintln!("arc: sealing {}: {why}", hex::encode(id)),
+            }
+        })
+        .map_err(|e| e.to_string())?;
+    Ok(json!({"sealing": hex::encode(id), "chain": listed.entry.chain, "first": listed.entry.first, "last": listed.entry.last, "leaves": listed.entry.leaves()}))
+}
+
+/// `arc.replicas`: the sealed copies this arcade holds, and a sealing under way.
+pub fn replicas(node: &Node) -> Result<Value, String> {
+    let svc = svc().ok_or("the ARCADE chain isn't running here")?;
+    let me = node.identity.verifying_key().to_bytes();
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let list: Vec<Value> = crate::arcseal::replicas(node, &svc.net)
+        .iter()
+        .map(|r| {
+            let id = arcade_arc::block::replica_id(&svc.net, &r.segment, &me);
+            json!({"segment": hex::encode(r.segment), "chain": r.chain, "first": r.first, "last": r.last, "bytes": r.bytes, "leaves": r.leaves,
+                   "replica_root": hex::encode(r.replica_root), "replica": hex::encode(id), "registered": reg.registered(&id),
+                   "commit_height": reg.commit(&id).map(|c| c.3)})
+        })
+        .collect();
+    let weight = reg.weight(&me);
+    drop(st);
+    let sealing = crate::arcseal::sealing().map(|(id, done, of)| json!({"segment": id, "done": done, "of": of}));
+    Ok(json!({"replicas": list, "sealing": sealing, "weight": weight}))
+}
+
+/// `arc.open {segment, leaves:[i..]}`: leaves of one of this arcade's replicas, opened.
+pub fn open(node: &Node, req: &Value) -> Result<Value, String> {
+    let svc = svc().ok_or("the ARCADE chain isn't running here")?;
+    let seg = req["segment"].as_str().ok_or("give a segment")?;
+    let r = crate::arcseal::replicas(node, &svc.net).into_iter().find(|r| hex::encode(r.segment) == seg).ok_or("no such replica here")?;
+    let picks: Vec<u64> = req["leaves"].as_array().map(|a| a.iter().filter_map(Value::as_u64).filter(|i| *i < r.leaves).collect()).unwrap_or_default();
+    let me = node.identity.verifying_key().to_bytes();
+    let opened = r.open(&me, &picks)?;
+    let ok: Vec<Value> = opened
+        .iter()
+        .zip(&picks)
+        .map(|(o, i)| {
+            let s = arcade_arc::merkle::verify(&r.replica_root, r.leaves, *i, &arcade_arc::merkle::leaf_hash(&o.sealed), &o.sealed_path);
+            let d = arcade_arc::merkle::verify(&r.root, r.leaves, *i, &arcade_arc::merkle::leaf_hash(&o.data), &o.data_path);
+            json!({"leaf": i, "sealed_ok": s, "data_ok": d})
+        })
+        .collect();
+    Ok(json!({"segment": seg, "opened": ok}))
+}
+
 /// `arc.segment_root {chain, first, last}`: the root this arcade makes for those heights of a
 /// chain it keeps.
 pub fn segment_root(node: &Node, req: &Value) -> Result<Value, String> {
@@ -1229,6 +1327,15 @@ mod tests {
     use secp256k1::{PublicKey, Secp256k1, SecretKey};
 
     const NET: Net = params::TESTNET;
+
+    /// The testnet built into V1.0 reads, and its genesis list holds.
+    #[test]
+    fn the_built_in_testnet_reads() {
+        let s = Settings::parse(&NET, TESTNET_SETTINGS).unwrap();
+        assert_eq!(s.holders.len(), 2);
+        assert_eq!(s.segment_bytes, params::SEGMENT_BYTES);
+        assert!(Registry::new(&NET, &s.holders, s.segment_bytes).is_some());
+    }
     const START: u64 = 1_797_000_000;
     const LATE: u64 = START + 10_000_000;
 
@@ -1274,7 +1381,7 @@ mod tests {
 
     fn chain() -> LocalChain {
         let s = Settings::parse(&NET, &settings()).unwrap();
-        Chain::new(NET, &s.genesis, StandIn, FixedHolders::new(&NET, &s.holders).unwrap(), &[])
+        Chain::new(NET, &s.genesis, StandIn, Registry::new(&NET, &s.holders, arcade_arc::params::SEGMENT_BYTES).unwrap(), &[])
     }
 
     /// `who`'s block on the tip, 150 seconds after it, with what waits in `pool`.
@@ -1444,7 +1551,7 @@ mod tests {
         // And with another chain's settings in the same home: nothing of the old copy stays.
         let text = settings().replace(&"04".repeat(32), &"05".repeat(32));
         let s = Settings::parse(&NET, &text).unwrap();
-        let mut new = Chain::new(NET, &s.genesis, StandIn, FixedHolders::new(&NET, &s.holders).unwrap(), &[]);
+        let mut new = Chain::new(NET, &s.genesis, StandIn, Registry::new(&NET, &s.holders, arcade_arc::params::SEGMENT_BYTES).unwrap(), &[]);
         grow(&mut new, 2, 3);
         let p2 = store::chain_params(&NET, &new.id_at(0).unwrap());
         reconcile(&db, p2, &new).unwrap();

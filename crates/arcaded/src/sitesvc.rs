@@ -199,6 +199,21 @@ pub fn fee(node: &Node, req: &Value) -> R {
 }
 
 pub fn broadcast(node: &Node, req: &Value) -> R {
+    send_raw(node, req, true)
+}
+
+/// A transaction this arcade built and signed itself (DigiDollar sends): pooled and sent as
+/// `broadcast` does, without checking its signatures again.
+pub fn broadcast_own(node: &Node, req: &Value) -> R {
+    send_raw(node, req, false)
+}
+
+/// `checked`: every input's signature is verified first, as for a transaction from the mesh
+/// (`mempoolshare::sort`). One with a bad signature is refused: pooled, it would be reported
+/// sent though no node relays it, and the coins it spends would stay held behind it. One with
+/// an input of a kind this arcade can't check (an inscription reveal, say) goes on to the
+/// coin's own peers, whose nodes check every script, without being pooled here.
+fn send_raw(node: &Node, req: &Value, checked: bool) -> R {
     let p = chain(node, req)?;
     let hex_tx = req["hex"].as_str().ok_or("hex required (the signed transaction)")?;
     let raw = hex::decode(hex_tx.trim()).map_err(|_| "hex is not hex".to_string())?;
@@ -236,6 +251,18 @@ pub fn broadcast(node: &Node, req: &Value) -> R {
     };
     if outs > ins {
         return Err(format!("the outputs ({outs}) are more than the coins spent ({ins})"));
+    }
+    if checked {
+        match crate::mempoolshare::sort(node, p, &tx) {
+            Ok(None) => {}
+            Ok(Some((n, why))) => {
+                crate::mempoolshare::pass_on(node, p, raw);
+                let _ = node.app.event("wallet", &format!("passed on {} for a website user (input {n} not checked here: {why})", tx.txid.to_hex()));
+                return Ok(json!({"txid": tx.txid.to_hex(), "fee": ins - outs, "size": tx.raw.len(), "pooled": false}));
+            }
+            Err(e) if e.contains("twice") => return Err("refused: a waiting transaction already spends one of these coins".into()),
+            Err(e) => return Err(format!("refused: {e}")),
+        }
     }
     if !crate::mempoolshare::add(node, p, &tx) {
         return Err("refused: a waiting transaction already spends one of these coins".into());
@@ -431,7 +458,10 @@ pub(crate) mod tests {
 
     #[test]
     fn broadcast_checks_then_pools() {
-        let t = setup();
+        use arcade_wallet::tx::{sign_keyhash, TxOutSpec, Utxo};
+        let (t, coins) = crate::mempoolshare::tests::funded();
+        let key = crate::mempoolshare::tests::key();
+        let mine = coins[1].script.clone();
         let change = OutPoint { txid: t.spend.txid, vout: 1 };
         // Spends a coin nobody has: refused.
         let ghost = tx(&[(Hash256([7; 32]), 0)], &[(10, p2pkh(4))], 0);
@@ -442,8 +472,18 @@ pub(crate) mod tests {
         // Spends A's spent coinbase again: refused.
         let again = tx(&[(t.cb1.txid, 0)], &[(10, p2pkh(4))], 0);
         assert!(broadcast(&t.node, &json!({"hex": hex::encode(&again.raw)})).is_err());
+        // Not signed by the coin's owner: refused, not pooled, not sent.
+        let unsigned = tx(&[(change.txid, 1)], &[(1000, p2pkh(4))], 0);
+        assert!(broadcast(&t.node, &json!({"hex": hex::encode(&unsigned.raw)})).unwrap_err().contains("refused"));
+        let good = sign_keyhash(t.p, 1, &coins[1..], &[TxOutSpec { value: 1300, script: mine.clone() }], &key, 0).unwrap();
+        let mut bad = good.raw.clone();
+        let at = bad.len() - 4 - 4 - 34 - 33 - 10; // inside the scriptSig's signature
+        bad[at] ^= 1;
+        let why = broadcast(&t.node, &json!({"hex": hex::encode(&bad)})).unwrap_err();
+        assert!(why.contains("refused: input 0"), "a bad signature: {why}");
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty());
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty());
         // A good one: pooled, queued for the coin's network, fee reported.
-        let good = tx(&[(change.txid, 1)], &[(1000, p2pkh(4)), (800, p2pkh(1))], 0);
         let v = broadcast(&t.node, &json!({"hex": hex::encode(&good.raw)})).unwrap();
         assert_eq!(v["txid"], good.txid.to_hex());
         assert_eq!(v["fee"], 100);
@@ -452,15 +492,28 @@ pub(crate) mod tests {
         // The same again: already known, not sent twice.
         assert_eq!(broadcast(&t.node, &json!({"hex": hex::encode(&good.raw)})).unwrap()["already"], true);
         assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 1);
-        // A rival spend of the same coin: refused.
-        let rival = tx(&[(change.txid, 1)], &[(1500, p2pkh(5))], 1);
+        // A rival spend of the same coin, signed: refused.
+        let rival = sign_keyhash(t.p, 1, &coins[1..], &[TxOutSpec { value: 1200, script: p2pkh(5) }], &key, 0).unwrap();
         assert!(broadcast(&t.node, &json!({"hex": hex::encode(&rival.raw)})).unwrap_err().contains("waiting transaction"));
         // A child of the waiting transaction may spend its output.
-        let child = tx(&[(good.txid, 0)], &[(900, p2pkh(6))], 0);
+        let out = Utxo { outpoint: OutPoint { txid: good.txid, vout: 0 }, value: 1300, script: mine.clone() };
+        let child = sign_keyhash(t.p, 1, &[out], &[TxOutSpec { value: 1200, script: p2pkh(6) }], &key, 0).unwrap();
         assert_eq!(broadcast(&t.node, &json!({"hex": hex::encode(&child.raw)})).unwrap()["fee"], 100);
         // Junk.
         assert!(broadcast(&t.node, &json!({"hex": "zz"})).is_err());
         assert!(broadcast(&t.node, &json!({"hex": "0100"})).is_err());
+    }
+
+    /// tx.coins and tx.activity with waiting transactions (pooled as the arcade's own sends
+    /// are, unchecked: the test chain's coins have no real keys).
+    #[test]
+    fn coins_and_activity_count_waiting_transactions() {
+        let t = setup();
+        let change = OutPoint { txid: t.spend.txid, vout: 1 };
+        let good = tx(&[(change.txid, 1)], &[(1000, p2pkh(4)), (800, p2pkh(1))], 0);
+        assert_eq!(broadcast_own(&t.node, &json!({"hex": hex::encode(&good.raw)})).unwrap()["fee"], 100);
+        let child = tx(&[(good.txid, 0)], &[(900, p2pkh(6))], 0);
+        assert_eq!(broadcast_own(&t.node, &json!({"hex": hex::encode(&child.raw)})).unwrap()["fee"], 100);
 
         // tx.coins now: A's confirmed change is spent by a waiting tx and leaves the list; the
         // waiting change to A shows as unconfirmed.

@@ -8,7 +8,7 @@
 use crate::format::Format;
 use crate::hash::Hash256;
 use crate::header::Header;
-use crate::pow::{meets_target, target_from_bits, try_pow_hash, PowAlgo, PowRule, U256};
+use crate::pow::{meets_target, target_from_bits, try_pow_hash, work_from_bits, PowAlgo, PowRule, U256};
 
 #[derive(Clone, Debug)]
 pub struct ChainParams {
@@ -30,7 +30,11 @@ pub struct ChainParams {
     pub format: Format,
     pub pow: PowRule,
     /// Apply the arcade's MAX_EASIER rule. Off for DigiByte and Kotia, as in the existing
-    /// arcade (its DGB index halted on 2026-10-28 when the rule misfired on multi-algo).
+    /// arcade (its DGB index halted on 2026-10-28 when the rule misfired on multi-algo: each
+    /// algorithm keeps its own difficulty, so a block's parent may be far harder), and for
+    /// Wojakcoin (its averaging window eases more than 4x per block). Where it is off, bits
+    /// are not bounded by the parent: headers whose work isn't checked count only
+    /// [`ChainParams::min_work`].
     pub max_easier: bool,
     pub pow_limit_bits: u32,
     /// A block at or below powLimit difficulty is always accepted (testnet rule).
@@ -71,6 +75,29 @@ impl ChainParams {
     pub fn block_id(&self, h: &Header) -> Hash256 {
         self.format.block_id(h)
     }
+
+    /// The work of a powLimit block: what a header counts when its work isn't checked.
+    pub fn min_work(&self) -> U256 {
+        work_from_bits(self.pow_limit_bits)
+    }
+
+    /// The work a header adds to its chain. Only a checked proof of work (the header's own, or
+    /// an AuxPoW parent's, which the caller checks) counts what its bits claim. A header whose
+    /// work isn't checked (DigiByte algorithms not implemented here, proof-of-stake blocks)
+    /// counts as a powLimit block, never more than it claims: otherwise one made-up header with
+    /// tiny bits would outweigh the whole chain.
+    ///
+    /// So on a chain of such blocks (Kotia after its last PoW height) every block weighs the
+    /// same and the longest chain wins; see sync's UNVERIFIED_REORG_DEPTH for the limit on how
+    /// deep such a chain may take the tip back.
+    pub fn header_work(&self, bits: u32, check: PowCheck) -> U256 {
+        let claimed = work_from_bits(bits);
+        match check {
+            PowCheck::Verified | PowCheck::AuxPow => claimed,
+            PowCheck::NotCheckable | PowCheck::NeedsBlock => claimed.min(self.min_work()),
+        }
+    }
+
 }
 
 /// The arcade's header-link rule (rawchain.py MAX_EASIER): a block's target may be at most
@@ -122,7 +149,8 @@ pub enum PowCheck {
     /// Merge-mined: the caller must check the AuxPoW's parent header.
     AuxPow,
     /// Not checkable yet (some DigiByte algorithms, Kotia proof of stake):
-    /// accepted on the heaviest-chain rule with link and merkle proofs only.
+    /// accepted with link and merkle proofs only, counting the minimum work
+    /// ([`ChainParams::header_work`]).
     NotCheckable,
     /// Header misses its PoW target but the chain allows proof-of-stake blocks here:
     /// decided by [`check_block_work`] once the block is in hand.
@@ -697,6 +725,29 @@ mod tests {
         assert!(too_easy(p, 0x1d0fffff, parent), "256x easier is not");
         assert!(!too_easy(p, 0x1b0fffff, parent), "harder is always fine");
         assert!(!too_easy(&PEPECOIN_TEST, 0x1e0fffff, 0x1b0fffff), "testnet powLimit is fine");
+    }
+
+    /// A header whose work isn't checked counts a powLimit block's work, whatever its bits
+    /// claim; a checked one counts its bits (the real DigiByte sha256d fixture).
+    #[test]
+    fn unchecked_work_counts_the_minimum() {
+        use crate::pow::work_from_bits;
+        let p = &DIGIBYTE_MAIN;
+        let tiny = 0x0300_0001; // target 1: claims nearly 2^256 work
+        assert_eq!(p.header_work(tiny, PowCheck::NotCheckable), p.min_work());
+        assert_eq!(p.header_work(tiny, PowCheck::NeedsBlock), p.min_work());
+        assert_eq!(p.header_work(tiny, PowCheck::Verified), work_from_bits(tiny));
+        // Never more than the header claims.
+        assert_eq!(p.header_work(0x207fffff, PowCheck::NotCheckable), work_from_bits(0x207fffff));
+        let raw: [u8; 80] = hex::decode("02a2f925994a1c8add99de9e8c12e798e70a2fab949b5d7a171f45b8cfd859c686ef944bec972620b6fcd7d2ab8c9fce88664ba4f5dc0c0c157249c95e5dca0f3e04c3788cd1de6ac73704199684e683").unwrap().try_into().unwrap();
+        let h = Header::parse(&raw);
+        assert!(meets_target(&pow_hash(PowAlgo::Sha256d, &raw), h.bits));
+        assert_eq!(p.header_work(h.bits, PowCheck::Verified), work_from_bits(h.bits));
+        assert!(p.header_work(h.bits, PowCheck::Verified) > p.min_work());
+        // A groestl header (not checked here) with the tiny bits passes as NotCheckable.
+        let g = p.genesis_header().unwrap();
+        let forged = Header { version: 0x0400 | 2, prev: p.block_id(&g), merkle_root: Hash256::ZERO, time: g.time + 15, bits: tiny, nonce: 0 };
+        assert_eq!(check_header(p, &forged, &g, 1), Ok(PowCheck::NotCheckable));
     }
 
     #[test]

@@ -74,6 +74,9 @@ cmds! {
     "wallet.create" Local "phrase?" "Create a wallet (or restore one from 12 words). Returns the new words once.";
     "wallet.phrase" Local "" "The wallet's 12 words.";
     "wallet.keys" Read "chain?" "Your addresses on a chain, their @tags and balances.";
+    "dd.wallet" Read "chain?" "Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen).";
+    "dd.send" Local "chain?, to, cents, send?" "Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown.";
+    "wallet.send" Local "chain?, to, amount, from?, send?" "Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
     "wallet.link" Wallet "chain, wif, tag" "Link another wallet to your @tag (signed by both keys).";
     "wallet.unlink" Wallet "chain, address, tag" "Remove a linked wallet.";
     "wallet.links" Read "chain" "Your linked wallets on a chain.";
@@ -85,7 +88,8 @@ cmds! {
     "wallet.imports" Local "" "Imported wallets, with balances on chains this arcade keeps addresses for.";
     "wallet.import_remove" Local "chain, address" "Forget an imported wallet and its key.";
     "tag.check" Public "tag" "Whether a @tag is free and valid.";
-    "tag.claim" Wallet "tag" "Claim a @tag on the home chain.";
+    "tag.claim" Wallet "tag" "Claim a @tag on the home chain (test coins for it are asked for by themselves).";
+    "start.status" Read "" "Getting started: wallet made, handle (claimed or being claimed), test coins asked for or here, synced.";
     "tag.list" Read "" "Your tag claims and their progress.";
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";
     // Messaging
@@ -161,11 +165,13 @@ cmds! {
     "explorer.search" Public "chain?, q" "Search: block, tx, address, @tag, inscription, token, name.";
     // Chains
     "chains.peers" Read "key" "A chain's P2P address book: nodes known, working in the last day, resting after failures; the working ones and the next to try.";
+    "mesh.overview" Public "" "The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours.";
     "chains.list" Public "" "Every chain V1.0 knows, installed or not, with sizes reported by arcades.";
     "chains.status" Public "key" "One chain's staged progress.";
     "chains.offers" Public "" "Chains other arcades offer over the mesh.";
     "chains.sizes" Admin "" "Measure this arcade's disk use per chain now.";
-    "chains.add" Admin "key, mode?, with?" "Install a chain (mode full, shared or chain; with = indexes).";
+    "chains.add" Admin "key, mode?, with?" "Install a chain (mode full, shared or chain; with = indexes). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
+    "chains.unqueue" Admin "key" "Take a chain out of the install queue.";
     "chains.pause" Admin "key" "Pause a chain.";
     "chains.resume" Admin "key" "Resume a chain.";
     "chains.index_add" Admin "key, index" "Add an index to a chain.";
@@ -175,6 +181,18 @@ cmds! {
     "chains.copy_start" Admin "key, what?" "Bootstrap a chain from the best copy offered: what = coins (the coin set; missing blocks are fetched from the network and stored, default) or all (the copy's blocks too).";
     "chains.copy_cancel" Admin "key" "Stop fetching a copy (its pieces are deleted) or decline the offer: the chain syncs the usual way.";
     "chains.copy_verify" Admin "key" "Re-check a coin set taken from a copy: derive it from the blocks again (ours replaces it if it differs).";
+    "chains.index_copy_status" Public "key?" "Index copies (docs/INDEXBOOT.md): what old arcades offer per chain, the fetch, its votes, and whether an index here came from a copy.";
+    "chains.index_copy_start" Admin "key, index, from?" "Fetch an index copy now from the best offer (index = ledger or ord; from = one arcade's node id): it is taken in only if 2 or more other arcades agree with it.";
+    "chains.index_copy_cancel" Admin "key, index" "Stop fetching an index copy (its pieces are deleted).";
+    // V1.0 copies (docs/V1SHARE.md)
+    "share.held" Public "" "V1.0 copies of chain parts held here (blocks, coins, ord, tokens, names, maps, ledger, profiles, messages): id, height, rows, size; and those being made.";
+    "share.offers" Public "key" "V1.0 copies other arcades hold for a chain, per part: id, height, how many made it themselves and how many hold it.";
+    "share.fetch" Admin "key, fam, id?" "Fetch a part's copy from every arcade holding it at once: the newest one 2 or more arcades made themselves (or the id given). Pieces are checked against the manifest; the copy is then held and served here too.";
+    "share.install" Admin "key" "Install an added chain (or the home chain) from V1.0 copies: asks the linked V1.0 arcades for blocks and coins copies a few blocks ahead, waits until 2 or more made them, fetched from every holder and taken in as they come (no replay); the coins are trusted until re-checked.";
+    "share.install_cancel" Admin "key" "Stop installing a chain from copies.";
+    "share.cancel" Admin "key, fam" "Stop fetching a copy (its pieces are deleted).";
+    "share.serve" Admin "key, on" "Answer other V1.0 arcades' requests for copies of a chain (on by default): a copy is made when this arcade reaches the asked height, and deleted after 2 hours unused.";
+    "share.make" Admin "key, fam" "Make a V1.0 copy of one part of an installed chain now, from one frozen view of the database (in the background; see share.held).";
     // Borrowed coins
     "borrow.status" Read "" "Borrowed coins: the switches, and per chain its lenders, tip, floor, tip mismatch and your balance.";
     "borrow.set" Admin "on, chain?" "Turn borrowing on or off: for every coin (no chain) or for one chain (off removes its borrowed data).";

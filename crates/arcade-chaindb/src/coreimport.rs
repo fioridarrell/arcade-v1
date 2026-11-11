@@ -200,7 +200,7 @@ impl ChainDb {
     /// our headers don't reach `to`.
     pub fn header_path(&self, c: u16, from: u32, to: u32) -> Result<Vec<Hash256>> {
         let best = self.best_header(c)?.ok_or_else(|| err("no headers yet"))?;
-        self.store.read(|r| {
+        self.store(c).read(|r| {
             let mut rec = header_rec(r, c, &best)?.ok_or_else(|| err("best header missing"))?;
             let mut h = best;
             if rec.height < to {
@@ -246,7 +246,7 @@ impl ChainDb {
             b.check().map_err(|e| err(format!("block {}: {e}", b.hash())))?;
             blocks.push(b);
         }
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut out = Vec::with_capacity(blocks.len());
             for blk in &blocks {
                 let hash = blk.hash();
@@ -267,7 +267,7 @@ impl ChainDb {
 
     /// Txids of a stored block, in order.
     pub fn stored_txids(&self, params: &ChainParams, b: u32) -> Result<Vec<Hash256>> {
-        self.store.read(|r| r.scan_prefix(BLOCK_TX, &k_block(params.chain_no, b))?.iter().map(|(_, raw)| row_txid(raw, params)).collect())
+        self.store(params.chain_no).read(|r| r.scan_prefix(BLOCK_TX, &k_block(params.chain_no, b))?.iter().map(|(_, raw)| row_txid(raw, params)).collect())
     }
 
     /// Write the tx index rows of stored blocks, `bs` = their block numbers, in one sorted pass.
@@ -278,7 +278,7 @@ impl ChainDb {
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
-            self.store.read(|r| {
+            self.store(c).read(|r| {
                 for &b in chunk {
                     for (k, raw) in r.scan_prefix(BLOCK_TX, &k_block(c, b))? {
                         let p = be_u32(&k, k.len() - 4);
@@ -307,7 +307,7 @@ impl ChainDb {
             if batch.is_empty() {
                 break;
             }
-            self.store.write(|w| {
+            self.wstore(c)?.write(|w| {
                 for (k, v) in &batch {
                     w.put(TXS, k, v)?;
                 }
@@ -321,16 +321,16 @@ impl ChainDb {
 
     /// Whether an import of a coin set was left unfinished (the chain must stay held).
     pub fn import_pending(&self, c: u16) -> Result<Option<(u32, Hash256)>> {
-        self.store.read(|r| Ok(r.get(STATE, &k_state(c, IMPORTING))?.map(|v| (be_u32(&v, 32), Hash256(v[..32].try_into().unwrap())))))
+        self.store(c).read(|r| Ok(r.get(STATE, &k_state(c, IMPORTING))?.map(|v| (be_u32(&v, 32), Hash256(v[..32].try_into().unwrap())))))
     }
 
     /// A STATE value as text (trusted / verified notes).
     pub fn state_text(&self, c: u16, name: &str) -> Result<Option<String>> {
-        self.store.read(|r| Ok(r.get(STATE, &k_state(c, name))?.map(|v| String::from_utf8_lossy(&v).into_owned())))
+        self.store(c).read(|r| Ok(r.get(STATE, &k_state(c, name))?.map(|v| String::from_utf8_lossy(&v).into_owned())))
     }
 
     pub fn set_state_text(&self, c: u16, name: &str, v: Option<&str>) -> Result<()> {
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             match v {
                 Some(v) => w.put(STATE, &k_state(c, name), v.as_bytes())?,
                 None => {
@@ -360,7 +360,7 @@ impl ChainDb {
         let c = params.chain_no;
         self.flush_coins(c)?;
         let tip = self.tip(c)?.ok_or_else(|| err("connect genesis first"))?;
-        let target = *path.last().ok_or_else(|| err("nothing to import"))?;
+        path.last().ok_or_else(|| err("nothing to import"))?;
         if tip.height + path.len() as u32 != to {
             return Err(err(format!("path covers {} blocks above {}, not up to {to}", path.len(), tip.height)));
         }
@@ -386,7 +386,7 @@ impl ChainDb {
                     }
                 }
             }
-            self.store.read(|r| {
+            self.store(c).read(|r| {
                 for k in &page {
                     rep.read += 1;
                     rep.read_amount += k.value as u128;
@@ -403,10 +403,92 @@ impl ChainDb {
             })?;
             note(format!("coin set: {} coins read", rep.read));
         }
+        let sorted = sorter.finish()?;
+        self.finish_coin_import(params, path, to, tip, sorted, rep, trusted, tmp, stop, note)
+    }
+
+    /// Take in a coin set given by position (a V1.0 copy, docs/V1SHARE.md §2): each coin as
+    /// (height, tx position, vout, value, coinbase, script). Heights at or below our tip use
+    /// our own blocks; above it, `path`'s (stored already, as for import_coins).
+    #[allow(clippy::too_many_arguments)]
+    pub fn import_coins_at(
+        &self,
+        params: &ChainParams,
+        path: &[Hash256],
+        to: u32,
+        next: &mut dyn FnMut() -> std::result::Result<Option<(u32, u32, u32, u64, bool, Vec<u8>)>, String>,
+        trusted: &str,
+        tmp: &Path,
+        stop: &AtomicBool,
+        note: Note,
+    ) -> Result<CoinImport> {
+        let c = params.chain_no;
+        self.flush_coins(c)?;
+        let tip = self.tip(c)?.ok_or_else(|| err("connect genesis first"))?;
+        if tip.height + path.len() as u32 != to {
+            return Err(err(format!("path covers {} blocks above {}, not up to {to}", path.len(), tip.height)));
+        }
+        if !path.is_empty() && self.header(c, &path[0])?.map(|r| r.header.prev) != Some(tip.hash) {
+            return Err(err("the copy's blocks don't extend our tip"));
+        }
+        // Block number of every height 0..=to.
+        let mut bs: Vec<u32> = Vec::with_capacity(to as usize + 1);
+        self.store(c).read(|r| {
+            r.for_each_prefix(HEIGHT, &k_chain(c), |k, v| {
+                if be_u32(k, 2) as usize == bs.len() && bs.len() as u32 <= tip.height {
+                    bs.push(be_u32(v, 32));
+                }
+                Ok((bs.len() as u32) <= tip.height)
+            })
+        })?;
+        if bs.len() as u32 != tip.height + 1 {
+            return Err(err("our best chain has a gap"));
+        }
+        for h in path {
+            let b = self.header(c, h)?.map(|r| r.b).filter(|b| *b != 0).ok_or_else(|| err(format!("block {h} is not stored")))?;
+            bs.push(b);
+        }
+        let mut sorter = Sorter::new(tmp, &format!("coins-{c}"))?;
+        let mut rep = CoinImport::default();
+        while let Some((h, p, vout, value, coinbase, script)) = next().map_err(err)? {
+            if rep.read % 100_000 == 0 {
+                if stop.load(Ordering::Relaxed) {
+                    return Err(err("stopped"));
+                }
+                if rep.read % 1_000_000 == 0 {
+                    note(format!("coin set: {} coins read", rep.read));
+                }
+            }
+            rep.read += 1;
+            rep.read_amount += value as u128;
+            let b = *bs.get(h as usize).ok_or_else(|| err(format!("a coin at height {h}, above the copy's {to}")))?;
+            rep.kept += 1;
+            rep.kept_amount += value as u128;
+            sorter.push(&k_pos(c, b, p, vout), &encode_coin(value, h, coinbase, &script))?;
+        }
+        let sorted = sorter.finish()?;
+        self.finish_coin_import(params, path, to, tip, sorted, rep, trusted, tmp, stop, note)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn finish_coin_import(
+        &self,
+        params: &ChainParams,
+        path: &[Hash256],
+        to: u32,
+        tip: Tip,
+        mut sorted: Sorted,
+        mut rep: CoinImport,
+        trusted: &str,
+        tmp: &Path,
+        stop: &AtomicBool,
+        note: Note,
+    ) -> Result<CoinImport> {
+        let c = params.chain_no;
+        let target = path.last().copied().unwrap_or(tip.hash);
         // 2. Only the differences are written. From here until the tip moves the coins are
         // half old, half new: IMPORTING says so (the arcade holds the chain and redoes it).
-        let mut sorted = sorter.finish()?;
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut v = target.0.to_vec();
             v.extend_from_slice(&to.to_be_bytes());
             w.put(STATE, &k_state(c, IMPORTING), &v)
@@ -416,7 +498,7 @@ impl ChainDb {
         self.join_main(params, path, tip.height)?;
         let pre = k_chain(c);
         loop {
-            let n = self.store.write(|w| {
+            let n = self.wstore(c)?.write(|w| {
                 let mut n = 0;
                 for (k, _) in w.scan_prefix_limit(UNDO, &pre, 20_000)? {
                     w.del(UNDO, &k)?;
@@ -429,7 +511,7 @@ impl ChainDb {
             }
         }
         let new_b = self.header(c, &target)?.map(|r| r.b).unwrap_or(0);
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let t = Tip { hash: target, height: to, b: new_b };
             w.put(STATE, &k_state(c, "tip"), &encode_tip(&t))?;
             w.put(STATE, &k_state(c, "coins_at"), &encode_tip(&t))?;
@@ -455,7 +537,7 @@ impl ChainDb {
     fn join_main(&self, params: &ChainParams, path: &[Hash256], base: u32) -> Result<()> {
         let c = params.chain_no;
         for (i, chunk) in path.chunks(50_000).enumerate() {
-            self.store.write(|w| {
+            self.wstore(c)?.write(|w| {
                 for (j, h) in chunk.iter().enumerate() {
                     let height = base + 1 + (i * 50_000 + j) as u32;
                     let mut rec = header_rec(w, c, h)?.ok_or_else(|| err("header missing"))?;
@@ -498,7 +580,7 @@ impl ChainDb {
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
-            let page = if existing_done { Vec::new() } else { self.store.read(|r| r.scan_after(OUTPUTS, &pre, after.as_deref(), 50_000))? };
+            let page = if existing_done { Vec::new() } else { self.store(c).read(|r| r.scan_after(OUTPUTS, &pre, after.as_deref(), 50_000))? };
             if page.is_empty() {
                 existing_done = true;
             }
@@ -545,7 +627,7 @@ impl ChainDb {
             }
             if apply && (!puts.is_empty() || !dels.is_empty()) {
                 // Address rows of removed coins (their scripts read before they go).
-                self.store.read(|r| {
+                self.store(c).read(|r| {
                     for k in &dels {
                         let v = r.get(OUTPUTS, k)?.ok_or_else(|| err("coin vanished"))?;
                         let (b, p, vout) = (be_u32(k, 2), be_u32(k, 6), be_u32(k, 10));
@@ -555,7 +637,7 @@ impl ChainDb {
                     }
                     Ok(())
                 })?;
-                self.store.write(|w| {
+                self.wstore(c)?.write(|w| {
                     for k in &dels {
                         w.del(OUTPUTS, k)?;
                     }
@@ -586,7 +668,7 @@ impl ChainDb {
                 if batch.is_empty() {
                     break;
                 }
-                self.store.write(|w| {
+                self.wstore(c)?.write(|w| {
                     for k in &batch {
                         w.del(BY_SCRIPT, k)?;
                     }
@@ -605,7 +687,7 @@ impl ChainDb {
         }
         while self.clear_address_rows_batch(c, 20_000)? > 0 {}
         let tip = self.tip(c)?.map(|t| t.height).unwrap_or(0);
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             w.put(STATE, &k_state(c, crate::addrbuild::BACKFILL), &tip.to_be_bytes())?;
             w.del(STATE, &k_state(c, crate::addrbuild::BACKFILL_FROM))?;
             w.put(STATE, &k_state(c, crate::addrbuild::PENDING), b"1")?;
@@ -619,7 +701,7 @@ impl ChainDb {
         let mut after: Option<Vec<u8>> = None;
         let (mut n, mut sum) = (0u64, 0u128);
         loop {
-            let page = self.store.read(|r| r.scan_after(OUTPUTS, &pre, after.as_deref(), 100_000))?;
+            let page = self.store(c).read(|r| r.scan_after(OUTPUTS, &pre, after.as_deref(), 100_000))?;
             let Some((last, _)) = page.last() else { break };
             after = Some(last.clone());
             for (_, v) in &page {
@@ -673,7 +755,7 @@ impl Replay {
                 return Err(err("stopped"));
             }
             let end = to.min(self.height + 1000);
-            db.store.read(|r| {
+            db.store(c).read(|r| {
                 for h in self.height + 1..=end {
                     let hv = r.get(HEIGHT, &k_height(c, h))?.ok_or_else(|| err(format!("height {h} is not on the main chain")))?;
                     let b = be_u32(&hv, 32);

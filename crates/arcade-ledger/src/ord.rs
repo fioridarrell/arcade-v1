@@ -13,6 +13,7 @@
 //!     line = sha256(block hash hex + "\n" + per genesis piece "<txid>i0:0:<ctype hex>\n"), as dx;
 //!     chunk hash = sha256(the 100 line hex strings concatenated), chunks of 100 from ord_start
 //!   ord.v1.state    C|"next"          -> next number u64
+//!   ord.v1.types    by content type (ordtypes.rs; derived, not in index copies)
 //! iid = genesis txid (internal byte order) | n u32 (always 0 here); shown as "<txid>i0".
 
 use arcade_chain::params::ChainParams;
@@ -41,6 +42,8 @@ pub const PENDING_BODY: &str = "ord.v1.pending_body";
 /// a long inscription was quadratic).
 pub const PENDING_TXS: &str = "ord.v1.pending_txs";
 pub const TABLES: &[&str] = &[INSC, NUM, PENDING, AT, LOC, BLOCK, STATE, IDS, PENDING_BODY, PENDING_TXS];
+/// Tables each arcade derives from the others itself (index copies leave them out).
+pub const DERIVED: &[&str] = &[crate::ordtypes::TYPES];
 pub const GROUPS: u64 = 64;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -473,7 +476,7 @@ impl Indexer for OrdIndexer {
         "ord.v1"
     }
     fn tables(&self) -> Vec<TableDef> {
-        let mut t: Vec<TableDef> = TABLES.iter().map(|n| TableDef::plain(n)).collect();
+        let mut t: Vec<TableDef> = TABLES.iter().chain(DERIVED).map(|n| TableDef::plain(n)).collect();
         for h in &self.hooks {
             t.extend(h.tables());
         }
@@ -491,6 +494,9 @@ impl Indexer for OrdIndexer {
         let mut moves = String::new();
         let mut births = 0u32;
         let mut next = l.get(STATE, &k(c, b"next"))?.map(|v| be_u64(&v, 0)).unwrap_or(0);
+        // The type rows (once built on this chain): the block's new inscriptions are added.
+        let mut types = crate::ordtypes::trim(l, c, next)?;
+        let mut typed = false;
         for (pos, tx) in ctx.block.txs.iter().enumerate() {
             if tx.is_coinbase() {
                 continue;
@@ -669,6 +675,10 @@ impl Indexer for OrdIndexer {
                 if self.keeps(number) {
                     l.put(INSC, &k(c, &iid), row.to_string().as_bytes())?;
                     l.put(NUM, &KeyBuf::new().u16(c).u64(number).done(), &iid)?;
+                    if let Some(m) = types.as_mut() {
+                        crate::ordtypes::add(l, c, m, number, &ct)?;
+                        typed = true;
+                    }
                 }
                 for h in &self.hooks {
                     h.born(l, c, &Born { params: p, iid: &iid, number, height: ctx.height, ctype: &ct, body: &cm.p.body,
@@ -678,6 +688,9 @@ impl Indexer for OrdIndexer {
         }
         if births > 0 || !lines.is_empty() || !moves.is_empty() {
             l.put(STATE, &k(c, b"next"), &next.to_be_bytes())?;
+        }
+        if let (true, Some(m)) = (typed, &types) {
+            crate::ordtypes::save(l, c, m)?;
         }
         // Fingerprint inputs for this block (dx).
         let line: [u8; 32] = Sha256::digest(format!("{}\n{lines}", ctx.block.header.hash().to_hex()).as_bytes()).into();
@@ -701,7 +714,7 @@ pub fn resolve(db: &ChainDb, c: u16, id: &str) -> Option<[u8; 36]> {
         return Some(iid_bytes(&Hash256::from_hex(id).ok()?, 0));
     }
     let n: u64 = id.parse().ok()?;
-    let v = db.store.read(|r| r.get(NUM, &KeyBuf::new().u16(c).u64(n).done())).ok()??;
+    let v = db.store(c).read(|r| r.get(NUM, &KeyBuf::new().u16(c).u64(n).done())).ok()??;
     v.as_slice().try_into().ok()
 }
 
@@ -709,9 +722,9 @@ pub fn resolve(db: &ChainDb, c: u16, id: &str) -> Option<[u8; 36]> {
 pub fn inscription(db: &ChainDb, p: &ChainParams, id: &str) -> Option<Value> {
     let c = p.chain_no;
     let iid = resolve(db, c, id)?;
-    let mut v: Value = serde_json::from_slice(&db.store.read(|r| r.get(INSC, &k(c, &iid))).ok()??).ok()?;
+    let mut v: Value = serde_json::from_slice(&db.store(c).read(|r| r.get(INSC, &k(c, &iid))).ok()??).ok()?;
     v["id"] = json!(iid_str(&iid));
-    if let Some(at) = db.store.read(|r| r.get(AT, &k(c, &iid))).ok().flatten() {
+    if let Some(at) = db.store(c).read(|r| r.get(AT, &k(c, &iid))).ok().flatten() {
         let mut t = [0u8; 32];
         t.copy_from_slice(&at[..32]);
         let txid = Hash256(t);
@@ -750,7 +763,13 @@ pub fn body_of(p: &ChainParams, meta: &Value, get_tx: &dyn Fn(&Hash256) -> Optio
     let d = dialect(p);
     let mut body = Vec::new();
     let mut left = 0u64;
-    for (i, t) in meta["txs"].as_array().cloned().unwrap_or_default().iter().enumerate() {
+    let txs = meta["txs"].as_array().cloned().unwrap_or_default();
+    // A record copied from an old arcade knows only its first piece's txid until the
+    // background pass finds the others (docs/INDEXBOOT.md §3.1).
+    if (txs.len() as u64) < meta["pieces"].as_u64().unwrap_or(1) {
+        return Err("this inscription's later pieces are not located yet (copied index)".into());
+    }
+    for (i, t) in txs.iter().enumerate() {
         let h = Hash256::from_hex(t.as_str().unwrap_or("")).map_err(|e| e.to_string())?;
         let tx = get_tx(&h).ok_or("piece transaction not available")?;
         let s = &tx.inputs.first().ok_or("no inputs")?.script_sig;
@@ -767,7 +786,7 @@ pub fn chunk(db: &ChainDb, p: &ChainParams, n: u32) -> Option<(String, u32)> {
     let mut cat = String::with_capacity(6400);
     let mut births = 0;
     for h in base..base + 100 {
-        let v = db.store.read(|r| r.get(BLOCK, &KeyBuf::new().u16(p.chain_no).u32(h).done())).ok()??;
+        let v = db.store(p.chain_no).read(|r| r.get(BLOCK, &KeyBuf::new().u16(p.chain_no).u32(h).done())).ok()??;
         cat.push_str(&hex::encode(&v[..32]));
         births += u32::from_be_bytes(v[64..68].try_into().ok()?);
     }
@@ -776,12 +795,40 @@ pub fn chunk(db: &ChainDb, p: &ChainParams, n: u32) -> Option<(String, u32)> {
 
 /// An inscription's number, whether or not its record is held here.
 pub fn number_of(db: &ChainDb, c: u16, iid: &[u8; 36]) -> Option<u64> {
-    let v = db.store.read(|r| r.get(IDS, &k(c, iid))).ok()??;
+    let v = db.store(c).read(|r| r.get(IDS, &k(c, iid))).ok()??;
     Some(u64::from_be_bytes(v[..8].try_into().ok()?))
 }
 
+/// (number, content type) of inscriptions numbered lo..hi kept here, in one snapshot (a
+/// Shared-storage arcade skips the groups it doesn't keep).
+pub fn content_types(db: &ChainDb, c: u16, lo: u64, hi: u64) -> Vec<(u64, String)> {
+    if hi <= lo {
+        return Vec::new();
+    }
+    let pre = KeyBuf::new().u16(c).done();
+    let mut out = Vec::new();
+    db.store(c)
+        .read(|r| {
+            let after = KeyBuf::new().u16(c).u64(lo.saturating_sub(1)).done();
+            let rows = r.scan_after(NUM, &pre, (lo > 0).then_some(&after[..]), (hi - lo) as usize)?;
+            for (key, iid) in rows {
+                let n = be_u64(&key, 2);
+                if n >= hi {
+                    break;
+                }
+                if let Some(v) = r.get(INSC, &k(c, &iid))? {
+                    let ct = serde_json::from_slice::<Value>(&v).ok().and_then(|v| v["ct"].as_str().map(String::from)).unwrap_or_default();
+                    out.push((n, ct));
+                }
+            }
+            Ok(())
+        })
+        .ok();
+    out
+}
+
 pub fn count(db: &ChainDb, c: u16) -> u64 {
-    db.store
+    db.store(c)
         .read(|r| r.get(STATE, &k(c, b"next")))
         .ok()
         .flatten()
@@ -794,7 +841,7 @@ pub fn held_by(db: &ChainDb, p: &ChainParams, script: &[u8]) -> Result<Vec<Strin
     let c = p.chain_no;
     let mut out = Vec::new();
     for (op, _, _) in db.coins_for_script(p, script)? {
-        for (key, _) in db.store.read(|r| r.scan_prefix(LOC, &loc_prefix(c, &op.txid, op.vout)))? {
+        for (key, _) in db.store(c).read(|r| r.scan_prefix(LOC, &loc_prefix(c, &op.txid, op.vout)))? {
             out.push(iid_str(&key[key.len() - 36..]));
         }
     }

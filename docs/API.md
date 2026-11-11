@@ -82,6 +82,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `mesh.udp` | `/api/v1/mesh/udp` | read | — | UDP hole punching: STUN server and proved addresses, NAT kind, which links run over UDP paths (RTT, packets), introductions. |
 | `mesh.udp_set` | `/api/v1/mesh/udp_set` | admin | on?, lan_dial?, stun_port?, drop? | Turn UDP paths and introductions on or off (ARCADE_MESH_UDP=0 overrides), offer LAN addresses to every peer, set the STUN port for the next start (0 = none); drop = a peer id prefix whose path to fail now (falls back to TCP). |
+| `mesh.overview` | `/api/v1/mesh/overview` | public | — | The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours. |
 
 ### Tx
 
@@ -99,6 +100,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `wallet.create` | `/api/v1/wallet/create` | local | phrase? | Create a wallet (or restore one from 12 words). Returns the new words once. |
 | `wallet.phrase` | `/api/v1/wallet/phrase` | local | — | The wallet's 12 words. |
 | `wallet.keys` | `/api/v1/wallet/keys` | read | chain? | Your addresses on a chain, their @tags and balances. |
+| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, send? | Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
 | `wallet.link` | `/api/v1/wallet/link` | wallet | chain, wif, tag | Link another wallet to your @tag (signed by both keys). |
 | `wallet.unlink` | `/api/v1/wallet/unlink` | wallet | chain, address, tag | Remove a linked wallet. |
 | `wallet.links` | `/api/v1/wallet/links` | read | chain | Your linked wallets on a chain. |
@@ -109,6 +111,13 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `wallet.preview` | `/api/v1/wallet/preview` | read | id | A request's transaction as it would be built now: outputs and fee. |
 | `wallet.approve` | `/api/v1/wallet/approve` | local | id | Approve a request: sign and send it. |
 | `wallet.deny` | `/api/v1/wallet/deny` | local | id | Refuse a request. |
+
+### Dd
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `dd.wallet` | `/api/v1/dd/wallet` | read | chain? | Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen). |
+| `dd.send` | `/api/v1/dd/send` | local | chain?, to, cents, send? | Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown. |
 
 ### Account
 
@@ -245,6 +254,22 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `chains.copy_start` | `/api/v1/chains/copy_start` | admin | key, what? | Bootstrap a chain from the best copy offered: what = coins (the coin set; missing blocks are fetched from the network and stored, default) or all (the copy's blocks too). |
 | `chains.copy_cancel` | `/api/v1/chains/copy_cancel` | admin | key | Stop fetching a copy (its pieces are deleted) or decline the offer: the chain syncs the usual way. |
 | `chains.copy_verify` | `/api/v1/chains/copy_verify` | admin | key | Re-check a coin set taken from a copy: derive it from the blocks again (ours replaces it if it differs). |
+| `chains.index_copy_status` | `/api/v1/chains/index_copy_status` | public | key? | Index copies (docs/INDEXBOOT.md): what old arcades offer per chain, the fetch, its votes, and whether an index here came from a copy. |
+| `chains.index_copy_start` | `/api/v1/chains/index_copy_start` | admin | key, index, from? | Fetch an index copy now from the best offer (index = ledger or ord; from = one arcade's node id): it is taken in only if 2 or more other arcades agree with it. |
+| `chains.index_copy_cancel` | `/api/v1/chains/index_copy_cancel` | admin | key, index | Stop fetching an index copy (its pieces are deleted). |
+
+### Share
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `share.held` | `/api/v1/share/held` | public | — | V1.0 copies of chain parts held here (blocks, coins, ord, tokens, names, maps, ledger, profiles, messages): id, height, rows, size; and those being made. |
+| `share.offers` | `/api/v1/share/offers` | public | key | V1.0 copies other arcades hold for a chain, per part: id, height, how many made it themselves and how many hold it. |
+| `share.fetch` | `/api/v1/share/fetch` | admin | key, fam, id? | Fetch a part's copy from every arcade holding it at once: the newest one 2 or more arcades made themselves (or the id given). Pieces are checked against the manifest; the copy is then held and served here too. |
+| `share.install` | `/api/v1/share/install` | admin | key | Install an added chain (or the home chain) from V1.0 copies: its blocks and coins made by 2 or more arcades at the same checkpoint, fetched from every holder and taken in as they come (no replay); the coins are trusted until re-checked. |
+| `share.install_cancel` | `/api/v1/share/install_cancel` | admin | key | Stop installing a chain from copies. |
+| `share.cancel` | `/api/v1/share/cancel` | admin | key, fam | Stop fetching a copy (its pieces are deleted). |
+| `share.auto` | `/api/v1/share/auto` | admin | key, on | Make copies of every part of a chain at each checkpoint (about a day of its blocks) while at the tip; off by default (copies take disk). |
+| `share.make` | `/api/v1/share/make` | admin | key, fam | Make a V1.0 copy of one part of an installed chain now, from one frozen view of the database (in the background; see share.held). |
 
 ### Borrow
 

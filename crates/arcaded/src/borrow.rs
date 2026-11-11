@@ -115,8 +115,23 @@ pub fn watched(node: &Node, p: &ChainParams) -> Vec<Watched> {
         }
     }
     for k in keys {
-        if let Some(s) = script_for_address(p, &k.address) {
-            add(&mut out, Watched { address: k.address.clone(), script: s, key: KeySrc::Tag(k.index) });
+        let pk = hex::decode(&k.pubkey).ok().and_then(|b| arcade_wallet::secp256k1::PublicKey::from_slice(&b).ok());
+        match pk {
+            // Every address of the key: on DigiByte its dgb1... address first, then D...
+            Some(pk) => {
+                for (a, s) in crate::coinsend::key_scripts(p, &pk) {
+                    add(&mut out, Watched { address: a, script: s, key: KeySrc::Tag(k.index) });
+                }
+                // DigiDollar coins sit at the key's Taproot output (zero-value outputs).
+                if let Some((a, _, s)) = crate::ddsvc::dd_address(p, &pk) {
+                    add(&mut out, Watched { address: a, script: s, key: KeySrc::Tag(k.index) });
+                }
+            }
+            None => {
+                if let Some(s) = script_for_address(p, &k.address) {
+                    add(&mut out, Watched { address: k.address.clone(), script: s, key: KeySrc::Tag(k.index) });
+                }
+            }
         }
     }
     // Imported wallets (any kind: legacy, P2SH-SegWit, native SegWit) of the account in use.
@@ -519,6 +534,11 @@ fn stored_header(node: &Node, p: &ChainParams, h: u32) -> Option<(Hash256, Heade
     Some((Hash256(v[..32].try_into().unwrap()), Header::parse(v[32..112].try_into().unwrap())))
 }
 
+/// The height of a borrowed coin's block (None when it isn't one of ours, or isn't mined yet).
+pub fn coin_height(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<u32> {
+    coin(node, p, op).and_then(|c| c["h"].as_u64()).map(|h| h as u32)
+}
+
 fn coin(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<Value> {
     get_json(node, &k_c(p.key, op))
 }
@@ -587,7 +607,8 @@ fn connect(node: &Node, p: &ChainParams, height: u32, b: &Block, watch: &HashSet
                 if coin(node, p, &op).is_some() {
                     continue;
                 }
-                let a = arcade_ledger::address::address_of(&o.script_pubkey, p);
+                // As the wallet names it (SegWit outputs too: dgb1...).
+                let a = arcade_ledger::address::wallet_address_of(&o.script_pubkey, p);
                 let row = json!({"v": o.value, "s": hex::encode(&o.script_pubkey), "a": a, "h": height, "cb": tx.is_coinbase(), "sp": null, "sh": null, "src": "block"});
                 undo.push(json!({"add": [tx.txid.to_hex(), vout]}));
                 puts.push((k_c(key, &op), row.to_string().into_bytes()));
@@ -684,14 +705,38 @@ pub fn installed_ready(node: &Node, p: &ChainParams) -> bool {
     tip > 0 && tip + 10 >= top && addresses_ready
 }
 
+/// How far the home chain is behind the best height anyone tells us (headers, arcades on the
+/// mesh, lenders), and whether its address rows are built.
+pub(crate) fn home_lag(node: &Node) -> (u32, bool) {
+    let p = node.params;
+    let c = p.chain_no;
+    let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
+    let best = node.chain.best_header(c).ok().flatten().and_then(|h| node.chain.header(c, &h).ok().flatten()).map(|r| r.height).unwrap_or(0);
+    let mesh = node.mesh_tips.lock().unwrap().values().map(|t| t.height as u32).max().unwrap_or(0);
+    let bk = node.bk_peers.lock().unwrap().values().map(|h| *h as u32).max().unwrap_or(0);
+    let lent = node.offers_for(p.key).iter().map(|o| o.3 as u32).max().unwrap_or(0);
+    let top = best.max(mesh).max(bk).max(lent);
+    let addresses_ready = !node.chain.addresses_on(c).unwrap_or(true) || !node.chain.addresses_pending(c).unwrap_or(true);
+    (top.saturating_sub(tip), addresses_ready)
+}
+
 /// Start, keep and stop borrowing per chain (called every 20 s and on every switch).
+/// Any chain is borrowed while it is being synced or taken in from copies, the home chain
+/// included (Martin: balances, the test coin and the @handle claim work at once on a fresh
+/// install); its own copy takes over once it has caught up.
 pub fn manage(node: &Node) {
     let c = cfg(node);
     let installed: BTreeSet<String> = node.extra.lock().unwrap().keys().cloned().collect();
     for p in ALL_CHAINS.iter().copied() {
         let home = p.chain_no == node.params.chain_no;
-        let on = chain_on(&c, p.key) && !home && !(installed.contains(p.key) && installed_ready(node, p));
         let running = ST.runs.lock().unwrap().get(p.key).cloned();
+        let on = if home {
+            // Home: start when 100+ blocks behind, stop once within 10 with addresses built.
+            let (lag, addr_ready) = home_lag(node);
+            chain_on(&c, p.key) && if running.is_some() { !(lag <= 10 && addr_ready) } else { lag > 100 }
+        } else {
+            chain_on(&c, p.key) && !(installed.contains(p.key) && installed_ready(node, p))
+        };
         match (on, running) {
             (true, None) => {
                 // Only once an arcade lends it (or we borrowed it before).
@@ -708,7 +753,7 @@ pub fn manage(node: &Node) {
             (false, Some(run)) => {
                 run.stop.store(true, Ordering::Relaxed);
                 ST.runs.lock().unwrap().remove(p.key);
-                let why = if installed.contains(p.key) { "its installed copy has caught up" } else { "switched off" };
+                let why = if installed.contains(p.key) || home { "its own copy has caught up" } else { "switched off" };
                 let _ = node.app.event("borrow", &format!("stopped borrowing {} ({why}); its borrowed data is removed", p.name));
                 let n = node.self_arc();
                 let key = p.key;
@@ -1137,6 +1182,15 @@ pub fn spendable(node: &Node, p: &ChainParams, script: &[u8]) -> Vec<Utxo> {
     out
 }
 
+/// Does the borrowed copy of a chain know a transaction: it waits at a lender, or one of the
+/// coins read for this arcade's addresses came from it?
+pub fn knows_tx(node: &Node, p: &ChainParams, txid: &Hash256) -> bool {
+    if ST.pool.lock().unwrap().get(p.key).is_some_and(|m| m.contains_key(txid)) {
+        return true;
+    }
+    coin_rows(node, p.key).iter().any(|(op, _)| op.txid == *txid)
+}
+
 /// borrow.coins: the wallet's coins on a borrowed chain.
 pub fn coins(node: &Node, key: &str) -> R {
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
@@ -1146,7 +1200,10 @@ pub fn coins(node: &Node, key: &str) -> R {
     let spent = pool_spent(p.key);
     let rows: Vec<Value> = coin_rows(node, p.key)
         .into_iter()
-        .map(|(op, c)| json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": c["v"], "address": c["a"], "height": c["h"], "coinbase": c["cb"],
+        .map(|(op, c)| json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": c["v"],
+                               // Rows kept before SegWit outputs had a name: name them from the script.
+                               "address": if c["a"].is_null() { json!(c["s"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|s| arcade_ledger::address::wallet_address_of(&s, p))) } else { c["a"].clone() },
+                               "height": c["h"], "coinbase": c["cb"],
                                "spent_by": c["sp"], "spent_at": c["sh"], "from": c["src"], "spending": spent.contains(&op)}))
         .collect();
     let unconfirmed: Vec<Value> = ST.pool.lock().unwrap().get(p.key).map(|m| m.iter().map(|(id, v)| json!({"txid": id.to_hex(), "seen": v.1, "size": v.0.len()})).collect()).unwrap_or_default();
@@ -1159,10 +1216,10 @@ pub fn coins(node: &Node, key: &str) -> R {
 // ---------------- sending ----------------
 
 fn fee_rate(node: &Node, p: &ChainParams) -> u64 {
-    let doge_like = matches!(p.key, "peptest" | "pep" | "doge" | "flop" | "wjk" | "kot");
-    let fallback = if doge_like { crate::claims::FEE_PER_KB } else { 20_000 };
+    let fp = crate::coinsend::fee_policy(p);
+    let fallback = fp.fallback_per_kb.max(fp.floor_per_kb);
     match call_any(node, p, json!([["estimatesmartfee", [6]]])) {
-        Ok((_, a)) => r(&a[0]).ok().and_then(|v| v["feerate"].as_f64()).filter(|f| *f > 0.0).map(|f| (f * 1e8) as u64).map(|s| s.clamp(1_000, crate::claims::FEE_PER_KB.max(fallback))).unwrap_or(fallback),
+        Ok((_, a)) => r(&a[0]).ok().and_then(|v| v["feerate"].as_f64()).filter(|f| *f > 0.0).map(|f| (f * 1e8) as u64).map(|s| s.clamp(fp.floor_per_kb, crate::claims::FEE_PER_KB.max(fallback))).unwrap_or(fallback),
         Err(_) => fallback,
     }
 }
@@ -1176,23 +1233,50 @@ pub fn send(node: &Node, key: &str, to: &str, amount: u64, from: Option<&str>, b
         return Err(format!("{} is not borrowed here (installed chains send from the Wallet tab)", p.name));
     }
     let to_script = script_for_address(p, to).ok_or_else(|| format!("{to} is not a {} address", p.name))?;
-    // Only standard (P2PKH) addresses can be signed for here; SegWit imports can't spend yet.
-    let p2pkh = |sc: &[u8]| sc.len() == 25 && sc[0] == 0x76 && sc[1] == 0xa9;
-    let w: Vec<Watched> = watched(node, p).into_iter().filter(|x| p2pkh(&x.script)).collect();
+    // Key-hash coins can be signed for here: P2PKH, and P2WPKH (BIP143) on SegWit chains. Other
+    // kinds (P2SH-wrapped SegWit imports) can't spend yet.
+    let keyhash = |sc: &[u8]| (sc.len() == 25 && sc[0] == 0x76 && sc[1] == 0xa9) || (sc.len() == 22 && sc[0] == 0 && sc[1] == 20);
+    let w: Vec<Watched> = watched(node, p).into_iter().filter(|x| keyhash(&x.script)).collect();
     let pick = match from {
-        Some(f) => w.iter().find(|x| x.address == f).cloned().ok_or("that address is not this wallet's, or is SegWit (sending from SegWit isn't supported yet)")?,
+        Some(f) => w.iter().find(|x| x.address == f).cloned().ok_or("that address is not this wallet's, or is a kind that can't be spent here yet")?,
         None => w.iter().filter(|x| !matches!(x.key, KeySrc::None)).max_by_key(|x| spendable(node, p, &x.script).iter().map(|u| u.value).sum::<u64>()).cloned().ok_or("this wallet has no address on that chain")?,
     };
     let sk = key_of(node, p, &pick.key).ok_or("no key for that address here")?;
-    let coins = spendable(node, p, &pick.script);
-    let dust = if matches!(p.key, "btc" | "ltc" | "ltctest" | "dgb" | "dgbtest") { 1_000 } else { crate::claims::DUST };
-    let tx = arcade_wallet::tx::build_send(p, &to_script, amount, &sk, &coins, fee_rate(node, p), dust, arcade_app::now() as u32).map_err(e)?;
+    // Every key-hash address of the same key spends together; change goes to its receiving one.
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    let mine = crate::coinsend::key_scripts(p, &pk);
+    let mut coins = Vec::new();
+    for (_, sc) in mine.iter().filter(|(_, sc)| w.iter().any(|x| &x.script == sc)) {
+        coins.extend(spendable(node, p, sc));
+    }
+    if !mine.iter().any(|(_, sc)| *sc == pick.script) {
+        coins.extend(spendable(node, p, &pick.script));
+    }
+    let change = if mine.iter().any(|(_, sc)| *sc == pick.script) { mine[0].1.clone() } else { pick.script.clone() };
+    let fp = crate::coinsend::fee_policy(p);
+    let tx = arcade_wallet::tx::build_send_keyhash(p, &to_script, amount, &sk, &coins, &change, fee_rate(node, p), fp.dust, arcade_app::now() as u32)?;
     let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
     let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
     let mut out = json!({"txid": tx.txid.to_hex(), "from": pick.address, "to": to, "amount": amount, "fee": fee, "size": tx.raw.len(), "sent": false});
     if !broadcast {
         return Ok(out);
     }
+    match broadcast_tx(node, p, &tx) {
+        Ok(answers) => out["lenders"] = answers,
+        Err((why, answers)) => {
+            out["lenders"] = answers;
+            return Err(why);
+        }
+    }
+    let _ = node.app.event("borrow", &format!("sent {amount} on {} to {to} ({})", p.name, tx.txid.to_hex()));
+    out["sent"] = json!(true);
+    Ok(out)
+}
+
+/// Send a signed transaction on a borrowed chain: to every lender (sendrawtransaction) and the
+/// coin's P2P peers we know; kept as waiting here once a lender takes it. Ok(lender answers),
+/// or Err(why, lender answers) when no lender took it.
+pub fn broadcast_tx(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<Value, (String, Value)> {
     let hx = hex::encode(&tx.raw);
     let mut answers = Vec::new();
     let mut ok = false;
@@ -1224,14 +1308,22 @@ pub fn send(node: &Node, key: &str, to: &str, amount: u64, from: Option<&str>, b
         });
     }
     if !ok {
-        out["lenders"] = json!(answers);
-        return Err(format!("no lender took the transaction: {}", json!(answers)));
+        return Err((format!("no lender took the transaction: {}", json!(answers)), json!(answers)));
     }
     ST.pool.lock().unwrap().entry(p.key.to_string()).or_default().insert(tx.txid, (tx.raw.clone(), arcade_app::now()));
-    let _ = node.app.event("borrow", &format!("sent {amount} on {} to {to} ({})", p.name, tx.txid.to_hex()));
-    out["sent"] = json!(true);
-    out["lenders"] = json!(answers);
-    Ok(out)
+    Ok(json!(answers))
+}
+
+/// A transaction of a borrowed chain, from a lender's Core (checked against its txid).
+pub fn raw_tx(node: &Node, p: &ChainParams, txid: &arcade_chain::Hash256) -> Result<Tx, String> {
+    let (_, a) = call_any(node, p, json!([["getrawtransaction", [txid.to_hex(), 0]]]))?;
+    let hx = r(&a[0])?;
+    let raw = hex::decode(hx.as_str().ok_or("not hex")?).map_err(|e| e.to_string())?;
+    let tx = Tx::parse_with(&raw, &p.format).map_err(|e| e.to_string())?;
+    if tx.txid != *txid {
+        return Err("the lender's transaction has another txid".into());
+    }
+    Ok(tx)
 }
 
 // ---------------- status ----------------
@@ -1394,11 +1486,11 @@ fn x_tx(node: &Node, p: &'static ChainParams, id: &str) -> R {
         let prev = ans.get(k).filter(|_| k < n_in).and_then(|x| r(x).ok()).and_then(|x| x.as_str()).and_then(|s| hex::decode(s).ok()).and_then(|b| Tx::parse_with(&b, &p.format).ok()).filter(|pt| pt.txid == i.prevout.txid);
         let o = prev.as_ref().and_then(|pt| pt.outputs.get(i.prevout.vout as usize));
         total_in += o.map(|o| o.value).unwrap_or(0);
-        let a = o.and_then(|o| arcade_ledger::address::address_of(&o.script_pubkey, p));
+        let a = o.and_then(|o| arcade_ledger::address::wallet_address_of(&o.script_pubkey, p));
         json!({"txid": i.prevout.txid.to_hex(), "vout": i.prevout.vout, "value": o.map(|o| o.value), "address": a, "tag": null})
     }).collect();
     let outputs: Vec<Value> = t.outputs.iter().enumerate().map(|(k, o)| {
-        let a = arcade_ledger::address::address_of(&o.script_pubkey, p);
+        let a = arcade_ledger::address::wallet_address_of(&o.script_pubkey, p);
         let unspent = ans.get(n_in + k).and_then(|x| r(x).ok()).map(|x| !x.is_null());
         let ours = coin(node, p, &OutPoint { txid, vout: k as u32 });
         let spent_by = ours.as_ref().and_then(|c| c["sp"].as_str().map(|s| json!({"txid": s, "vin": c["vin"]})))
@@ -1438,13 +1530,31 @@ fn x_addr(node: &Node, p: &'static ChainParams, a: &str) -> R {
     Ok(v)
 }
 
+/// The whole mempool, from a lender's Core (getrawmempool, verbose): newest first, up to
+/// 500, with ours (pushed to us in full) first.
 fn x_mempool(node: &Node, p: &'static ChainParams) -> R {
     let pool: Vec<(Hash256, Vec<u8>, u64)> = ST.pool.lock().unwrap().get(p.key).map(|m| m.iter().map(|(k, v)| (*k, v.0.clone(), v.1)).collect()).unwrap_or_default();
-    let txs: Vec<Value> = pool.iter().filter_map(|(_, raw, seen)| Tx::parse_with(raw, &p.format).ok().map(|t| json!({"txid": t.txid.to_hex(), "seen": seen, "size": t.raw.len(),
-        "out": t.outputs.iter().map(|o| o.value).sum::<u64>(), "rbf": t.inputs.iter().any(|i| i.sequence < 0xffff_fffe), "kind": "payment"}))).collect();
-    let info = call_any(node, p, json!([["getmempoolinfo", []]])).ok().and_then(|(_, a)| r(&a[0]).ok().cloned()).unwrap_or(Value::Null);
-    Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": [], "unit": crate::explorer::unit(p), "lender_pool": info,
-              "note": "Borrowed: only waiting transactions that touch this wallet are listed; lender_pool is the lender's whole mempool."}))
+    let mut txs: Vec<Value> = pool.iter().filter_map(|(_, raw, seen)| Tx::parse_with(raw, &p.format).ok().map(|t| json!({"txid": t.txid.to_hex(), "seen": seen, "size": t.raw.len(),
+        "out": t.outputs.iter().map(|o| o.value).sum::<u64>(), "rbf": t.inputs.iter().any(|i| i.sequence < 0xffff_fffe), "kind": "payment", "mine": true}))).collect();
+    let ans = call_any(node, p, json!([["getmempoolinfo", []], ["getrawmempool", [true]]])).ok();
+    let info = ans.as_ref().and_then(|(_, a)| r(&a[0]).ok().cloned()).unwrap_or(Value::Null);
+    let mut whole: Vec<Value> = ans.as_ref().and_then(|(_, a)| r(&a[1]).ok().cloned()).and_then(|v| v.as_object().cloned()).map(|m| {
+        m.into_iter().map(|(txid, e)| {
+            let fee = e["fees"]["base"].as_f64().or_else(|| e["fee"].as_f64()).map(|f| (f * 1e8).round() as u64);
+            json!({"txid": txid, "seen": e["time"], "size": e["vsize"].as_u64().or_else(|| e["size"].as_u64()), "fee": fee, "out": null, "kind": "payment"})
+        }).collect()
+    }).unwrap_or_default();
+    whole.retain(|w| !txs.iter().any(|t| t["txid"] == w["txid"]));
+    whole.sort_by_key(|w| std::cmp::Reverse(w["seen"].as_u64().unwrap_or(0)));
+    let total = info["size"].as_u64().unwrap_or((txs.len() + whole.len()) as u64);
+    txs.extend(whole.into_iter().take(500));
+    Ok(json!({"count": total, "txs": txs, "pending_tags": [], "unit": crate::explorer::unit(p), "lender_pool": info,
+              "note": "Borrowed: the lender's whole mempool (newest 500 shown)."}))
+}
+
+/// The borrow state line of a chain being borrowed ("Borrowed · at block …").
+pub fn state_text(key: &str) -> Option<String> {
+    ST.runs.lock().unwrap().get(key).map(|r| r.state.lock().unwrap().clone())
 }
 
 #[cfg(test)]

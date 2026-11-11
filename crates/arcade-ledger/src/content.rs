@@ -23,10 +23,10 @@ pub fn inscription(db: &ChainDb, c: u16, id: &str) -> Option<Value> {
         id.to_string()
     } else {
         let n: u64 = id.parse().ok()?;
-        let v = db.store.read(|r| r.get(BY_NUMBER, &KeyBuf::new().u16(c).u64(n).done())).ok()??;
+        let v = db.store(c).read(|r| r.get(BY_NUMBER, &KeyBuf::new().u16(c).u64(n).done())).ok()??;
         String::from_utf8(v).ok()?
     };
-    let v = db.store.read(|r| r.get(INSCRIPTION, &KeyBuf::new().u16(c).bytes(txid.as_bytes()).done())).ok()??;
+    let v = db.store(c).read(|r| r.get(INSCRIPTION, &KeyBuf::new().u16(c).bytes(txid.as_bytes()).done())).ok()??;
     serde_json::from_slice(&v).ok()
 }
 
@@ -52,7 +52,7 @@ pub fn content(db: &ChainDb, p: &ChainParams, id: &str) -> Result<Content, Strin
     let meta = inscription(db, c, id).ok_or("no such inscription")?;
     let txid = meta["txid"].as_str().unwrap_or("").to_string();
     let pre = KeyBuf::new().u16(c).bytes(txid.as_bytes()).done();
-    let pieces = db.store.read(|r| r.scan_prefix(PIECE, &pre)).map_err(|e| e.to_string())?;
+    let pieces = db.store(c).read(|r| r.scan_prefix(PIECE, &pre)).map_err(|e| e.to_string())?;
     let mut stream = Vec::new();
     for (_, ptx) in pieces.iter().rev() {
         // highest countdown first (keys sort ascending)

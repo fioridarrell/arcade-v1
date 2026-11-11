@@ -50,7 +50,7 @@
     return h("div", { class: "fd-card" + (depth ? " fd-sub" : "") },
       h("div", { class: "fd-head" }, who, a.name && a.name !== a.tag ? h("span", { class: "s" }, " " + a.name) : "",
         h("span", { class: "s" }, ` · ${p.height ? ago(p.age_hours || 0) : "waiting for a block"}${p.edited ? " · edited" : ""}${p.channel && p.channel !== "main" ? " · #" + p.channel : ""}`)),
-      text, file, acts, replyBox, tipBox,
+      text, ...(p.muted ? [] : contentEmbeds(p.text)), file, acts, replyBox, tipBox,
       ...(p.replies || []).map((r) => card(r, depth + 1)));
   }
 

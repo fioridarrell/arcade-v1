@@ -94,7 +94,7 @@ fn best_height(node: &Node, c: u16) -> u32 {
 }
 
 /// Our own headers up to `h` (each checked as any header sync checks it).
-fn headers_to(node: &Node, p: &'static ChainParams, h: u32, cancel: &AtomicBool, note: &dyn Fn(String)) -> Result<(), String> {
+pub(crate) fn headers_to(node: &Node, p: &'static ChainParams, h: u32, cancel: &AtomicBool, note: &dyn Fn(String)) -> Result<(), String> {
     let c = p.chain_no;
     let syncer = Syncer::new(&node.chain, p);
     for _round in 0..5 {
@@ -772,8 +772,8 @@ mod tests {
             assert_eq!(rep.read, n);
             assert_eq!(db.tip(c).unwrap(), reference.tip(c).unwrap());
             for t in [arcade_chaindb::schema::OUTPUTS, arcade_chaindb::schema::TXS, arcade_chaindb::schema::HEIGHT] {
-                let a = db.store.read(|r| r.scan_prefix(t, b"")).unwrap();
-                let b = reference.store.read(|r| r.scan_prefix(t, b"")).unwrap();
+                let a = db.store(c).read(|r| r.scan_prefix(t, b"")).unwrap();
+                let b = reference.store(c).read(|r| r.scan_prefix(t, b"")).unwrap();
                 assert!(a == b, "{t} from {upto}");
             }
             assert!(db.build_addresses(p, &tmp, &stop, &mut |_| {}).unwrap());

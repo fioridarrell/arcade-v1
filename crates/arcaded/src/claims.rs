@@ -42,7 +42,13 @@ pub fn spendable(node: &Node, script: &[u8]) -> Vec<Utxo> {
     coins(node, script)
 }
 
-fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
+pub(crate) fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
+    // The home chain still catching up: its borrowed copy knows the coins (incl. waiting ones).
+    if crate::borrow::is_borrowed(node.params.key) {
+        let mut out = crate::borrow::spendable(node, node.params, script);
+        out.retain(|u| !node.pending_spent.lock().unwrap().contains(&u.outpoint));
+        return out;
+    }
     let mut out = confirmed_coins(node, script);
     out.extend(unconfirmed_coins(node, script));
     out
@@ -51,16 +57,15 @@ fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
 /// Outputs of pooled (unconfirmed) transactions paying `script`, not already spent by
 /// another pooled transaction or by one of ours. Spending them is valid: parent and child
 /// confirm together (Core accepts chains of unconfirmed transactions).
-fn unconfirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
+pub(crate) fn unconfirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     let p = node.params;
     let c = p.chain_no;
     let mut out = Vec::new();
     for (_, raw) in node.chain.mempool(c).unwrap_or_default() {
         let Ok(tx) = arcade_chain::Tx::parse_with(&raw, &p.format) else { continue };
-        // BIP125: a parent that signals replaceability could be swapped out; never build on it.
-        if signals_rbf(&tx) {
-            continue;
-        }
+        // A parent that signals replaceability (BIP125) could be swapped out; it is still
+        // spent (test coins usable within seconds), and a claim whose transaction drops out
+        // of the pool that way is built again (advance_one, Sent).
         for (vout, o) in tx.outputs.iter().enumerate() {
             if o.script_pubkey != script {
                 continue;
@@ -111,6 +116,14 @@ pub fn start(node: &Node, tag: &str) -> Result<Claim, String> {
     if !node.app.has_wallet().map_err(|e| e.to_string())? {
         return Err("create a wallet first (arcade wallet create)".into());
     }
+    // One @handle per wallet (Martin 2026-11-10: no claiming more than one).
+    let p = node.params;
+    if let Some(t) = node.app.tag_keys(p.chain_no).unwrap_or_default().into_iter().find_map(|k| k.tag) {
+        return Err(format!("this wallet already has @{t}; one @handle per wallet"));
+    }
+    if let Some(c) = node.app.claims().unwrap_or_default().into_iter().find(|c| c.chain == p.chain_no && c.status != ClaimStatus::Failed) {
+        return Err(format!("this wallet already has a claim for @{} in progress", c.tag));
+    }
     let index = node.app.free_tag_index(node.params.chain_no).map_err(|e| e.to_string())?;
     let now = arcade_app::now();
     let claim = Claim {
@@ -156,33 +169,53 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                 Ok(tx) => {
                     crate::claims::mark_spent(node, &tx);
                     node.tx_outbox.lock().unwrap().push(tx.raw.clone());
+                    // While the home chain is borrowed (catching up), its lenders send it now.
+                    if crate::borrow::is_borrowed(p.key) {
+                        if let Err((why, _)) = crate::borrow::broadcast_tx(node, p, &tx) {
+                            node.app.event("tag", &format!("claim for @{}: lenders didn't take it yet ({why})", c.tag)).ok();
+                        }
+                    }
                     c.txid = Some(tx.txid.to_hex());
                     set(&mut c, ClaimStatus::Sent, "claim sent; waiting for a block");
                     node.app.event("tag", &format!("claim for @{} sent in {}", c.tag, tx.txid)).ok();
                 }
                 Err(e) => {
-                    if c.status == ClaimStatus::Checking {
-                        let already = node.app.faucet_requests().unwrap_or_default().iter().any(|f| f.address == key.address);
-                        if !already {
-                            crate::faucet::ask(node, &key.address, &c.tag)?;
-                        }
-                    }
+                    // Test coins: asked for by themselves, and again while none came.
+                    crate::faucet::ask_if_needed(node, &key.address, &c.tag)?;
                     set(&mut c, ClaimStatus::Funding, &format!("waiting for test coins to {} ({e})", key.address));
                 }
             }
         }
         ClaimStatus::Sent => {
-            let confirmed = arcade_ledger::index::tag_row(&node.chain, p.chain_no, &c.tag).ok().flatten().map(|r| r.address == key.address);
+            let local = arcade_ledger::index::tag_row(&node.chain, p.chain_no, &c.tag).ok().flatten().map(|r| r.address == key.address);
+            // This arcade's own tag index still catching up: the mesh's word decides
+            // (ThinkPad 2026-11-09: @test14 was claimed on chain, but the local index was at
+            // block 54,000, so the card waited for the test coin for good).
+            let lagging = local.is_none() && (crate::borrow::is_borrowed(p.key) || crate::borrow::home_lag(node).0 > 10);
+            let mesh = if lagging { mesh_owner(node, &c.tag) } else { None };
+            let confirmed = local.or(mesh.as_ref().map(|a| *a == key.address));
             match confirmed {
                 Some(true) => {
-                    set(&mut c, ClaimStatus::Confirmed, "confirmed on chain");
+                    set(&mut c, ClaimStatus::Confirmed, if local.is_some() { "confirmed on chain" } else { "confirmed on chain (seen by the mesh; this arcade is still catching up)" });
                     let mut k = key.clone();
                     k.tag = Some(c.tag.clone());
                     node.app.put_tag_key(&k).ok();
                     node.app.event("tag", &format!("@{} is yours", c.tag)).ok();
                 }
                 Some(false) => set(&mut c, ClaimStatus::Failed, "someone else's claim confirmed first"),
-                None => {}
+                None => {
+                    // Neither confirmed nor waiting any more (its parent was replaced, or it
+                    // was dropped): after 10 minutes the claim is built again.
+                    let Some(txid) = c.txid.as_deref().and_then(|t| arcade_chain::Hash256::from_hex(t).ok()) else { return Ok(c) };
+                    let pooled = node.chain.mempool(p.chain_no).unwrap_or_default().iter()
+                        .any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &p.format).map(|t| t.txid == txid).unwrap_or(false));
+                    let mined = node.chain.tx_raw(p, &txid).ok().flatten().is_some();
+                    // Only rebuilt when this arcade can tell (a lagging one may not hold the block yet).
+                    if !pooled && !mined && !lagging && c.updated + 600 < arcade_app::now() {
+                        c.txid = None;
+                        set(&mut c, ClaimStatus::Checking, "the claim's transaction dropped out; building it again");
+                    }
+                }
             }
         }
         ClaimStatus::Confirmed | ClaimStatus::Failed => {}
@@ -191,8 +224,47 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
     Ok(c)
 }
 
+/// Who holds `tag` according to an arcade on the mesh (its explorer.tag answer), asked at
+/// most every 30 s per tag.
+fn mesh_owner(node: &Node, tag: &str) -> Option<String> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static LAST: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let now = arcade_app::now();
+    {
+        let mut g = LAST.lock().unwrap();
+        let m = g.get_or_insert_with(HashMap::new);
+        if m.get(tag).is_some_and(|t| t + 30 > now) {
+            return None;
+        }
+        m.insert(tag.to_string(), now);
+    }
+    let v = crate::explorer::handle(node, "explorer.tag", &serde_json::json!({"chain": node.params.key, "tag": tag})).ok()?;
+    v["_mesh"].is_object().then(|| v["home_address"].as_str().map(String::from)).flatten()
+}
+
+/// A wallet with no @handle and no claim yet keeps asking for test coins while it has none
+/// (an ask made when no arcade could pay is asked again after 15 minutes).
+fn ask_for_first_handle(node: &Node) {
+    let p = node.params;
+    if !node.app.has_wallet().unwrap_or(false) {
+        return;
+    }
+    if node.app.tag_keys(p.chain_no).unwrap_or_default().iter().any(|k| k.tag.is_some())
+        || node.app.claims().unwrap_or_default().iter().any(|c| c.chain == p.chain_no && c.status != ClaimStatus::Failed)
+    {
+        return;
+    }
+    let Ok((key, _)) = node.app.tag_key(p, 0) else { return };
+    let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&key.pubkey).unwrap()).unwrap());
+    if coins(node, &script).is_empty() {
+        let _ = crate::faucet::ask_if_needed(node, &key.address, "");
+    }
+}
+
 /// Called after each sync round.
 pub fn advance_all(node: &Node) {
+    ask_for_first_handle(node);
     for c in node.app.claims().unwrap_or_default() {
         if !matches!(c.status, ClaimStatus::Confirmed | ClaimStatus::Failed) {
             let _ = advance_one(node, c);
@@ -202,7 +274,7 @@ pub fn advance_all(node: &Node) {
 
 /// Remember the coins a transaction we just built spends, until a block settles them.
 pub fn mark_spent(node: &Node, tx: &arcade_chain::Tx) {
-    let _ = node.chain.mempool_add(node.params, tx, arcade_app::now());
+    let _ = crate::mempoolshare::add(node, node.params, tx);
     let mut ps = node.pending_spent.lock().unwrap();
     for i in &tx.inputs {
         ps.insert(i.prevout);
@@ -297,4 +369,46 @@ pub fn pending_tags(node: &Node) -> Vec<(String, String)> {
 /// BIP125 opt-in replace-by-fee: any input with nSequence < 0xfffffffe.
 pub fn signals_rbf(tx: &arcade_chain::Tx) -> bool {
     tx.inputs.iter().any(|i| i.sequence < 0xffff_fffe)
+}
+
+/// start.status: where this arcade's owner is in getting started (the Home tab's guide):
+/// wallet made, handle claimed or being claimed, test coins asked for or here.
+pub fn start_status(node: &Node) -> serde_json::Value {
+    use serde_json::json;
+    let p = node.params;
+    let wallet = node.app.has_wallet().unwrap_or(false);
+    if !wallet {
+        return json!({"wallet": false});
+    }
+    let tag = node.app.tag_keys(p.chain_no).unwrap_or_default().into_iter().find_map(|k| k.tag);
+    let claim = node.app.claims().unwrap_or_default().into_iter().filter(|c| c.chain == p.chain_no).max_by_key(|c| c.created);
+    let index = claim.as_ref().map(|c| c.key_index).unwrap_or(0);
+    let (key, _) = match node.app.tag_key(p, index) {
+        Ok(k) => k,
+        Err(e) => return json!({"wallet": true, "error": e.to_string()}),
+    };
+    let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&key.pubkey).unwrap()).unwrap());
+    let balance: u64 = coins(node, &script).iter().map(|u| u.value).sum();
+    let ask = crate::faucet::last_ask(node, &key.address);
+    let best = {
+        let ours = node.chain.best_header(p.chain_no).ok().flatten().and_then(|h| node.chain.header(p.chain_no, &h).ok().flatten()).map(|r| r.height as u64).unwrap_or(0);
+        let mesh = node.mesh_tips.lock().unwrap().values().map(|t| t.height).max().unwrap_or(0);
+        let bk = node.bk_peers.lock().unwrap().values().copied().max().unwrap_or(0);
+        ours.max(mesh).max(bk)
+    };
+    json!({
+        "wallet": true, "tag": tag, "address": key.address, "balance": balance,
+        "claim": claim.map(|c| json!({"tag": c.tag, "status": format!("{:?}", c.status).to_lowercase(), "note": c.note})),
+        "faucet": ask.map(|(s, at)| {
+            let paid = node.app.faucet_requests().unwrap_or_default().into_iter().filter(|f| f.address == key.address && f.txid.is_some()).max_by_key(|f| f.created);
+            json!({"status": format!("{s:?}").to_lowercase(), "at": at, "txid": paid.as_ref().and_then(|f| f.txid.clone()), "by": paid.and_then(|f| f.paid_by)})
+        }),
+        "synced": node.sync_state.lock().unwrap().starts_with("synced"),
+        // How far this arcade has read the chain (a fresh install catches up first; a coin
+        // paid in a recent block shows only once it gets there).
+        "height": node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height),
+        // The chain's height: our best header, or what other arcades report (a fresh install
+        // is still fetching headers too).
+        "best": best,
+    })
 }

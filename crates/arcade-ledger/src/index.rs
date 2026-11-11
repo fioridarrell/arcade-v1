@@ -99,7 +99,7 @@ impl Indexer for TagIndexer {
 pub fn read_tags(db: &arcade_chaindb::ChainDb, c: u16) -> Result<Vec<(String, TagRow)>> {
     let pre = KeyBuf::new().u16(c).done();
     Ok(db
-        .store
+        .store(c)
         .read(|r| r.scan_prefix(TAG, &pre))?
         .into_iter()
         .filter_map(|(key, v)| {
@@ -129,11 +129,11 @@ pub fn tag_row(db: &arcade_chaindb::ChainDb, c: u16, tag: &str) -> Result<Option
 }
 
 pub fn tag_of(db: &arcade_chaindb::ChainDb, c: u16, address: &str) -> Result<Option<String>> {
-    db.store.read(|r| Ok(r.get(TAG_BY_ADDRESS, &k(c, address))?.map(|v| String::from_utf8_lossy(&v).into_owned())))
+    db.store(c).read(|r| Ok(r.get(TAG_BY_ADDRESS, &k(c, address))?.map(|v| String::from_utf8_lossy(&v).into_owned())))
 }
 
 fn read_tags_one(db: &arcade_chaindb::ChainDb, table: &str, c: u16, key: &str) -> Result<Option<Value>> {
-    db.store.read(|r| Ok(r.get(table, &k(c, key))?.and_then(|v| serde_json::from_slice(&v).ok())))
+    db.store(c).read(|r| Ok(r.get(table, &k(c, key))?.and_then(|v| serde_json::from_slice(&v).ok())))
 }
 
 pub fn names_digest(db: &arcade_chaindb::ChainDb, c: u16) -> Result<String> {
@@ -315,14 +315,14 @@ pub fn profile(db: &arcade_chaindb::ChainDb, c: u16, address: &str) -> Result<Op
 
 /// Whose profile states `address` (on chain `net`) as theirs.
 pub fn owner_of_linked(db: &arcade_chaindb::ChainDb, c: u16, net: &str, address: &str) -> Result<Option<String>> {
-    db.store.read(|r| {
+    db.store(c).read(|r| {
         Ok(r.get(LINKED, &KeyBuf::new().u16(c).var(net.as_bytes()).bytes(address.as_bytes()).done())?
             .map(|v| String::from_utf8_lossy(&v).into_owned()))
     })
 }
 
 pub fn profile_count(db: &arcade_chaindb::ChainDb, c: u16) -> Result<usize> {
-    Ok(db.store.read(|r| r.scan_prefix(PROFILE, &KeyBuf::new().u16(c).done()))?.len())
+    Ok(db.store(c).read(|r| r.scan_prefix(PROFILE, &KeyBuf::new().u16(c).done()))?.len())
 }
 
 #[cfg(test)]

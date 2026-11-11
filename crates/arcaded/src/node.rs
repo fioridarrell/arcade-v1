@@ -90,8 +90,12 @@ pub struct Node {
     pub me: std::sync::OnceLock<std::sync::Weak<Node>>,
     /// Coins spent by our own transactions that are not in a block yet.
     pub pending_spent: Mutex<std::collections::HashSet<arcade_chain::OutPoint>>,
-    /// Asker ids someone has already paid (a `sent` or `closed` record was seen).
+    /// Asker ids that are paid: a `closed` record, a `sent` record whose payment was found (in
+    /// the pool or a block), or an ask this arcade paid itself.
     pub asks_done: Mutex<std::collections::BTreeSet<String>>,
+    /// Payment notices not yet backed by a payment seen here: asker id -> (txid, the notice's
+    /// time). Each keeps its ask closed for a while only (crate::faucet).
+    pub asks_sent: Mutex<BTreeMap<String, Vec<(String, u64)>>>,
 }
 
 

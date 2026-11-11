@@ -28,6 +28,9 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade chain copy status [key]             Core-data copies (cb) offered, fetches in progress, trusted/verified coin sets
   arcade chain copy start <key> [coins|all]  bootstrap from the best copy (coins: coin set only, the default)
   arcade chain copy cancel|verify <key>      stop a fetch (sync it myself) | re-check a copied coin set now
+  arcade chain index copy status [key]       index copies old arcades offer, fetches, votes, copied indexes
+  arcade chain index copy start <key> ledger|ord [--from NODE]   take a copy now (2+ other arcades must agree)
+  arcade chain index copy cancel <key> ledger|ord                stop fetching it
   arcade chain pause|resume|remove <key>
   arcade chain index add|remove <key> <index>
   arcade ledger [height]         ledger fingerprints vs. other arcades; a block's digest rows
@@ -265,6 +268,21 @@ fn main() {
         ["chain", "copy", "start", k, w] => json!({"cmd": "chains.copy_start", "key": k, "what": w}),
         ["chain", "copy", "cancel", k] => json!({"cmd": "chains.copy_cancel", "key": k}),
         ["chain", "copy", "verify", k] => json!({"cmd": "chains.copy_verify", "key": k}),
+        ["chain", "share", "offers", k] => json!({"cmd": "share.offers", "key": k}),
+        ["chain", "share", "fetch", k, f] => json!({"cmd": "share.fetch", "key": k, "fam": f}),
+        ["chain", "share", "fetch", k, f, id] => json!({"cmd": "share.fetch", "key": k, "fam": f, "id": id}),
+        ["chain", "share", "cancel", k, f] => json!({"cmd": "share.cancel", "key": k, "fam": f}),
+        ["chain", "share", "install", k] => json!({"cmd": "share.install", "key": k}),
+        ["chain", "share", "install", k, "cancel"] => json!({"cmd": "share.install_cancel", "key": k}),
+        ["chain", "share", "serve", k, "on"] => json!({"cmd": "share.serve", "key": k, "on": true}),
+        ["chain", "share", "serve", k, "off"] => json!({"cmd": "share.serve", "key": k, "on": false}),
+        ["chain", "share", "held"] => json!({"cmd": "share.held"}),
+        ["chain", "share", "make", k, f] => json!({"cmd": "share.make", "key": k, "fam": f}),
+        ["chain", "index", "copy", "status"] => json!({"cmd": "chains.index_copy_status"}),
+        ["chain", "index", "copy", "status", k] => json!({"cmd": "chains.index_copy_status", "key": k}),
+        ["chain", "index", "copy", "start", k, ix] => json!({"cmd": "chains.index_copy_start", "key": k, "index": ix}),
+        ["chain", "index", "copy", "start", k, ix, "--from", node] => json!({"cmd": "chains.index_copy_start", "key": k, "index": ix, "from": node}),
+        ["chain", "index", "copy", "cancel", k, ix] => json!({"cmd": "chains.index_copy_cancel", "key": k, "index": ix}),
         ["chain", "index", "add", k, ix] => json!({"cmd": "chains.index_add", "key": k, "index": ix}),
         ["chain", "index", "remove", k, ix] => json!({"cmd": "chains.index_remove", "key": k, "index": ix}),
         ["chain", "add", k, rest @ ..] => {
@@ -320,13 +338,14 @@ fn main() {
             for st in r["stages"].as_array().unwrap() {
                 let p = st["pct"].as_f64().unwrap_or(0.0);
                 let bar: String = "█".repeat((p / 5.0).round() as usize);
+                let per = if st["unit"] == "rows" { "rows/s" } else { "blk/s" };
                 let rate = match st["rate"].as_f64() {
-                    Some(r) if r >= 10.0 => format!("{r:.0} blk/s"),
-                    Some(r) => format!("{r:.1} blk/s"),
+                    Some(r) if r >= 10.0 => format!("{r:.0} {per}"),
+                    Some(r) => format!("{r:.1} {per}"),
                     None if st["info"] == true => String::new(),
                     None => "measuring".into(),
                 };
-                println!("  {:<22} {:<20} {:>5.1}% {:>11}  {}", st["name"].as_str().unwrap_or(""), format!("{bar:░<20}"), p, rate, st["detail"].as_str().unwrap_or(""));
+                println!("  {:<34} {:<20} {:>5.1}% {:>13}  {}", st["name"].as_str().unwrap_or(""), format!("{bar:░<20}"), p, rate, st["detail"].as_str().unwrap_or(""));
             }
             println!("  overall {:.1}%", r["overall"].as_f64().unwrap_or(0.0));
             return;

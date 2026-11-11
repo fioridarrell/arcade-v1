@@ -72,6 +72,11 @@
     }
     const btn = document.createElement("button");
     if (c.installed) { btn.textContent = c.home ? "Manage indexes…" : "Manage…"; btn.onclick = () => { manage(c.key); reveal(); }; }
+    else if (c.queued) {
+      // One install at a time: this one waits its turn.
+      btn.textContent = `Queued #${c.queued} · Cancel`;
+      btn.onclick = async () => { try { await api("chains.unqueue", { key: c.key }); msg(`${c.name} is out of the install queue.`); refresh(); } catch (e) { msg(e.message, true); } };
+    }
     else { btn.textContent = "Install…"; btn.className = "primary"; btn.onclick = () => { choose(c); reveal(); }; }
     act.append(btn);
     el.append(logoOf(c.key, c.name), info, bal, act);
@@ -171,6 +176,13 @@
     const withIdx = [...$("c-idx").querySelectorAll("input:checked")].map((i) => i.dataset.k);
     try {
       const st = await api("chains.add", { key: open.key, mode, with: withIdx });
+      if (st.queued) {
+        // Another chain is still being installed: this one starts by itself after it.
+        $("c-installer").hidden = true;
+        msg(`${open.name} waits its turn (#${st.position} in the queue); it installs by itself once ${st.behind.toUpperCase()} has caught up. One install runs at a time.`);
+        refresh();
+        return;
+      }
       watching = open.key; showProgress(st); refresh();
     } catch (e) { msg(e.message, true); }
   }
@@ -231,7 +243,8 @@
       li.className = (p >= 100 ? "done" : p > 0 ? "run" : "wait") + (s.current ? " now" : "") + (s.info ? " info" : "");
       li.innerHTML = `<div class="sh"><span class="sn"></span><span class="sd"></span></div><div class="bar"><i></i></div>`;
       li.querySelector(".sn").textContent = s.name;
-      const rate = s.at == null && s.rate == null ? "" : s.rate == null ? "measuring…" : `${s.rate >= 10 ? Math.round(s.rate).toLocaleString() : s.rate.toFixed(1)} blocks/s`;
+      const per = s.unit === "rows" ? "rows/s" : "blocks/s";
+      const rate = s.at == null && s.rate == null ? "" : s.rate == null ? "measuring…" : `${s.rate >= 10 ? Math.round(s.rate).toLocaleString() : s.rate.toFixed(1)} ${per}`;
       li.querySelector(".sd").textContent = s.info ? s.detail : p >= 100 ? `done · ${rate} · ${s.detail}` : `${p.toFixed(1)}% · ${rate}${s.at ? ` · ${s.at.toLocaleString()} of ${(s.of ?? 0).toLocaleString()}` : ""} · ${s.detail}`;
       if (s.current) li.querySelector(".sn").textContent = `${s.name} (now)`;
       li.querySelector(".bar > i").style.width = p + "%";

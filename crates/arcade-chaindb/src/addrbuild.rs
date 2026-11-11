@@ -44,8 +44,101 @@ pub const TXROW: u8 = b'T';
 pub const TXS_PENDING: &str = "txs_pending";
 const KINDS: [(u8, &str); 4] = [(HIST, SCRIPT_HIST), (SPEND, SPENDS), (COIN, BY_SCRIPT), (TXROW, TXS)];
 
+// ---------------- progress per step, and resuming (docs/ADDRBUILD.md) ----------------
+
+/// The six steps, as shown in chain status.
+pub const STEP_NAMES: [&str; 6] = ["sort the log", "address history", "spends", "address coins", "transaction index", "clear the log"];
+
+/// One step's progress: done of total, in blocks or rows; state 0 waiting, 1 running, 2 done.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct StepProgress {
+    pub done: u64,
+    pub total: u64,
+    pub unit: &'static str,
+    pub state: u8,
+}
+
+impl ChainDb {
+    /// The address build's progress on a chain, step by step (None: no build running).
+    pub fn build_progress(&self, c: u16) -> Option<[StepProgress; 6]> {
+        self.addr_progress.lock().unwrap().get(&c).cloned()
+    }
+
+    fn set_step(&self, c: u16, i: usize, done: u64, total: u64, unit: &'static str, state: u8) {
+        let mut m = self.addr_progress.lock().unwrap();
+        let e = m.entry(c).or_default();
+        e[i] = StepProgress { done, total, unit, state };
+    }
+}
+
+/// STATE: how far the build got (step 1's run files and log position, the merged kinds),
+/// so a restart resumes instead of starting over. Plain lines (no JSON here).
+pub const RUNS_STATE: &str = "addr_runs";
+
+#[derive(Default, Debug, Clone)]
+struct Resume {
+    upto: u32,
+    first: u32,
+    after: Option<Vec<u8>>,
+    rows: u64,
+    counts: [u64; 4],
+    log_rows: u64,
+    cut_done: bool,
+    merged: Vec<u8>,
+    files: Vec<(u8, PathBuf)>,
+}
+
+impl Resume {
+    fn encode(&self) -> Vec<u8> {
+        let mut o = format!(
+            "upto {}\nfirst {}\nafter {}\nrows {}\ncounts {} {} {} {}\nlogrows {}\ncut {}\nmerged {}\n",
+            self.upto, self.first, self.after.as_ref().map(hex::encode).unwrap_or_else(|| "-".into()), self.rows,
+            self.counts[0], self.counts[1], self.counts[2], self.counts[3], self.log_rows, self.cut_done as u8,
+            String::from_utf8_lossy(&self.merged)
+        );
+        for (k, p) in &self.files {
+            o.push_str(&format!("file {} {}\n", *k as char, p.display()));
+        }
+        o.into_bytes()
+    }
+    fn decode(v: &[u8]) -> Option<Resume> {
+        let mut r = Resume::default();
+        for line in String::from_utf8_lossy(v).lines() {
+            let (k, rest) = line.split_once(' ').unwrap_or((line, ""));
+            match k {
+                "upto" => r.upto = rest.parse().ok()?,
+                "first" => r.first = rest.parse().ok()?,
+                "after" => r.after = if rest == "-" { None } else { Some(hex::decode(rest).ok()?) },
+                "rows" => r.rows = rest.parse().ok()?,
+                "counts" => {
+                    let n: Vec<u64> = rest.split(' ').filter_map(|x| x.parse().ok()).collect();
+                    if n.len() != 4 {
+                        return None;
+                    }
+                    r.counts = [n[0], n[1], n[2], n[3]];
+                }
+                "logrows" => r.log_rows = rest.parse().ok()?,
+                "cut" => r.cut_done = rest == "1",
+                "merged" => r.merged = rest.as_bytes().to_vec(),
+                "file" => {
+                    let (kc, path) = rest.split_once(' ')?;
+                    r.files.push((kc.as_bytes().first().copied()?, PathBuf::from(path)));
+                }
+                _ => {}
+            }
+        }
+        Some(r)
+    }
+    /// Usable only if every run file is still there.
+    fn whole(&self) -> bool {
+        self.files.iter().all(|(_, p)| p.exists())
+    }
+}
+
 /// Bytes of rows sorted in memory per run file.
 const RUN_BYTES: usize = if cfg!(test) { 3000 } else { 512 << 20 };
+/// Log rows read per page in step 1.
+const LOG_PAGE: usize = if cfg!(test) { 50 } else { 50_000 };
 /// Rows per write while building (short writes, so the syncer gets turns).
 const WRITE_ROWS: usize = if cfg!(test) { 37 } else { 20_000 };
 
@@ -92,18 +185,18 @@ pub type Note<'a> = &'a mut dyn FnMut(String);
 impl ChainDb {
     /// Whether address rows wait to be built for a chain.
     pub fn addresses_pending(&self, c: u16) -> Result<bool> {
-        Ok(self.store.read(|r| r.get(STATE, &k_state(c, PENDING)))?.is_some())
+        Ok(self.store(c).read(|r| r.get(STATE, &k_state(c, PENDING)))?.is_some())
     }
 
     /// Whether the Addresses index is on for a chain (it is unless turned off).
     pub fn addresses_on(&self, c: u16) -> Result<bool> {
-        Ok(self.store.read(|r| r.get(STATE, &k_state(c, OFF)))?.is_none())
+        Ok(self.store(c).read(|r| r.get(STATE, &k_state(c, OFF)))?.is_none())
     }
 
     /// Turn the Addresses index off: no more address rows. The caller deletes the old ones
     /// with clear_address_rows_batch.
     pub fn set_addresses_off(&self, c: u16) -> Result<()> {
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             w.put(STATE, &k_state(c, OFF), b"1")?;
             w.del(STATE, &k_state(c, PENDING))?;
             w.del(STATE, &k_state(c, BACKFILL))?;
@@ -116,7 +209,7 @@ impl ChainDb {
     pub fn clear_address_rows_batch(&self, c: u16, max: usize) -> Result<usize> {
         // Tx index rows waiting in the log belong in the tx index, addresses or not.
         let pre = k_chain(c);
-        let moved = self.store.write(|w| {
+        let moved = self.wstore(c)?.write(|w| {
             let mut n = 0usize;
             for (k, v) in w.scan_prefix_limit(ADDR_LOG, &pre, max.max(1))? {
                 if v.first() == Some(&TXROW) {
@@ -137,7 +230,7 @@ impl ChainDb {
     /// Turn the Addresses index on. Blocks connected from now on write their rows; those
     /// already stored are built by build_addresses from the blocks themselves.
     pub fn set_addresses_on(&self, c: u16) -> Result<()> {
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             if w.get(STATE, &k_state(c, OFF))?.is_none() {
                 return Ok(());
             }
@@ -161,48 +254,99 @@ impl ChainDb {
         }
         // Coins and deletions still in the coin cache must reach the database first.
         self.flush_coins(c)?;
-        let upto = self.tip(c)?.map(|t| t.height).unwrap_or(0);
-        let backfill = self.store.read(|r| r.get(STATE, &k_state(c, BACKFILL)))?.map(|v| be_u32(&v, 0));
-        let from = self.store.read(|r| r.get(STATE, &k_state(c, BACKFILL_FROM)))?.map(|v| be_u32(&v, 0)).unwrap_or(1).max(1);
+        let backfill = self.store(c).read(|r| r.get(STATE, &k_state(c, BACKFILL)))?.map(|v| be_u32(&v, 0));
+        let from = self.store(c).read(|r| r.get(STATE, &k_state(c, BACKFILL_FROM)))?.map(|v| be_u32(&v, 0)).unwrap_or(1).max(1);
         std::fs::create_dir_all(tmp).map_err(io)?;
+        // A build cut short by a restart goes on where it was (log builds; backfills start over).
+        let saved = self.store(c).read(|r| r.get(STATE, &k_state(c, RUNS_STATE)))?.and_then(|v| Resume::decode(&v));
+        let mut res: Resume = match saved {
+            Some(r) if backfill.is_none() && r.whole() => {
+                note(format!("building addresses: going on where the last build stopped ({} rows sorted, {} run files)", r.rows, r.files.len()));
+                r
+            }
+            other => {
+                if let Some(r) = other {
+                    for (_, p) in &r.files {
+                        let _ = std::fs::remove_file(p);
+                    }
+                }
+                Resume { upto: self.tip(c)?.map(|t| t.height).unwrap_or(0), ..Default::default() }
+            }
+        };
+        let upto = res.upto;
+        self.addr_progress.lock().unwrap().insert(c, Default::default());
         let mut runs: Vec<(u8, PathBuf)> = Vec::new();
         if let Some(bf) = backfill {
             if !self.backfill_runs(params, from, bf, tmp, stop, note, &mut runs)? {
                 for (_, p) in &runs {
                     let _ = std::fs::remove_file(p);
                 }
+                self.addr_progress.lock().unwrap().remove(&c);
                 return Ok(false);
+            }
+            // Backfill rows are counted by kind from their files' sizes (an estimate for the bars).
+            for (k, p) in &runs {
+                if let Some(i) = KINDS.iter().position(|(kind, _)| kind == k) {
+                    res.counts[i] += std::fs::metadata(p).map(|m| m.len() / 64).unwrap_or(0);
+                }
             }
         }
-        match self.cut_runs(c, upto, tmp, stop, note)? {
-            Some(r) => runs.extend(r),
-            None => {
-                for (_, p) in &runs {
-                    let _ = std::fs::remove_file(p);
-                }
-                return Ok(false);
+        if !res.cut_done {
+            if !self.cut_runs(c, &mut res, tmp, stop, note)? {
+                self.addr_progress.lock().unwrap().remove(&c);
+                return Ok(false); // stopped: the run files and the record stay for the next start
             }
-        };
+        } else {
+            self.set_step(c, 0, 1, 1, "blocks", 2);
+        }
+        runs.extend(res.files.iter().cloned());
         let done = (|| {
             for (i, (kind, table)) in KINDS.iter().enumerate() {
+                if res.merged.contains(kind) {
+                    self.set_step(c, i + 1, res.counts[i], res.counts[i], "rows", 2);
+                    continue;
+                }
                 let files: Vec<&PathBuf> = runs.iter().filter(|(k, _)| k == kind).map(|(_, p)| p).collect();
-                if !self.merge_into(c, *kind, table, &files, stop, &mut |s| note(format!("building addresses: step {} of 6, {s}", i + 2)))? {
+                self.set_step(c, i + 1, 0, res.counts[i], "rows", 1);
+                if !self.merge_into(c, i + 1, res.counts[i], *kind, table, &files, stop, &mut |s| note(format!("building addresses: step {} of 6, {s}", i + 2)))? {
                     return Ok(false);
+                }
+                self.set_step(c, i + 1, res.counts[i], res.counts[i], "rows", 2);
+                if backfill.is_none() {
+                    res.merged.push(*kind);
+                    self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()))?;
                 }
             }
             note("building addresses: step 6 of 6, clearing the log".into());
             if backfill.is_some() {
-                self.store.write(|w| {
+                self.wstore(c)?.write(|w| {
                     w.del(STATE, &k_state(c, BACKFILL))?;
                     w.del(STATE, &k_state(c, BACKFILL_FROM)).map(|_| ())
                 })?;
             }
-            self.clear_log(c, upto, stop)
+            self.clear_log(c, upto, res.log_rows, stop)
         })();
-        for (_, p) in &runs {
-            let _ = std::fs::remove_file(p);
+        let finished = matches!(done, Ok(true));
+        // Kept for the next start unless finished (or a backfill, which starts over anyway).
+        if finished || backfill.is_some() {
+            for (_, p) in &runs {
+                let _ = std::fs::remove_file(p);
+            }
+            self.wstore(c)?.write(|w| w.del(STATE, &k_state(c, RUNS_STATE)).map(|_| ()))?;
         }
+        self.addr_progress.lock().unwrap().remove(&c);
         done
+    }
+
+    /// Run files a build cut short left for the next start (kept by the cleanup at start).
+    pub fn addr_resume_files(&self) -> Vec<PathBuf> {
+        self.stores()
+            .iter()
+            .flat_map(|s| s.read(|r| r.scan_prefix(STATE, b"")).unwrap_or_default())
+            .filter(|(k, _)| k.len() > 2 && &k[2..] == RUNS_STATE.as_bytes())
+            .filter_map(|(_, v)| Resume::decode(&v))
+            .flat_map(|r| r.files.into_iter().map(|(_, p)| p))
+            .collect()
     }
 
     /// Step 1 for a chain stored before the index was on: every row of heights 1..=upto
@@ -236,7 +380,9 @@ impl ChainDb {
         let failed: Mutex<Option<arcade_store::StoreError>> = Mutex::new(None);
         const SPAN: u32 = 500;
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
-        let work = || -> Result<()> {
+        // The block each thread is reading now (0 = between spans), shown in the progress note.
+        let at: Vec<std::sync::atomic::AtomicU32> = (0..threads).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
+        let work = |slot: usize| -> Result<()> {
             loop {
                 if stop.load(Ordering::Relaxed) || failed.lock().unwrap().is_some() {
                     return Ok(());
@@ -248,8 +394,11 @@ impl ChainDb {
                 let to = (from + SPAN - 1).min(upto);
                 let mut local: [Vec<Vec<u8>>; 4] = Default::default();
                 let mut bytes = 0usize;
-                self.store.read(|r| {
+                self.store(c).read(|r| {
                     for h in from..=to {
+                        at[slot].store(h, Ordering::Relaxed);
+                        let t0 = std::time::Instant::now();
+                        let (mut n_tx, mut n_in, mut prev_bytes) = (0usize, 0usize, 0usize);
                         let Some(hv) = r.get(HEIGHT, &k_height(c, h))? else { continue };
                         let b = be_u32(&hv, 32);
                         for (k, raw) in r.scan_prefix(BLOCK_TX, &k_block(c, b))? {
@@ -258,6 +407,8 @@ impl ChainDb {
                             }
                             let p = be_u32(&k, k.len() - 4);
                             let tx = arcade_chain::Tx::parse_with(&raw, &params.format).map_err(|e| arcade_store::StoreError::Other(e.to_string()))?;
+                            n_tx += 1;
+                            n_in += tx.inputs.len();
                             let t12 = tx.txid.t12();
                             let mut add = |i: usize, key: Vec<u8>, val: &[u8]| {
                                 let r = record(&key, val);
@@ -273,14 +424,14 @@ impl ChainDb {
                                     if crate::db::is_pruned(&fraw) {
                                         return Err(arcade_store::StoreError::Other(format!("block {h}: a spent coin's transaction is not stored here (Shared storage)")));
                                     }
-                                    let ftx = arcade_chain::Tx::parse_with(&fraw, &params.format).map_err(|e| arcade_store::StoreError::Other(e.to_string()))?;
-                                    let Some(out) = ftx.outputs.get(inp.prevout.vout as usize) else { continue };
-                                    let sid = script_id(&out.script_pubkey);
+                                    prev_bytes += fraw.len();
+                                    let Some((out_value, out_script)) = arcade_chain::Tx::output_at(&fraw, &params.format, inp.prevout.vout).map_err(|e| arcade_store::StoreError::Other(e.to_string()))? else { continue };
+                                    let sid = script_id(out_script);
                                     let mut sp = b.to_be_bytes().to_vec();
                                     sp.extend_from_slice(&p.to_be_bytes());
                                     sp.extend_from_slice(&(vin as u32).to_be_bytes());
                                     add(1, k_pos(c, pb, pp, inp.prevout.vout), &sp);
-                                    add(0, k_hist(c, &sid, h, &t12), &hist_val(0, out.value));
+                                    add(0, k_hist(c, &sid, h, &t12), &hist_val(0, out_value));
                                 }
                             }
                             for out in &tx.outputs {
@@ -290,20 +441,27 @@ impl ChainDb {
                                 add(0, k_hist(c, &script_id(&out.script_pubkey), h, &t12), &hist_val(out.value, 0));
                             }
                         }
+                        let took = t0.elapsed();
+                        if took > std::time::Duration::from_secs(2) {
+                            eprintln!("addrbuild: block {h} took {:.1}s: {n_tx} txs, {n_in} inputs, {:.1} MB of spent coins' transactions parsed", took.as_secs_f64(), prev_bytes as f64 / 1e6);
+                        }
                     }
                     Ok(())
                 })?;
+                at[slot].store(0, Ordering::Relaxed);
                 push(&acc, local, bytes, (to - from + 1) as u64)?;
             }
         };
         let mut last_note = std::time::Instant::now();
         std::thread::scope(|sc| {
-            let hs: Vec<_> = (0..threads).map(|_| sc.spawn(|| if let Err(e) = work() { *failed.lock().unwrap() = Some(e) })).collect();
+            let (work, failed) = (&work, &failed);
+            let hs: Vec<_> = (0..threads).map(|i| sc.spawn(move || if let Err(e) = work(i) { *failed.lock().unwrap() = Some(e) })).collect();
             while hs.iter().any(|h| !h.is_finished()) {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 if last_note.elapsed() > std::time::Duration::from_secs(2) {
                     let done = acc.lock().unwrap().done;
-                    note(format!("building addresses: step 1 of 4, reading the stored blocks (block {} of {upto})", done.min(upto as u64)));
+                    let now: Vec<String> = at.iter().map(|a| a.load(Ordering::Relaxed)).filter(|h| *h > 0).map(|h| h.to_string()).collect();
+                    note(format!("building addresses: step 1 of 4, reading the stored blocks (block {} of {upto}; threads at {})", done.min(upto as u64), now.join(", ")));
                     last_note = std::time::Instant::now();
                 }
             }
@@ -326,7 +484,7 @@ impl ChainDb {
                 *runs = a.files;
                 return Ok(false);
             }
-            let page = self.store.read(|r| {
+            let page = self.store(c).read(|r| {
                 let rows = r.scan_after(OUTPUTS, &pre, after.as_deref(), 50_000)?;
                 let mut out = Vec::new();
                 for (k, v) in &rows {
@@ -365,23 +523,26 @@ impl ChainDb {
         Ok(true)
     }
 
-    /// Step 1: the log up to `upto`, as sorted run files per kind.
-    fn cut_runs(&self, c: u16, upto: u32, tmp: &Path, stop: &AtomicBool, note: Note) -> Result<Option<Vec<(u8, PathBuf)>>> {
+    /// Step 1: the log up to `res.upto`, as sorted run files per kind. Each time run files are
+    /// written, the record (files, log position, counts) is saved, so a restart goes on from
+    /// there. False when stopped.
+    fn cut_runs(&self, c: u16, res: &mut Resume, tmp: &Path, stop: &AtomicBool, note: Note) -> Result<bool> {
         let pre = k_chain(c);
-        let first = self.store.read(|r| r.scan_prefix_limit(ADDR_LOG, &pre, 1))?.first().map(|(k, _)| be_u32(k, 2)).unwrap_or(0);
-        let mut runs: Vec<(u8, PathBuf)> = Vec::new();
+        let upto = res.upto;
+        if res.after.is_none() && res.rows == 0 {
+            res.first = self.store(c).read(|r| r.scan_prefix_limit(ADDR_LOG, &pre, 1))?.first().map(|(k, _)| be_u32(k, 2)).unwrap_or(0);
+        }
+        let first = res.first;
+        let total = upto.saturating_sub(first) as u64 + 1;
         let mut bufs: [Vec<Vec<u8>>; 4] = Default::default();
         let mut bytes = 0usize;
-        let mut after: Option<Vec<u8>> = None;
-        let mut rows = 0u64;
+        let mut after: Option<Vec<u8>> = res.after.clone();
+        let save = |res: &Resume| self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()));
         loop {
             if stop.load(Ordering::Relaxed) {
-                for (_, p) in &runs {
-                    let _ = std::fs::remove_file(p);
-                }
-                return Ok(None);
+                return Ok(false);
             }
-            let page = self.store.read(|r| r.scan_after(ADDR_LOG, &pre, after.as_deref(), 50_000))?;
+            let page = self.store(c).read(|r| r.scan_after(ADDR_LOG, &pre, after.as_deref(), LOG_PAGE))?;
             let Some((last, _)) = page.last() else { break };
             after = Some(last.clone());
             let mut past = false;
@@ -390,27 +551,38 @@ impl ChainDb {
                     past = true;
                     break;
                 }
+                res.log_rows += 1;
                 let Some(i) = KINDS.iter().position(|(kind, _)| *kind == v[0]) else { continue };
                 bytes += v.len() + 24;
                 bufs[i].push(v[1..].to_vec());
-                rows += 1;
+                res.counts[i] += 1;
+                res.rows += 1;
             }
             let h = be_u32(after.as_ref().unwrap(), 2).min(upto);
-            note(format!("building addresses: step 1 of 6, sorting the log ({rows} rows, block {} of {upto})", h.max(first)));
+            self.set_step(c, 0, h.saturating_sub(first) as u64, total, "blocks", 1);
+            note(format!("building addresses: step 1 of 6, sorting the log ({} rows, block {} of {upto})", res.rows, h.max(first)));
             if bytes >= RUN_BYTES {
-                flush_runs(c, "log", tmp, &mut bufs, &mut runs)?;
+                flush_runs(c, "log", tmp, &mut bufs, &mut res.files)?;
                 bytes = 0;
+                res.after = after.clone();
+                save(res)?;
             }
             if past {
                 break;
             }
         }
-        flush_runs(c, "log", tmp, &mut bufs, &mut runs)?;
-        Ok(Some(runs))
+        flush_runs(c, "log", tmp, &mut bufs, &mut res.files)?;
+        res.after = after;
+        res.cut_done = true;
+        save(res)?;
+        self.set_step(c, 0, total, total, "blocks", 2);
+        Ok(true)
     }
 
     /// Steps 2-4: merge one kind's runs and write them in key order.
-    fn merge_into(&self, c: u16, kind: u8, table: &str, files: &[&PathBuf], stop: &AtomicBool, note: &mut dyn FnMut(String)) -> Result<bool> {
+    #[allow(clippy::too_many_arguments)]
+    fn merge_into(&self, c: u16, step: usize, recs_total: u64, kind: u8, table: &str, files: &[&PathBuf], stop: &AtomicBool, note: &mut dyn FnMut(String)) -> Result<bool> {
+        let mut recs_read = 0u64;
         let mut readers: Vec<BufReader<std::fs::File>> =
             files.iter().map(|p| std::fs::File::open(p).map(|f| BufReader::with_capacity(1 << 20, f)).map_err(io)).collect::<Result<_>>()?;
         let total: u64 = files.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
@@ -438,6 +610,7 @@ impl ChainDb {
         let mut cur: Option<Vec<u8>> = None;
         let mut written = 0u64;
         while let Some(std::cmp::Reverse((key, i, rec))) = heap.pop() {
+            recs_read += 1;
             if let Some(rec2) = next(&mut readers[i], &mut read_bytes)? {
                 heap.push(std::cmp::Reverse((key_of(&rec2).to_vec(), i, rec2)));
             }
@@ -456,6 +629,7 @@ impl ChainDb {
                 written += self.write_batch(c, kind, table, &batch)?;
                 batch.clear();
                 let pct = if total > 0 { read_bytes * 100 / total } else { 100 };
+                self.set_step(c, step, recs_read.min(recs_total.max(recs_read)), recs_total.max(recs_read), "rows", 1);
                 note(format!("{} {pct}% ({written} rows)", match kind { HIST => "address history", SPEND => "spends", TXROW => "transaction index", _ => "address coins" }));
                 std::thread::sleep(std::time::Duration::from_millis(5));
             }
@@ -467,7 +641,7 @@ impl ChainDb {
         Ok(true)
     }
 
-    fn write_batch(&self, _c: u16, kind: u8, table: &str, batch: &[Vec<u8>]) -> Result<u64> {
+    fn write_batch(&self, c: u16, kind: u8, table: &str, batch: &[Vec<u8>]) -> Result<u64> {
         if batch.is_empty() {
             return Ok(0);
         }
@@ -484,7 +658,7 @@ impl ChainDb {
             std::thread::scope(|sc| {
                 for part in batch.chunks(per) {
                     sc.spawn(move || {
-                        let _ = self.store.read(|r| {
+                        let _ = self.store(c).read(|r| {
                             for rec in part {
                                 let _ = r.get(OUTPUTS, &coin_key(key_of(rec)));
                             }
@@ -494,7 +668,7 @@ impl ChainDb {
                 }
             });
         }
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut n = 0;
             for rec in batch {
                 let k = key_of(rec);
@@ -509,13 +683,15 @@ impl ChainDb {
     }
 
     /// Delete the built log rows; the chain is done when none are left.
-    fn clear_log(&self, c: u16, upto: u32, stop: &AtomicBool) -> Result<bool> {
+    fn clear_log(&self, c: u16, upto: u32, log_rows: u64, stop: &AtomicBool) -> Result<bool> {
         let pre = k_chain(c);
+        let mut cleared = 0u64;
         loop {
+            self.set_step(c, 5, cleared.min(log_rows.max(cleared)), log_rows.max(cleared), "rows", 1);
             if stop.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            let left = self.store.write(|w| {
+            let left = self.store(c).write(|w| {
                 let page = w.scan_prefix_limit(ADDR_LOG, &pre, 50_000)?;
                 let mut n = 0;
                 for (k, _) in &page {
@@ -525,10 +701,13 @@ impl ChainDb {
                     w.del(ADDR_LOG, k)?;
                     n += 1;
                 }
+                cleared += n;
                 if n == 0 {
                     if page.is_empty() {
                         w.del(STATE, &k_state(c, PENDING))?;
                         w.del(STATE, &k_state(c, TXS_PENDING))?;
+                        // Every tx row is in TXS now: the runs go (txruns).
+                        crate::txruns::drop_all(w, c)?;
                     }
                     return Ok(false);
                 }

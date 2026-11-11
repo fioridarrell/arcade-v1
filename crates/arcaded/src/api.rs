@@ -71,6 +71,14 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "peers" => Ok(json!(node.links.lock().unwrap().values().map(|l| json!({"addr": l.addr, "node_id": l.node_id, "since": l.since})).collect::<Vec<_>>())),
         "wallet.create" => {
             let phrase = node.app.create_wallet(s("phrase").as_deref()).map_err(|e| e.to_string())?;
+            // Test coins for the first handle come by themselves: asked for now, so they are
+            // usually here by the time a handle is picked (a restored wallet may have some).
+            if let Ok((k, _)) = node.app.tag_key(p, 0) {
+                let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
+                if crate::claims::coins(node, &script).is_empty() {
+                    let _ = crate::faucet::ask_if_needed(node, &k.address, "");
+                }
+            }
             let restored = s("phrase").is_some();
             Ok(json!({"phrase": if restored { Value::Null } else { json!(phrase) }, "restored": restored}))
         }
@@ -88,11 +96,26 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             // A borrowed copy answers while the installed one catches up.
             let installed = !crate::borrow::is_borrowed(cp.key) && (cp.chain_no == p.chain_no || node.extra.lock().unwrap().contains_key(cp.key)) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
             Ok(json!(keys.iter().map(|k| {
-                let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
-                json!({"index": k.index, "address": k.address, "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else { None },
-                       "balance": if installed { node.chain.balance_for_script(cp.chain_no, &script).ok() } else { crate::borrow::balance(node, cp, &script) },
-                       "borrowed": !installed && crate::borrow::is_borrowed(cp.key)})
+                let pk = arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap();
+                // Every address of the key (DigiByte: dgb1... to receive, its D... still counted).
+                let scripts = crate::coinsend::key_scripts(cp, &pk);
+                let bal = |sc: &[u8]| if installed { node.chain.balance_for_script(cp.chain_no, sc).ok() } else { crate::borrow::balance(node, cp, sc) };
+                let balance = scripts.iter().map(|(_, sc)| bal(sc)).try_fold(0u64, |a, b| b.map(|x| a + x));
+                // Home chain: coins still waiting in the mempool, spendable already.
+                let pending: u64 = if cp.chain_no == p.chain_no && !crate::borrow::is_borrowed(cp.key) { scripts.iter().flat_map(|(_, sc)| crate::claims::unconfirmed_coins(node, sc)).map(|u| u.value).sum() } else { 0 };
+                json!({"index": k.index, "address": scripts[0].0, "legacy": scripts.get(1).map(|x| x.0.clone()), "pending": pending,
+                       "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else { None },
+                       "balance": balance, "borrowed": !installed && crate::borrow::is_borrowed(cp.key)})
             }).collect::<Vec<_>>()))
+        }
+        "dd.wallet" => crate::ddsvc::wallet(node, s("chain").as_deref()),
+        "dd.send" => {
+            let cents = req["cents"].as_i64().ok_or("cents required (DigiDollar cents: $12.50 is 1250)")?;
+            crate::ddsvc::send(node, s("chain").as_deref(), &s("to").ok_or("to required (a DD... or TD... address)")?, cents, req["send"] == true)
+        }
+        "wallet.send" => {
+            let amount = req["amount"].as_u64().ok_or("amount required (satoshis)")?;
+            crate::coinsend::send(node, s("chain").as_deref(), &s("to").ok_or("to required")?, amount, s("from").as_deref(), req["send"] == true)
         }
         "wallet.link" => crate::links::link(node, &s("chain").ok_or("chain required")?, &s("wif").ok_or("wif required")?, &s("tag").ok_or("tag required")?),
         "wallet.unlink" => crate::links::unlink(node, &s("chain").ok_or("chain required")?, &s("address").ok_or("address required")?, &s("tag").ok_or("tag required")?),
@@ -266,6 +289,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "tag.check" => Ok(json!(crate::claims::check(node, &s("tag").ok_or("tag required")?))),
         "tag.claim" => Ok(json!(crate::claims::start(node, &s("tag").ok_or("tag required")?)?)),
         "tag.list" => Ok(json!(node.app.claims().map_err(|e| e.to_string())?)),
+        "start.status" => Ok(crate::claims::start_status(node)),
         "faucet.ask" => {
             let (k, _) = node.app.tag_key(p, s("index").and_then(|i| i.parse().ok()).unwrap_or(0)).map_err(|e| e.to_string())?;
             Ok(json!(crate::faucet::ask(node, &k.address, &s("tag").unwrap_or_default())?))
@@ -431,7 +455,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 }
             }
         }
-        c if c.starts_with("explorer.") => crate::explorer::handle(node, c, &req),
+        c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
         "chains.offers" => Ok(json!(node.offers.lock().unwrap().iter().map(|(id, o)| json!({"node": id, "addr": o.addr, "at": o.at, "bk": o.bk, "cr": o.cr})).collect::<Vec<_>>())),
         "chains.peers" => {
             let p = arcade_chain::params::by_key(&s("key").ok_or("key required")?).ok_or("unknown chain")?;
@@ -439,6 +463,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!({"chain": p.key, "known": known, "working": good, "resting": resting, "good": crate::peerbook::good(node, p.net, 50), "next": node.coin_candidates(p).into_iter().take(10).collect::<Vec<_>>()}))
         }
         "chains.list" => Ok(crate::chains::list(node)),
+        "mesh.overview" => Ok(crate::meshview::overview(node)),
         "chains.sizes" => {
             // Measure now (instead of waiting for the six-hourly pass) and show the result.
             let m = crate::sizes::measure(node)?;
@@ -450,6 +475,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::chains::add(&node.self_arc(), &s("key").ok_or("key required")?, &s("mode").unwrap_or_else(|| "full".into()), with)
         }
+        "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),
         "chains.pause" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, true),
         "chains.resume" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, false),
         "chains.index_add" => crate::chains::add_index(&node.self_arc(), &s("key").ok_or("key required")?, &s("index").ok_or("index required")?),
@@ -465,6 +491,33 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let started = crate::cbimport::start_verify(node.self_arc(), p.key.to_string());
             Ok(serde_json::json!({"started": started, "note": crate::cbimport::verify_note(p.key)}))
         }
+        // Index copies from old arcades (crate::lxfetch)
+        #[cfg(feature = "oldimport")]
+        "chains.index_copy_status" => {
+            let k = s("key");
+            Ok(json!({"ledger": crate::lxfetch::status(node, k.as_deref()), "ord": crate::dxfetch::status(node, k.as_deref())}))
+        }
+        #[cfg(feature = "oldimport")]
+        "chains.index_copy_start" | "chains.index_copy_cancel" => {
+            let key = s("key").ok_or("key required")?;
+            let start = req["cmd"] == "chains.index_copy_start";
+            match s("index").as_deref() {
+                Some("ledger") if start => crate::lxfetch::start(node, &key, s("from")),
+                Some("ledger") => crate::lxfetch::cancel(node, &key),
+                Some("ord") if start => crate::dxfetch::start(node, &key, s("from")),
+                Some("ord") => crate::dxfetch::cancel(node, &key),
+                _ => Err("index = ledger or ord".into()),
+            }
+        }
+        // V1.0 copies (crate::v1copy)
+        "share.held" => Ok(crate::v1copy::held(node)),
+        "share.offers" => crate::vxshare::offers_json(node, &s("key").ok_or("key required")?),
+        "share.fetch" => crate::vxshare::start(node, &s("key").ok_or("key required")?, &s("fam").ok_or("fam required")?, s("id")),
+        "share.install" => crate::v1import::start(node.self_arc(), &s("key").ok_or("key required")?),
+        "share.install_cancel" => crate::v1import::cancel(&s("key").ok_or("key required")?),
+        "share.cancel" => crate::vxshare::cancel(node, &s("key").ok_or("key required")?, &s("fam").ok_or("fam required")?),
+        "share.serve" => crate::v1copy::set_serve(node, &s("key").ok_or("key required")?, req["on"] != false),
+        "share.make" => crate::v1copy::start_make(node.self_arc(), &s("key").ok_or("key required")?, &s("fam").ok_or("fam required (blocks, coins, ord, ...)")?),
         // Borrowed coins (crate::borrow)
         "borrow.status" => Ok(crate::borrow::status_all(node)),
         "borrow.set" => {

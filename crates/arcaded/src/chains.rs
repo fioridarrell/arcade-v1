@@ -36,6 +36,9 @@ pub struct ChainRun {
     pub share_note: Mutex<String>,
     /// Where the chain is coming from right now (arcade mesh, an arcade's Core node, P2P).
     pub source: Mutex<String>,
+    /// Indexes that can't move: indexer name -> why. Kept apart from `state`, which follow()
+    /// reads to tell whether the coin's P2P network is failing.
+    pub index_notes: Mutex<std::collections::BTreeMap<String, String>>,
 }
 
 pub fn indexer_name(index: &str) -> &'static str {
@@ -53,13 +56,13 @@ fn is_rider(ix: &str) -> bool {
 }
 
 /// Rows an index owns.
-fn tables_of(index: &str) -> Vec<String> {
+pub(crate) fn tables_of(index: &str) -> Vec<String> {
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
     match index {
         "ledger" => arcade_ledger::engine::LedgerIndexer.tables_named(),
         "profiles" => s(&[arcade_ledger::index::PROFILE, arcade_ledger::index::LINKED]),
         "messages" => s(arcade_ledger::messages::TABLES),
-        "ord" => s(arcade_ledger::ord::TABLES),
+        "ord" => s(&[arcade_ledger::ord::TABLES, arcade_ledger::ord::DERIVED].concat()),
         "names" => s(&[arcade_ledger::names::CLAIM, arcade_ledger::names::WIN]),
         "maps" => s(&[arcade_ledger::maps::MAP]),
         "tokens" => s(&[arcade_ledger::tokens::TICK, arcade_ledger::tokens::BAL, arcade_ledger::tokens::HOLDER, arcade_ledger::tokens::XFER]),
@@ -68,13 +71,14 @@ fn tables_of(index: &str) -> Vec<String> {
 }
 
 /// Check a requested set of indexes for a chain; riders bring ord with them.
-fn normalize(p: &ChainParams, indexes: &[String]) -> Result<Vec<String>, String> {
+fn normalize(p: &ChainParams, indexes: &[String], home: bool) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     for ix in indexes {
         if !INDEXES.contains(&ix.as_str()) {
             return Err(format!("unknown index {ix}; indexes: {}", INDEXES.join(", ")));
         }
-        if ix == "messages" {
+        // (The home chain's own list holds messages: adding another index there must work.)
+        if ix == "messages" && !home {
             return Err("messages live on the home chain (Pepecoin testnet), where they're always on".into());
         }
         // Runes live on Bitcoin and dunes on Dogecoin only.
@@ -183,8 +187,20 @@ pub fn start_home(node: &Node) -> Result<(), String> {
     register_shared(node, node.params, &home_indexes(node), &node.share_of(node.params.key))
 }
 
+#[cfg_attr(not(feature = "oldimport"), allow(dead_code))]
+/// Register a chain's indexes again, as configured (after an index was taken out to take a copy in).
+pub fn reregister(node: &Node, p: &'static ChainParams) -> Result<(), String> {
+    let indexes = if p.chain_no == node.params.chain_no {
+        home_indexes(node)
+    } else {
+        node.extra.lock().unwrap().get(p.key).map(|r| r.indexes.clone()).ok_or("the chain is not installed")?
+    };
+    register_shared(node, p, &indexes, &node.share_of(p.key))
+}
+
 /// Start every chain the user installed earlier.
 pub fn start_saved(node: &Arc<Node>) {
+    run_queue(node.clone());
     for c in saved(node) {
         let (Some(key), Some(mode)) = (c["key"].as_str(), c["mode"].as_str()) else { continue };
         let indexes: Vec<String> = c["indexes"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
@@ -216,6 +232,7 @@ fn launch(node: &Arc<Node>, key: &str, mode: &str, mut indexes: Vec<String>, add
         added,
         share,
         share_note: Mutex::new(String::new()),
+        index_notes: Mutex::new(Default::default()),
         source: Mutex::new(String::new()),
     });
     node.extra.lock().unwrap().insert(key.into(), run.clone());
@@ -225,7 +242,95 @@ fn launch(node: &Arc<Node>, key: &str, mode: &str, mut indexes: Vec<String>, add
 }
 
 /// Install a chain (by hand only), with the indexes the user opted into.
+// ---------------- one install at a time (Martin): the others wait in a queue ----------------
+
+const QUEUE: &[u8] = b"install_queue";
+
+fn queue(node: &Node) -> Vec<Value> {
+    node.app.store.read(|r| r.get(arcade_app::META, QUEUE)).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+fn save_queue(node: &Node, q: &[Value]) {
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, QUEUE, &serde_json::to_vec(q).unwrap()));
+}
+
+/// The installed chain still being synced or taken in (not caught up yet), if any.
+pub fn installing_now(node: &Node) -> Option<&'static ChainParams> {
+    let runs: Vec<Arc<ChainRun>> = node.extra.lock().unwrap().values().cloned().collect();
+    runs.into_iter().filter(|r| !r.paused.load(Ordering::Relaxed)).map(|r| r.params).find(|p| !crate::borrow::installed_ready(node, p))
+}
+
+/// Position (1 = next) of a chain waiting to be installed.
+pub fn queued_at(node: &Node, key: &str) -> Option<usize> {
+    queue(node).iter().position(|e| e["key"] == key).map(|i| i + 1)
+}
+
+/// chains.unqueue: take a chain out of the install queue.
+pub fn unqueue(node: &Node, key: &str) -> Result<Value, String> {
+    let mut q = queue(node);
+    let n = q.len();
+    q.retain(|e| e["key"] != key);
+    if q.len() == n {
+        return Err(format!("{key} isn't waiting to be installed"));
+    }
+    save_queue(node, &q);
+    Ok(json!({"unqueued": key}))
+}
+
+/// Every 20 s: when no chain is being installed, the next one in the queue starts.
+pub fn run_queue(node: Arc<Node>) {
+    std::thread::Builder::new()
+        .name("install-queue".into())
+        .spawn(move || loop {
+            std::thread::sleep(Duration::from_secs(20));
+            if installing_now(&node).is_some() {
+                continue;
+            }
+            let mut q = queue(&node);
+            if q.is_empty() {
+                continue;
+            }
+            let e = q.remove(0);
+            save_queue(&node, &q);
+            let key = e["key"].as_str().unwrap_or("").to_string();
+            let with: Vec<String> = e["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            match add_now(&node, &key, e["mode"].as_str().unwrap_or("full"), with) {
+                Ok(_) => {
+                    let _ = node.app.event("chains", &format!("installing {key} (its turn in the queue)"));
+                }
+                Err(err) => {
+                    let _ = node.app.event("chains", &format!("could not install {key} from the queue: {err}"));
+                }
+            }
+        })
+        .unwrap();
+}
+
+/// chains.add: install a chain now, or, while another chain is still being installed, put it
+/// in the queue (one install at a time: each gets the disk and network to itself).
 pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Result<Value, String> {
+    let key = by_key(key).map(|p| p.key).unwrap_or(key);
+    let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
+    if let Some(busy) = installing_now(node).filter(|b| b.key != p.key) {
+        if node.extra.lock().unwrap().contains_key(p.key) {
+            return Err(format!("{} is already installed", p.name));
+        }
+        if p.chain_no == node.params.chain_no {
+            return Err(format!("{} is this arcade's home chain and is always installed", p.name));
+        }
+        let mut q = queue(node);
+        if let Some(i) = q.iter().position(|e| e["key"] == p.key) {
+            return Ok(json!({"queued": true, "key": p.key, "position": i + 1, "behind": busy.key}));
+        }
+        q.push(json!({"key": p.key, "mode": mode, "with": indexes, "at": arcade_app::now()}));
+        save_queue(node, &q);
+        let _ = node.app.event("chains", &format!("{} waits to be installed (#{} after {})", p.name, q.len(), busy.name));
+        return Ok(json!({"queued": true, "key": p.key, "position": q.len(), "behind": busy.key}));
+    }
+    add_now(node, key, mode, indexes)
+}
+
+fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Result<Value, String> {
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
@@ -241,7 +346,7 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     if mode == "light" || mode == "index" {
         return Err("Light and Index-only storage (borrowing blocks from the mesh) are coming; use full or chain for now".into());
     }
-    let indexes = normalize(p, &indexes)?;
+    let indexes = normalize(p, &indexes, false)?;
     if mode == "chain" && indexes.iter().any(|i| i != "addresses") {
         return Err("Blockchain-only storage keeps no protocol indexes (Addresses is fine); choose full to add indexes".into());
     }
@@ -315,7 +420,7 @@ pub fn add_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, Stri
     }
     let mut want = cur.clone();
     want.push(index.into());
-    let set = normalize(p, &want)?;
+    let set = normalize(p, &want, home)?;
     if index == "addresses" && run.as_ref().is_none_or(|r| r.mode != "shared" || crate::shares::pruned(node, p.net).is_empty()) {
         // Rows for the blocks already stored are built from them, in the background.
         if crate::addrsvc::clearing(p.chain_no) {
@@ -451,6 +556,8 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
     let c = r.params.chain_no;
     let name = r.params.name;
     std::thread::spawn(move || {
+        // Let the chain's threads see the stop first: a chain's own file is deleted whole.
+        std::thread::sleep(std::time::Duration::from_secs(10));
         while n.chain.remove_chain_batch(c, 20_000).map(|x| x > 0).unwrap_or(false) {}
         let _ = n.app.event("chains", &format!("removed {name} and its data"));
     });
@@ -552,8 +659,28 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
                 // the index is written in one sorted pass after the catch-up.
                 stages.push(json!({"name": "Addresses · collect", "detail": "taken from each block as it is stored (received coins, spends, history)",
                                    "overall_pct": blocks_pct, "pct": blocks_pct, "at": tip, "of": peer}));
-                stages.push(json!({"name": "Addresses · build", "index": ix, "detail": detail, "overall_pct": blocks_pct * 0.9,
-                                   "pct": p_, "at": 0, "of": peer}));
+                // The build's six steps, each with its own bar and rate (docs/ADDRBUILD.md).
+                match node.chain.build_progress(c) {
+                    Some(steps) => {
+                        for (i, st) in steps.iter().enumerate() {
+                            let name = format!("Addresses · {} {}", i + 1, arcade_chaindb::addrbuild::STEP_NAMES[i]);
+                            let pct = if st.state == 2 { 100.0 } else if st.total > 0 { st.done as f64 * 100.0 / st.total as f64 } else { 0.0 };
+                            let rate = if st.state == 1 { stage_rate(p.key, &name, st.done) } else { None };
+                            let unit = if st.unit.is_empty() { "rows" } else { st.unit };
+                            let detail = match st.state {
+                                2 => "done".to_string(),
+                                1 => unit.to_string(),
+                                _ => "waiting".to_string(),
+                            };
+                            // (The index's remove button on the first of the six rows only.)
+                            let index = if i == 0 { json!(ix) } else { Value::Null };
+                            stages.push(json!({"name": name, "index": index, "detail": detail, "overall_pct": blocks_pct * 0.9,
+                                               "pct": pct, "at": st.done, "of": st.total, "rate": rate, "unit": unit}));
+                        }
+                    }
+                    None => stages.push(json!({"name": "Addresses · build", "index": ix, "detail": detail, "overall_pct": blocks_pct * 0.9,
+                                               "pct": p_, "at": 0, "of": peer})),
+                }
             } else {
                 stages.push(json!({"name": "Addresses", "index": ix, "detail": detail, "overall_pct": blocks_pct, "pct": p_, "at": tip, "of": peer}));
             }
@@ -571,7 +698,8 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         let top = tip.max(peer);
         let span = top.saturating_sub(start) + 1;
         let put_off = peer.saturating_sub(tip) > arcade_chaindb::sync::DEFER_BEHIND as u64 && at < tip && tip + 1 >= start;
-        let detail = if put_off { format!("from block {start}: put off until the chain catches up, then read from the stored blocks") } else if !running { "waiting to start (rebuilding)".to_string() } else if is_rider(ix) { format!("from block {start}, with the ord index") } else { format!("from block {start}") };
+        let stuck = run.as_ref().and_then(|r| r.index_notes.lock().unwrap().get(name).cloned());
+        let detail = if let Some(n) = stuck { n } else if put_off { format!("from block {start}: put off until the chain catches up, then read from the stored blocks") } else if !running { "waiting to start (rebuilding)".to_string() } else if is_rider(ix) { format!("from block {start}, with the ord index") } else { format!("from block {start}") };
         // An index that starts further along the chain than we are can't move yet; for the
         // overall figure it counts at the pace of the blocks (it finishes with them).
         let blocks_pct = pct(tip, peer.max(1));
@@ -619,8 +747,12 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         }
         None => node.sync_state.lock().unwrap().clone(),
     };
+    // Borrowed while it catches up (from copies or syncing), so balances and the Explorer
+    // work meanwhile.
+    let borrowed = crate::borrow::is_borrowed(p.key);
     Ok(json!({"key": key, "name": p.name, "installed": true, "home": home, "mode": mode, "indexes": indexes,
-              "state": state, "overall": overall, "stages": stages, "tip": tip, "copy": copy}))
+              "state": state, "overall": overall, "stages": stages, "tip": tip, "copy": copy, "borrowed": borrowed,
+              "borrow_state": if borrowed { crate::borrow::state_text(p.key) } else { None }}))
 }
 
 pub fn list(node: &Node) -> Value {
@@ -633,7 +765,8 @@ pub fn list(node: &Node) -> Value {
                    "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()),
                    "dunes": p.key == "doge", "runes": p.key == "btc", "sizes": crate::sizes::for_chain(node, p.key),
                    "offers": node.offers_for(p.key).len(),
-                   "borrowed": st["borrowed"] == true, "lenders": st["lenders"], "tip": st["tip"], "floor": st["floor"], "mismatch": st["mismatch"]})
+                   "borrowed": st["borrowed"] == true, "lenders": st["lenders"], "tip": st["tip"], "floor": st["floor"], "mismatch": st["mismatch"],
+                   "queued": queued_at(node, p.key)})
         })
         .collect::<Vec<_>>())
 }
@@ -657,7 +790,8 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
     }
     let ours = || node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
     let fresh = ours() == 0;
-    let wait_max = Duration::from_secs(if fresh { 90 } else { 20 });
+    // Already hearing offers (the usual case once installed): no need to wait for more.
+    let wait_max = Duration::from_secs(if fresh { 90 } else if node.offers_for(p.key).is_empty() { 20 } else { 0 });
     let t0 = std::time::Instant::now();
     let mut first: Option<std::time::Instant> = None;
     loop {
@@ -704,9 +838,12 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
         };
         // Retry the parallel download after a hiccup (a source vanishing, a slow stretch);
         // only after three quick failures in a row fall back to one source at a time.
-        let mut quick_fails = 0;
-        while !run.stop.load(Ordering::Relaxed) && !crate::coreboot::held(p.key) && ours() + 2000 < top && quick_fails < 3 {
+        // (Rounds that connect nothing count too, however long they took: two in a row and the
+        // one-source-at-a-time path below takes over.)
+        let (mut quick_fails, mut idle) = (0, 0);
+        while !run.stop.load(Ordering::Relaxed) && !crate::coreboot::held(p.key) && ours() + 2000 < top && quick_fails < 3 && idle < 2 {
             let t = std::time::Instant::now();
+            let before = ours();
             match crate::psync::run(node, p, syncer, top as u32, &progress, &run.stop) {
                 Ok(n) => {
                     let _ = node.app.event("chains", &format!("{}: parallel download connected {n} blocks", p.name));
@@ -718,6 +855,7 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
                     std::thread::sleep(Duration::from_secs(5));
                 }
             }
+            idle = if ours() > before { 0 } else { idle + 1 };
         }
     }
     for (id, addr, kind, their) in offers {
@@ -736,8 +874,15 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             },
         };
         let how = if kind == "bk" { "blocks" } else { "Core node" };
-        let _ = node.app.event("chains", &format!("bootstrapping {} from arcade {short} at {addr} ({how}, its tip {their})", p.name));
-        *run.source.lock().unwrap() = format!("bootstrap from arcade {short} ({how}, its tip {their})");
+        // Only a real catch-up (2,000+ behind) is a bootstrap; nearer, this is just following the chain
+        // through another arcade (the coin's P2P network doesn't answer, or is behind).
+        // Same line as the "every source at once" catch-up above.
+        let far = their > ours() + 2000;
+        let doing = if far { "bootstrapping from" } else { "following via" };
+        if far {
+            let _ = node.app.event("chains", &format!("bootstrapping {} from arcade {short} at {addr} ({how}, its tip {their})", p.name));
+        }
+        *run.source.lock().unwrap() = format!("{} arcade {short} ({how}, its tip {their})", if far { "bootstrap from" } else { "following via" });
         if let Err(e) = syncer.ensure_genesis(src.as_mut()) {
             let _ = node.app.event("chains", &format!("{}: arcade {addr}: {e}", p.name));
             continue;
@@ -746,14 +891,14 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
             if run.stop.load(Ordering::Relaxed) || run.paused.load(Ordering::Relaxed) || crate::coreboot::held(p.key) {
                 return;
             }
-            set(format!("bootstrapping from arcade {short} ({how}): block {} of {their}", ours()));
+            set(format!("{doing} arcade {short} ({how}): block {} of {their}", ours()));
             run.peer_tip.fetch_max(their as u32, Ordering::Relaxed);
             syncer.known_top.set(syncer.known_top.get().max(their as u32));
             let h = syncer.sync_headers_once(src.as_mut());
             let b = syncer.sync_blocks(src.as_mut(), 500, 500);
             match (h, b) {
                 (Ok(hn), Ok(pr)) => {
-                    set(format!("bootstrapping from arcade {short} ({how}): block {} of {their}", ours()));
+                    set(format!("{doing} arcade {short} ({how}): block {} of {their}", ours()));
                     if hn == 0 && pr.blocks == 0 {
                         break;
                     }
@@ -764,11 +909,75 @@ fn mesh_first(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
                 }
             }
         }
-        let _ = node.app.event("chains", &format!("{} bootstrap from arcade {short} reached {}", p.name, ours()));
+        if far {
+            let _ = node.app.event("chains", &format!("{} bootstrap from arcade {short} reached {}", p.name, ours()));
+        }
         if ours() >= their {
             break;
         }
     }
+}
+
+/// Bring the chain's indexes up to the stored tip, 500 blocks a batch, at most `max_batches`
+/// batches per index this call (the rest on the next), so one index catching up doesn't hold
+/// back the others. Runs after each P2P sync pass and also when the coin's P2P network can't
+/// be reached (blocks then come from the arcade mesh, and the indexes must still walk them; a
+/// capped call there keeps the mesh pulls coming). False when stopped, paused or a copy is
+/// being taken in, so the caller starts over. Never touches `run.state`.
+fn walk_indexes(node: &Node, run: &ChainRun, max_batches: usize) -> bool {
+    let p = run.params;
+    // Far behind, the chain comes in first; the indexes walk it once it has caught up.
+    if node.far_behind(p) {
+        return true;
+    }
+    // One note per index, changed only for an index walked this call; logged when it changes.
+    let note = |name: &str, why: Option<String>| {
+        let mut notes = run.index_notes.lock().unwrap();
+        match why {
+            Some(w) if notes.get(name) != Some(&w) => {
+                eprintln!("{} {name} index: {w}", p.name);
+                notes.insert(name.to_string(), w);
+            }
+            None => {
+                notes.remove(name);
+            }
+            _ => {}
+        }
+    };
+    let mut names: Vec<&str> = run.indexes.iter().map(|i| indexer_name(i)).filter(|n| !n.is_empty()).collect();
+    names.sort_unstable();
+    names.dedup();
+    for name in names {
+        #[cfg(feature = "oldimport")]
+        if crate::lxfetch::walk_waits(p.key, name) {
+            note(name, Some("waiting for an index copy being fetched".into()));
+            continue;
+        }
+        let mut problem = None;
+        for _ in 0..max_batches {
+            if run.stop.load(Ordering::Relaxed) || run.paused.load(Ordering::Relaxed) || crate::coreboot::held(p.key) {
+                return false;
+            }
+            if run.mode == "shared" {
+                if let Err(e) = crate::shares::prepare_backfill(node, p, name, 500) {
+                    problem = Some(format!("waiting for blocks held by other arcades: {e}"));
+                }
+            }
+            let more = match node.chain.backfill(p, name, 500) {
+                Ok(n) => n > 0,
+                Err(e) => {
+                    problem = Some(e.to_string());
+                    false
+                }
+            };
+            std::thread::sleep(Duration::from_millis(30));
+            if !more {
+                break;
+            }
+        }
+        note(name, problem);
+    }
+    true
 }
 
 fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
@@ -802,6 +1011,8 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
         }
         let Some(mut peer) = node.coin_candidates(p).iter().find_map(|a| Peer::connect(p, a, Duration::from_secs(20)).ok()) else {
             set(format!("no {} peer reachable; retrying", p.name));
+            // New blocks come from the arcade mesh then: the indexes still walk what is stored.
+            walk_indexes(&node, &run, 40);
             std::thread::sleep(Duration::from_secs(20));
             continue;
         };
@@ -828,6 +1039,7 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
                         set(format!("synced at {tip} · new blocks from the arcade mesh ({} P2P doesn't answer)", p.name));
                         *run.source.lock().unwrap() = format!("arcade mesh ({} P2P doesn't answer)", p.name);
                     }
+                    walk_indexes(&node, &run, 40);
                     continue 'outer;
                 }
             };
@@ -838,27 +1050,8 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
                     continue 'outer;
                 }
             };
-            let mut names: Vec<&str> = run.indexes.iter().map(|i| indexer_name(i)).filter(|n| !n.is_empty()).collect();
-            names.dedup();
-            // Far behind, the chain comes in first; the indexes walk it once it has caught up.
-            if node.far_behind(p) {
-                names.clear();
-            }
-            for name in names {
-                while {
-                    if run.mode == "shared" {
-                        if let Err(e) = crate::shares::prepare_backfill(&node, p, name, 500) {
-                            set(format!("{name}: waiting for blocks held by other arcades: {e}"));
-                        }
-                    }
-                    let more = node.chain.backfill(p, name, 500).map(|x| x > 0).unwrap_or(false);
-                    std::thread::sleep(Duration::from_millis(30));
-                    more
-                } {
-                    if run.stop.load(Ordering::Relaxed) || crate::coreboot::held(p.key) {
-                        continue 'outer;
-                    }
-                }
+            if !walk_indexes(&node, &run, usize::MAX) {
+                continue 'outer;
             }
             if run.mode == "shared" && last_balance.elapsed() > Duration::from_secs(crate::shares::every()) {
                 match crate::shares::balance(&node, p) {
@@ -868,6 +1061,10 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
                 last_balance = std::time::Instant::now();
             }
             let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+            // At the network's tip: copies another arcade asked for at this height (docs/V1SHARE.md §3).
+            if b > 0 && tip >= run.peer_tip.load(Ordering::Relaxed) {
+                crate::v1copy::checkpoint(&node, p, tip, crate::v1copy::families_of(&run.mode, &run.indexes));
+            }
             set(if h == 0 && b == 0 { format!("synced at {tip}") } else { format!("syncing {tip}") });
             if h == 0 && b == 0 {
                 std::thread::sleep(Duration::from_secs(15));

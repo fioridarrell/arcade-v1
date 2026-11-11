@@ -1318,14 +1318,14 @@ pub fn divisible(prop: &Value) -> bool {
 
 /// An arcade token's property record; read and JSON errors as text.
 pub fn property(db: &arcade_chaindb::ChainDb, c: u16, pid: u32) -> std::result::Result<Option<Value>, String> {
-    let raw = db.store.read(|r| r.get(PROPERTY, &KeyBuf::new().u16(c).u32(pid).done())).map_err(|e| e.to_string())?;
+    let raw = db.store(c).read(|r| r.get(PROPERTY, &KeyBuf::new().u16(c).u32(pid).done())).map_err(|e| e.to_string())?;
     raw.map(|v| serde_json::from_slice(&v).map_err(|e| e.to_string())).transpose()
 }
 
 /// Token holdings of an address: (propertyid, units), units > 0.
 pub fn holdings(db: &arcade_chaindb::ChainDb, c: u16, address: &str) -> Vec<(u32, u64)> {
     let pre = KeyBuf::new().u16(c).bytes(address.as_bytes()).u8(0).done();
-    db.store
+    db.store(c)
         .read(|r| r.scan_prefix(BALANCE, &pre))
         .unwrap_or_default()
         .into_iter()
@@ -1336,7 +1336,7 @@ pub fn holdings(db: &arcade_chaindb::ChainDb, c: u16, address: &str) -> Vec<(u32
 
 /// Holders of token `pid`: (units, address), largest first.
 pub fn holders(db: &arcade_chaindb::ChainDb, c: u16, pid: u32) -> Result<Vec<(u64, String)>> {
-    let rows = db.store.read(|r| r.scan_prefix(BALANCE, &c.to_be_bytes()))?;
+    let rows = db.store(c).read(|r| r.scan_prefix(BALANCE, &c.to_be_bytes()))?;
     let mut hs: Vec<(u64, String)> = rows
         .iter()
         .filter_map(|(k, b)| {
@@ -1352,13 +1352,13 @@ pub fn holders(db: &arcade_chaindb::ChainDb, c: u16, pid: u32) -> Result<Vec<(u6
 }
 
 pub fn block_records(db: &arcade_chaindb::ChainDb, c: u16, h: u32) -> Result<Vec<String>> {
-    let mut recs: Vec<String> = match db.store.read(|r| r.get(ROWS, &k(c).u32(h).done()))? {
+    let mut recs: Vec<String> = match db.store(c).read(|r| r.get(ROWS, &k(c).u32(h).done()))? {
         Some(v) => String::from_utf8_lossy(&v).split_inclusive('\n').map(String::from).collect(),
         None => Vec::new(),
     };
-    for (key, _) in db.store.read(|r| r.scan_prefix(PROPERTY_BY_BLOCK, &k(c).u32(h).done()))? {
+    for (key, _) in db.store(c).read(|r| r.scan_prefix(PROPERTY_BY_BLOCK, &k(c).u32(h).done()))? {
         let pid = be_u32(&key, key.len() - 4);
-        if let Some(v) = db.store.read(|r| r.get(PROPERTY, &k(c).u32(pid).done()))? {
+        if let Some(v) = db.store(c).read(|r| r.get(PROPERTY, &k(c).u32(pid).done()))? {
             let p: Value = serde_json::from_slice(&v).unwrap_or_default();
             let s = |f: &str| p[f].as_str().unwrap_or("").to_string();
             recs.push(format!(
@@ -1383,10 +1383,10 @@ pub fn range_digest(db: &arcade_chaindb::ChainDb, c: u16, lo: u32, hi: u32) -> R
     let mut hs = Sha256::new();
     hs.update(format!("{lo}-{hi}\n").as_bytes());
     let mut heights: std::collections::BTreeSet<u32> = std::collections::BTreeSet::new();
-    for (key, _) in db.store.read(|r| r.scan_prefix(ROWS, &k(c).done()))? {
+    for (key, _) in db.store(c).read(|r| r.scan_prefix(ROWS, &k(c).done()))? {
         heights.insert(be_u32(&key, 2));
     }
-    for (key, _) in db.store.read(|r| r.scan_prefix(PROPERTY_BY_BLOCK, &k(c).done()))? {
+    for (key, _) in db.store(c).read(|r| r.scan_prefix(PROPERTY_BY_BLOCK, &k(c).done()))? {
         heights.insert(be_u32(&key, 2));
     }
     for h in heights.range(lo..=hi) {
@@ -1405,7 +1405,7 @@ pub fn checkpoint(indexed: u32, floor: u32) -> Option<u32> {
 /// consensus_hash: balances, open orders, properties (consensushash.py).
 pub fn consensus_hash(db: &arcade_chaindb::ChainDb, c: u16) -> Result<String> {
     let mut hs = Sha256::new();
-    for (key, v) in db.store.read(|r| r.scan_prefix(BALANCE, &k(c).done()))? {
+    for (key, v) in db.store(c).read(|r| r.scan_prefix(BALANCE, &k(c).done()))? {
         let b: Vec<u64> = (0..4).map(|i| be_u64(&v, i * 8)).collect();
         if b.iter().all(|x| *x == 0) {
             continue;
@@ -1414,7 +1414,7 @@ pub fn consensus_hash(db: &arcade_chaindb::ChainDb, c: u16) -> Result<String> {
         let pid = be_u32(&key, key.len() - 4);
         hs.update(format!("{addr}|{pid}|{}|{}|{}|{}", b[0], b[1], b[2], b[3]).as_bytes());
     }
-    for (_, v) in db.store.read(|r| r.scan_prefix(BOOK, &k(c).done()))? {
+    for (_, v) in db.store(c).read(|r| r.scan_prefix(BOOK, &k(c).done()))? {
         let o: Value = serde_json::from_slice(&v).unwrap_or_default();
         if o["sale_amount"].as_u64().unwrap_or(0) == 0 {
             continue;
@@ -1422,7 +1422,7 @@ pub fn consensus_hash(db: &arcade_chaindb::ChainDb, c: u16) -> Result<String> {
         hs.update(format!("{}|{}|{}|{}|{}|{}|{}", o["txid"].as_str().unwrap(), o["address"].as_str().unwrap(), o["sale_property"], o["sale_amount"], o["want_property"], o["want_amount"], o["reserved"]).as_bytes());
     }
     for eco in [1, 2] {
-        for (_, v) in db.store.read(|r| r.scan_prefix(PROPERTY, &k(c).done()))? {
+        for (_, v) in db.store(c).read(|r| r.scan_prefix(PROPERTY, &k(c).done()))? {
             let p: Value = serde_json::from_slice(&v).unwrap_or_default();
             if p["ecosystem"] == eco {
                 hs.update(format!("{}|{}", p["id"], p["issuer"].as_str().unwrap_or("")).as_bytes());

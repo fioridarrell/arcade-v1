@@ -83,6 +83,13 @@ pub const ADDON_PREFIXES: &[&str] = &["ord.", "tok.", "names.", "sites.", "maps.
 pub struct Store {
     db: Database<NoWriteMap>,
     schema: &'static Schema,
+    /// This open database's number in the process (for state kept beside it in memory).
+    id: usize,
+}
+
+static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+fn next_id() -> usize {
+    NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 impl Store {
@@ -108,7 +115,7 @@ impl Store {
             ..Default::default()
         };
         let db = Database::open_with_options(path.as_ref(), opts)?;
-        let store = Store { db, schema };
+        let store = Store { db, schema, id: next_id() };
         store.init()?;
         Ok(store)
     }
@@ -123,7 +130,7 @@ impl Store {
             ..Default::default()
         };
         let db = Database::open_with_options(path.as_ref(), opts)?;
-        let store = Store { db, schema };
+        let store = Store { db, schema, id: next_id() };
         let txn = store.db.begin_ro_txn()?;
         let meta = txn.open_table(Some(META))?;
         let name: Option<Vec<u8>> = txn.get(&meta, META_SCHEMA)?;
@@ -133,6 +140,11 @@ impl Store {
         drop(meta);
         drop(txn);
         Ok(store)
+    }
+
+    /// This open database's number in the process.
+    pub fn id(&self) -> usize {
+        self.id
     }
 
     pub fn schema(&self) -> &'static Schema {
@@ -178,7 +190,7 @@ impl Store {
                 .iter()
                 .find(|m| m.to == to)
                 .ok_or(StoreError::MissingMigration(to))?;
-            let w = WriteTxn { txn: self.db.begin_rw_txn()?, schema: self.schema };
+            let w = WriteTxn { txn: self.db.begin_rw_txn()?, schema: self.schema, id: self.id };
             // Tables declared now but missing in the file are created before the migration runs.
             for t in self.schema.tables {
                 w.txn.create_table(Some(t.name), flags(t))?;
@@ -209,15 +221,45 @@ impl Store {
 
     /// Run `f` in a read transaction (a consistent snapshot; never blocks writers).
     pub fn read<T>(&self, f: impl FnOnce(&ReadTxn) -> Result<T>) -> Result<T> {
-        let r = ReadTxn { txn: self.db.begin_ro_txn()?, schema: self.schema };
+        let r = ReadTxn { txn: self.db.begin_ro_txn()?, schema: self.schema, id: self.id };
         f(&r)
     }
 
     /// Run `f` in a write transaction. Commits if `f` returns Ok, aborts otherwise.
     pub fn write<T>(&self, f: impl FnOnce(&WriteTxn) -> Result<T>) -> Result<T> {
-        let w = WriteTxn { txn: self.db.begin_rw_txn()?, schema: self.schema };
+        let w = WriteTxn { txn: self.db.begin_rw_txn()?, schema: self.schema, id: self.id };
         let out = f(&w)?;
         w.txn.commit()?;
+        Ok(out)
+    }
+
+    /// Flush every commit to disk now (a SafeNoSync file's last commits included), so the next
+    /// open, read-only ones too, finds a steady state with nothing to recover.
+    pub fn sync(&self) -> Result<()> {
+        self.db.sync(true)?;
+        Ok(())
+    }
+
+    /// A write transaction committed by hand ([`WriteTxn::commit`]); dropped uncommitted,
+    /// it is aborted. For copies too big for one transaction.
+    pub fn begin_write(&self) -> Result<WriteTxn<'_>> {
+        Ok(WriteTxn { txn: self.db.begin_rw_txn()?, schema: self.schema, id: self.id })
+    }
+
+    /// Add-on tables present in this file, with whether each is a dup table.
+    pub fn addon_defs(&self) -> Result<Vec<(String, bool)>> {
+        let txn = self.db.begin_ro_txn()?;
+        let meta = txn.open_table(Some(META))?;
+        let mut c = txn.cursor(&meta)?;
+        let mut out = Vec::new();
+        let mut cur: Option<(Vec<u8>, Vec<u8>)> = c.set_range(b"addon:")?;
+        while let Some((k, v)) = cur {
+            if !k.starts_with(b"addon:") {
+                break;
+            }
+            out.push((String::from_utf8_lossy(&k[6..]).into_owned(), v.first() == Some(&1)));
+            cur = c.next()?;
+        }
         Ok(out)
     }
 
@@ -324,6 +366,11 @@ fn check(schema: &Schema, table: &str) -> Result<()> {
 
 macro_rules! read_methods {
     () => {
+        /// The open database this transaction belongs to (Store::id).
+        pub fn store_id(&self) -> usize {
+            self.id
+        }
+
         /// Value for `key`, if any (first value for a dup table).
         pub fn get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
             check(self.schema, table)?;
@@ -471,6 +518,7 @@ macro_rules! read_methods {
 pub struct ReadTxn<'db> {
     txn: Transaction<'db, RO, NoWriteMap>,
     schema: &'static Schema,
+    id: usize,
 }
 
 impl ReadTxn<'_> {
@@ -480,6 +528,7 @@ impl ReadTxn<'_> {
 pub struct WriteTxn<'db> {
     txn: Transaction<'db, RW, NoWriteMap>,
     schema: &'static Schema,
+    id: usize,
 }
 
 impl WriteTxn<'_> {
@@ -506,6 +555,26 @@ impl WriteTxn<'_> {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Like [`WriteTxn::append`] for a dup table: rows in ascending (key, value) order.
+    pub fn append_dup(&self, table: &str, key: &[u8], value: &[u8]) -> Result<()> {
+        check(self.schema, table)?;
+        let t = self.txn.open_table(Some(table))?;
+        match self.txn.put(&t, key, value, WriteFlags::APPEND_DUP) {
+            Ok(()) => Ok(()),
+            Err(libmdbx::Error::KeyMismatch) | Err(libmdbx::Error::KeyExist) => {
+                self.txn.put(&t, key, value, WriteFlags::UPSERT)?;
+                Ok(())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Commit a transaction from [`Store::begin_write`].
+    pub fn commit(self) -> Result<()> {
+        self.txn.commit()?;
+        Ok(())
     }
 
     /// Insert only if absent. Returns false if the key already existed.

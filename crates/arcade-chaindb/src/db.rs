@@ -215,8 +215,13 @@ fn parse_meta(v: &[u8]) -> Result<Meta> {
 pub trait Rd {
     fn get(&self, table: &str, key: &[u8]) -> Result<Option<Vec<u8>>>;
     fn scan(&self, table: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
+    /// The open database (for the tx index runs kept in memory beside it).
+    fn store_id(&self) -> usize;
 }
 impl Rd for ReadTxn<'_> {
+    fn store_id(&self) -> usize {
+        ReadTxn::store_id(self)
+    }
     fn get(&self, t: &str, k: &[u8]) -> Result<Option<Vec<u8>>> {
         ReadTxn::get(self, t, k)
     }
@@ -225,6 +230,9 @@ impl Rd for ReadTxn<'_> {
     }
 }
 impl Rd for WriteTxn<'_> {
+    fn store_id(&self) -> usize {
+        WriteTxn::store_id(self)
+    }
     fn get(&self, t: &str, k: &[u8]) -> Result<Option<Vec<u8>>> {
         WriteTxn::get(self, t, k)
     }
@@ -253,14 +261,15 @@ pub(crate) fn header_rec<R: Rd>(r: &R, c: u16, hash: &Hash256) -> Result<Option<
 /// duplicate txid; then each is checked by full hash.
 pub(crate) fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
     let c = params.chain_no;
-    let cands = r.scan(TXS, &k_txs(c, &txid.t12()))?;
+    let mut cands: Vec<(u32, u32)> = r.scan(TXS, &k_txs(c, &txid.t12()))?.iter().map(|(_, bp)| (be_u32(bp, 0), be_u32(bp, 4))).collect();
+    cands.extend(crate::txruns::find(r, r.store_id(), c, &txid.t12())?);
+    cands.sort_unstable();
+    cands.dedup();
     if cands.len() == 1 {
-        let bp = &cands[0].1;
-        return Ok(Some((be_u32(bp, 0), be_u32(bp, 4))));
+        return Ok(Some(cands[0]));
     }
     let mut found = None;
-    for (_, bp) in cands {
-        let (b, p) = (be_u32(&bp, 0), be_u32(&bp, 4));
+    for (b, p) in cands {
         if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
             if row_txid(&raw, params)? == *txid {
                 found = Some((b, p)); // the latest stored copy wins (BIP30-style duplicates)
@@ -362,6 +371,9 @@ fn locate_c<R: Rd>(r: &R, params: &ChainParams, cc: &CoinCache, txid: &Hash256) 
     for (_, bp) in r.scan(TXS, &k_txs(c, &t12))? {
         cands.push((be_u32(&bp, 0), be_u32(&bp, 4)));
     }
+    cands.extend(crate::txruns::find(r, r.store_id(), c, &t12)?);
+    cands.sort_unstable();
+    cands.dedup();
     if cands.len() <= 1 {
         return Ok(cands.pop());
     }
@@ -405,10 +417,21 @@ fn flush_cache(w: &WriteTxn, c: u16, cc: &mut CoinCache, tip: &Tip) -> Result<()
     let left: std::collections::HashSet<(u32, u32)> =
         if cc.log_txs { coins.iter().map(|(k, _)| (be_u32(k, 2), be_u32(k, 6))).collect() } else { Default::default() };
     let mut logged = 0u32;
+    // While catching up with the log on, txs that still have a coin go into a sorted run
+    // (sequential) instead of TXS (random), and are logged too, for the sorted build of TXS
+    // after the catch-up (txruns). ARCADE_TXS_RUNS=0 keeps the old way (for comparisons).
+    let runs_on = cc.log_txs && std::env::var("ARCADE_TXS_RUNS").map(|v| v != "0").unwrap_or(true);
+    let mut run_rows: Vec<([u8; 12], [u8; 8])> = Vec::new();
     for (t12, bps) in &txs {
         let k = k_txs(c, t12);
-        for bp in bps {
-            if cc.log_txs && !left.contains(&(be_u32(bp, 0), be_u32(bp, 4))) {
+        let mut bps = bps.clone();
+        bps.sort_unstable();
+        for bp in &bps {
+            let live = left.contains(&(be_u32(bp, 0), be_u32(bp, 4)));
+            if runs_on && live {
+                run_rows.push((*t12, *bp));
+            }
+            if cc.log_txs && (!live || runs_on) {
                 let mut lk = k_chain(c);
                 lk.extend_from_slice(&tip.height.to_be_bytes());
                 lk.extend_from_slice(&(0x8000_0000u32 + logged).to_be_bytes());
@@ -424,6 +447,7 @@ fn flush_cache(w: &WriteTxn, c: u16, cc: &mut CoinCache, tip: &Tip) -> Result<()
             }
         }
     }
+    crate::txruns::add_run(w, c, &run_rows)?;
     if logged > 0 {
         w.put(STATE, &k_state(c, crate::addrbuild::TXS_PENDING), b"1")?;
     }
@@ -442,8 +466,8 @@ fn flush_cache(w: &WriteTxn, c: u16, cc: &mut CoinCache, tip: &Tip) -> Result<()
     w.put(STATE, &k_state(c, "coins_at"), &encode_tip(tip))?;
     if std::env::var_os("ARCADE_SYNC_TIMES").is_some() {
         eprintln!(
-            "  flush parts: {n_coins} coins {:.1}s · {n_txs} tx index rows ({logged} put off) {:.1}s · {n_spent} older coins deleted {:.1}s · {n_bs} address rows deleted {:.1}s",
-            t_coins.as_secs_f64(), (t_txs - t_coins).as_secs_f64(), (t_spent - t_txs).as_secs_f64(), (t0.elapsed() - t_spent).as_secs_f64()
+            "  flush parts: {n_coins} coins {:.1}s · {n_txs} tx index rows ({logged} put off, {} in a run) {:.1}s · {n_spent} older coins deleted {:.1}s · {n_bs} address rows deleted {:.1}s",
+            t_coins.as_secs_f64(), run_rows.len(), (t_txs - t_coins).as_secs_f64(), (t_spent - t_txs).as_secs_f64(), (t0.elapsed() - t_spent).as_secs_f64()
         );
     }
     cc.bytes = 0;
@@ -459,7 +483,15 @@ fn tadd(i: usize, t: std::time::Instant) {
 }
 
 pub struct ChainDb {
-    pub store: Store,
+    /// The shared file (`chain.mdbx`): chains stored before SPLITDB, until they are moved.
+    legacy: Arc<Store>,
+    /// Where each chain's own file goes: `<dir>/chains/<key>/chain.mdbx` (docs/SPLITDB.md).
+    dir: std::path::PathBuf,
+    readonly: bool,
+    /// Chains whose file is decided: their own file, or the shared one (they have rows there).
+    files: std::sync::RwLock<std::collections::HashMap<u16, Arc<Store>>>,
+    /// Per open file: held while a batch of blocks is connected, and by the stop's last flush.
+    batches: std::sync::Mutex<std::collections::HashMap<usize, Arc<std::sync::Mutex<()>>>>,
     /// Indexers and the chains they run on.
     indexers: std::sync::RwLock<Vec<(u16, Arc<dyn Indexer>)>>,
     /// Coin caches of chains catching up (see CoinCache).
@@ -478,36 +510,272 @@ fn ix_key(c: u16, name: &str) -> Vec<u8> {
 /// writes are the last word (a block connected after its chain's flush would land in a new
 /// cache that is lost, winding the tip back again at the next start).
 pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-/// Held while a batch of blocks is connected (and committed), and by the stop's last flush.
-static BATCH: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// The directory name of a chain's own file: its key (`chains/doge/chain.mdbx`), or `c<number>`
+/// for a chain number no params know (tests).
+pub fn chain_dir_name(c: u16) -> String {
+    arcade_chain::params::ALL_CHAINS.iter().find(|p| p.chain_no == c).map(|p| p.key.to_string()).unwrap_or_else(|| format!("c{c}"))
+}
+
+fn chain_no_of_dir(name: &str) -> Option<u16> {
+    if let Some(p) = arcade_chain::params::ALL_CHAINS.iter().find(|p| p.key == name) {
+        return Some(p.chain_no);
+    }
+    name.strip_prefix('c').and_then(|n| n.parse().ok())
+}
+
+/// Delete a batch of chain `c`'s rows from one file (0 = none left).
+fn clear_chain_rows(s: &Store, c: u16, max: usize) -> Result<usize> {
+    let pre = k_chain(c);
+    let mut tables: Vec<String> = CHAIN_SCHEMA.tables.iter().map(|t| t.name.to_string()).collect();
+    tables.extend(s.addon_tables()?);
+    s.write(|w| {
+        let mut n = 0;
+        for t in &tables {
+            if n >= max {
+                break;
+            }
+            for (k, _) in w.scan_prefix_limit(t, &pre, max - n)? {
+                w.del(t, &k)?;
+                n += 1;
+            }
+        }
+        Ok(n)
+    })
+}
+
+/// Where the chains' own files go: `<home>/chains/` beside `<home>/chain.mdbx`; beside any
+/// other name (tests keep several in one directory), `<name>.chains/`.
+fn chains_dir(shared: &Path) -> std::path::PathBuf {
+    let dir = shared.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+    match shared.file_name().and_then(|n| n.to_str()) {
+        Some("chain.mdbx") | None => dir.join("chains"),
+        Some(n) => dir.join(format!("{n}.chains")),
+    }
+}
+
+/// Whether a file holds anything of chain `c`.
+fn has_rows(s: &Store, c: u16) -> Result<bool> {
+    let pre = k_chain(c);
+    s.read(|r| {
+        for t in [STATE, HEADERS, HDR, BLOCK_META, BLOCK_TX] {
+            if !r.scan_prefix_limit(t, &pre, 1)?.is_empty() {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    })
+}
 
 impl ChainDb {
+    /// Open the chain databases: `path` is the shared file (`<home>/chain.mdbx`), and every
+    /// `<home>/chains/<key>/chain.mdbx` beside it is a chain's own file (docs/SPLITDB.md).
     pub fn open(path: impl AsRef<Path>) -> Result<ChainDb> {
         // chain.mdbx can always be rebuilt from the chain: skip the per-commit flush (a power
         // cut can lose the last few blocks, which the next sync fetches again).
+        let path = path.as_ref();
         let db = ChainDb {
-            store: Store::open_sync(path, &CHAIN_SCHEMA, false)?,
+            legacy: Arc::new(Store::open_sync(path, &CHAIN_SCHEMA, false)?),
+            dir: chains_dir(path),
+            readonly: false,
+            files: Default::default(),
+            batches: Default::default(),
             indexers: Default::default(),
             caches: Default::default(),
             cache_bytes: std::sync::atomic::AtomicUsize::new(cache_budget()),
             addr_progress: Default::default(),
         };
+        db.open_own_files()?;
         for c in 0..=255u16 {
             db.recover_coins(c)?;
         }
+        db.load_runs()?;
         Ok(db)
     }
 
-    /// Use a coin cache of `mb` MB while catching up (0 = none).
-    /// Open a chain.mdbx for reading only (safe while its arcaded runs): reads work, writes fail.
+    /// Open the chain databases for reading only (safe while their arcaded runs): reads work,
+    /// writes fail, and no file is created.
     pub fn open_readonly(path: impl AsRef<Path>) -> Result<ChainDb> {
-        Ok(ChainDb {
-            store: Store::open_readonly(path, &CHAIN_SCHEMA)?,
+        let path = path.as_ref();
+        let db = ChainDb {
+            legacy: Arc::new(Store::open_readonly(path, &CHAIN_SCHEMA)?),
+            dir: chains_dir(path),
+            readonly: true,
+            files: Default::default(),
+            batches: Default::default(),
             indexers: Default::default(),
             caches: Default::default(),
             cache_bytes: std::sync::atomic::AtomicUsize::new(0),
             addr_progress: Default::default(),
-        })
+        };
+        db.open_own_files()?;
+        db.load_runs()?;
+        Ok(db)
+    }
+
+    /// The path of chain `c`'s own file (whether or not it exists).
+    pub fn own_path(&self, c: u16) -> std::path::PathBuf {
+        self.dir.join(chain_dir_name(c)).join("chain.mdbx")
+    }
+
+    fn open_own_files(&self) -> Result<()> {
+        let Ok(rd) = std::fs::read_dir(&self.dir) else { return Ok(()) };
+        let mut files = self.files.write().unwrap();
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let p = e.path().join("chain.mdbx");
+            if !p.is_file() {
+                continue;
+            }
+            let Some(c) = chain_no_of_dir(&name) else {
+                eprintln!("chain files: {} is no chain's; left alone", e.path().display());
+                continue;
+            };
+            let s = if self.readonly { Store::open_readonly(&p, &CHAIN_SCHEMA)? } else { Store::open_sync(&p, &CHAIN_SCHEMA, false)? };
+            files.insert(c, Arc::new(s));
+        }
+        if !files.is_empty() && !self.readonly {
+            let mut names: Vec<String> = files.keys().map(|c| chain_dir_name(*c)).collect();
+            names.sort();
+            eprintln!("chain files: {} in their own files ({})", names.join(", "), self.dir.display());
+        }
+        Ok(())
+    }
+
+    /// The database holding chain `c`: its own file, or the shared one (also for a chain with
+    /// nothing stored yet, so reads find nothing). Never creates a file.
+    pub fn store(&self, c: u16) -> Arc<Store> {
+        self.files.read().unwrap().get(&c).cloned().unwrap_or_else(|| self.legacy.clone())
+    }
+
+    /// The database holding the rows whose keys start with `key`'s chain number.
+    pub fn store_for(&self, key: &[u8]) -> Arc<Store> {
+        self.store(u16::from_be_bytes([key.first().copied().unwrap_or(0), key.get(1).copied().unwrap_or(0)]))
+    }
+
+    /// The database to write chain `c` into: a chain with nothing in the shared file gets its
+    /// own file, created now.
+    pub fn wstore(&self, c: u16) -> Result<Arc<Store>> {
+        if let Some(s) = self.files.read().unwrap().get(&c) {
+            return Ok(s.clone());
+        }
+        if self.readonly {
+            return Ok(self.legacy.clone());
+        }
+        let mut files = self.files.write().unwrap();
+        if let Some(s) = files.get(&c) {
+            return Ok(s.clone());
+        }
+        let s = if has_rows(&self.legacy, c)? {
+            self.legacy.clone()
+        } else {
+            let p = self.own_path(c);
+            std::fs::create_dir_all(p.parent().unwrap()).map_err(|e| StoreError::Other(format!("{}: {e}", p.display())))?;
+            let s = Arc::new(Store::open_sync(&p, &CHAIN_SCHEMA, false)?);
+            // Add-on tables of indexers already registered for this chain.
+            for (ch, ix) in self.indexers.read().unwrap().iter() {
+                if *ch == c {
+                    for t in ix.tables() {
+                        s.add_table(t)?;
+                    }
+                }
+            }
+            s
+        };
+        files.insert(c, s.clone());
+        Ok(s)
+    }
+
+    /// Whether chain `c` has its own file.
+    pub fn has_own_file(&self, c: u16) -> bool {
+        self.files.read().unwrap().get(&c).is_some_and(|s| !Arc::ptr_eq(s, &self.legacy))
+    }
+
+    /// Every open database: the shared file first, then each chain's own.
+    pub fn stores(&self) -> Vec<Arc<Store>> {
+        let mut v = vec![self.legacy.clone()];
+        for s in self.files.read().unwrap().values() {
+            if !v.iter().any(|x| Arc::ptr_eq(x, s)) {
+                v.push(s.clone());
+            }
+        }
+        v
+    }
+
+    /// Every row of a table across all files, in key order (tools and tests).
+    pub fn scan_all(&self, table: &str) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let mut out = Vec::new();
+        for s in self.stores() {
+            if s.schema().tables.iter().any(|t| t.name == table) || s.addon_tables()?.iter().any(|t| t == table) {
+                out.extend(s.read(|r| r.scan_prefix(table, b""))?);
+            }
+        }
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(out)
+    }
+
+    /// Entries of a table across all files.
+    pub fn count_all(&self, table: &str) -> Result<u64> {
+        let mut n = 0;
+        for s in self.stores() {
+            if s.schema().tables.iter().any(|t| t.name == table) || s.addon_tables()?.iter().any(|t| t == table) {
+                n += s.count(table)?;
+            }
+        }
+        Ok(n)
+    }
+
+    /// Add-on tables in any file.
+    pub fn addon_tables_all(&self) -> Result<Vec<String>> {
+        let mut v = Vec::new();
+        for s in self.stores() {
+            for t in s.addon_tables()? {
+                if !v.contains(&t) {
+                    v.push(t);
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// (table, entries, bytes on disk) summed across all files.
+    pub fn table_sizes_all(&self) -> Result<Vec<(String, u64, u64)>> {
+        let mut v: Vec<(String, u64, u64)> = Vec::new();
+        for s in self.stores() {
+            for (t, n, b) in s.table_sizes()? {
+                match v.iter_mut().find(|x| x.0 == t) {
+                    Some(x) => {
+                        x.1 += n;
+                        x.2 += b;
+                    }
+                    None => v.push((t, n, b)),
+                }
+            }
+        }
+        Ok(v)
+    }
+
+    /// The shared file (moving chains out of it: arcade-split).
+    pub fn legacy_store(&self) -> Arc<Store> {
+        self.legacy.clone()
+    }
+
+    fn batch_of(&self, s: &Store) -> Arc<std::sync::Mutex<()>> {
+        self.batches.lock().unwrap().entry(s.id()).or_default().clone()
+    }
+
+    /// The tx index runs of chains catching up (filters into memory).
+    fn load_runs(&self) -> Result<()> {
+        for s in self.stores() {
+            let sid = s.id();
+            s.read(|r| {
+                let chains: Vec<u16> = r.scan_prefix(STATE, b"")?.into_iter()
+                    .filter(|(k, _)| k.len() > 2 && &k[2..] == crate::txruns::STATE_RUNS.as_bytes())
+                    .map(|(k, _)| u16::from_be_bytes([k[0], k[1]])).collect();
+                crate::txruns::load(r, sid, &chains)
+            })?;
+        }
+        Ok(())
     }
 
     pub fn set_coin_cache_mb(&self, mb: usize) {
@@ -520,13 +788,21 @@ impl ChainDb {
     }
 
     /// Stopping: wait for a batch being connected to commit (or roll back), then write every
-    /// coin cache. Nothing connects afterwards (STOPPING is set first by the caller).
+    /// coin cache, then sync every file (an error there comes back as chain u16::MAX). Nothing connects afterwards (STOPPING is set first by the caller).
     pub fn flush_all_for_stop(&self) -> Vec<(u16, Result<()>)> {
-        let _batch = BATCH.lock().unwrap_or_else(|e| e.into_inner());
         let mut out = Vec::new();
         for c in 0..=255u16 {
             if !self.coins_settled(c) {
+                let lock = self.batch_of(&self.store(c));
+                let _batch = lock.lock().unwrap_or_else(|e| e.into_inner());
                 out.push((c, self.flush_coins(c)));
+            }
+        }
+        // The files are written without a flush per commit: put them on disk now, or the next
+        // open finds a weak last commit (a read-only open, e.g. arcade-split's, can't recover it).
+        for s in self.stores() {
+            if let Err(e) = s.sync() {
+                out.push((u16::MAX, Err(e)));
             }
         }
         out
@@ -534,7 +810,7 @@ impl ChainDb {
 
     /// Write a chain's coin cache to the database now (it matches the current tip).
     pub fn flush_coins(&self, c: u16) -> Result<()> {
-        self.store.write(|w| {
+        self.store(c).write(|w| {
             let mut caches = self.caches.lock().unwrap();
             if let Some(cc) = caches.get_mut(&c).filter(|cc| !cc.is_empty()) {
                 if let Some(tip) = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)) {
@@ -549,7 +825,7 @@ impl ChainDb {
     /// the coin cache was flushed) is wound back to it: the blocks stay stored, and their stretch
     /// is connected again.
     fn recover_coins(&self, c: u16) -> Result<()> {
-        self.store.write(|w| {
+        self.store(c).write(|w| {
             let Some(tip) = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)) else { return Ok(()) };
             let Some(at) = w.get(STATE, &k_state(c, "coins_at"))?.map(|v| decode_tip(&v)) else {
                 w.put(STATE, &k_state(c, "coins_at"), &encode_tip(&tip))?;
@@ -578,7 +854,7 @@ impl ChainDb {
     /// indexer's start, call [`ChainDb::backfill`] until it returns 0.
     pub fn add_indexer(&self, chain_no: u16, ix: Arc<dyn Indexer>) -> Result<()> {
         for t in ix.tables() {
-            self.store.add_table(t)?;
+            self.wstore(chain_no)?.add_table(t)?;
         }
         let mut v = self.indexers.write().unwrap();
         if !v.iter().any(|(c, i)| *c == chain_no && i.name() == ix.name()) {
@@ -602,9 +878,10 @@ impl ChainDb {
     pub fn remove_index_batch(&self, chain_no: u16, name: &str, tables: &[String], max: usize) -> Result<usize> {
         self.remove_indexer(chain_no, name);
         let pre = k_chain(chain_no);
-        self.store.write(|w| {
+        let have = self.tables_in(chain_no)?;
+        self.store(chain_no).write(|w| {
             let mut n = 0;
-            for t in tables {
+            for t in tables.iter().filter(|t| have.contains(t.as_str())) {
                 if n >= max {
                     break;
                 }
@@ -624,9 +901,10 @@ impl ChainDb {
     /// indexer's progress (for an index riding on another). Call until it returns 0.
     pub fn clear_rows_batch(&self, chain_no: u16, tables: &[String], max: usize) -> Result<usize> {
         let pre = k_chain(chain_no);
-        self.store.write(|w| {
+        let have = self.tables_in(chain_no)?;
+        self.store(chain_no).write(|w| {
             let mut n = 0;
-            for t in tables {
+            for t in tables.iter().filter(|t| have.contains(t.as_str())) {
                 if n >= max {
                     break;
                 }
@@ -639,36 +917,42 @@ impl ChainDb {
         })
     }
 
+    /// The tables that exist in chain `c`'s file. Clearing a list of tables skips the ones a
+    /// file never had: an index never added there (adding the tokens rider to a chain that
+    /// had no tok.* tables stopped the ord rows' removal part way, Wojakcoin 2026-11-10).
+    fn tables_in(&self, c: u16) -> Result<std::collections::HashSet<String>> {
+        let s = self.store(c);
+        Ok(s.addon_tables()?.into_iter().chain(s.schema().tables.iter().map(|t| t.name.to_string())).collect())
+    }
+
     /// Delete everything stored for a chain, a batch at a time. Returns rows deleted in this
-    /// call (0 = done). Every table's keys start with the 2-byte chain number.
+    /// call (0 = done). Every table's keys start with the 2-byte chain number. Rows in the
+    /// shared file go a batch at a time; a chain's own file is deleted whole at the end (its
+    /// space comes back at once). Stop the chain's threads first.
     pub fn remove_chain_batch(&self, chain_no: u16, max: usize) -> Result<usize> {
-        let pre = k_chain(chain_no);
-        let mut tables: Vec<String> = CHAIN_SCHEMA.tables.iter().map(|t| t.name.to_string()).collect();
-        tables.extend(self.store.addon_tables()?);
-        self.store.write(|w| {
-            let mut n = 0;
-            for t in &tables {
-                if n >= max {
-                    break;
-                }
-                for (k, _) in w.scan_prefix_limit(t, &pre, max - n)? {
-                    w.del(t, &k)?;
-                    n += 1;
-                }
-            }
-            Ok(n)
-        })
+        let n = clear_chain_rows(&self.legacy, chain_no, max)?;
+        if n > 0 {
+            return Ok(n);
+        }
+        let own = self.files.write().unwrap().remove(&chain_no);
+        if let Some(s) = own.filter(|s| !Arc::ptr_eq(s, &self.legacy)) {
+            drop(s);
+            // A reader still holding it keeps the unlinked file until it closes.
+            let dir = self.own_path(chain_no).parent().unwrap().to_path_buf();
+            std::fs::remove_dir_all(&dir).map_err(|e| StoreError::Other(format!("{}: {e}", dir.display())))?;
+        }
+        Ok(0)
     }
 
     /// Height an indexer has folded in on a chain (None = nothing yet).
     pub fn indexed_to(&self, c: u16, name: &str) -> Result<Option<u32>> {
-        self.store.read(|r| Ok(r.get(STATE, &ix_key(c, name))?.map(|v| be_u32(&v, 0))))
+        self.store(c).read(|r| Ok(r.get(STATE, &ix_key(c, name))?.map(|v| be_u32(&v, 0))))
     }
 
     /// Set (or with None, forget) how far an indexer has folded in on a chain. Only for an index
     /// whose rows were written another way: a copy taken in (docs/INDEXBOOT.md §4.2).
     pub fn set_indexed_to(&self, c: u16, name: &str, h: Option<u32>) -> Result<()> {
-        self.store.write(|w| match h {
+        self.wstore(c)?.write(|w| match h {
             Some(h) => w.put(STATE, &ix_key(c, name), &h.to_be_bytes()),
             None => w.del(STATE, &ix_key(c, name)).map(|_| ()),
         })
@@ -683,7 +967,7 @@ impl ChainDb {
             .ok_or_else(|| other(format!("no indexer {name}")))?;
         let Some(tip) = self.tip(c)? else { return Ok(0) };
         // Tx index rows still in the log: protocol indexes look txs up by id; wait for them.
-        if self.store.read(|r| r.get(STATE, &k_state(c, crate::addrbuild::TXS_PENDING)))?.is_some() {
+        if self.store(c).read(|r| r.get(STATE, &k_state(c, crate::addrbuild::TXS_PENDING)))?.is_some() {
             return Ok(0);
         }
         let start = match self.indexed_to(c, name)? {
@@ -694,7 +978,7 @@ impl ChainDb {
             return Ok(0);
         }
         let end = tip.height.min(start + max - 1);
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             for h in start..=end {
                 let hv = w.get(HEIGHT, &k_height(c, h))?.ok_or(StoreError::Corrupt { table: HEIGHT, why: "gap" })?;
                 let b = be_u32(&hv, 32);
@@ -738,20 +1022,20 @@ impl ChainDb {
     // ---------- reads ----------
 
     pub fn header(&self, c: u16, hash: &Hash256) -> Result<Option<HeaderRec>> {
-        self.store.read(|r| header_rec(r, c, hash))
+        self.store(c).read(|r| header_rec(r, c, hash))
     }
 
     pub fn tip(&self, c: u16) -> Result<Option<Tip>> {
-        self.store.read(|r| Ok(r.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v))))
+        self.store(c).read(|r| Ok(r.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v))))
     }
 
     /// Best known header (most work), which may be ahead of the tip.
     pub fn best_header(&self, c: u16) -> Result<Option<Hash256>> {
-        self.store.read(|r| Ok(r.get(STATE, &k_state(c, "best"))?.map(|v| Hash256(v[..32].try_into().unwrap()))))
+        self.store(c).read(|r| Ok(r.get(STATE, &k_state(c, "best"))?.map(|v| Hash256(v[..32].try_into().unwrap()))))
     }
 
     pub fn hash_at(&self, c: u16, height: u32) -> Result<Option<Hash256>> {
-        self.store.read(|r| Ok(r.get(HEIGHT, &k_height(c, height))?.map(|v| Hash256(v[..32].try_into().unwrap()))))
+        self.store(c).read(|r| Ok(r.get(HEIGHT, &k_height(c, height))?.map(|v| Hash256(v[..32].try_into().unwrap()))))
     }
 
     /// Raw block bytes, rebuilt exactly from the stored parts.
@@ -760,7 +1044,7 @@ impl ChainDb {
         if h.b == 0 {
             return Ok(None);
         }
-        self.store.read(|r| {
+        self.store(c).read(|r| {
             let m = parse_meta(&r.get(BLOCK_META, &k_block(c, h.b))?.ok_or(StoreError::Corrupt {
                 table: BLOCK_META,
                 why: "header points at a missing block",
@@ -802,7 +1086,7 @@ impl ChainDb {
         }
         let end = tip.height.min(start.saturating_add(max).saturating_sub(1));
         let n = if start > tip.height { 0 } else { end - start + 1 };
-        self.store.read(|r| {
+        self.store(c).read(|r| {
             let mut o = Vec::new();
             arcade_chain::encode::write_varint(&mut o, n as u64);
             for h in start..start + n {
@@ -826,9 +1110,10 @@ impl ChainDb {
     /// Raw transaction by txid (checked by full hash) and its block number.
     pub fn tx_raw(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(Vec<u8>, u32)>> {
         let c = params.chain_no;
-        self.store.read(|r| {
-            for (_, bp) in r.scan_prefix(TXS, &k_txs(c, &txid.t12()))? {
-                let (b, p) = (be_u32(&bp, 0), be_u32(&bp, 4));
+        self.store(c).read(|r| {
+            let mut cands: Vec<(u32, u32)> = r.scan_prefix(TXS, &k_txs(c, &txid.t12()))?.iter().map(|(_, bp)| (be_u32(bp, 0), be_u32(bp, 4))).collect();
+            cands.extend(crate::txruns::find(r, r.store_id(), c, &txid.t12())?);
+            for (b, p) in cands {
                 let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? else { continue };
                 if row_txid(&raw, params)? == *txid {
                     return Ok(if is_pruned(&raw) { None } else { Some((raw, b)) });
@@ -841,7 +1126,7 @@ impl ChainDb {
     /// A stored transaction by block number and position.
     pub fn tx_at(&self, params: &ChainParams, b: u32, p: u32) -> Result<Option<Tx>> {
         let c = params.chain_no;
-        self.store.read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
+        self.store(c).read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
             Some(raw) if !is_pruned(&raw) => Ok(Some(Tx::parse_with(&raw, &params.format).map_err(other)?)),
             _ => Ok(None),
         })
@@ -849,7 +1134,7 @@ impl ChainDb {
 
     /// The height of stored block number `b`, when it is on the main chain.
     pub fn block_height_of(&self, c: u16, b: u32) -> Result<Option<u32>> {
-        let Some(m) = self.store.read(|r| r.get(BLOCK_META, &k_block(c, b)))? else { return Ok(None) };
+        let Some(m) = self.store(c).read(|r| r.get(BLOCK_META, &k_block(c, b)))? else { return Ok(None) };
         let h80: [u8; 80] = m.get(..80).and_then(|x| x.try_into().ok()).ok_or(StoreError::Corrupt { table: BLOCK_META, why: "short block meta" })?;
         let hash = Header::parse(&h80).hash();
         let Some(rec) = self.header(c, &hash)? else { return Ok(None) };
@@ -858,13 +1143,13 @@ impl ChainDb {
 
     /// Where a transaction is (block number, position), even when its body is pruned.
     pub fn tx_location(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
-        self.store.read(|r| locate(r, params, txid))
+        self.store(params.chain_no).read(|r| locate(r, params, txid))
     }
 
     /// Txid at a block number and position (pruned or not).
     pub fn txid_at(&self, params: &ChainParams, b: u32, p: u32) -> Result<Option<Hash256>> {
         let c = params.chain_no;
-        self.store.read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
+        self.store(c).read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
             Some(raw) => Ok(Some(row_txid(&raw, params)?)),
             None => Ok(None),
         })
@@ -872,7 +1157,7 @@ impl ChainDb {
 
     /// Is block number `b`'s body pruned here (Shared storage)?
     pub fn is_block_pruned(&self, c: u16, b: u32) -> Result<bool> {
-        self.store.read(|r| Ok(r.get(BLOCK_TX, &k_block_tx(c, b, 0))?.map(|v| is_pruned(&v)).unwrap_or(false)))
+        self.store(c).read(|r| Ok(r.get(BLOCK_TX, &k_block_tx(c, b, 0))?.map(|v| is_pruned(&v)).unwrap_or(false)))
     }
 
     /// Drop a stored block's body, keeping each transaction's txid (so lookups, coins and
@@ -880,7 +1165,7 @@ impl ChainDb {
     /// inside the undo window. Returns bytes freed (0 = already pruned).
     pub fn prune_block(&self, params: &ChainParams, b: u32) -> Result<u64> {
         let c = params.chain_no;
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut freed = 0u64;
             for (k, raw) in w.scan_prefix(BLOCK_TX, &k_block(c, b))? {
                 if is_pruned(&raw) {
@@ -912,7 +1197,7 @@ impl ChainDb {
     /// Prune many blocks in one commit (see prune_block). Returns bytes freed.
     pub fn prune_blocks(&self, params: &ChainParams, bs: &[u32]) -> Result<u64> {
         let c = params.chain_no;
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut freed = 0u64;
             for &b in bs {
                 for (k, raw) in w.scan_prefix(BLOCK_TX, &k_block(c, b))? {
@@ -959,7 +1244,7 @@ impl ChainDb {
             return Ok(vec![]);
         }
         let end = tip.height.min(start + max - 1);
-        self.store.read(|r| {
+        self.store(c).read(|r| {
             let mut need: Vec<u32> = Vec::new();
             for h in start..=end {
                 let hv = r.get(HEIGHT, &k_height(c, h))?.ok_or(StoreError::Corrupt { table: HEIGHT, why: "gap" })?;
@@ -998,7 +1283,7 @@ impl ChainDb {
         if params.block_id(&h) != params.block_id(&blk.header) || blk.txs.len() as u32 != n || blk.computed_merkle_root() != h.merkle_root {
             return Err(other("block does not match the stored header"));
         }
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             for (p, tx) in blk.txs.iter().enumerate() {
                 let k = k_block_tx(c, b, p as u32);
                 if let Some(old) = w.get(BLOCK_TX, &k)? {
@@ -1015,7 +1300,7 @@ impl ChainDb {
     /// Header, height and transaction count of a stored block by its block number.
     pub fn block_at(&self, params: &ChainParams, b: u32) -> Result<Option<(Header, u32, u32)>> {
         let c = params.chain_no;
-        let Some(m) = self.store.read(|r| r.get(BLOCK_META, &k_block(c, b)))? else { return Ok(None) };
+        let Some(m) = self.store(c).read(|r| r.get(BLOCK_META, &k_block(c, b)))? else { return Ok(None) };
         let m = parse_meta(&m)?;
         let h = Header::parse(&m.header80);
         let height = self.header(c, &params.block_id(&h))?.map(|r| r.height).unwrap_or(0);
@@ -1025,10 +1310,12 @@ impl ChainDb {
     /// Full txids of stored transactions whose id starts with `t12` (normally one).
     pub fn txids_by_t12(&self, params: &ChainParams, t12: &[u8; 12]) -> Result<Vec<Hash256>> {
         let c = params.chain_no;
-        self.store.read(|r| {
+        self.store(c).read(|r| {
             let mut out = Vec::new();
-            for (_, bp) in r.scan_prefix(TXS, &k_txs(c, t12))? {
-                if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, be_u32(&bp, 0), be_u32(&bp, 4)))? {
+            let mut cands: Vec<(u32, u32)> = r.scan_prefix(TXS, &k_txs(c, t12))?.iter().map(|(_, bp)| (be_u32(bp, 0), be_u32(bp, 4))).collect();
+            cands.extend(crate::txruns::find(r, r.store_id(), c, t12)?);
+            for (b, p) in cands {
+                if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
                     let txid = row_txid(&raw, params)?;
                     if !out.contains(&txid) {
                         out.push(txid);
@@ -1041,7 +1328,7 @@ impl ChainDb {
 
     /// An unspent output.
     pub fn coin(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<Coin>> {
-        self.store.read(|r| match locate(r, params, &op.txid)? {
+        self.store(params.chain_no).read(|r| match locate(r, params, &op.txid)? {
             Some((b, p)) => coin_at(r, params, b, p, op.vout),
             None => Ok(None),
         })
@@ -1051,7 +1338,7 @@ impl ChainDb {
     pub fn coins_for_script(&self, params: &ChainParams, script: &[u8]) -> Result<Vec<(OutPoint, u64, u32)>> {
         let c = params.chain_no;
         let sid = script_id(script);
-        self.store.read(|r| {
+        self.store(c).read(|r| {
             let pre = k_sid(c, &sid);
             let mut out = Vec::new();
             for (k, v) in r.scan_prefix(BY_SCRIPT, &pre)? {
@@ -1073,7 +1360,7 @@ impl ChainDb {
     pub fn balance_for_script(&self, c: u16, script: &[u8]) -> Result<u64> {
         let sid = script_id(script);
         Ok(self
-            .store
+            .store(c)
             .read(|r| r.scan_prefix(BY_SCRIPT, &k_sid(c, &sid)))?
             .iter()
             .map(|(_, v)| u64::from_le_bytes(v[0..8].try_into().unwrap()))
@@ -1085,7 +1372,7 @@ impl ChainDb {
         let sid = script_id(script);
         let pre = k_sid(c, &sid);
         Ok(self
-            .store
+            .store(c)
             .read(|r| r.scan_prefix(SCRIPT_HIST, &pre))?
             .iter()
             .map(|(k, v)| {
@@ -1098,7 +1385,7 @@ impl ChainDb {
     /// Who spent an outpoint: (block number, position, input index).
     pub fn spender(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<(u32, u32, u32)>> {
         let c = params.chain_no;
-        self.store.read(|r| match locate(r, params, &op.txid)? {
+        self.store(c).read(|r| match locate(r, params, &op.txid)? {
             Some((b, p)) => Ok(r
                 .get(SPENDS, &k_pos(c, b, p, op.vout))?
                 .map(|v| (be_u32(&v, 0), be_u32(&v, 4), be_u32(&v, 8)))),
@@ -1116,7 +1403,7 @@ impl ChainDb {
         if self.tx_raw(params, &tx.txid)?.is_some() {
             return Ok(false);
         }
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let k = k_txs(c, &tx.txid.t12());
             if w.contains(MEMPOOL, &k)? {
                 return Ok(false);
@@ -1139,7 +1426,7 @@ impl ChainDb {
     /// Every pooled transaction: (first seen, raw).
     pub fn mempool(&self, c: u16) -> Result<Vec<(u64, Vec<u8>)>> {
         Ok(self
-            .store
+            .store(c)
             .read(|r| r.scan_prefix(MEMPOOL, &k_chain(c)))?
             .into_iter()
             .map(|(_, v)| (u64::from_le_bytes(v[..8].try_into().unwrap()), v[8..].to_vec()))
@@ -1148,12 +1435,12 @@ impl ChainDb {
 
     /// A pooled transaction's raw bytes by txid.
     pub fn mempool_tx(&self, c: u16, txid: &Hash256) -> Result<Option<Vec<u8>>> {
-        Ok(self.store.read(|r| r.get(MEMPOOL, &k_txs(c, &txid.t12())))?.map(|v| v[8..].to_vec()))
+        Ok(self.store(c).read(|r| r.get(MEMPOOL, &k_txs(c, &txid.t12())))?.map(|v| v[8..].to_vec()))
     }
 
     /// The pooled transaction spending an outpoint, if any.
     pub fn mempool_spender(&self, c: u16, op: &OutPoint) -> Result<Option<Hash256>> {
-        self.store.read(|r| {
+        self.store(c).read(|r| {
             Ok(r.get(MEMPOOL_SPENDS, &k_out(c, &op.txid.t12(), op.vout))?.map(|v| Hash256(v[..32].try_into().unwrap())))
         })
     }
@@ -1161,7 +1448,7 @@ impl ChainDb {
     /// Drop pooled transactions older than `max_age` seconds.
     pub fn mempool_expire(&self, params: &ChainParams, now: u64, max_age: u64) -> Result<u32> {
         let c = params.chain_no;
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut n = 0;
             for (k, v) in w.scan_prefix(MEMPOOL, &k_chain(c))? {
                 if now.saturating_sub(u64::from_le_bytes(v[..8].try_into().unwrap())) > max_age {
@@ -1180,7 +1467,7 @@ impl ChainDb {
 
     /// Store headers (already checked by the caller) and move `best` if any has more work.
     pub fn put_headers(&self, c: u16, recs: &[(Hash256, HeaderRec)]) -> Result<()> {
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut best = w.get(STATE, &k_state(c, "best"))?.map(|v| U256::from_be_bytes(v[32..64].try_into().unwrap()));
             let mut best_hash = None;
             for (hash, rec) in recs {
@@ -1231,10 +1518,11 @@ impl ChainDb {
     /// one at a time inside the single writer. Misses (coins made in the same batch) are fine.
     pub fn warm(&self, params: &ChainParams, blk: &Block, height: u32, addresses: bool) {
         let c = params.chain_no;
-        let _ = self.store.read(|r| {
+        let _ = self.store(c).read(|r| {
             for tx in &blk.txs {
                 let t12 = tx.txid.t12();
                 let _ = r.scan(TXS, &k_txs(c, &t12));
+                let _ = crate::txruns::find(r, r.store_id(), c, &t12);
                 if !tx.is_coinbase() {
                     for inp in &tx.inputs {
                         let Ok(Some((pb, pp))) = locate(r, params, &inp.prevout.txid) else { continue };
@@ -1271,8 +1559,10 @@ impl ChainDb {
     }
 
     pub(crate) fn connect_blocks_with(&self, params: &ChainParams, blocks: &[Block], check: bool, defer: bool) -> Result<Tip> {
-        // One batch at a time against a stop (flush_all_for_stop waits for it to commit).
-        let _batch = BATCH.lock().unwrap_or_else(|e| e.into_inner());
+        // One batch at a time per file against a stop (flush_all_for_stop waits for it to commit).
+        let store = self.wstore(params.chain_no)?;
+        let lock = self.batch_of(&store);
+        let _batch = lock.lock().unwrap_or_else(|e| e.into_inner());
         if STOPPING.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(other("the arcade is stopping"));
         }
@@ -1286,7 +1576,7 @@ impl ChainDb {
             self.indexers.read().unwrap().iter().filter(|(ch, _)| *ch == c).map(|(_, i)| i.clone()).collect()
         };
         let t0 = std::time::Instant::now();
-        let r = self.store.write(|w| {
+        let r = store.write(|w| {
             let mut tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v));
             // The Addresses index is a choice per chain (on unless turned off).
             let addr = if w.get(STATE, &k_state(c, crate::addrbuild::OFF))?.is_some() {
@@ -1350,7 +1640,7 @@ impl ChainDb {
 
     /// Disconnect the tip block using its undo record.
     pub fn disconnect_tip(&self, c: u16) -> Result<Tip> {
-        self.store.write(|w| {
+        self.store(c).write(|w| {
             let tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)).ok_or_else(|| other("no tip"))?;
             if tip.height == 0 {
                 return Err(other("refusing to disconnect genesis"));

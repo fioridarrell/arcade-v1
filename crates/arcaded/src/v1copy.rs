@@ -102,7 +102,7 @@ pub fn canonical(v: &Value) -> String {
 /// Make a copy of one family of chain `p` now, from a single read transaction. The copy's
 /// height is the tip (blocks, coins) or the family's index height as of that view.
 pub fn make(node: &Node, p: &'static ChainParams, fam: &str) -> Result<Value, String> {
-    node.chain.store.read(|r| Ok(make_in(node, p, fam, r))).map_err(|e| e.to_string())?
+    node.chain.store(p.chain_no).read(|r| Ok(make_in(node, p, fam, r))).map_err(|e| e.to_string())?
 }
 
 /// Make a copy of one family from the read transaction `r` (all families asked for at one height
@@ -152,7 +152,8 @@ pub fn make_in(node: &Node, p: &'static ChainParams, fam: &str, r: &arcade_store
                 let Some(h) = h else {
                     return Ok(Err(format!("{} has no {fam} index here", p.name)));
                 };
-                let have: Vec<String> = crate::chains::tables_of(fam);
+                // Derived tables (built by each arcade from the rest) aren't copied.
+                let have: Vec<String> = crate::chains::tables_of(fam).into_iter().filter(|t| !arcade_ledger::ord::DERIVED.contains(&t.as_str())).collect();
                 let tables: Vec<&str> = have.iter().map(|s| s.as_str()).collect();
                 copyout::export_tables(r, c, &tables, &mut sink)?;
                 (h, json!({"tables": tables}))
@@ -269,7 +270,7 @@ pub fn checkpoint(node: &std::sync::Arc<Node>, p: &'static ChainParams, tip: u32
     let (tx, rx) = std::sync::mpsc::channel::<()>();
     let n = node.clone();
     let spawned = std::thread::Builder::new().name(format!("checkpoint-{}", p.net)).spawn(move || {
-        let _ = n.chain.store.read(|r| {
+        let _ = n.chain.store(p.chain_no).read(|r| {
             let _ = tx.send(());
             for f in &fams {
                 if let Err(e) = make_in(&n, p, f, r) {
@@ -394,7 +395,14 @@ pub fn touch(id: &str) {
 
 /// Copies nobody fetched for 2 hours are deleted (made on request, they would only take
 /// disk). Runs at most once a minute.
+/// When this arcade started (first call).
+fn started() -> u64 {
+    static S: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *S.get_or_init(arcade_app::now)
+}
+
 pub fn sweep(node: &Node) {
+    started();
     static LAST: std::sync::OnceLock<std::sync::Mutex<u64>> = std::sync::OnceLock::new();
     {
         let mut l = LAST.get_or_init(Default::default).lock().unwrap();
@@ -418,7 +426,9 @@ pub fn sweep(node: &Node) {
                 }
                 let made = std::fs::metadata(i.path().join("manifest.json")).and_then(|m| m.modified()).ok()
                     .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()).map(|d| d.as_secs()).unwrap_or(0);
-                let used = last_used().get(&name).copied().unwrap_or(0).max(made);
+                // Who used it lately is known only since this start: a copy is never removed
+                // in the first 30 minutes after a restart (an arcade may be fetching it).
+                let used = last_used().get(&name).copied().unwrap_or(0).max(made).max(started() + 30 * 60 - 2 * 3600);
                 if used + 2 * 3600 < now {
                     let _ = std::fs::remove_dir_all(i.path());
                     last_used().remove(&name);

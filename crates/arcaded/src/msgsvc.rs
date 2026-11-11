@@ -314,7 +314,7 @@ fn profiles_by_key(node: &Node) -> BTreeMap<String, Value> {
     let c = node.params.chain_no;
     let pre = KeyBuf::new().u16(c).done();
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
-    for (_, v) in node.chain.store.read(|r| r.scan_prefix(arcade_ledger::index::PROFILE, &pre)).unwrap_or_default() {
+    for (_, v) in node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::index::PROFILE, &pre)).unwrap_or_default() {
         let Ok(v) = serde_json::from_slice::<Value>(&v) else { continue };
         if let Some(k) = v["pubkey"].as_str() {
             out.insert(k.to_string(), v);

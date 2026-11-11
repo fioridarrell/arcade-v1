@@ -317,7 +317,7 @@ fn inflate(data: &[u8], z: bool) -> Result<Vec<u8>, String> {
 
 /// The block hash we store at a height.
 fn our_hash(node: &Node, c: u16, h: u32) -> Option<String> {
-    let v = node.chain.store.read(|r| r.get(arcade_chaindb::schema::HEIGHT, &arcade_chaindb::schema::k_height(c, h))).ok()??;
+    let v = node.chain.store(c).read(|r| r.get(arcade_chaindb::schema::HEIGHT, &arcade_chaindb::schema::k_height(c, h))).ok()??;
     Some(arcade_chain::Hash256(v[..32].try_into().ok()?).to_hex())
 }
 

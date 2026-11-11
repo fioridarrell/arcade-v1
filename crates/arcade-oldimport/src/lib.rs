@@ -52,13 +52,13 @@ pub fn ord_rules(net: &str) -> Option<i64> {
 
 /// The copy mark of an index on a chain (None = never copied).
 pub fn copy_state(db: &ChainDb, c: u16, indexer: &str) -> Option<Value> {
-    let v = db.store.read(|r| r.get(schema::STATE, &schema::k_state(c, &format!("copy:{indexer}")))).ok()??;
+    let v = db.store(c).read(|r| r.get(schema::STATE, &schema::k_state(c, &format!("copy:{indexer}")))).ok()??;
     serde_json::from_slice(&v).ok()
 }
 
 /// Set the copy mark of an index on a chain (a later step adds what it checked).
 pub fn set_copy_state(db: &ChainDb, c: u16, indexer: &str, v: &Value) -> Result<()> {
-    db.store.write(|w| w.put(schema::STATE, &schema::k_state(c, &format!("copy:{indexer}")), v.to_string().as_bytes())).map_err(e)
+    db.wstore(c).map_err(e)?.write(|w| w.put(schema::STATE, &schema::k_state(c, &format!("copy:{indexer}")), v.to_string().as_bytes())).map_err(e)
 }
 
 /// Writes rows in key order, table by table. Rows are gathered in memory, spilled to sorted
@@ -171,11 +171,13 @@ impl<'a> Sink<'a> {
             if srcs.len() > 1 {
                 say(&format!("  writing {t} ({} sorted runs)", srcs.len()));
             }
+            // Every key starts with its chain number: the rows go to that chain's file.
+            let c = heap.peek().map(|Reverse((k, _, _))| u16::from_be_bytes([k[0], k[1]])).unwrap_or(0);
+            let st = self.db.wstore(c).map_err(e)?;
             while !heap.is_empty() {
                 let mut done = 0usize;
                 let mut err: Option<String> = None;
-                self.db
-                    .store
+                st
                     .write(|w| {
                         while done < 64 << 20 {
                             let Some(Reverse((k, i, v))) = heap.pop() else { break };
@@ -232,7 +234,7 @@ fn meta(conn: &Connection, sql: &str, k: &str) -> Result<Option<String>> {
 /// Clear an index's rows for one chain and forget its progress.
 fn clear(db: &ChainDb, c: u16, indexer: &str, tables: &[TableDef]) -> Result<()> {
     for t in tables {
-        db.store.add_table(*t).map_err(e)?;
+        db.wstore(c).map_err(e)?.add_table(*t).map_err(e)?;
     }
     let names: Vec<String> = tables.iter().map(|t| t.name.to_string()).collect();
     while db.clear_rows_batch(c, &names, 200_000).map_err(e)? > 0 {}
@@ -280,7 +282,7 @@ fn check_hashes(db: &ChainDb, c: u16, conn: &Connection, sql: &str, lo: u32, hi:
     while let Some(r) = rows.next().map_err(e)? {
         let h: u32 = r.get(0).map_err(e)?;
         let theirs: String = r.get(1).map_err(e)?;
-        match db.store.read(|t| t.get(schema::HEIGHT, &schema::k_height(c, h))).map_err(e)? {
+        match db.store(c).read(|t| t.get(schema::HEIGHT, &schema::k_height(c, h))).map_err(e)? {
             Some(v) => {
                 let ours = Hash256(v[..32].try_into().unwrap()).to_hex();
                 if ours != theirs {
@@ -646,7 +648,7 @@ impl Follow<'_> {
             let mut cands: Vec<(u32, u32, u32)> = Vec::new();
             for vout in 0..tx.outputs.len() as u32 {
                 let k = schema::k_pos(c, b, pp, vout);
-                if let Some(v) = self.b.store.read(|r| r.get(schema::SPENDS, &k)).map_err(e)? {
+                if let Some(v) = self.b.store(c).read(|r| r.get(schema::SPENDS, &k)).map_err(e)? {
                     let (b2, p2, vin) = (be(&v, 0), be(&v, 4), be(&v, 8));
                     if vin == 0 {
                         if let Some(h) = self.height(b2)? {
@@ -693,7 +695,7 @@ fn fill_pieces(db: &ChainDb, blocks: &ChainDb, p: &ChainParams, multis: &[([u8; 
     for (i, (iid, genesis, n)) in multis.iter().enumerate() {
         match f.pieces(genesis, *n)? {
             Ok(ps) => {
-                let Some(raw) = db.store.read(|r| r.get(ord::INSC, &ck(c, iid))).map_err(e)? else { continue };
+                let Some(raw) = db.store(c).read(|r| r.get(ord::INSC, &ck(c, iid))).map_err(e)? else { continue };
                 let mut row: Value = serde_json::from_slice(&raw).map_err(e)?;
                 row["txs"] = json!(ps.iter().map(|x| x.0.to_hex()).collect::<Vec<_>>());
                 sink.put(ord::INSC, ck(c, iid), row.to_string().into_bytes())?;

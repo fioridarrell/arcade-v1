@@ -82,6 +82,6 @@ fn pieces_across_blocks() {
     assert_eq!(v["txs"], serde_json::json!(want));
     assert_eq!((v["size"].as_u64(), v["pieces"].as_u64(), v["h"].as_u64()), (Some(5), Some(3), Some(3)));
     for t in [arcade_ledger::ord::PENDING, arcade_ledger::ord::PENDING_BODY, arcade_ledger::ord::PENDING_TXS] {
-        assert!(db.store.read(|r| r.scan_prefix(t, b"")).unwrap().is_empty(), "{t} left over");
+        assert!(db.scan_all(t).unwrap().is_empty(), "{t} left over");
     }
 }

@@ -13,6 +13,6 @@ fn main() {
             }
         }
     }
-    let n = db.store.count(arcade_ledger::engine::INSCRIPTION).unwrap();
+    let n = db.count_all(arcade_ledger::engine::INSCRIPTION).unwrap();
     println!("last before {hi}: {last:?}; inscriptions stored: {n}");
 }

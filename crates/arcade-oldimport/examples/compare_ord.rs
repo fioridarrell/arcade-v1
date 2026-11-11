@@ -24,7 +24,7 @@ fn main() {
     let mut records = 0u64;
     let mut after: Option<Vec<u8>> = None;
     loop {
-    let rows = conv.store.read(|r| r.scan_after(ord::INSC, &pre, after.as_deref(), 100_000)).unwrap();
+    let rows = conv.store_for(&pre).read(|r| r.scan_after(ord::INSC, &pre, after.as_deref(), 100_000)).unwrap();
     if rows.is_empty() {
         break;
     }
@@ -37,7 +37,7 @@ fn main() {
             continue;
         }
         multi += 1;
-        let Some(nv) = native.store.read(|r| r.get(ord::INSC, k)).unwrap() else {
+        let Some(nv) = native.store_for(k).read(|r| r.get(ord::INSC, k)).unwrap() else {
             no_native += 1;
             continue;
         };

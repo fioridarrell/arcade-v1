@@ -1,3 +1,8 @@
+//! The Explorer's type filter. Where the ord index has its type rows (`ord.v1.types`,
+//! arcade_ledger::ordtypes, docs/ORDTYPES.md) a page is one read of those rows, and the
+//! rows are built here in the background on a chain that doesn't have them yet. Until then
+//! (and on an arcade whose build hasn't finished) the old way below answers:
+//!
 //! Inscriptions per content-type group, counted per chunk of 4,096 inscription numbers, so the
 //! Explorer's type filter pages like the full list (Martin 2026-11-10: "paginated in the exact
 //! same way as the inscriptions are"). Small on purpose: 9 counters per 4,096 inscriptions
@@ -18,13 +23,15 @@ fn chunk() -> u64 {
     static C: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
     *C.get_or_init(|| std::env::var("ARCADE_ORDTYPE_CHUNK").ok().and_then(|v| v.parse().ok()).filter(|v| *v > 0).unwrap_or(4096))
 }
-pub const GROUPS: [&str; 9] = ["image", "svg", "text", "html", "json", "audio", "video", "model", "other"];
+pub const GROUPS: [&str; 9] = arcade_ledger::ordtypes::GROUP_NAMES;
 /// Chunks not counted yet read live per question at most (while the counting runs).
 const LIVE_CHUNKS: usize = 16;
 
 type Counts = BTreeMap<u64, [u32; 9]>;
 static CACHE: Mutex<Option<HashMap<u16, Counts>>> = Mutex::new(None);
 static RUNNING: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
+/// Chains whose type rows are being built.
+static BUILDING: Mutex<Option<HashSet<u16>>> = Mutex::new(None);
 /// For the background counting thread (set by main).
 static NODE: std::sync::OnceLock<std::sync::Weak<Node>> = std::sync::OnceLock::new();
 
@@ -37,7 +44,11 @@ pub fn group_index(ty: &str) -> Option<usize> {
 }
 
 fn group_of(ct: &str) -> usize {
-    group_index(crate::explorer::type_group(ct)).unwrap_or(8)
+    arcade_ledger::ordtypes::group_of(ct) as usize
+}
+
+fn building(c: u16) -> bool {
+    BUILDING.lock().unwrap().as_ref().is_some_and(|b| b.contains(&c))
 }
 
 fn file(node: &Node, p: &ChainParams) -> std::path::PathBuf {
@@ -98,6 +109,10 @@ fn count_chunk(node: &Node, p: &ChainParams, i: u64) -> [u32; 9] {
 /// Count every settled chunk not counted yet, newest first, in the background (once per chain
 /// at a time).
 pub fn ensure(node: &Node, p: &'static ChainParams) {
+    // The build reads every record once; counting at the same time would only slow it.
+    if building(p.chain_no) {
+        return;
+    }
     let total = ord::count(&node.chain, p.chain_no);
     let top = settled(total);
     let missing = with_counts(node, p, |c| {
@@ -150,6 +165,9 @@ pub struct Page {
 
 /// Numbers of the `g` group's inscriptions from `offset` (0 = newest), up to `n`.
 pub fn page(node: &Node, p: &'static ChainParams, g: usize, offset: u64, n: u64) -> Page {
+    if let Some((numbers, total)) = arcade_ledger::ordtypes::page(&node.chain, p.chain_no, g as u8, offset, n) {
+        return Page { numbers, total, counting: false };
+    }
     ensure(node, p);
     let all = ord::count(&node.chain, p.chain_no);
     let top = settled(all);
@@ -208,4 +226,83 @@ pub fn page(node: &Node, p: &'static ChainParams, g: usize, offset: u64, n: u64)
         }
     }
     Page { numbers: out, total, counting }
+}
+
+/// Every group's total on a chain: (all inscriptions, per group, still counting older ones).
+/// Counted chunks plus the newest part read live; chunks not counted yet are left out (and
+/// counted in the background).
+pub fn totals(node: &Node, p: &'static ChainParams) -> (u64, [u64; 9], bool) {
+    let all = ord::count(&node.chain, p.chain_no);
+    if let Some(t) = arcade_ledger::ordtypes::totals(&node.chain, p.chain_no) {
+        return (all, t, false);
+    }
+    ensure(node, p);
+    let top = settled(all);
+    let mut t = [0u64; 9];
+    let missing = with_counts(node, p, |c| {
+        for (i, k) in c.iter() {
+            if *i < top {
+                for g in 0..9 {
+                    t[g] += k[g] as u64;
+                }
+            }
+        }
+        (0..top).filter(|i| !c.contains_key(i)).count()
+    });
+    for (_, ct) in ord::content_types(&node.chain, p.chain_no, top * chunk(), all) {
+        t[group_of(&ct)] += 1;
+    }
+    (all, t, missing > 0)
+}
+
+/// Build the type rows of chain `p` once, in the background.
+fn build(node: &std::sync::Arc<Node>, p: &'static ChainParams) {
+    if !BUILDING.lock().unwrap().get_or_insert_with(HashSet::new).insert(p.chain_no) {
+        return;
+    }
+    let n = node.clone();
+    std::thread::Builder::new()
+        .name(format!("ord types {}", p.key))
+        .spawn(move || {
+            let key = p.key;
+            let say = |m: &str| eprintln!("ord types {key}: {m}");
+            say("building the type rows (the Explorer's type filter pages from them once built)");
+            match arcade_ledger::ordtypes::build(&n.chain, p.chain_no, &say) {
+                Ok(_) => {
+                    let _ = n.app.event("chains", &format!("{}: the inscription type filter is ready", p.name));
+                    // The old counts aren't needed any more.
+                    let _ = std::fs::remove_file(file(&n, p));
+                    if let Some(m) = CACHE.lock().unwrap().as_mut() {
+                        m.remove(&p.chain_no);
+                    }
+                }
+                Err(e) => say(&format!("could not build them: {e} (tries again in a few minutes)")),
+            }
+            BUILDING.lock().unwrap().as_mut().map(|b| b.remove(&p.chain_no));
+        })
+        .ok();
+}
+
+/// Each chain this arcade keeps an ord index for gets its type rows (built once in the
+/// background, then kept by the ord index with each block), so the Explorer's type filter has
+/// its totals and pages at once (Martin 2026-11-10: preload them; make it fast).
+pub fn run(node: std::sync::Arc<Node>) {
+    std::thread::sleep(std::time::Duration::from_secs(30));
+    loop {
+        let mut chains: Vec<&'static ChainParams> = Vec::new();
+        if crate::chains::home_indexes(&node).iter().any(|i| i == "ord") {
+            chains.push(node.params);
+        }
+        for r in node.extra.lock().unwrap().values() {
+            if r.indexes.iter().any(|i| i == "ord") {
+                chains.push(r.params);
+            }
+        }
+        for p in chains {
+            if arcade_ledger::ordtypes::meta(&node.chain, p.chain_no).is_none() {
+                build(&node, p);
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_secs(120));
+    }
 }

@@ -106,13 +106,13 @@ fn ord_snapshot_converts() {
     assert_eq!(ord::count(&db, p.chain_no), 2);
     assert_eq!(ord::chunk(&db, p, 0).unwrap(), (chunk0, 1));
     // The location map: the coin tx(3):1 holds inscription 0.
-    let loc = db.store.read(|r| r.scan_prefix(ord::LOC, &arcade_store::KeyBuf::new().u16(p.chain_no).bytes(&Hash256::from_hex(&hex::encode(tx(3))).unwrap().0).done())).unwrap();
+    let loc = db.store(p.chain_no).read(|r| r.scan_prefix(ord::LOC, &arcade_store::KeyBuf::new().u16(p.chain_no).bytes(&Hash256::from_hex(&hex::encode(tx(3))).unwrap().0).done())).unwrap();
     assert_eq!(loc.len(), 1);
     // The unfinished one, with its body piece.
     let pk = arcade_store::KeyBuf::new().u16(p.chain_no).bytes(&Hash256::from_hex(&pend).unwrap().0).done();
-    let pv: serde_json::Value = serde_json::from_slice(&db.store.read(|r| r.get(ord::PENDING, &pk)).unwrap().unwrap()).unwrap();
+    let pv: serde_json::Value = serde_json::from_slice(&db.store_for(&pk).read(|r| r.get(ord::PENDING, &pk)).unwrap().unwrap()).unwrap();
     assert_eq!((pv["left"].as_u64(), pv["ct"].as_str()), (Some(2), Some(hex::encode("text/plain").as_str())));
-    assert_eq!(db.store.read(|r| r.scan_prefix(ord::PENDING_BODY, &pk)).unwrap()[0].1, b"ab");
+    assert_eq!(db.store_for(&pk).read(|r| r.scan_prefix(ord::PENDING_BODY, &pk)).unwrap()[0].1, b"ab");
 
     // Tokens and names.
     let t = tokens::tick(&db, p.chain_no, "FROG").unwrap();
@@ -126,17 +126,17 @@ fn ord_snapshot_converts() {
     // size), which must give the very same rows.
     let before: Vec<_> = ["ord.v1.insc", "ord.v1.block", "ord.v1.loc", "names.v1.win", "tok.v1.bal"]
         .iter()
-        .map(|t| db.store.read(|r| r.scan_prefix(t, &p.chain_no.to_be_bytes())).unwrap())
+        .map(|t| db.store(p.chain_no).read(|r| r.scan_prefix(t, &p.chain_no.to_be_bytes())).unwrap())
         .collect();
     let small = arcade_oldimport::Opts { allow_unstored: true, spill_bytes: Some(2000) };
     arcade_oldimport::import_ord(&db, p, &file, &small, &|_| {}).unwrap();
     let after: Vec<_> = ["ord.v1.insc", "ord.v1.block", "ord.v1.loc", "names.v1.win", "tok.v1.bal"]
         .iter()
-        .map(|t| db.store.read(|r| r.scan_prefix(t, &p.chain_no.to_be_bytes())).unwrap())
+        .map(|t| db.store(p.chain_no).read(|r| r.scan_prefix(t, &p.chain_no.to_be_bytes())).unwrap())
         .collect();
     assert_eq!(before, after);
     assert_eq!(before[1].len(), 100);
-    assert_eq!(db.store.read(|r| r.scan_prefix(ord::IDS, &p.chain_no.to_be_bytes())).unwrap().len(), 2);
+    assert_eq!(db.store(p.chain_no).read(|r| r.scan_prefix(ord::IDS, &p.chain_no.to_be_bytes())).unwrap().len(), 2);
     assert!(!dir.path().join(format!(".arcade-sort-{}", std::process::id())).exists());
 }
 

@@ -185,18 +185,18 @@ pub type Note<'a> = &'a mut dyn FnMut(String);
 impl ChainDb {
     /// Whether address rows wait to be built for a chain.
     pub fn addresses_pending(&self, c: u16) -> Result<bool> {
-        Ok(self.store.read(|r| r.get(STATE, &k_state(c, PENDING)))?.is_some())
+        Ok(self.store(c).read(|r| r.get(STATE, &k_state(c, PENDING)))?.is_some())
     }
 
     /// Whether the Addresses index is on for a chain (it is unless turned off).
     pub fn addresses_on(&self, c: u16) -> Result<bool> {
-        Ok(self.store.read(|r| r.get(STATE, &k_state(c, OFF)))?.is_none())
+        Ok(self.store(c).read(|r| r.get(STATE, &k_state(c, OFF)))?.is_none())
     }
 
     /// Turn the Addresses index off: no more address rows. The caller deletes the old ones
     /// with clear_address_rows_batch.
     pub fn set_addresses_off(&self, c: u16) -> Result<()> {
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             w.put(STATE, &k_state(c, OFF), b"1")?;
             w.del(STATE, &k_state(c, PENDING))?;
             w.del(STATE, &k_state(c, BACKFILL))?;
@@ -209,7 +209,7 @@ impl ChainDb {
     pub fn clear_address_rows_batch(&self, c: u16, max: usize) -> Result<usize> {
         // Tx index rows waiting in the log belong in the tx index, addresses or not.
         let pre = k_chain(c);
-        let moved = self.store.write(|w| {
+        let moved = self.wstore(c)?.write(|w| {
             let mut n = 0usize;
             for (k, v) in w.scan_prefix_limit(ADDR_LOG, &pre, max.max(1))? {
                 if v.first() == Some(&TXROW) {
@@ -230,7 +230,7 @@ impl ChainDb {
     /// Turn the Addresses index on. Blocks connected from now on write their rows; those
     /// already stored are built by build_addresses from the blocks themselves.
     pub fn set_addresses_on(&self, c: u16) -> Result<()> {
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             if w.get(STATE, &k_state(c, OFF))?.is_none() {
                 return Ok(());
             }
@@ -254,11 +254,11 @@ impl ChainDb {
         }
         // Coins and deletions still in the coin cache must reach the database first.
         self.flush_coins(c)?;
-        let backfill = self.store.read(|r| r.get(STATE, &k_state(c, BACKFILL)))?.map(|v| be_u32(&v, 0));
-        let from = self.store.read(|r| r.get(STATE, &k_state(c, BACKFILL_FROM)))?.map(|v| be_u32(&v, 0)).unwrap_or(1).max(1);
+        let backfill = self.store(c).read(|r| r.get(STATE, &k_state(c, BACKFILL)))?.map(|v| be_u32(&v, 0));
+        let from = self.store(c).read(|r| r.get(STATE, &k_state(c, BACKFILL_FROM)))?.map(|v| be_u32(&v, 0)).unwrap_or(1).max(1);
         std::fs::create_dir_all(tmp).map_err(io)?;
         // A build cut short by a restart goes on where it was (log builds; backfills start over).
-        let saved = self.store.read(|r| r.get(STATE, &k_state(c, RUNS_STATE)))?.and_then(|v| Resume::decode(&v));
+        let saved = self.store(c).read(|r| r.get(STATE, &k_state(c, RUNS_STATE)))?.and_then(|v| Resume::decode(&v));
         let mut res: Resume = match saved {
             Some(r) if backfill.is_none() && r.whole() => {
                 note(format!("building addresses: going on where the last build stopped ({} rows sorted, {} run files)", r.rows, r.files.len()));
@@ -314,12 +314,12 @@ impl ChainDb {
                 self.set_step(c, i + 1, res.counts[i], res.counts[i], "rows", 2);
                 if backfill.is_none() {
                     res.merged.push(*kind);
-                    self.store.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()))?;
+                    self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()))?;
                 }
             }
             note("building addresses: step 6 of 6, clearing the log".into());
             if backfill.is_some() {
-                self.store.write(|w| {
+                self.wstore(c)?.write(|w| {
                     w.del(STATE, &k_state(c, BACKFILL))?;
                     w.del(STATE, &k_state(c, BACKFILL_FROM)).map(|_| ())
                 })?;
@@ -332,7 +332,7 @@ impl ChainDb {
             for (_, p) in &runs {
                 let _ = std::fs::remove_file(p);
             }
-            self.store.write(|w| w.del(STATE, &k_state(c, RUNS_STATE)).map(|_| ()))?;
+            self.wstore(c)?.write(|w| w.del(STATE, &k_state(c, RUNS_STATE)).map(|_| ()))?;
         }
         self.addr_progress.lock().unwrap().remove(&c);
         done
@@ -340,10 +340,9 @@ impl ChainDb {
 
     /// Run files a build cut short left for the next start (kept by the cleanup at start).
     pub fn addr_resume_files(&self) -> Vec<PathBuf> {
-        self.store
-            .read(|r| r.scan_prefix(STATE, b""))
-            .unwrap_or_default()
-            .into_iter()
+        self.stores()
+            .iter()
+            .flat_map(|s| s.read(|r| r.scan_prefix(STATE, b"")).unwrap_or_default())
             .filter(|(k, _)| k.len() > 2 && &k[2..] == RUNS_STATE.as_bytes())
             .filter_map(|(_, v)| Resume::decode(&v))
             .flat_map(|r| r.files.into_iter().map(|(_, p)| p))
@@ -395,7 +394,7 @@ impl ChainDb {
                 let to = (from + SPAN - 1).min(upto);
                 let mut local: [Vec<Vec<u8>>; 4] = Default::default();
                 let mut bytes = 0usize;
-                self.store.read(|r| {
+                self.store(c).read(|r| {
                     for h in from..=to {
                         at[slot].store(h, Ordering::Relaxed);
                         let t0 = std::time::Instant::now();
@@ -485,7 +484,7 @@ impl ChainDb {
                 *runs = a.files;
                 return Ok(false);
             }
-            let page = self.store.read(|r| {
+            let page = self.store(c).read(|r| {
                 let rows = r.scan_after(OUTPUTS, &pre, after.as_deref(), 50_000)?;
                 let mut out = Vec::new();
                 for (k, v) in &rows {
@@ -531,19 +530,19 @@ impl ChainDb {
         let pre = k_chain(c);
         let upto = res.upto;
         if res.after.is_none() && res.rows == 0 {
-            res.first = self.store.read(|r| r.scan_prefix_limit(ADDR_LOG, &pre, 1))?.first().map(|(k, _)| be_u32(k, 2)).unwrap_or(0);
+            res.first = self.store(c).read(|r| r.scan_prefix_limit(ADDR_LOG, &pre, 1))?.first().map(|(k, _)| be_u32(k, 2)).unwrap_or(0);
         }
         let first = res.first;
         let total = upto.saturating_sub(first) as u64 + 1;
         let mut bufs: [Vec<Vec<u8>>; 4] = Default::default();
         let mut bytes = 0usize;
         let mut after: Option<Vec<u8>> = res.after.clone();
-        let save = |res: &Resume| self.store.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()));
+        let save = |res: &Resume| self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()));
         loop {
             if stop.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            let page = self.store.read(|r| r.scan_after(ADDR_LOG, &pre, after.as_deref(), LOG_PAGE))?;
+            let page = self.store(c).read(|r| r.scan_after(ADDR_LOG, &pre, after.as_deref(), LOG_PAGE))?;
             let Some((last, _)) = page.last() else { break };
             after = Some(last.clone());
             let mut past = false;
@@ -642,7 +641,7 @@ impl ChainDb {
         Ok(true)
     }
 
-    fn write_batch(&self, _c: u16, kind: u8, table: &str, batch: &[Vec<u8>]) -> Result<u64> {
+    fn write_batch(&self, c: u16, kind: u8, table: &str, batch: &[Vec<u8>]) -> Result<u64> {
         if batch.is_empty() {
             return Ok(0);
         }
@@ -659,7 +658,7 @@ impl ChainDb {
             std::thread::scope(|sc| {
                 for part in batch.chunks(per) {
                     sc.spawn(move || {
-                        let _ = self.store.read(|r| {
+                        let _ = self.store(c).read(|r| {
                             for rec in part {
                                 let _ = r.get(OUTPUTS, &coin_key(key_of(rec)));
                             }
@@ -669,7 +668,7 @@ impl ChainDb {
                 }
             });
         }
-        self.store.write(|w| {
+        self.wstore(c)?.write(|w| {
             let mut n = 0;
             for rec in batch {
                 let k = key_of(rec);
@@ -692,7 +691,7 @@ impl ChainDb {
             if stop.load(Ordering::Relaxed) {
                 return Ok(false);
             }
-            let left = self.store.write(|w| {
+            let left = self.store(c).write(|w| {
                 let page = w.scan_prefix_limit(ADDR_LOG, &pre, 50_000)?;
                 let mut n = 0;
                 for (k, _) in &page {
@@ -707,6 +706,8 @@ impl ChainDb {
                     if page.is_empty() {
                         w.del(STATE, &k_state(c, PENDING))?;
                         w.del(STATE, &k_state(c, TXS_PENDING))?;
+                        // Every tx row is in TXS now: the runs go (txruns).
+                        crate::txruns::drop_all(w, c)?;
                     }
                     return Ok(false);
                 }

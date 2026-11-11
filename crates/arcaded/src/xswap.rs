@@ -301,8 +301,9 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
             let (sk, pk) = wallet_key(node, node.params)?;
             let to = arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
             let outs = htlc::pay_out(&[(pay_op, s["pay_value"].as_u64().unwrap_or(0))], &to, htlc::SPEND_FEE)?;
+            check_coin(node, node.params, &pay_op, &pay_lock.script())?;
             let raw = htlc::refund(node.params, &pay_lock, &[(pay_op, s["pay_value"].as_u64().unwrap_or(0))], outs, &sk)?;
-            s["refund_tx"] = json!(broadcast(node, node.params, &raw)?);
+            sent(s, "refund_tx", broadcast(node, node.params, &raw)?, st.as_str(), node.params.key, pay_op);
             s["step"] = json!("refunded");
             return Ok(());
         }
@@ -356,7 +357,7 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
                 let dollars = arcade_wallet::tx::Utxo { outpoint: OutPoint { txid: dtxid, vout: dv }, value: 0, script: dlock.script() };
                 let reserve = arcade_wallet::tx::Utxo { outpoint: OutPoint { txid: dtxid, vout: rv }, value: dtx.outputs[rv as usize].value, script: dlock.script() };
                 let ctx = ddlock::build_spend(pd, &dsk, &dlock, &dollars, cents, &reserve, &to, &dgb_to, Some(&secret))?;
-                s["claim_tx"] = json!(broadcast(node, pd, &ctx.raw)?);
+                sent(s, "claim_tx", broadcast(node, pd, &ctx.raw)?, "dd_locked", pd.key, dollars.outpoint);
                 s["step"] = json!("claimed");
             }
             _ => {}
@@ -389,8 +390,10 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
         let to = arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
         let value = s["pay_value"].as_u64().unwrap_or(0);
         let outs = htlc::pay_out(&[(pay_op, value)], &to, htlc::SPEND_FEE)?;
+        // Checked before it goes: the lock this claim names is the one the coin is held by.
+        check_coin(node, node.params, &pay_op, &pay_lock.script())?;
         let raw = htlc::claim(node.params, &pay_lock, &[(pay_op, value)], outs, &secret, &sk)?;
-        s["claim_tx"] = json!(broadcast(node, node.params, &raw)?);
+        sent(s, "claim_tx", broadcast(node, node.params, &raw)?, "dd_locked", node.params.key, pay_op);
         s["step"] = json!("claimed");
         let _ = node.app.event("wallet", &format!("swap {}: secret read off the dollar claim; price claimed", &s["id"].as_str().unwrap_or("")[..12]));
     } else if now() > dlock.time + 600 {
@@ -400,10 +403,51 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
         let dollars = arcade_wallet::tx::Utxo { outpoint: OutPoint { txid: dtxid, vout: dv }, value: 0, script: dlock.script() };
         let reserve = arcade_wallet::tx::Utxo { outpoint: OutPoint { txid: dtxid, vout: rv }, value: dtx.outputs[rv as usize].value, script: dlock.script() };
         let rtx = ddlock::build_spend(pd, &dsk, &dlock, &dollars, s["cents"].as_i64().unwrap_or(0), &reserve, &to, &dgb_to, None)?;
-        s["refund_tx"] = json!(broadcast(node, pd, &rtx.raw)?);
+        sent(s, "refund_tx", broadcast(node, pd, &rtx.raw)?, "dd_locked", pd.key, dollars.outpoint);
         s["step"] = json!("refunded");
     }
     Ok(())
+}
+
+/// A spend of a lock coin is built only when the coin is held by exactly the lock this arcade computes (a claim
+/// with a wrong redeem script is refused by the network after it was sent; 2026-11-10, c3c6e1b3).
+fn check_coin(node: &Node, p: &ChainParams, op: &OutPoint, script: &[u8]) -> Result<(), String> {
+    let tx = tx_of(node, p, &op.txid).ok_or("the lock's transaction isn't here")?;
+    match tx.outputs.get(op.vout as usize) {
+        Some(o) if o.script_pubkey == script => Ok(()),
+        _ => Err("that coin is not held by the lock as computed here: nothing sent".into()),
+    }
+}
+
+/// Note what was sent, so a spend the network never took is built again (retry).
+fn sent(s: &mut Value, field: &str, txid: String, from: &str, chain: &str, op: OutPoint) {
+    s[field] = json!(txid);
+    s["sent"] = json!({"field": field, "txid": txid, "from": from, "chain": chain, "coin": format!("{}:{}", op.txid.to_hex(), op.vout), "at": now()});
+}
+
+/// How long a claim or refund may wait for a block before it is built and sent again.
+const RESEND_AFTER: u32 = 20 * 60;
+
+/// A claim or refund not in a block RESEND_AFTER after it was sent, while the lock's coin is still unspent in the
+/// chain's blocks: the network didn't take it. Drop this arcade's own copy and go back a step, so the next tick
+/// builds it again.
+fn retry(node: &Node, s: &mut Value) {
+    let sent = s["sent"].clone();
+    let (Some(txid), Some(chain), Some(at)) = (sent["txid"].as_str(), sent["chain"].as_str(), sent["at"].as_u64()) else { return };
+    let Some(p) = by_key(chain) else { return };
+    let Ok(txid) = Hash256::from_hex(txid) else { return };
+    if now() < at as u32 + RESEND_AFTER || depth(node, p, &txid) > 0 {
+        return;
+    }
+    let coin = sent["coin"].as_str().unwrap_or("").split_once(':').and_then(|(t, v)| Some(OutPoint { txid: Hash256::from_hex(t).ok()?, vout: v.parse().ok()? }));
+    let Some(coin) = coin else { return };
+    if node.chain.spender(p, &coin).ok().flatten().is_some() {
+        return; // spent in a block (by this spend under another id, or by the other side): nothing to do here
+    }
+    let _ = node.chain.mempool_remove(p, &txid);
+    s["resent"] = json!(s["resent"].as_u64().unwrap_or(0) + 1);
+    s["step"] = sent["from"].clone();
+    s["last"] = json!(format!("{} {} was not taken by the network; built again", sent["field"].as_str().unwrap_or(""), txid.to_hex()));
 }
 
 /// Every 15 s: move each running swap one step if it can.
@@ -411,10 +455,18 @@ pub fn start(node: Arc<Node>) {
     std::thread::spawn(move || loop {
         std::thread::sleep(std::time::Duration::from_secs(15));
         for mut s in list(&node, "xswap") {
-            if matches!(s["step"].as_str(), Some("claimed" | "refunded" | "dd_refunded" | "failed")) {
+            let before = s.clone();
+            if matches!(s["step"].as_str(), Some("claimed" | "refunded")) {
+                // Done, once its spend is in a block; until then, sent again if the network never took it.
+                retry(&node, &mut s);
+                if s != before {
+                    put(&node, "xswap", &s);
+                }
                 continue;
             }
-            let before = s.clone();
+            if matches!(s["step"].as_str(), Some("dd_refunded" | "failed")) {
+                continue;
+            }
             if let Err(e) = step(&node, &mut s) {
                 s["last"] = json!(e);
             }

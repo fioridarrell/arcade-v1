@@ -491,6 +491,10 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "xswap.book" => Ok(json!(crate::xswap::book(node))),
         "xswap.take" => crate::xswap::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?, req["cents"].as_i64().ok_or("cents required")?),
         "xswap.list" => Ok(json!(crate::xswap::swaps(node))),
+        "t20swap.place" => crate::t20swap::place(node, &s("tick").ok_or("tick required")?, &s("amount").ok_or("amount required")?, &s("dgb").unwrap_or_else(|| "dgbtest".into()), req["price"].as_u64().ok_or("price required")?),
+        "t20swap.book" => Ok(json!(crate::t20swap::book(node))),
+        "t20swap.take" => crate::t20swap::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?),
+        "t20swap.list" => Ok(json!(crate::t20swap::swaps(node))),
         "chains.offers" => Ok(json!(node.offers.lock().unwrap().iter().map(|(id, o)| json!({"node": id, "addr": o.addr, "at": o.at, "bk": o.bk, "cr": o.cr})).collect::<Vec<_>>())),
         "chains.peers" => {
             let p = arcade_chain::params::by_key(&s("key").ok_or("key required")?).ok_or("unknown chain")?;

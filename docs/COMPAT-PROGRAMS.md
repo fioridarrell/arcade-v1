@@ -19,6 +19,10 @@ of a Core node, from this computer only.
 
 ## Pointing a program at V1.0
 
+- The page API (`/r/...`) answers an app page with its page pass, or a program on this computer that sends the
+  RPC cookie (`<home>/.cookie`) as Basic auth, as `/rpc` and the Core RPC take it: reads only, on the home chain;
+  `/r/send` and the market's writes still need an app page's pass.
+
 - The arcade's address: `http://127.0.0.1:<http port>` (not a public name through a proxy:
   these routes answer only this computer).
 - The node's RPC: the same address; the cookie file is `<arcade home>/.cookie`.

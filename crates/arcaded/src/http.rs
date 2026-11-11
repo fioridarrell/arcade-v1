@@ -539,7 +539,11 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"this arcade's page API answers only its own pages"}"#);
         }
         let page = page_of(node, &r);
-        if page.is_none() && !matches!(path.as_str(), "/r/blockheight" | "/r/blocktime") {
+        // A program on this computer (a website's server, a payout service) reads with the RPC
+        // cookie as Basic auth, as /rpc and the Core RPC take it: the home chain's reads only.
+        // Every write (/r/send, the market's) still needs an app page's pass.
+        let program = page.is_none() && matches!(r.method.as_str(), "GET" | "HEAD") && cookie_ok(node, &r);
+        if page.is_none() && !program && !matches!(path.as_str(), "/r/blockheight" | "/r/blocktime") {
             return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page pass"}"#);
         }
         // An app on another chain than the home chain (the chain in its pass): its reads answer

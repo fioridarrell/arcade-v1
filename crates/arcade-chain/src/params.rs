@@ -662,6 +662,89 @@ pub static BELLSCOIN_MAIN: ChainParams = ChainParams {
     index_start: 1_289_000,
 };
 
+/// Luckycoin (LKY), Luckycoin Core 5.0.1 on Dogecoin 1.14's code: Scrypt, Digishield from 69,360, AuxPoW chain id 0x2013
+/// (strict) from block 176,000, no SegWit. From github.com/LuckycoinFoundation/Luckycoin master (chainparams.cpp,
+/// version.h), 2026-11-11; the genesis header below hashes to its genesis. It kept Litecoin's magic (fbc0b6db);
+/// its port and genesis tell them apart. 5.0.1 refuses 4.0.x nodes: protocol 70015.
+pub static LUCKYCOIN_MAIN: ChainParams = ChainParams {
+    key: "lky",
+    net: "lky",
+    chain_no: 14,
+    name: "Luckycoin",
+    magic: [0xfb, 0xc0, 0xb6, 0xdb],
+    p2p_port: 9917,
+    genesis: "9b7bce58999062b63bfb18586813c42491fa32f4591d8d3043cb4fa9e551541b",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000f9abf8b1949a6a5c2362247fe78164d0041613381d3eab3e1e6e5638d0ef806f10559c51f0ff0f1e3841ac00",
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: Some(0x2013),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: None,
+    p2pkh_version: 47,
+    p2sh_version: 5,
+    wif_version: 175,
+    bip44_coin_type: 3,
+    protocol_version: 70015,
+    dns_seeds: &["mainnet.luckycoinfoundation.org"],
+    fixed_peers: &["149.102.135.48:9917", "5.161.255.153:9917", "207.180.249.242:9917", "91.99.78.148:9917"],
+    checkpoints: &[
+        (0, "9b7bce58999062b63bfb18586813c42491fa32f4591d8d3043cb4fa9e551541b"),
+        (6452, "e502fdfb3a35ee853ccd4a68433b1f9bbe3295c7d453fbcc484d06a766971475"),
+        (69240, "07d2b42e1898d59594b10f26fdc76d4f970a10b4b330237012f48eb489c8d744"),
+        (172330, "8458c3eeda44dc11352edad04e0eb69ae898c69c0dded3b3903b37f5bf352555"),
+        (320000, "3da52a29c4a7528d7624a4a74d659c08fbc7808cd4c217d152ba5981fc318b68"),
+        (640000, "99e1d5c9283b9b70c2ff3dec80aa1b9517822c789b4dcbf2b984c395e99d487d"),
+        (720000, "12b47acc054fd204faa8924a2243f1b4a1c208c717ac0c9333f581860269d8aa"),
+    ],
+    coinbase_maturity: 70,
+    // The original arcade's Luckycoin floor (config.py LKY_MAINNET_FLOOR).
+    index_start: 1_153_000,
+};
+
+/// Junkcoin (JKC), Junkcoin Core 4.0.3.1 on Litecoin 0.21's code: Scrypt, AuxPoW chain id 0x2020 (strict) from block
+/// 173,000, SegWit from 1,145,000, Taproot from 1,155,000, MWEB from 1,165,000. From
+/// github.com/Junkcoin-Foundation/junkcoin-core master (chainparams.cpp, version.h), 2026-11-11; the genesis header
+/// below hashes to its genesis. It kept Litecoin's magic (fbc0b6db), as Luckycoin did; its port and genesis tell them
+/// apart. Protocol 70015 (not Litecoin's 70017).
+pub static JUNKCOIN_MAIN: ChainParams = ChainParams {
+    key: "jkc",
+    net: "jkc",
+    chain_no: 15,
+    name: "Junkcoin",
+    magic: [0xfb, 0xc0, 0xb6, 0xdb],
+    p2p_port: 9771,
+    genesis: "a2effa738145e377e08a61d76179c21703e13e48910b30a2a87f0dfe794b64c6",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000c8dba1acb85826f819cbb65d83122cb96cf76be95025e11f91074327b024e13d10c78051f0ff0f1ea167af06",
+    format: Format::AUXPOW_MWEB,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: Some(0x2020),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: Some("jc"),
+    p2pkh_version: 16,
+    p2sh_version: 5,
+    wif_version: 144,
+    bip44_coin_type: 3,
+    protocol_version: 70015,
+    dns_seeds: &["mainnet.junk-coin.com", "junk-seed.s3na.xyz", "jkc-seed.junkiewally.xyz"],
+    fixed_peers: &["204.12.227.26:9771", "3.212.41.153:9771", "3.66.245.44:9771", "8.218.231.1:9771"],
+    checkpoints: &[
+        (0, "a2effa738145e377e08a61d76179c21703e13e48910b30a2a87f0dfe794b64c6"),
+        (6452, "506562c2172d9f10e86d2b467ed3bb7b9eba40148d18d1e660c1ff692604f3fc"),
+        (69240, "c34f5d113fe92f3206ef8855caf51cd6252286e3381b253bbc1237211198c22b"),
+        (168312, "deea2bcecb1146ae9cd74d67b29b4d0161e9bb63beb9022ca10f3625dda6c0e6"),
+        (172000, "6208026838cd18d3f401f3c5c2305105a3aafeb63164827d3e341f356cb3529a"),
+    ],
+    coinbase_maturity: 70,
+    // No original-arcade floor: indexes start near the tip when it was added (2026-11-11, tip 1,215,059).
+    index_start: 1_215_000,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
     &[
         &PEPECOIN_TEST,
@@ -677,6 +760,8 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &WOJAKCOIN_MAIN,
         &SHIBACOIN_MAIN,
         &BELLSCOIN_MAIN,
+        &LUCKYCOIN_MAIN,
+        &JUNKCOIN_MAIN,
     ];
 
 /// A chain by its mesh name (what the existing arcades call it).
@@ -687,6 +772,9 @@ impl ChainParams {
     pub fn user_agent(&self) -> &'static str {
         match self.key {
             "flop" => "/Floptoshi:2.0.0/",
+            // Junkcoin Core 4 (net_processing.cpp) drops a peer whose user agent holds neither "JKC:3.1.1" nor
+            // "JunkcoinCore:4." (it shares Litecoin's magic and keeps Litecoin nodes out); a BIP14 comment says it.
+            "jkc" => "/arcade:1.0.0(JunkcoinCore:4.0.3 compatible)/",
             _ => "/arcade:1.0.0/",
         }
     }
@@ -752,11 +840,12 @@ mod tests {
                 assert_ne!(a.chain_no, b.chain_no);
                 assert_ne!(a.key, b.key);
                 assert_ne!(a.genesis, b.genesis, "{} and {}", a.name, b.name);
-                // A shared magic is only Bellscoin's, which kept Dogecoin's: a connection already knows its chain,
-                // and a peer of the other one never leads back to this chain's genesis.
+                // Shared magics are only the forks that kept their parent's (Bellscoin Dogecoin's; Luckycoin and Junkcoin Litecoin's): a
+                // connection already knows its chain, and a peer of the other never leads back to this chain's genesis.
                 if a.magic == b.magic {
-                    let pair = [a.key, b.key];
-                    assert!(pair.contains(&"bel") && pair.contains(&"doge"), "{} and {} share a magic", a.name, b.name);
+                    let mut pair = [a.key, b.key];
+                    pair.sort();
+                    assert!(matches!(pair, ["bel", "doge"] | ["lky", "ltc"] | ["jkc", "ltc"] | ["jkc", "lky"]), "{} and {} share a magic", a.name, b.name);
                 }
             }
         }

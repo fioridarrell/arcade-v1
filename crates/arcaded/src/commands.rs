@@ -151,8 +151,8 @@ cmds! {
     "explorer.inscription" Public "chain?, id" "One inscription.";
     "explorer.tokens" Public "chain?, offset?, limit?" "Tokens.";
     "explorer.token" Public "chain?, tick, offset?, n?" "One token and a page of its holders, biggest first (n: 25, at most 100; total: how many hold it).";
-    "explorer.collections" Public "chain?, q?, sort?, status?, offset?, n?" "A page of a chain's collections (sort: newest, oldest, name or size; status: active or all; n at most 60), Sub 1K first.";
-    "explorer.collection" Public "chain?, id, offset?, n?" "One collection (its root inscription id, or sub1k) and a page of its items by number (n: 48, at most 96).";
+    "explorer.collections" Public "chain?, q?, sort?, status?, source?, offset?, n?" "A page of a chain's collections, on-chain (kind registry) and Nintondo's known ones (kind known; id = slug): sort newest, oldest, name, size or holders; status active or all; source all, registry or known; n at most 60. Sub 1K first.";
+    "explorer.collection" Public "chain?, id | slug, offset?, n?" "One collection (a root inscription id, sub1k, or a known collection's slug) and a page of its items by number (n: 48, at most 96). A known one not held yet is asked for and answers loading {state, have, of}.";
     "explorer.collection_of" Public "chain?, id" "The collections an inscription is in.";
     "explorer.names" Public "chain?" "Names.";
     "explorer.name" Public "chain?, name" "One name.";
@@ -234,6 +234,8 @@ cmds! {
     "trade.who" Local "address" "Whether a player can be sealed to (has published a messaging key).";
     "prize.seed" Local "page, pool?, game?, session?, judge?, referee?" "A seed for one run (the seed door): from the referee of a pool (the page's own unless it names one), of the page's refereed pools (game), or of a judge, issued to this arcade's player: {seed, expires[, pools]}.";
     "prize.claim" Local "page, secret, pool?, lot?, replay?, send?" "Claim one free lot of a prize pool on the chain (the claim door): the page's own token pool unless it names one, opened with its phrase; a refereed pool's referee checks the run (replay). Without send: what it costs ({piece, price, fee, pool_pays}); with send: signed and sent, {txid, piece}.";
+    "collections.known_get" Read "" "Whether this arcade asks Nintondo for its known collections: {known}.";
+    "collections.known_set" Admin "on" "Ask Nintondo for its lists of Doginals, Pepinals and Bellinals (off by default): the listing once a day, a collection's pieces when somebody opens it.";
     "referee.get" Read "" "The referee arcade this one asks for seeds when a page names none, and whose key /r/verified trusts by default: {url, pubkey}, or {} when none is set.";
     "referee.set" Admin "url" "Name the referee arcade (https://...): its key is read from its /r/referee. An empty url clears it.";
     "realtime.lanes" Local "token" "Which players of the seat's room the fast lane reaches now (up), and how (routes: direct link or relay).";

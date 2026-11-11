@@ -1,6 +1,6 @@
-//! On-chain collections read from a chain's ord index (collreg): settled only when deep enough,
-//! waiting for parts, first to publish, the same publisher replaces, other chains refused, and a
-//! deep reorg starts the reading again.
+//! On-chain collections read from a chain's ord index (collreg): read once in a block, waiting
+//! for parts, first to publish, the same publisher replaces, other chains refused, and a reorg
+//! that changes anything read (even one block, even a root slipped in behind) starts it again.
 use arcade_chain::encode::write_varint;
 use arcade_chain::hash::merkle_root;
 use arcade_chain::params::{ChainParams, DIGIBYTE_MAIN};
@@ -111,18 +111,28 @@ impl Chain {
     /// Inscribe each body (collection type) to `owner`: a block of coins, then a block of
     /// reveals. Their txids.
     fn inscribe(&mut self, owner: u8, bodies: &[Vec<u8>]) -> Vec<String> {
+        self.inscribe_ct(owner, collreg::CONTENT_TYPE, bodies)
+    }
+    fn inscribe_ct(&mut self, owner: u8, ct: &str, bodies: &[Vec<u8>]) -> Vec<String> {
         let coins: Vec<Tx> = bodies.iter().map(|_| { self.nonce += 1; tx(None, 9, self.nonce) }).collect();
         self.connect(coins.clone());
         let mut reveals = Vec::new();
         for (cb, body) in coins.iter().zip(bodies) {
             self.nonce += 1;
             assert!(body.len() <= 520, "one push");
-            let s = [push(b"ord"), vec![0x51], push(collreg::CONTENT_TYPE.as_bytes()), vec![0], push(body), push(&[0x30; 71])].concat();
+            let s = [push(b"ord"), vec![0x51], push(ct.as_bytes()), vec![0], push(body), push(&[0x30; 71])].concat();
             reveals.push(tx(Some((cb.txid, s)), owner, self.nonce));
         }
         let ids = reveals.iter().map(|t| t.txid.to_hex()).collect();
         self.connect(reveals);
         ids
+    }
+    fn undo(&mut self, blocks: u32) {
+        for _ in 0..blocks {
+            let t = self.db.disconnect_tip(self.p.chain_no).unwrap();
+            self.tip = t.hash;
+            self.height -= 1;
+        }
     }
     fn scan(&self) -> collreg::Pass {
         collreg::scan(&self.db, self.p, self.height).unwrap()
@@ -161,10 +171,8 @@ fn collections_settle_by_the_rules() {
     let p1 = part(json!([[A, 1, [1]], [B, 2, [-1]]]));
     let p1id = ch.inscribe(5, &[p1.clone()]).remove(0);
     let dogs = ch.inscribe(5, &[root("Dogs", "dgb", &[(p1id.clone(), p1.clone())], None)]).remove(0);
-    // Not deep enough yet: nothing read.
-    assert_eq!(ch.scan().read, 0);
-    assert!(ch.status(&dogs).is_null());
-    ch.empty(collreg::DEPTH);
+    // Read as soon as it is in a block.
+    assert_eq!(collreg::CONFIRMATIONS, 1);
     let pass = ch.scan();
     assert_eq!((pass.read, pass.settled), (2, 1), "{pass:?}");
     let v = ch.status(&dogs);
@@ -188,7 +196,6 @@ fn collections_settle_by_the_rules() {
         root("Elsewhere", "doge", &[(p2id.clone(), p2.clone())], None),
         root("Later", "dgb", &[(late_id.clone(), late.clone())], None),
     ]);
-    ch.empty(collreg::DEPTH);
     ch.scan();
     assert_eq!(ch.status(&ids[0])["status"], "claimed");
     assert!(ch.status(&ids[0])["reason"].as_str().unwrap().contains("Dogs"));
@@ -200,7 +207,6 @@ fn collections_settle_by_the_rules() {
     let p3id = ch.inscribe(7, &[p3.clone()]).remove(0);
     let theirs = ch.inscribe(7, &[root("Dogs 2", "dgb", &[(p3id.clone(), p3.clone())], Some(&dogs[..64]))]).remove(0);
     let mine = ch.inscribe(5, &[root("Dogs 2", "dgb", &[(p3id.clone(), p3.clone())], Some(&dogs[..64]))]).remove(0);
-    ch.empty(collreg::DEPTH);
     ch.scan();
     assert_eq!(ch.status(&theirs)["status"], "refused");
     assert_eq!(ch.status(&mine)["status"], "active", "{}", ch.status(&mine));
@@ -212,16 +218,21 @@ fn collections_settle_by_the_rules() {
     // The late part arrives (as the txid the root named it can't be: that root waits on).
     assert_eq!(ch.status(&ids[2])["status"], "waiting");
 
-    // A reorg deeper than DEPTH moves a read inscription: everything is read again.
-    for _ in 0..(collreg::DEPTH * 2 + 4) {
-        let t = ch.db.disconnect_tip(c).unwrap();
-        ch.tip = t.hash;
-        ch.height -= 1;
-    }
+    // A reorg that moves a read collection inscription: everything is read again.
+    ch.undo(4); // mine's blocks and theirs's go
     ch.inscribe(9, &[part(json!([[A, 1, [0]]]))]);
-    ch.empty(collreg::DEPTH);
     assert!(ch.scan().restarted);
     ch.scan();
     assert!(ch.status(&mine).is_null(), "gone with its blocks");
     assert_eq!(ch.status(&dogs)["status"], "active", "read again: nothing replaced it any more");
+
+    // A one-block reorg that puts a root behind the reading position: the last row read was a
+    // plain JSON inscription (not a collection); in its place now sits a new root.
+    ch.inscribe_ct(9, "application/json", &[b"{\"hello\":1}".to_vec()]);
+    assert_eq!(ch.scan().read, 0, "read past it");
+    ch.undo(2);
+    let slipped = ch.inscribe(9, &[root("Slipped", "dgb", &[(p1id.clone(), p1.clone())], None)]).remove(0);
+    assert!(ch.scan().restarted, "the last row read changed: read again");
+    ch.scan();
+    assert_eq!(ch.status(&slipped)["status"], "claimed", "seen, though it sat behind the reading position: {}", ch.status(&slipped));
 }

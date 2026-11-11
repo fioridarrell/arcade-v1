@@ -529,6 +529,7 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
         let (n, c, name) = (node.clone(), p.chain_no, p.name);
         std::thread::spawn(move || {
             let _ = arcade_ledger::collreg::wipe(&n.chain, c);
+            crate::knowncoll::wipe(&n, c);
             let _ = n.app.event("chains", &format!("removed the collections index on {name}"));
         });
         return Ok(json!({"removed": index, "chain": key}));
@@ -564,6 +565,7 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
         }
         if coll {
             let _ = arcade_ledger::collreg::wipe(&n.chain, c);
+            crate::knowncoll::wipe(&n, c);
         }
         let _ = n.app.event("chains", &format!("removed the {label}"));
     });

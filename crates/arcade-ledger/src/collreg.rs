@@ -14,7 +14,10 @@
 //! - **Same chain** (Martin 2026-11-11): a root counts only for items on the chain it is
 //!   inscribed on; its "chain" must name this chain ("main" and "test" are the original's
 //!   names for Pepecoin and its testnet). Its parts are inscriptions on this chain too.
-//! - Only inscriptions [`DEPTH`] blocks deep are read.
+//! - An inscription is read once it is in a block ([`CONFIRMATIONS`]; Martin 2026-11-11: one
+//!   block, not six). A reorg that changes anything read already starts the reading over: every
+//!   collection inscription read must still be at its number, and so must the last inscription
+//!   the reader passed (a root slipped in behind the reading position would move it).
 //! - Roots are settled in inscription-number order. A root whose parts aren't all here yet
 //!   **waits** and is tried again after each pass's new roots, in number order.
 //! - **First to publish**: a root naming an item another root owns is **claimed** (unused).
@@ -30,6 +33,7 @@
 //!   coll.v1.item   C|root number|item n  -> JSON     [id, [trait value or ""]]
 //!   coll.v1.of     C|iid                 -> root number u64 | item number u64
 //!   coll.v1.state  C|"seq"               -> u64      the next json-group row of ord.v1.types to read
+//!   coll.v1.state  C|"last"              -> number u64 | iid   the last row read (the reorg check)
 //!
 //! A root is known by its number here and by its txid to people (`<txid>i0`).
 
@@ -46,8 +50,8 @@ use std::collections::{BTreeMap, HashSet};
 pub const CONTENT_TYPE: &str = "application/vnd.arcade.collection+json";
 pub const ROOT_P: &str = "arcade-collection";
 pub const PART_P: &str = "arcade-collection-items";
-/// Blocks deep an inscription must be before it is read.
-pub const DEPTH: u32 = 6;
+/// Confirmations an inscription needs before it is read (1: in a block).
+pub const CONFIRMATIONS: u32 = 1;
 pub const MAX_SUPPLY: u64 = 1_000_000;
 /// Items per page of a collection.
 pub const PAGE: usize = 48;
@@ -255,8 +259,8 @@ fn record(db: &ChainDb, c: u16, iid: &[u8; 36]) -> Option<Value> {
     get(db, ord::INSC, &k(c).bytes(iid).done()).and_then(|v| serde_json::from_slice(&v).ok())
 }
 
-/// Every row of the collection tables on chain `c` goes (a reorg deeper than [`DEPTH`] moved
-/// an inscription read already, or the index is removed).
+/// Every row of the collection tables on chain `c` goes (a reorg moved an inscription read
+/// already, or the index is removed).
 pub fn wipe(db: &ChainDb, c: u16) -> StoreResult<()> {
     let tables: Vec<String> = TABLES.iter().map(|t| t.to_string()).collect();
     while db.clear_rows_batch(c, &tables, 50_000)? > 0 {}
@@ -271,7 +275,7 @@ pub struct Pass {
     pub settled: u64,
     /// Waiting for the ord index's type rows (an arcade still building them).
     pub no_types: bool,
-    /// A deep reorg was seen: the tables were cleared and are read again.
+    /// A reorg changed what was read: the tables were cleared and are read again.
     pub restarted: bool,
 }
 
@@ -284,7 +288,7 @@ fn publisher(db: &ChainDb, p: &ChainParams, rec: &Value) -> String {
     tx.outputs.first().and_then(|o| crate::address::address_of(&o.script_pubkey, p)).unwrap_or_default()
 }
 
-/// One pass on chain `p`: read the collection-type inscriptions now [`DEPTH`] deep, then settle
+/// One pass on chain `p`: read the collection-type inscriptions with [`CONFIRMATIONS`], then settle
 /// new roots and the ones waiting. `tip` is the chain's height.
 pub fn scan(db: &ChainDb, p: &ChainParams, tip: u32) -> StoreResult<Pass> {
     let c = p.chain_no;
@@ -307,11 +311,25 @@ pub fn scan(db: &ChainDb, p: &ChainParams, tip: u32) -> StoreResult<Pass> {
         return Ok(pass);
     }
     let seq_key = k(c).bytes(b"seq").done();
+    let last_key = k(c).bytes(b"last").done();
     let mut seq = get(db, STATE, &seq_key).map(|v| be_u64(&v, 0)).unwrap_or(0);
-    let deep = tip.saturating_sub(DEPTH);
+    let pre = k(c).u8(json_g).done();
+    // The last row read: still that row, still the same inscription at that number.
+    if seq > 0 {
+        let row = get(db, crate::ordtypes::TYPES, &k(c).u8(json_g).u64(seq - 1).done()).map(|v| be_u64(&v, 0));
+        let same = get(db, STATE, &last_key).is_some_and(|v| {
+            v.len() == 44 && row == Some(be_u64(&v, 0)) && iid_of_number(db, c, be_u64(&v, 0)).is_some_and(|now| now[..] == v[8..])
+        });
+        if !same {
+            wipe(db, c)?;
+            pass.restarted = true;
+            return Ok(pass);
+        }
+    }
+    let deep = (tip + 1).saturating_sub(CONFIRMATIONS);
+    let mut last: Option<(u64, [u8; 36])> = None;
     let mut fresh: Vec<(u64, [u8; 36])> = Vec::new();
     'rows: loop {
-        let pre = k(c).u8(json_g).done();
         let after = (seq > 0).then(|| k(c).u8(json_g).u64(seq - 1).done());
         let rows = db.store(c).read(|r| r.scan_after(crate::ordtypes::TYPES, &pre, after.as_deref(), 2_000))?;
         if rows.is_empty() {
@@ -328,14 +346,18 @@ pub fn scan(db: &ChainDb, p: &ChainParams, tip: u32) -> StoreResult<Pass> {
             if ct.split(';').next().unwrap_or("").trim().eq_ignore_ascii_case(CONTENT_TYPE) {
                 fresh.push((n, iid));
             }
+            last = Some((n, iid));
             seq += 1;
         }
     }
-    if !fresh.is_empty() || seq > 0 {
+    if let Some((n, iid)) = last {
         store.write(|w| {
             for (n, iid) in &fresh {
                 w.put(CAND, &k(c).u64(*n).done(), iid)?;
             }
+            let mut v = n.to_be_bytes().to_vec();
+            v.extend_from_slice(&iid);
+            w.put(STATE, &last_key, &v)?;
             w.put(STATE, &seq_key, &seq.to_be_bytes())
         })?;
     }

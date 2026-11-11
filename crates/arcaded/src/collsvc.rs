@@ -73,12 +73,12 @@ pub fn run(node: Arc<Node>) {
                 Ok(pass) if pass.no_types => Note { detail: "waiting for the ord index's type rows to be built".into(), done: false },
                 Ok(pass) => {
                     busy |= pass.read > 0 || pass.restarted;
-                    let behind = ord_at + collreg::DEPTH < tip;
+                    let behind = ord_at < tip;
                     let mut d = summary(&node, p);
                     if behind {
                         d.push_str(&format!(" · reading with the ord index (block {ord_at} of {tip})"));
                     } else {
-                        d.push_str(&format!(" · read to {} blocks below the tip", collreg::DEPTH));
+                        d.push_str(" · read to the newest block");
                     }
                     Note { detail: d, done: !behind && pass.read == 0 && !pass.restarted }
                 }
@@ -114,27 +114,45 @@ fn root_row(n: u64, v: &Value) -> Value {
            "replaces": if v["replaces"].as_str().unwrap_or("").is_empty() { Value::Null } else { json!(format!("{}i0", v["replaces"].as_str().unwrap())) }})
 }
 
-/// `explorer.collections {chain, q?, sort?, status?, offset?, n?}`: a page of the chain's
-/// collections. sort: newest (default) | oldest | name | size; status: active (default) | all;
-/// q: part of the name, or a root's id. Sub 1K comes first (unless searched away).
+/// A known collection's row (Nintondo's list): `id` is its slug.
+fn known_row(p: &ChainParams, v: &Value) -> Value {
+    json!({"kind": "known", "id": v["slug"], "slug": v["slug"], "name": v["name"], "chain": p.key, "supply": v["supply"],
+           "count": v["count"], "owners": v["owners"], "height": v["height"], "created": v["created"], "cover": v["cover"],
+           "state": v["state"], "have": v["have"], "why": v["why"], "fp": v["fp"], "source": v["source"], "status": "active"})
+}
+
+/// `explorer.collections {chain, q?, sort?, status?, source?, offset?, n?}`: a page of the
+/// chain's collections. sort: newest (default) | oldest | name | size | holders; status: active
+/// (default) | all (registry roots not in use too); source: all (default) | registry | known;
+/// q: part of the name, a root's id or a slug. Sub 1K comes first (unless filtered away).
 pub fn list(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
     let q = req["q"].as_str().unwrap_or("").trim().to_lowercase();
     let all = req["status"] == "all";
-    let mut rows: Vec<Value> = collreg::roots(&node.chain, p.chain_no)
-        .iter()
-        .filter(|(_, v)| all || v["status"] == "active")
-        .map(|(n, v)| root_row(*n, v))
-        .filter(|r| q.is_empty() || r["name"].as_str().unwrap_or("").to_lowercase().contains(&q) || r["id"].as_str().is_some_and(|i| i.starts_with(&q)))
-        .collect();
-    let name = |r: &Value| r["name"].as_str().unwrap_or("").to_lowercase();
-    match req["sort"].as_str().unwrap_or("newest") {
-        "oldest" => rows.sort_by_key(|r| r["number"].as_u64()),
-        "name" => rows.sort_by(|a, b| name(a).cmp(&name(b)).then(a["number"].as_u64().cmp(&b["number"].as_u64()))),
-        "size" => rows.sort_by(|a, b| b["count"].as_u64().cmp(&a["count"].as_u64()).then(a["number"].as_u64().cmp(&b["number"].as_u64()))),
-        "newest" => rows.sort_by(|a, b| b["number"].as_u64().cmp(&a["number"].as_u64())),
-        s => return Err(format!("sort is newest, oldest, name or size, not {s}")),
+    let source = req["source"].as_str().unwrap_or("all");
+    if !matches!(source, "all" | "registry" | "known") {
+        return Err(format!("source is all, registry or known, not {source}"));
     }
-    if q.is_empty() || "sub 1k".contains(&q) || q == collreg::SUB1K {
+    let mut rows: Vec<Value> = Vec::new();
+    if source != "known" {
+        rows.extend(collreg::roots(&node.chain, p.chain_no).iter().filter(|(_, v)| all || v["status"] == "active").map(|(n, v)| root_row(*n, v)));
+    }
+    if source != "registry" {
+        rows.extend(crate::knowncoll::lines(node, p.chain_no).iter().map(|v| known_row(p, v)));
+    }
+    rows.retain(|r| q.is_empty() || r["name"].as_str().unwrap_or("").to_lowercase().contains(&q) || r["id"].as_str().is_some_and(|i| i.to_lowercase().starts_with(&q)));
+    let name = |r: &Value| r["name"].as_str().unwrap_or("").to_lowercase();
+    // Newest by block (a root's, or the first piece's for a known one), then by root number.
+    let when = |r: &Value| (r["height"].as_u64().unwrap_or(0), r["number"].as_u64().unwrap_or(0));
+    let size = |r: &Value| r["count"].as_u64().unwrap_or(0).max(if r["kind"] == "known" { r["supply"].as_u64().unwrap_or(0) } else { 0 });
+    match req["sort"].as_str().unwrap_or("newest") {
+        "oldest" => rows.sort_by_key(|r| when(r)),
+        "name" => rows.sort_by(|a, b| name(a).cmp(&name(b)).then(when(a).cmp(&when(b)))),
+        "size" => rows.sort_by(|a, b| size(b).cmp(&size(a)).then(name(a).cmp(&name(b)))),
+        "holders" => rows.sort_by(|a, b| b["owners"].as_u64().cmp(&a["owners"].as_u64()).then(name(a).cmp(&name(b)))),
+        "newest" => rows.sort_by(|a, b| when(b).cmp(&when(a))),
+        s => return Err(format!("sort is newest, oldest, name, size or holders, not {s}")),
+    }
+    if source != "known" && (q.is_empty() || "sub 1k".contains(&q) || q == collreg::SUB1K) {
         rows.insert(0, sub1k_row(node, p));
     }
     let total = rows.len();
@@ -142,13 +160,17 @@ pub fn list(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> 
     let n = req["n"].as_u64().unwrap_or(24).clamp(1, 60) as usize;
     let page: Vec<Value> = rows.into_iter().skip(off).take(n).collect();
     let (detail, done) = note(p.chain_no);
-    Ok(json!({"chain": p.key, "total": total, "offset": off, "n": n, "items": page, "reading": !done, "note": detail}))
+    let known = crate::knowncoll::source(p).map(|_| json!({"asks_nintondo": crate::knowncoll::enabled(node), "note": crate::knowncoll::note(p.chain_no)}));
+    Ok(json!({"chain": p.key, "total": total, "offset": off, "n": n, "items": page, "reading": !done, "note": detail, "known": known}))
 }
 
 /// `explorer.collection {chain, id, offset?, n?}`: one collection (a root's id, or "sub1k") and
 /// a page of its items by number in the collection (48 by default, at most 96).
 pub fn get(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
-    let id = req["id"].as_str().ok_or("give a collection's id (its root inscription, or sub1k)")?.trim();
+    if let Some(slug) = req["slug"].as_str() {
+        return get_known(node, p, slug.trim(), req);
+    }
+    let id = req["id"].as_str().ok_or("give a collection's id (its root inscription, or sub1k), or a known collection's slug")?.trim();
     let off = req["offset"].as_u64().unwrap_or(0);
     let n = req["n"].as_u64().unwrap_or(collreg::PAGE as u64).clamp(1, 96);
     let c = p.chain_no;
@@ -181,6 +203,36 @@ pub fn get(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
     Ok(v)
 }
 
+/// A known collection (`slug`) and a page of its pieces by position. One not held here yet is
+/// asked for (when this arcade asks Nintondo) and answers its state: wanted, loading (have of
+/// supply), skipped (why) or listed (nobody here asks Nintondo).
+fn get_known(node: &Node, p: &ChainParams, slug: &str, req: &Value) -> Result<Value, String> {
+    let c = p.chain_no;
+    let line = crate::knowncoll::line(node, c, slug).ok_or_else(|| format!("no known collection {slug} on {}", p.name))?;
+    let line = if line["state"] == "listed" && crate::knowncoll::enabled(node) { crate::knowncoll::want(node, p, slug).unwrap_or(line) } else { line };
+    let mut v = known_row(p, &line);
+    let off = req["offset"].as_u64().unwrap_or(0);
+    let n = req["n"].as_u64().unwrap_or(collreg::PAGE as u64).clamp(1, 96) as usize;
+    v["total"] = line["count"].clone();
+    v["offset"] = json!(off);
+    if line["state"] != "held" {
+        v["items"] = json!([]);
+        v["loading"] = json!({"state": line["state"], "have": line["have"], "of": line["supply"], "why": line["why"],
+                              "asks_nintondo": crate::knowncoll::enabled(node)});
+        return Ok(v);
+    }
+    let items: Vec<Value> = crate::knowncoll::items(node, c, slug, off, n)
+        .into_iter()
+        .map(|it| {
+            let id = it[0].as_str().unwrap_or("").to_string();
+            let insc = ord::parse_iid(&id).and_then(|b| ord::number_of(&node.chain, c, &b));
+            json!({"number": crate::knowncoll::position_of(it[1].as_str().unwrap_or("")), "name": it[1], "id": id, "inscription": insc.or(it[2].as_u64()), "traits": {}})
+        })
+        .collect();
+    v["items"] = json!(items);
+    Ok(v)
+}
+
 /// `explorer.collection_of {chain, id}`: the collections an inscription (id or number) is in here.
 pub fn of(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
     let id = req["id"].as_str().map(String::from).or_else(|| req["id"].as_u64().map(|n| n.to_string())).ok_or("give an inscription id or number")?;
@@ -191,6 +243,10 @@ pub fn of(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String> {
         if let Some(v) = collreg::roots(&node.chain, c).into_iter().find(|r| r.0 == rn).map(|r| r.1) {
             ins.push(json!({"kind": "registry", "id": v["id"], "name": v["name"], "number": num}));
         }
+    }
+    if let Some((slug, pos)) = crate::knowncoll::of(node, c, &iid) {
+        let name = crate::knowncoll::line(node, c, &slug).map(|l| l["name"].clone()).unwrap_or(json!(slug));
+        ins.push(json!({"kind": "known", "id": slug, "slug": slug, "name": name, "number": pos}));
     }
     if let Some(num) = ord::number_of(&node.chain, c, &iid).filter(|n| *n < SUB1K_SIZE) {
         ins.push(json!({"kind": "sub1k", "id": collreg::SUB1K, "name": "Sub 1K", "number": num}));

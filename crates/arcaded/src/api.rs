@@ -283,6 +283,8 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "prize.claim" => crate::prizesvc::claim(node, &s("page").unwrap_or_default(), req, req["send"] == true),
         "referee.get" => Ok(crate::refereesvc::setting(node)),
         "referee.set" => crate::refereesvc::set(node, &s("url").unwrap_or_default()),
+        "collections.known_get" => Ok(serde_json::json!({"known": crate::knowncoll::enabled(node)})),
+        "collections.known_set" => crate::knowncoll::set(node, req["on"] == true),
         "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
         "ring.send" => crate::ringsvc::send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &s("line").unwrap_or_default(), &s("link").unwrap_or_default()),
         "ring.waiting" => Ok(crate::ringsvc::waiting(node)),

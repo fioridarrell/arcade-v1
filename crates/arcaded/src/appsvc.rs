@@ -6,8 +6,8 @@
 //! - Opens `play` only when that page has the same creator, else the card's own page.
 //! - Likes, dislikes, comments and tips on any version count for the app (home chain feed acts).
 //! - Popular = hot(likes − dislikes + 0.5·comments, block time); New = newest first. Starred first.
-//! - Copycats: a card that looks like an earlier card by another creator (cards::looks_like) is
-//!   hidden until the operator clears it; trusted publishers are never flagged.
+//! - Copycats: a card that looks like an earlier card of a listed app by another creator
+//!   (cards::looks_like) is hidden until the operator clears it; trusted publishers are never flagged.
 //! - Installing keeps (chain, creator, name): it always opens the newest version.
 
 use crate::node::Node;
@@ -105,8 +105,13 @@ fn block_time(node: &Node, c: u16, h: u64) -> u64 {
 /// Copycat flags: the newest card of each app compared with earlier cards by other creators.
 fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
     let trusted: BTreeSet<String> = meta_get(node, "apps_trusted").as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    // What a card can be mistaken for is an app the store still lists: not one its creator removed,
+    // and not one the operator confirmed as a copy.
     let mut all: Vec<(&Ver, &str)> = Vec::new();
     for a in apps {
+        if a.removed || meta_get(node, &format!("cardwatch:{}:{}", a.chain.key, a.versions[0].txid)) == "confirmed" {
+            continue;
+        }
         for v in &a.versions {
             all.push((v, a.chain.key));
         }
@@ -321,6 +326,23 @@ pub fn set_perms(node: &Node, id: &str, set: &Value) -> Result<Value, String> {
     }
     meta_put(node, &format!("appperm:{id}"), &v)?;
     Ok(v)
+}
+
+/// Ids of the apps whose Notifications switch is on.
+pub fn notify_ids(node: &Node) -> Vec<String> {
+    let rows = node.app.store.read(|r| r.scan_prefix(arcade_app::META, b"appperm:")).unwrap_or_default();
+    rows.into_iter()
+        .filter(|(_, v)| serde_json::from_slice::<Value>(v).is_ok_and(|v| v["notify"] == true))
+        .filter_map(|(k, _)| String::from_utf8(k).ok().map(|k| k["appperm:".len()..].to_string()))
+        .collect()
+}
+
+/// The app a page belongs to (the txid of any of its versions, on any chain kept here):
+/// its id, name and chain, and the txid its card goes by.
+pub fn of_page(node: &Node, txid: &str) -> Option<Value> {
+    let a = gather(node).into_iter().find(|a| a.versions.iter().any(|v| v.txid == txid))?;
+    let first = &a.versions[0];
+    Some(json!({"id": app_id(a.chain.key, &first.creator, &first.card.key()), "name": first.card.name, "chain": a.chain.key, "txid": first.txid}))
 }
 
 /// Operator's verdict on a flagged card: "clear" (show it) or "confirm" (keep it hidden).

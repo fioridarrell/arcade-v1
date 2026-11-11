@@ -332,6 +332,11 @@ fn contacts(node: &Node) -> BTreeMap<String, Value> {
         .collect()
 }
 
+/// `address` is in the address book.
+pub fn in_book(node: &Node, address: &str) -> bool {
+    !address.is_empty() && contacts(node).values().any(|c| c["address"] == address)
+}
+
 pub fn mutes(node: &Node) -> BTreeMap<String, u64> {
     node.app
         .ascan(arcade_app::MUTES, b"")

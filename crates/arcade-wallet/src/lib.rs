@@ -1,5 +1,7 @@
 pub mod dd;
 pub mod keys;
+pub mod legacy;
+pub mod legs;
 pub mod taproot;
 pub mod tx;
 

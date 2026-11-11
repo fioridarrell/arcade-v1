@@ -19,11 +19,11 @@ pub const WIN: &str = "names.v1.win";
 pub const RULES: [&str; 3] = ["spec", "json", "doge2023"];
 
 /// Python's str.isspace().
-fn py_space(c: char) -> bool {
+pub(crate) fn py_space(c: char) -> bool {
     c.is_whitespace() || ('\x1c'..='\x1f').contains(&c)
 }
 
-fn py_strip(s: &str) -> &str {
+pub(crate) fn py_strip(s: &str) -> &str {
     s.trim_matches(py_space)
 }
 

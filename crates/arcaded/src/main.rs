@@ -41,6 +41,7 @@ mod meshsvc;
 mod meshview;
 mod mempoolshare;
 mod msgsvc;
+mod namesites;
 mod ordtypes;
 mod staker;
 mod sitesvc;
@@ -50,6 +51,10 @@ mod node;
 mod peerbook;
 mod psync;
 mod realtime;
+mod prizesvc;
+mod refereesvc;
+mod tradesvc;
+mod ringsvc;
 mod rpc;
 mod sizes;
 mod udpsvc;
@@ -272,6 +277,7 @@ fn main() {
     chains::start_saved(&node);
     borrow::start(node.clone());
     ordtypes::init(&node);
+    namesites::init(&node);
     // A home chain far behind (a fresh install): installed from copies when the mesh has them.
     v1import::auto_home(node.clone());
     sizes::load(&node);
@@ -306,6 +312,10 @@ fn main() {
     {
         let n = node.clone();
         std::thread::Builder::new().name("rooms".into()).spawn(move || realtime::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("rings".into()).spawn(move || ringsvc::run(n)).unwrap();
     }
     {
         let n = node.clone();

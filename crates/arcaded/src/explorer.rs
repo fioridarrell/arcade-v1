@@ -10,6 +10,7 @@
 //!   explorer.tokens   {after?, n?}         token ticks
 //!   explorer.token    {tick}               a tick and its top holders
 //!   explorer.names / explorer.maps {after?, n?}, explorer.name {name}, explorer.map {claim}
+//!   explorer.site {name} / explorer.sites {all?}   a name's site, the names with one (namesites.rs)
 //!   explorer.mempool                       unconfirmed transactions
 //!   explorer.search   {q}                  what a search box string points at
 
@@ -91,7 +92,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.inscription", "explorer.tokens", "explorer.token", "explorer.names", "explorer.name", "explorer.maps",
     "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens", "explorer.ledger_token",
     "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag", "explorer.search",
-    "explorer.inscription_types",
+    "explorer.inscription_types", "explorer.site", "explorer.sites",
 ];
 
 /// Mesh answers kept a short while: the Explorer asks the same things again and again
@@ -257,7 +258,8 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             // A missing index, or a chain not kept here at all.
             // (Any other failure, e.g. a chain only borrowed here or not kept at all: any
             // arcade keeping the chain may know.)
-            let ix = missing_index(&e).unwrap_or_default();
+            // (A site is read from the names index, whatever else is missing here.)
+            let ix = missing_index(&e).or_else(|| matches!(cmd, "explorer.site" | "explorer.sites").then(|| "names".to_string())).unwrap_or_default();
             if crate::shares::index_holders(node, p.net, &ix).is_empty() {
                 return Err(e);
             }
@@ -436,6 +438,14 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             v["holders"] = json!(if more { format!("{count}+") } else { count.to_string() });
             v["top"] = json!(hs.iter().take(25).map(|(o, a, tr)| json!({"address": a, "tag": tag_of(&x, a), "overall": o.to_string(), "transferable": tr})).collect::<Vec<_>>());
             Ok(v)
+        }
+        "explorer.site" => {
+            x.need("names")?;
+            crate::namesites::site_here(x.node, x.p, &s("name").ok_or("give a name")?)
+        }
+        "explorer.sites" => {
+            x.need("names")?;
+            crate::namesites::directory_here(x.node, x.p, req["all"] == true)
         }
         "explorer.names" => {
             x.need("names")?;

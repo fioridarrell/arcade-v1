@@ -111,6 +111,22 @@ const CORS: [(&str, &str); 3] = [
     ("Access-Control-Allow-Methods", "GET, POST, OPTIONS"),
 ];
 
+/// Inscription content is served as a page of its own: an opaque origin that reaches nothing.
+const CONTENT_CSP: &str = "sandbox allow-scripts; default-src 'self' data: blob:; connect-src 'none'";
+
+fn status_line(code: u16) -> &'static str {
+    match code {
+        200 => "200 OK",
+        300 => "300 Multiple Choices",
+        307 => "307 Temporary Redirect",
+        400 => "400 Bad Request",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        503 => "503 Service Unavailable",
+        _ => "500 Internal Server Error",
+    }
+}
+
 fn cors() -> Vec<(&'static str, String)> {
     CORS.iter().map(|(k, v)| (*k, v.to_string())).collect()
 }
@@ -154,7 +170,7 @@ fn query_fields(q: &str) -> Map<String, Value> {
     m
 }
 
-fn pct_decode(s: &str) -> String {
+pub(crate) fn pct_decode(s: &str) -> String {
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
@@ -306,12 +322,45 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             let st = match code { 200 => "200 OK", 202 => "202 Accepted", _ => "400 Bad Request" };
             return respond(&mut s, st, "application/json", &cors, v.to_string().as_bytes());
         }
+        if let Some(a) = crate::namesites::route(node, &path, &query_fields(&r.query)) {
+            return respond(&mut s, status_line(a.code), a.ctype, &cors, &a.body);
+        }
         let (code, body) = crate::walletsvc::route(node, &path, &query_fields(&r.query));
         let st = match code { 200 => "200 OK", 403 => "403 Forbidden", 503 => "503 Service Unavailable", _ => "404 Not Found" };
         return respond(&mut s, st, "application/json", &cors, body.as_bytes());
     }
+    // A name's page on its own (sites on names, namesites.rs): sandboxed as an inscription is.
+    if path.starts_with("/site/") {
+        if !is_local {
+            return respond(&mut s, "403 Forbidden", "text/plain", &[], b"this arcade's pages answer only this computer\n");
+        }
+        if let Some(a) = crate::namesites::route(node, &path, &query_fields(&r.query)) {
+            let mut extra = vec![("Content-Security-Policy", CONTENT_CSP.to_string()), ("Cache-Control", "no-store".to_string()), ("Access-Control-Allow-Origin", "*".to_string())];
+            if let Some(to) = a.location {
+                extra.push(("Location", to));
+            }
+            return respond(&mut s, status_line(a.code), a.ctype, &extra, if r.method == "HEAD" { &[] } else { &a.body });
+        }
+    }
     let seg: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
     match seg.as_slice() {
+        // An ord inscription by its id (the pictures and pages a site names; the arcade ledger's
+        // own content is asked by txid or number below).
+        ["content", id] if arcade_ledger::sites::is_inscription_id(&id.to_lowercase()) => match crate::namesites::content(node, id, is_local) {
+            Some((ctype, bytes)) => respond(
+                &mut s,
+                "200 OK",
+                if ctype.is_empty() { "application/octet-stream" } else { &ctype },
+                &[
+                    ("Cache-Control", "public, max-age=31536000, immutable".into()),
+                    // As main's ord route: recursive inscriptions load their parts from here.
+                    ("Content-Security-Policy", ord_csp(node)),
+                    ("Access-Control-Allow-Origin", "*".into()),
+                ],
+                if r.method == "HEAD" { &[] } else { &bytes },
+            ),
+            None => respond(&mut s, "404 Not Found", "text/plain", &[], b"no such inscription on a chain this arcade can read\n"),
+        },
         ["content", id] => match arcade_ledger::content::content(&node.chain, p, id) {
             Ok(c) => respond(
                 &mut s,
@@ -320,7 +369,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
                 &[
                     ("ETag", format!("\"{}\"", c.sha256)),
                     ("Cache-Control", "public, max-age=31536000, immutable".into()),
-                    ("Content-Security-Policy", "sandbox allow-scripts; default-src 'self' data: blob:; connect-src 'none'".into()),
+                    ("Content-Security-Policy", CONTENT_CSP.into()),
                     // Apps (opaque origin) read their parts from here, as on the original.
                     ("Access-Control-Allow-Origin", "*".into()),
                 ],
@@ -330,14 +379,11 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             // (recursive Doginals/Pepinals ask /content/<id>; Martin 2026-11-10).
             Err(e) => match ord_content(node, id) {
                 Some((ct, bytes)) => {
-                    let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
-                    // Sandboxed (opaque origin, scripts only), loading only from this arcade.
-                    let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
                     respond(
                         &mut s,
                         "200 OK",
                         if ct.is_empty() { "application/octet-stream" } else { &ct },
-                        &[("Content-Security-Policy", csp), ("Access-Control-Allow-Origin", "*".into()), ("X-Content-Type-Options", "nosniff".into())],
+                        &[("Content-Security-Policy", ord_csp(node)), ("Access-Control-Allow-Origin", "*".into()), ("X-Content-Type-Options", "nosniff".into())],
                         if r.method == "HEAD" { &[] } else { &bytes },
                     )
                 }
@@ -360,6 +406,13 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
 
 /// An ord inscription's content type and bytes, from the first chain kept here with the ord
 /// index that has it (the home chain first).
+/// How an ord inscription is served: sandboxed (opaque origin, scripts only), loading only
+/// from this arcade, so recursive inscriptions can ask /content/<id> for their parts.
+fn ord_csp(node: &Node) -> String {
+    let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
+    format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'")
+}
+
 fn ord_content(node: &Node, id: &str) -> Option<(String, Vec<u8>)> {
     let mut chains: Vec<&'static arcade_chain::params::ChainParams> = Vec::new();
     if crate::chains::home_indexes(node).iter().any(|i| i == "ord") {

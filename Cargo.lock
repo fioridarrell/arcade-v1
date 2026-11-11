@@ -153,6 +153,7 @@ dependencies = [
 name = "arcade-desktop"
 version = "0.1.0"
 dependencies = [
+ "base64 0.23.1",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -170,6 +171,7 @@ dependencies = [
  "bs58",
  "hex",
  "regex",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
@@ -246,6 +248,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "secp256k1",
+ "serde_json",
  "sha2 0.11.1",
  "thiserror 1.0.69",
  "zeroize",

@@ -515,11 +515,10 @@ fn serve_loop(
 ) -> Result<(), LinkError> {
     let cr_reqs = &mut *cr_reqs;
     loop {
-        // Queued frames: every link sends every frame once.
+        // Queued frames: every link sends every frame once (those still in the ring).
         let pending: Vec<Value> = {
-            let ob = node.mesh_outbox.lock().unwrap();
-            let v = ob.iter().skip(*sent_outbox).cloned().collect();
-            *sent_outbox = ob.len();
+            let (v, next) = node.mesh_outbox.lock().unwrap().since(*sent_outbox);
+            *sent_outbox = next;
             v
         };
         for f in pending {

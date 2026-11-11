@@ -68,6 +68,59 @@ fn two_arcades_behind_one_address_are_two_links() {
     assert!(links.lock().unwrap().is_empty());
 }
 
+/// Frames waiting to be sent to every mesh link: the latest OUTBOX_RING only, numbered in
+/// order, so a link sends each once and one that fell behind (or a new one) starts at the
+/// oldest still kept.
+#[derive(Debug, Default)]
+pub struct Outbox {
+    /// Number of the oldest frame kept.
+    start: usize,
+    frames: std::collections::VecDeque<Value>,
+}
+
+pub const OUTBOX_RING: usize = 2000;
+
+impl Outbox {
+    pub fn push(&mut self, f: Value) {
+        self.frames.push_back(f);
+        while self.frames.len() > OUTBOX_RING {
+            self.frames.pop_front();
+            self.start += 1;
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    pub fn last(&self) -> Option<&Value> {
+        self.frames.back()
+    }
+
+    /// The frames numbered `from` on (those still kept), and the number after the last.
+    pub fn since(&self, from: usize) -> (Vec<Value>, usize) {
+        (self.frames.iter().skip(from.saturating_sub(self.start)).cloned().collect(), self.start + self.frames.len())
+    }
+}
+
+#[test]
+fn outbox_is_a_ring() {
+    let mut o = Outbox::default();
+    for n in 0..OUTBOX_RING + 10 {
+        o.push(serde_json::json!(n));
+    }
+    assert_eq!(o.len(), OUTBOX_RING);
+    let (all, next) = o.since(0);
+    assert_eq!((all.len(), all[0].clone(), next), (OUTBOX_RING, serde_json::json!(10), OUTBOX_RING + 10));
+    let (some, _) = o.since(OUTBOX_RING + 5);
+    assert_eq!(some, vec![serde_json::json!(OUTBOX_RING + 5), serde_json::json!(OUTBOX_RING + 6), serde_json::json!(OUTBOX_RING + 7), serde_json::json!(OUTBOX_RING + 8), serde_json::json!(OUTBOX_RING + 9)]);
+    assert!(o.since(next).0.is_empty());
+}
+
 pub struct Node {
     pub home: std::path::PathBuf,
     /// "__cookie__:<secret>" for /rpc (written to <home>/.cookie at start).
@@ -81,7 +134,7 @@ pub struct Node {
     /// Raw transactions waiting to be sent to coin peers.
     pub tx_outbox: Mutex<Vec<Vec<u8>>>,
     /// Frames waiting to be sent to every mesh link.
-    pub mesh_outbox: Mutex<Vec<Value>>,
+    pub mesh_outbox: Mutex<Outbox>,
     pub links: Mutex<BTreeMap<String, LinkInfo>>,
     pub mesh_tips: Mutex<BTreeMap<String, MeshTip>>,
     pub sync_state: Mutex<String>,

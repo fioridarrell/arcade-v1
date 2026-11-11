@@ -183,10 +183,11 @@
     if (page >= pages - 3) return [1, "…", pages - 4, pages - 3, pages - 2, pages - 1, pages];
     return [1, "…", page - 1, page, page + 1, "…", pages];
   }
-  function pager(total, size, page, where, gotoLabel, gotoPage) {
+  // `argOf`: a detail view's own arg for page p (a token's holders), instead of "p<n>".
+  function pager(total, size, page, where, gotoLabel, gotoPage, argOf) {
     const pages = Math.max(1, Math.ceil(total / size));
     page = Math.min(page, pages);
-    const to = (p) => go(where, `p${Math.min(pages, Math.max(1, p))}`);
+    const to = (p) => { const n = Math.min(pages, Math.max(1, p)); go(where, argOf ? argOf(n) : `p${n}`); };
     const nav = (cls, label, p, title, short) => h("button", { type: "button", class: cls, disabled: p < 1 || p > pages || p === page, title, "aria-label": title, "data-short": short || "", onclick: () => to(p) }, label);
     const slots = windowOf(page, pages).map((v) =>
       v === null ? h("button", { type: "button", class: "slot empty", tabindex: "-1", "aria-hidden": "true" }, "0")
@@ -486,15 +487,22 @@
           i.re && ["Reinscription", "yes"], ["Reveal", link(short(i.txs?.[i.txs.length - 1] || "", 12, 8), "tx", i.txs?.[i.txs.length - 1], "mono")]])));
   }
   async function vToken() {
-    const t = await xapi("explorer.token", { chain: chain.key, tick: arg });
+    // The arg is the tick, with "|p<n>" for a page of its holders past the first.
+    const m = /^(.*)\|p(\d+)$/s.exec(arg || "");
+    const tick = m ? m[1] : arg, size = 25, hpage = m ? Math.max(1, Number(m[2])) : 1;
+    const t = await xapi("explorer.token", { chain: chain.key, tick, offset: (hpage - 1) * size, n: size });
+    const total = t.total ?? t.top.length;
+    const hpager = () => total > size ? pager(total, size, hpage, "token", null, null, (p) => (p > 1 ? `${tick}|p${p}` : tick)) : "";
     const pct = Number(BigInt(t.minted || "0") * 1000n / (BigInt(t.supply || "1") || 1n)) / 10;
     return h("div", {}, crumbs(link("Tokens", "tokens"), t.shown || t.tick),
       head(t.shown || t.tick, pct >= 100 ? pill("minted out") : pill(`${pct}% minted`, true)),
       kv([["Supply", units(t.supply, t.dec)], ["Minted", units(t.minted, t.dec)], ["Mint limit", units(t.lim, t.dec)], ["Decimals", String(t.dec)],
         ["Deploy", link(`inscription #${fmt(t.n)}`, "inscription", t.id)], ["Deployer", addrLink(t.deployer)], ["Holders", t.holders]]),
-      h("h2", { class: "x-h2" }, "Top holders"),
-      t.top.length ? table([["Holder"], ["Balance", 1], ["Transferable", 1]], t.top.map((x) => ({ go: () => go("address", x.address), cells: [[addrLink(x.address, x.tag)], [units(x.overall, t.dec), 1], [units(x.transferable, t.dec), 1]] })))
-        : h("div", { class: "x-empty" }, "Nobody holds any yet."));
+      h("h2", { class: "x-h2" }, "Holders"),
+      t.top.length ? h("div", {}, hpager(),
+        table([["#", 1], ["Holder"], ["Balance", 1], ["Transferable", 1]], t.top.map((x, i) => ({ go: () => go("address", x.address), cells: [[fmt((hpage - 1) * size + i + 1), 1], [addrLink(x.address, x.tag)], [units(x.overall, t.dec), 1], [units(x.transferable, t.dec), 1]] }))),
+        hpager())
+        : h("div", { class: "x-empty" }, hpage > 1 ? "No holders on this page." : "Nobody holds any yet."));
   }
   let lastResults = null;
   async function vResults() {

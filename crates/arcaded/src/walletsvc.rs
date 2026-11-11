@@ -12,8 +12,9 @@ use serde_json::{json, Value};
 const REQ_LIFE: u64 = 3600;
 const MAX_WAITING: usize = 20;
 
+/// The chain a page read is on (crate::pagechain: the app frame's chain, else the home chain).
 fn c(node: &Node) -> u16 {
-    node.params.chain_no
+    crate::pagechain::params(node).chain_no
 }
 
 fn tag_of(node: &Node, a: &str) -> Option<String> {
@@ -205,12 +206,15 @@ pub(crate) fn key_for(node: &Node, address: &str) -> Result<arcade_wallet::Secre
 /// GET /r/wallet: who is looking (the node's own wallet on the operator's machine).
 pub fn wallet(node: &Node) -> Value {
     let addrs = ours(node);
-    let p = node.params;
+    // The page's chain: this wallet's addresses there, and its coins there (a chain kept here or
+    // borrowed).
+    let p = crate::pagechain::params(node);
     let mut spendable = 0u64;
     let mut sums: std::collections::BTreeMap<u32, u64> = Default::default();
     for a in &addrs {
         if let Some(script) = arcade_ledger::address::p2pkh_script_for_address(p, a) {
-            spendable += crate::claims::spendable(node, &script).iter().map(|u| u.value).sum::<u64>();
+            let coins = if p.chain_no == node.params.chain_no { crate::claims::spendable(node, &script) } else { crate::borrow::spendable(node, p, &script) };
+            spendable += coins.iter().map(|u| u.value).sum::<u64>();
         }
         for (pid, u) in holdings(node, a) {
             *sums.entry(pid).or_default() += u;
@@ -218,7 +222,7 @@ pub fn wallet(node: &Node) -> Value {
     }
     let tag = addrs.iter().find_map(|a| tag_of(node, a));
     let insc = all_inscriptions(node).iter().filter(|v| v["owner"].as_str().is_some_and(|o| addrs.iter().any(|a| a == o))).count();
-    json!({"network": p.net, "mainnet": false, "addresses": addrs, "tag": tag,
+    json!({"network": p.net, "mainnet": !p.key.ends_with("test"), "addresses": addrs, "tag": tag,
            "coin": {"spendable": spendable as f64 / 1e8, "ticker": ""},
            "tokens": balance_rows(node, &sums.into_iter().collect::<Vec<_>>()), "inscriptions": insc, "wallet": "operator"})
 }
@@ -382,7 +386,7 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
 pub(crate) fn tx_status(node: &Node, txid: &str) -> Option<Value> {
     let cc = c(node);
     let h = arcade_chain::Hash256::from_hex(txid).ok()?;
-    if let Some((b, _)) = node.chain.tx_location(node.params, &h).ok().flatten() {
+    if let Some((b, _)) = node.chain.tx_location(crate::pagechain::params(node), &h).ok().flatten() {
         let tip = node.chain.tip(cc).ok().flatten().map(|t| t.height).unwrap_or(0);
         let height = node.chain.block_height_of(cc, b).ok().flatten();
         let hash = height.and_then(|ht| node.chain.hash_at(cc, ht).ok().flatten());
@@ -390,7 +394,7 @@ pub(crate) fn tx_status(node: &Node, txid: &str) -> Option<Value> {
         return Some(json!({"txid": txid, "confirmed": true, "confirmations": height.map(|ht| tip.saturating_sub(ht) + 1), "conflicted": false,
                            "block": height, "blockhash": hash.map(|x| x.to_hex()), "time": time}));
     }
-    let pooled = node.chain.mempool(cc).ok()?.iter().any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &node.params.format).map(|t| t.txid == h).unwrap_or(false));
+    let pooled = node.chain.mempool(cc).ok()?.iter().any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &crate::pagechain::params(node).format).map(|t| t.txid == h).unwrap_or(false));
     pooled.then(|| json!({"txid": txid, "confirmed": false, "confirmations": 0, "conflicted": false, "block": Value::Null, "blockhash": Value::Null, "time": Value::Null}))
 }
 

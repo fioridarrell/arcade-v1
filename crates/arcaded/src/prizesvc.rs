@@ -46,7 +46,7 @@ static SCAN: Mutex<Option<Scan>> = Mutex::new(None);
 
 /// Inscriptions whose JSON names a prize pool (or a pool's deletion), in inscription order.
 fn rows(node: &Node) -> Vec<Row> {
-    let c = node.params.chain_no;
+    let c = crate::pagechain::params(node).chain_no;
     let mut g = SCAN.lock().unwrap();
     let scan = g.get_or_insert_with(Scan::default);
     if scan.chain != c {
@@ -137,7 +137,7 @@ fn pool_of(node: &Node, r: &Row) -> Option<Value> {
             return None;
         }
         let redeem = redeem_script(&hex::decode(p["pubkey"].as_str()?).ok()?, &hex::decode(ref_["pubkey"].as_str()?).ok()?, &creator_pub)?;
-        let addr = arcade_ledger::address::address_of(&arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(&redeem)), node.params)?;
+        let addr = arcade_ledger::address::address_of(&arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(&redeem)), crate::pagechain::params(node))?;
         if addr != p["pool"].as_str()? {
             return None;
         }
@@ -182,7 +182,7 @@ pub fn pools(node: &Node) -> Vec<Value> {
 /// A pool by txid or number.
 pub fn pool(node: &Node, key: &str) -> Option<Value> {
     let key = key.trim().trim_start_matches('#').to_lowercase();
-    let txid = if key.len() == 64 { key } else { arcade_ledger::content::inscription(&node.chain, node.params.chain_no, &key)?["txid"].as_str()?.to_string() };
+    let txid = if key.len() == 64 { key } else { arcade_ledger::content::inscription(&node.chain, crate::pagechain::params(node).chain_no, &key)?["txid"].as_str()?.to_string() };
     pools(node).into_iter().find(|p| p["txid"].as_str() == Some(txid.as_str()))
 }
 
@@ -198,7 +198,7 @@ pub fn lot_coins(p: &Value, n: i64) -> Option<(OutPoint, OutPoint)> {
 
 /// (free lots, lots waiting: spent only by a pooled transaction).
 pub fn lots(node: &Node, p: &Value) -> (Vec<i64>, u64) {
-    let net = node.params;
+    let net = crate::pagechain::params(node);
     let (mut free, mut waiting) = (Vec::new(), 0);
     let addr = p["pool"].as_str().unwrap_or("");
     for n in 0..p["count"].as_i64().unwrap_or(0) {
@@ -228,7 +228,7 @@ pub fn refusal(node: &Node, p: Option<&Value>, page: &str) -> String {
     }
     let game = p["game"].as_str().unwrap_or("");
     if !game.is_empty() {
-        let owner = arcade_ledger::content::inscription(&node.chain, node.params.chain_no, game).and_then(|i| i["owner"].as_str().map(String::from));
+        let owner = arcade_ledger::content::inscription(&node.chain, crate::pagechain::params(node).chain_no, game).and_then(|i| i["owner"].as_str().map(String::from));
         if owner.as_deref() != p["creator"].as_str() {
             return "this prize pays out only while its creator holds the page it belongs to".into();
         }
@@ -240,7 +240,7 @@ pub fn refusal(node: &Node, p: Option<&Value>, page: &str) -> String {
 }
 
 fn what(node: &Node, p: &Value) -> String {
-    let c = node.params.chain_no;
+    let c = crate::pagechain::params(node).chain_no;
     if p["kind"] == "nft" {
         let named = p["pieces"][0].as_str().and_then(|id| {
             let k = KeyBuf::new().u16(c).bytes(id.as_bytes()).done();
@@ -278,7 +278,7 @@ pub fn card(node: &Node, p: &Value, page: &str) -> Value {
 }
 
 fn page_txid(node: &Node, key: &str) -> Option<String> {
-    arcade_ledger::content::inscription(&node.chain, node.params.chain_no, key.trim().trim_start_matches('#')).and_then(|i| i["txid"].as_str().map(String::from))
+    arcade_ledger::content::inscription(&node.chain, crate::pagechain::params(node).chain_no, key.trim().trim_start_matches('#')).and_then(|i| i["txid"].as_str().map(String::from))
 }
 
 /// The /r/ routes: (status, body).
@@ -374,7 +374,7 @@ fn page_pool(node: &Node, page: &str) -> Option<Value> {
 /// issued to this arcade's player. {seed, expires[, pools]}.
 pub fn seed(node: &Node, page: &str, m: &Value) -> Result<Value, String> {
     let (address, _, _) = crate::msgsvc::sender_key(node)?;
-    let chain = node.params.net;
+    let chain = crate::pagechain::params(node).net;
     let (url, body) = if let Some(judge) = m["judge"].as_str().filter(|j| !j.is_empty()) {
         let named = m["referee"].as_str().unwrap_or("").trim_end_matches('/').to_string();
         let url = if named.is_empty() { crate::refereesvc::setting(node)["url"].as_str().unwrap_or("").to_string() } else { named };
@@ -471,7 +471,7 @@ fn lot_leg(node: &Node, p: &Value, n: i64) -> Result<Lot, String> {
         let fee = legs::swap_fee(&fees(), &opret);
         (fee, (2 * each + price).checked_sub(fee).ok_or("the lot does not cover its fee")?)
     };
-    let pool_script = arcade_ledger::address::script_for_address(node.params, p["pool"].as_str().unwrap_or("")).ok_or("bad pool address")?;
+    let pool_script = arcade_ledger::address::script_for_address(crate::pagechain::params(node), p["pool"].as_str().unwrap_or("")).ok_or("bad pool address")?;
     let code = match p["redeem"].as_str().filter(|r| !r.is_empty()) {
         Some(r) => hex::decode(r).map_err(|_| "bad redeem script")?,
         None => pool_script.clone(),
@@ -523,7 +523,7 @@ pub fn claim(node: &Node, page: &str, m: &Value, send: bool) -> Result<Value, St
     if refereed && replay.is_none() {
         return Err("this prize pays only for a run its referee checks: send the run with the claim".into());
     }
-    let content = arcade_ledger::content::content(&node.chain, node.params, p["txid"].as_str().unwrap_or(""))?;
+    let content = arcade_ledger::content::content(&node.chain, crate::pagechain::params(node), p["txid"].as_str().unwrap_or(""))?;
     let sigs = open_lots(&content.bytes, &secret)?;
     let (s0, s1) = (sigs.get(2 * n as usize).ok_or("that lot was never signed")?, sigs.get(2 * n as usize + 1).ok_or("that lot was never signed")?);
     let lot = lot_leg(node, &p, n)?;
@@ -579,7 +579,7 @@ pub fn claim(node: &Node, page: &str, m: &Value, send: bool) -> Result<Value, St
     };
     let what = what(node, &p);
     let preview = json!({"pool": p["txid"], "lot": n, "piece": what, "price": p["price"], "fee": fee, "fee_text": arcade_ledger::amount::fixed8(fee),
-                         "pool_pays": lot.pays > 0, "refereed": refereed, "seller": p["creator"], "seller_tag": arcade_ledger::index::tag_of(&node.chain, node.params.chain_no, p["creator"].as_str().unwrap_or("")).ok().flatten()});
+                         "pool_pays": lot.pays > 0, "refereed": refereed, "seller": p["creator"], "seller_tag": arcade_ledger::index::tag_of(&node.chain, crate::pagechain::params(node).chain_no, p["creator"].as_str().unwrap_or("")).ok().flatten()});
     if !send {
         return Ok(preview);
     }
@@ -588,7 +588,7 @@ pub fn claim(node: &Node, page: &str, m: &Value, send: bool) -> Result<Value, St
     if refereed {
         let url = referee_url(node, &p)?;
         let raw = hex::encode(legacy::serialize(&shape, &[]));
-        let got = post(&url, "/r/referee/sign", &json!({"chain": node.params.net, "pool": p["txid"], "lot": n, "raw": raw, "replay": replay}))?;
+        let got = post(&url, "/r/referee/sign", &json!({"chain": crate::pagechain::params(node).net, "pool": p["txid"], "lot": n, "raw": raw, "replay": replay}))?;
         let refs: Vec<Vec<u8>> = got["signatures"].as_array().map(|a| a.iter().filter_map(|s| s.as_str().and_then(|h| hex::decode(h).ok())).collect()).unwrap_or_default();
         let ref_pub = hex::decode(p["referee"]["pubkey"].as_str().unwrap_or("")).unwrap_or_default();
         if refs.len() != 2 {
@@ -616,8 +616,8 @@ pub fn claim(node: &Node, page: &str, m: &Value, send: bool) -> Result<Value, St
         script_sigs[i] = legs::script_sig(&legacy::sign(&sk, &d, legacy::ALL), &pk.serialize());
     }
     let raw = legacy::serialize(&shape, &script_sigs);
-    let tx = arcade_chain::Tx::parse_with(&raw, &node.params.format).map_err(|e| format!("built a claim that does not parse: {e}"))?;
-    if !crate::mempoolshare::add(node, node.params, &tx) {
+    let tx = arcade_chain::Tx::parse_with(&raw, &crate::pagechain::params(node).format).map_err(|e| format!("built a claim that does not parse: {e}"))?;
+    if !crate::mempoolshare::add(node, crate::pagechain::params(node), &tx) {
         return Err("the claim was refused: that lot was just taken".into());
     }
     crate::claims::mark_spent(node, &tx);

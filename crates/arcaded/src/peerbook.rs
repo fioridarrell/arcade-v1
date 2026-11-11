@@ -131,21 +131,19 @@ pub fn learn(node: &Node, net: &str, addrs: &[(String, u64)], src: &str) {
 
 /// Peers to try, best first: working recently (most recent first), then never tried (most
 /// recently heard of first), then those that failed but have rested. Resting ones are left out.
-/// ARCADE_COIN_PEERS=host:port,...: coin peers tried before any other (tests on one machine,
-/// where a test arcade's only way to a chain is a local node).
-/// An entry may name its chain, `net=host:port` (e.g. `test=127.0.0.1:44874,dgbtest=127.0.0.1:12033`); a bare
-/// one is for every chain.
+/// ARCADE_COIN_PEERS=[net=]host:port,...: the only coin peers tried (tests on one machine, where
+/// a test arcade's only way to a chain is a local node). `net=` names the chain a peer is for
+/// (`test=127.0.0.1:44874,main=127.0.0.1:33874`); a peer without one is for every chain.
 pub(crate) fn forced(net: &str) -> Vec<String> {
     std::env::var("ARCADE_COIN_PEERS")
         .map(|v| {
             v.split(',')
                 .map(str::trim)
-                .filter_map(|a| match a.split_once('=') {
-                    Some((n, h)) => (n == net).then_some(h),
-                    None => Some(a),
-                })
                 .filter(|a| !a.is_empty())
-                .map(String::from)
+                .filter_map(|a| match a.split_once('=') {
+                    Some((n, addr)) => (n == net).then(|| addr.to_string()),
+                    None => Some(a.to_string()),
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -257,4 +255,16 @@ pub fn run(node: std::sync::Arc<Node>) {
         }
         std::thread::sleep(Duration::from_secs(60));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn forced_peers_are_per_chain_when_named() {
+    // One test, so the process-wide variable is set by nobody else meanwhile.
+    std::env::set_var("ARCADE_COIN_PEERS", "test=127.0.0.1:1, main=127.0.0.1:2,127.0.0.1:3");
+    assert_eq!(forced("test"), vec!["127.0.0.1:1", "127.0.0.1:3"]);
+    assert_eq!(forced("main"), vec!["127.0.0.1:2", "127.0.0.1:3"]);
+    assert_eq!(forced("dgb"), vec!["127.0.0.1:3"]);
+    std::env::remove_var("ARCADE_COIN_PEERS");
+    assert!(forced("test").is_empty());
 }

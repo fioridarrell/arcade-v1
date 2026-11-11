@@ -248,19 +248,21 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         let Some(cp) = arcade_chain::params::by_key(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         let me = format!("http://127.0.0.1:{}", node.http_port.get().copied().unwrap_or(8420));
         let csp = format!("sandbox allow-scripts allow-pointer-lock; default-src 'self' {me} data: blob:; script-src 'self' {me} 'unsafe-inline' 'unsafe-eval' data: blob:; style-src 'self' {me} 'unsafe-inline' data:; img-src 'self' {me} data: blob:; media-src 'self' {me} data: blob:; font-src 'self' {me} data:; connect-src 'self' {me} data: blob:; frame-src 'self' {me}; object-src 'none'; base-uri 'none'; form-action 'none'");
-        return match arcade_ledger::content::content(&node.chain, cp, id) {
+        // From this arcade's ledger of that chain, or (a chain it only borrows) from an arcade on
+        // the mesh that keeps it.
+        return match crate::pagechain::content(node, cp, id) {
             Ok(c) => respond(
                 &mut s,
                 "200 OK",
-                if c.content_type.is_empty() { "application/octet-stream" } else { &c.content_type },
+                if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
                 &[
-                    ("ETag", format!("\"{}\"", c.sha256)),
+                    ("ETag", format!("\"{}\"", c.1)),
                     ("Cache-Control", "public, max-age=31536000, immutable".into()),
                     ("Content-Security-Policy", csp),
                     ("Access-Control-Allow-Origin", "*".into()),
                     ("Referrer-Policy", "unsafe-url".into()),
                 ],
-                if r.method == "HEAD" { &[] } else { &c.bytes },
+                if r.method == "HEAD" { &[] } else { &c.2 },
             ),
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         };
@@ -314,6 +316,14 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         if !is_local {
             return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"this arcade's page API answers only this computer"}"#);
         }
+        // An app on another chain than the home chain (its frame's address, the Referer): its
+        // reads answer on that chain (crate::pagechain); this arcade's wallet sends on the home
+        // chain only.
+        let page_chain = r.headers.get("referer").and_then(|v| v.as_str()).and_then(crate::pagechain::of_referer).filter(|p| p.chain_no != node.params.chain_no);
+        if r.method == "POST" && path == "/r/send" && page_chain.is_some() {
+            let msg = json!({"error": format!("this app is on {}: this arcade's wallet sends on {} only", page_chain.unwrap().name, node.params.name)});
+            return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());
+        }
         // A market write (marketsvc.rs, docs/MARKET.md step 2) files a request like a send does.
         let market_op = path.strip_prefix("/r/market/").filter(|op| matches!(*op, "place" | "cancel" | "take"));
         if r.method == "POST" && (path == "/r/send" || market_op.is_some()) {
@@ -339,6 +349,15 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         if let Some(a) = crate::namesites::route(node, &path, &query_fields(&r.query)) {
             return respond(&mut s, status_line(a.code), a.ctype, &cors, &a.body);
         }
+        if let Some(p) = page_chain {
+            let (code, body) = if path == "/r/wallet" {
+                crate::pagechain::with(p, || (200, crate::walletsvc::wallet(node).to_string()))
+            } else {
+                crate::pagechain::page_read(node, p, &path, &query_fields(&r.query))
+            };
+            let st = match code { 200 => "200 OK", 400 => "400 Bad Request", 403 => "403 Forbidden", 503 => "503 Service Unavailable", _ => "404 Not Found" };
+            return respond(&mut s, st, "application/json", &cors, body.as_bytes());
+        }
         let (code, body) = crate::walletsvc::route(node, &path, &query_fields(&r.query));
         let st = match code { 200 => "200 OK", 403 => "403 Forbidden", 503 => "503 Service Unavailable", _ => "404 Not Found" };
         return respond(&mut s, st, "application/json", &cors, body.as_bytes());
@@ -357,6 +376,27 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
         }
     }
     let seg: Vec<&str> = path.trim_start_matches('/').splitn(2, '/').collect();
+    // /content/<id> asked by an app on another chain (its frame's address, the Referer): that
+    // chain's inscription, from this arcade's ledger of it or from an arcade on the mesh.
+    if let (["content", id], Some(pc)) = (seg.as_slice(), r.headers.get("referer").and_then(|v| v.as_str()).and_then(crate::pagechain::of_referer).filter(|pc| pc.chain_no != node.params.chain_no)) {
+        if !arcade_ledger::sites::is_inscription_id(&id.to_lowercase()) {
+            return match crate::pagechain::content(node, pc, id) {
+                Ok(c) => respond(
+                    &mut s,
+                    "200 OK",
+                    if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
+                    &[
+                        ("ETag", format!("\"{}\"", c.1)),
+                        ("Cache-Control", "public, max-age=31536000, immutable".into()),
+                        ("Content-Security-Policy", CONTENT_CSP.into()),
+                        ("Access-Control-Allow-Origin", "*".into()),
+                    ],
+                    if r.method == "HEAD" { &[] } else { &c.2 },
+                ),
+                Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
+            };
+        }
+    }
     match seg.as_slice() {
         // An ord inscription by its id (the pictures and pages a site names; the arcade ledger's
         // own content is asked by txid or number below).

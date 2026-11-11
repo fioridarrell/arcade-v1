@@ -92,8 +92,16 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.inscription", "explorer.tokens", "explorer.token", "explorer.names", "explorer.name", "explorer.maps",
     "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens", "explorer.ledger_token",
     "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag", "explorer.search",
-    "explorer.inscription_types", "explorer.site", "explorer.sites",
+    "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
 ];
+
+/// Page routes another arcade may answer for an app on a chain it keeps: every public read
+/// under /r/ but the asking arcade's own (its wallet, its send requests).
+fn page_route_ok(path: &str) -> bool {
+    let rest = path.strip_prefix("/r/").unwrap_or("");
+    let first = rest.split(['/', '?']).next().unwrap_or("");
+    !rest.is_empty() && !matches!(first, "wallet" | "send") && !rest.contains("..")
+}
 
 /// Mesh answers kept a short while: the Explorer asks the same things again and again
 /// (switching coins and back, the overview's 30 s refresh). A failure is kept too, so a
@@ -168,6 +176,12 @@ fn mesh_from(id: &str) -> Value {
 }
 
 /// The index an error says is missing here ("the ord index is not on ...").
+/// The index a question needs, whatever the error says: a borrowed chain answers "borrowed",
+/// which names no index, and these must go to an arcade keeping the chain's arcade ledger.
+fn needed_index(cmd: &str) -> Option<&'static str> {
+    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards")).then_some("ledger")
+}
+
 fn missing_index(e: &str) -> Option<String> {
     let rest = e.strip_prefix("the ")?;
     let (ix, tail) = rest.split_once(' ')?;
@@ -259,7 +273,10 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             // (Any other failure, e.g. a chain only borrowed here or not kept at all: any
             // arcade keeping the chain may know.)
             // (A site is read from the names index, whatever else is missing here.)
-            let ix = missing_index(&e).or_else(|| matches!(cmd, "explorer.site" | "explorer.sites").then(|| "names".to_string())).unwrap_or_default();
+            let ix = missing_index(&e)
+                .or_else(|| needed_index(cmd).map(String::from))
+                .or_else(|| matches!(cmd, "explorer.site" | "explorer.sites").then(|| "names".to_string()))
+                .unwrap_or_default();
             if crate::shares::index_holders(node, p.net, &ix).is_empty() {
                 return Err(e);
             }
@@ -503,6 +520,36 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let total = ledger_count(&x);
             let before = req["before"].as_u64().unwrap_or(total).min(total);
             Ok(json!({"total": total, "items": ledger_latest(&x, before, n(24, 100))}))
+        }
+        // The rows of this chain that may be app cards, for an arcade's App Store that borrows it.
+        "explorer.app_cards" => {
+            x.need("ledger")?;
+            Ok(json!({"rows": crate::appsvc::card_rows(x.node, x.p)}))
+        }
+        // An arcade inscription's whole bytes (an app page, or what it fetches), for an arcade
+        // that does not keep this chain's ledger.
+        "explorer.ledger_bytes" => {
+            x.need("ledger")?;
+            let id = s("id").ok_or("give an inscription txid or number")?;
+            let c = arcade_ledger::content::content(&x.node.chain, x.p, id.trim_start_matches('#'))?;
+            if c.bytes.len() > 16 << 20 {
+                return Err("that inscription is larger than 16 MB".into());
+            }
+            let row = arcade_ledger::content::inscription(&x.node.chain, x.c(), id.trim_start_matches('#')).unwrap_or(Value::Null);
+            Ok(json!({"txid": row["txid"], "number": row["number"], "content_type": c.content_type, "sha256": c.sha256,
+                      "b64": base64::engine::general_purpose::STANDARD.encode(&c.bytes)}))
+        }
+        // A page route (GET /r/...) answered on this chain, for an app on it opened at an arcade
+        // that does not keep its ledger.
+        "explorer.page" => {
+            x.need("ledger")?;
+            let path = s("path").unwrap_or_default();
+            if !page_route_ok(&path) {
+                return Err("that is no public page read".into());
+            }
+            let q: serde_json::Map<String, Value> = req["query"].as_object().cloned().unwrap_or_default();
+            let (status, body) = crate::pagechain::with(x.p, || crate::walletsvc::route(x.node, &path, &q));
+            Ok(json!({"status": status, "body": body}))
         }
         "explorer.ledger_inscription" => {
             x.need("ledger")?;
@@ -1133,4 +1180,26 @@ mod type_tests {
         assert!(type_matches("model/gltf-binary", "model") && type_matches("application/pdf", "other") && type_matches("", "other"));
         assert!(type_matches("image/PNG", "image/png") && !type_matches("image/png", "image/webp"));
     }
+}
+
+#[cfg(test)]
+#[test]
+fn only_public_page_reads_are_answered_for_another_arcade() {
+    assert!(page_route_ok("/r/inscription/7063"));
+    assert!(page_route_ok("/r/verified/abc"));
+    assert!(page_route_ok("/r/balances/nAddr"));
+    assert!(!page_route_ok("/r/wallet"), "the asking arcade's own wallet");
+    assert!(!page_route_ok("/r/send/abc"), "its own send requests");
+    assert!(!page_route_ok("/r/"));
+    assert!(!page_route_ok("/content/abc"));
+    assert!(!page_route_ok("/r/../x"));
+}
+
+#[cfg(test)]
+#[test]
+fn ledger_questions_go_to_arcades_keeping_the_ledger() {
+    for c in ["explorer.ledger_bytes", "explorer.page", "explorer.app_cards", "explorer.ledger_inscription"] {
+        assert_eq!(needed_index(c), Some("ledger"), "{c}");
+    }
+    assert_eq!(needed_index("explorer.tx"), None);
 }

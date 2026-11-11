@@ -23,6 +23,12 @@ use std::collections::VecDeque;
 
 /// How many of the newest blocks are remembered: enough to check the next header after
 /// stepping back as far as an arcade ever does, with room to spare.
+/// What a follower's weight function answers for a writer whose draw weight it can't tell (a
+/// registered replica's owner: a borrowed copy holds no registry). The header's own claimed
+/// weight is taken then, on its source's word, until blocks commit to the weights (an open
+/// point of docs/ARCADECHAIN.md §14.14).
+pub const UNKNOWN_WEIGHT: u64 = u64::MAX;
+
 pub const KEEP: usize = 400;
 
 /// A header is checked against the blocks back to this many before the one it follows.
@@ -195,7 +201,13 @@ impl<T: TimeProofs + Clone> Headers<T> {
         for round in 0.. {
             for h in &next {
                 let at = to.tip().height + 1;
-                to.push(h, weight(&h.writer), now).map_err(|e| FollowError::Header(at, e))?;
+                // `UNKNOWN_WEIGHT`: a writer whose weight the follower can't tell (a registered
+                // replica's owner); the header's own claim is taken, on the source's word.
+                let w = match weight(&h.writer) {
+                    UNKNOWN_WEIGHT => h.weight,
+                    w => w,
+                };
+                to.push(h, w, now).map_err(|e| FollowError::Header(at, e))?;
                 ids.push(to.tip().id);
             }
             if next.is_empty() || round == 3 || to.tip().beats(self.tip()) || to.tip().height >= their {

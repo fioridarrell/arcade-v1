@@ -553,3 +553,18 @@ An arcade that hasn't installed the chain can still use the coin: it borrows the
 3. That there is no better branch. A borrowed copy sees the branches its lenders show it.
 
 **Open, before real storage decides the draw (step 3):** a borrowed copy must know each writer's draw weight to check a draw. With the stand-in holders it reads the weights from its settings, as everyone does. With real storage records the weights are in the chain's state, which a borrowed copy doesn't keep. Proposed: the first block of each epoch commits to that epoch's table of weights (one root in the header), so a lender shows a writer's weight with a short path and the borrowed copy checks it against a header it already checked.
+
+### 14.15 The catalog from the arcade's side, sealing and registration (Martin 2026-11-11)
+
+Built for the live testnet. Martin's decisions: the test coin is in main for every arcade; anyone may write by sealing and registering; **a replica counts for the draw from its registration proof** until audits (step 5) are built.
+
+- **Storage items** (catalog entries, attestations, registration commits and proofs) wait in a pool and are shared over the mesh (`ac` frame op `it`); a writer puts in its block the ones the next block can carry, in group order.
+- **Segments:** an arcade with the chain installed measures every listed chain it keeps in full, a range at a time (100 blocks below that chain's tip), cuts it by the catalog's rule, offers the next segment when nobody has and it has weight, and attests every waiting entry whose root it makes itself. `arc.catalog` shows the catalog; `arc.segment_root` the root an arcade makes.
+- **Sealing:** `arc.seal` seals a listed segment under the arcade's mesh key on every core (`sealed.bin`, 128 bytes a leaf), keeps the leaf hashes of the sealed copy and of the data, checks the data root against the catalog's, and deletes the unsealed bytes: one copy on disk. `arc.replicas` lists them; `arc.open` opens leaves.
+- **Registration** (`registry.rs`, replacing the fixed holders): a commit names a listed segment, the owner (mesh key), a payout address, the replica root, an anchor block at most 100 blocks back on the branch, and a work stamp of at least 20 zero bits; one replica per owner and segment. The seed of the block 10 after the commit's picks 16 leaves; the proof (each sealed leaf to the replica root, its data to the catalog root, and unsealing with the owner's key to that data) is due in the 20 blocks after. An arcade registers each of its sealed replicas by itself, paid to its wallet's first address on the chain.
+- **Weight and pay:** a key weighs its genesis weight plus, for each registered replica, the segment's bytes split among the segment's replicas. Each epoch's pot is shared by weight among the genesis holders' and the replicas' addresses.
+- **Borrowed copies** check genesis writers' weights from the built-in list; a registered writer's weight they take from the header, on their lenders' word (`light::UNKNOWN_WEIGHT`), until blocks commit to the weights.
+
+### 14.16 The testnet in V1.0
+
+`crates/arcaded/arctest.json` is the ARCADE testnet every arcade knows: block 0 (time 2026-11-11 22:11 UTC; the lists and beacons are placeholders until the genesis list of §10 exists), the genesis writers (the GX10 and the JB20B, 1 GiB each), 2.5-minute blocks and the rule's 1 GiB segments. `--arc-local <settings>` replaces it with a local test chain for closed test networks. Still stand-ins: the proof of time (§14.8), and audits and serving checks (not built).

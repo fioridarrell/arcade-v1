@@ -10,6 +10,7 @@ pub mod light;
 pub mod log;
 pub mod merkle;
 pub mod params;
+pub mod registry;
 pub mod pool;
 pub mod script;
 pub mod segment;

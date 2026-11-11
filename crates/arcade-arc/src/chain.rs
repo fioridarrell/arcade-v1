@@ -762,6 +762,14 @@ impl FixedHolders {
     pub fn pot(&self) -> u64 {
         self.pot
     }
+
+    /// Of `items`, in order, the ones the next block (at `height`) can carry: each is tried
+    /// on a copy of the catalog after the ones kept before it. Nothing here changes.
+    pub fn fitting(&self, items: &[Item], height: u64) -> Vec<Item> {
+        let mut catalog = self.catalog.clone();
+        let w = Fixed(&self.weights, self.total);
+        items.iter().filter(|i| matches!(i, Item::CatalogEntry(_) | Item::Attest(_)) && catalog.apply(std::slice::from_ref(*i), height, &w).is_ok()).cloned().collect()
+    }
 }
 
 impl Storage for FixedHolders {

@@ -614,6 +614,54 @@ pub static SHIBACOIN_MAIN: ChainParams = ChainParams {
     index_start: 0,
 };
 
+/// Bellscoin (BEL), Bells 3: Scrypt, AuxPoW (chain id 16, strict) and SegWit both from block 144,000, bech32 "bel".
+/// From Bells Core (github.com/Nintondo/bellscoinV3 master, src/kernel/chainparams.cpp, chainparamsseeds.h,
+/// node/protocol_version.h, consensus/consensus.h), 2026-11-11; the genesis header below hashes to its genesis.
+/// It kept Dogecoin's magic (c0c0c0c0); its port and genesis tell the two apart.
+pub static BELLSCOIN_MAIN: ChainParams = ChainParams {
+    key: "bel",
+    net: "bel",
+    chain_no: 13,
+    name: "Bellscoin",
+    magic: [0xc0, 0xc0, 0xc0, 0xc0],
+    p2p_port: 19919,
+    genesis: "e5be24df57c43a82d15c2f06bda961296948f8f8eb48501bed1efb929afe0698",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000696ad20e2dd4365c7459b4a4a5af743d5e92c6da3229e6532cd605f6533f2a5b1aae7652f0ff0f1ec1ad0000",
+    format: Format::AUXPOW_SEGWIT,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    auxpow_chain_id: Some(16),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: Some("bel"),
+    p2pkh_version: 25,
+    p2sh_version: 30,
+    wif_version: 153,
+    bip44_coin_type: 3,
+    protocol_version: 70016,
+    dns_seeds: &["bdnsseeder.quark.blue"],
+    fixed_peers: &[
+        "65.21.180.169:19919",
+        "5.161.184.103:19919",
+        "23.162.56.39:19919",
+        "135.181.31.54:19919",
+        "162.55.243.23:19919",
+        "3.66.245.44:19919",
+    ],
+    checkpoints: &[
+        (0, "e5be24df57c43a82d15c2f06bda961296948f8f8eb48501bed1efb929afe0698"),
+        (1000, "35668ee4f0fc1334849813c8a8e583814e9b22bfe5dc5a2bd2ded2b3aeec6643"),
+        (10000, "2c05ea6918e28ca2d216c6518940c8782c09bebfe705d792155465662e275351"),
+        (20000, "e705ee3c0097e6466155f8eea44a813f4f3e0774f1336ab20da1e7076dcc36d9"),
+        (30000, "22b2474f45c8d29f31e9caeb6bcccc68f583e2d40afb782e10ad19b63ff47f84"),
+        (40000, "50c259c50c5c2ab235f2ceb45da49f7c046f0411667c00d81cb8165f2b843ea1"),
+    ],
+    coinbase_maturity: 30,
+    // The original arcade's Bellscoin floor (config.py BEL_MAINNET_FLOOR).
+    index_start: 1_289_000,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
     &[
         &PEPECOIN_TEST,
@@ -628,6 +676,7 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &BITCOIN_MAIN,
         &WOJAKCOIN_MAIN,
         &SHIBACOIN_MAIN,
+        &BELLSCOIN_MAIN,
     ];
 
 /// A chain by its mesh name (what the existing arcades call it).
@@ -702,7 +751,13 @@ mod tests {
             for b in &ALL_CHAINS[i + 1..] {
                 assert_ne!(a.chain_no, b.chain_no);
                 assert_ne!(a.key, b.key);
-                assert_ne!(a.magic, b.magic);
+                assert_ne!(a.genesis, b.genesis, "{} and {}", a.name, b.name);
+                // A shared magic is only Bellscoin's, which kept Dogecoin's: a connection already knows its chain,
+                // and a peer of the other one never leads back to this chain's genesis.
+                if a.magic == b.magic {
+                    let pair = [a.key, b.key];
+                    assert!(pair.contains(&"bel") && pair.contains(&"doge"), "{} and {} share a magic", a.name, b.name);
+                }
             }
         }
     }

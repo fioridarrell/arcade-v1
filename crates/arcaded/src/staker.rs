@@ -130,7 +130,7 @@ fn advance(node: &Node, max: u32) -> Result<Option<u32>, String> {
     }
     if m.at.is_none() {
         m.cps.retain(|(a, hh, _)| *a <= tip.height && on_best(node, *a, hh));
-        m.at = m.cps.last().cloned();
+        m.at = start_point(&m.cps, tip.height);
     }
     let mut done = 0;
     let mut err = None;
@@ -165,6 +165,15 @@ fn advance(node: &Node, max: u32) -> Result<Option<u32>, String> {
         Some(e) if done == 0 => Err(e),
         _ => Ok(at),
     }
+}
+
+/// The checkpoint to work the modifier out from: the newest one that leaves the self-check's
+/// whole window (the newest SELF_CHECK blocks, and the block before them) after it. Starting at
+/// a checkpoint inside that window left the blocks before it with no modifier in memory, so the
+/// self-check failed them and staking stopped until they aged out (JB20B, 2026-11-11: a reorg
+/// at the tip went back to the checkpoint at 1,540,000 and 55 good blocks failed).
+fn start_point(cps: &[(u32, Hash256, Hash256)], tip: u32) -> Option<(u32, Hash256, Hash256)> {
+    cps.iter().rev().find(|(a, _, _)| a.saturating_add(SELF_CHECK + 1) < tip).cloned()
 }
 
 fn modifier_at(height: u32) -> Option<Hash256> {
@@ -485,4 +494,26 @@ fn try_slot(node: &Node, p: &'static ChainParams) -> Result<(), String> {
         break;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cp(a: u32) -> (u32, Hash256, Hash256) {
+        (a, Hash256::ZERO, Hash256::ZERO)
+    }
+
+    #[test]
+    fn start_point_leaves_room_for_the_self_check() {
+        let cps = vec![cp(1_520_000), cp(1_530_000), cp(1_540_000)];
+        // The tip just past the newest checkpoint: start one checkpoint back.
+        assert_eq!(start_point(&cps, 1_540_148).map(|c| c.0), Some(1_530_000));
+        assert_eq!(start_point(&cps, 1_540_000 + SELF_CHECK + 1).map(|c| c.0), Some(1_530_000));
+        // Far enough past it: the newest checkpoint will do.
+        assert_eq!(start_point(&cps, 1_540_000 + SELF_CHECK + 2).map(|c| c.0), Some(1_540_000));
+        // No checkpoint far enough back: from genesis.
+        assert_eq!(start_point(&[cp(10_000)], 10_100), None);
+        assert_eq!(start_point(&[], 5), None);
+    }
 }

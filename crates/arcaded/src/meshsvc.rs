@@ -1,7 +1,7 @@
 //! Mesh thread per seed: keep a link to an existing arcade, answer pings, learn index tips
 //! and peers, and send queued frames (welcome asks).
 
-use crate::node::{LinkInfo, MeshTip, Node};
+use crate::node::{MeshTip, Node};
 use arcade_mesh::link::{Frame, Link, LinkError};
 use serde_json::{json, Value};
 use std::sync::Arc;
@@ -179,7 +179,7 @@ pub fn run(node: Arc<Node>, addr: String) {
                     std::thread::sleep(Duration::from_secs(1800));
                     continue;
                 }
-                node.links.lock().unwrap().insert(addr.clone(), LinkInfo { addr: addr.clone(), node_id: id.clone(), since: now() });
+                let key = crate::node::link_add(&node.links, &addr, &id, now());
                 let _ = node.app.put_peer(&arcade_app::Peer {
                     id: id.clone(),
                     host: if addr.starts_with("wss://") { addr.clone() } else { addr.rsplit_once(':').map(|x| x.0.trim_matches(|c| c == '[' || c == ']')).unwrap_or(&addr).into() },
@@ -190,7 +190,7 @@ pub fn run(node: Arc<Node>, addr: String) {
                 });
                 let _ = node.app.event("mesh", &format!("linked to {addr} ({})", &id[..16]));
                 let r = serve(&node, &mut link, &addr);
-                node.links.lock().unwrap().remove(&addr);
+                crate::node::link_remove(&node.links, &key);
                 let _ = node.app.event("mesh", &format!("link to {addr} ended: {}", r.err().map(|e| e.to_string()).unwrap_or_default()));
             }
         }
@@ -213,9 +213,9 @@ pub fn listen(node: Arc<Node>, port: u16) {
             let peer_ip = s.peer_addr().map(|a| a.ip().to_string()).unwrap_or_default();
             let Ok(mut link) = Link::handshake(s, NET, &node.identity, false, node.mesh_port) else { return };
             let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
-            node.links.lock().unwrap().insert(addr.clone(), LinkInfo { addr: addr.clone(), node_id: link.peer_id.clone(), since: now() });
+            let key = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
             let _ = serve(&node, &mut link, &addr);
-            node.links.lock().unwrap().remove(&addr);
+            crate::node::link_remove(&node.links, &key);
         });
     }
 }

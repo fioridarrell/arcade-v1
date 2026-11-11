@@ -1199,10 +1199,10 @@ fn run_intro_link(node: Arc<Node>, peer: String, cell: Arc<Cell>) {
             let ip = cell.p.lock().unwrap().current.map(|a| a.ip().to_string()).unwrap_or_default();
             let addr = format!("{ip}:{}", link.peer_listen.unwrap_or(0));
             g().lock().unwrap().udp_links.insert(peer.clone());
-            node.links.lock().unwrap().insert(addr.clone(), LinkInfo { addr: addr.clone(), node_id: peer.clone(), since: now_s() });
+            let key = crate::node::link_add(&node.links, &addr, &peer, now_s());
             let _ = node.app.event("mesh", &format!("udp-only link to {} ({addr})", short(&peer)));
             let r = crate::meshsvc::serve(&node, &mut link, &addr);
-            node.links.lock().unwrap().remove(&addr);
+            crate::node::link_remove(&node.links, &key);
             let _ = node.app.event("mesh", &format!("udp-only link to {} ended: {}", short(&peer), r.err().map(|e| e.to_string()).unwrap_or_default()));
         }
         Ok(_) => {

@@ -39,6 +39,35 @@ pub struct LinkInfo {
     pub since: u64,
 }
 
+/// Each live link has an entry of its own: two arcades behind one public address (one router,
+/// the same mesh port) are two links, and one closing leaves the other listed. The key is the
+/// address and a number for this link; `LinkInfo.addr` stays the address.
+pub fn link_add(links: &Mutex<BTreeMap<String, LinkInfo>>, addr: &str, node_id: &str, since: u64) -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let key = format!("{addr}#{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+    links.lock().unwrap().insert(key.clone(), LinkInfo { addr: addr.to_string(), node_id: node_id.to_string(), since });
+    key
+}
+
+/// Remove the entry `link_add` made for one link.
+pub fn link_remove(links: &Mutex<BTreeMap<String, LinkInfo>>, key: &str) {
+    links.lock().unwrap().remove(key);
+}
+
+#[cfg(test)]
+#[test]
+fn two_arcades_behind_one_address_are_two_links() {
+    let links = Mutex::new(BTreeMap::new());
+    let a = link_add(&links, "129.0.0.1:8421", "aaaa", 1);
+    let b = link_add(&links, "129.0.0.1:8421", "bbbb", 2);
+    let ids = |l: &Mutex<BTreeMap<String, LinkInfo>>| l.lock().unwrap().values().map(|x| x.node_id.clone()).collect::<Vec<_>>();
+    assert_eq!(ids(&links), vec!["aaaa", "bbbb"], "both listed");
+    link_remove(&links, &a);
+    assert_eq!(ids(&links), vec!["bbbb"], "one closing leaves the other");
+    link_remove(&links, &b);
+    assert!(links.lock().unwrap().is_empty());
+}
+
 pub struct Node {
     pub home: std::path::PathBuf,
     /// "__cookie__:<secret>" for /rpc (written to <home>/.cookie at start).

@@ -98,6 +98,15 @@ impl ChainParams {
         }
     }
 
+    /// The checkpoint hash at `height`, if there is one.
+    pub fn checkpoint_at(&self, height: u32) -> Option<Hash256> {
+        self.checkpoints.iter().find(|(h, _)| *h == height).map(|(_, x)| Hash256::from_hex(x).expect("valid checkpoint hex"))
+    }
+
+    /// The highest checkpoint height at or below `height`: no fork may start under it.
+    pub fn last_checkpoint(&self, height: u32) -> Option<u32> {
+        self.checkpoints.iter().map(|(h, _)| *h).filter(|h| *h <= height).max()
+    }
 }
 
 /// The arcade's header-link rule (rawchain.py MAX_EASIER): a block's target may be at most
@@ -117,6 +126,8 @@ pub enum HeaderError {
     TooEasy,
     #[error("unknown mining algorithm in header version")]
     UnknownAlgo,
+    #[error("not the checkpoint's block")]
+    Checkpoint,
 }
 
 pub fn too_easy(params: &ChainParams, bits: u32, parent_bits: u32) -> bool {
@@ -157,7 +168,7 @@ pub enum PowCheck {
     NeedsBlock,
 }
 
-/// Check a header at `height` against its parent: link, difficulty step and work.
+/// Check a header at `height` against its parent: link, checkpoint, difficulty step and work.
 pub fn check_header(
     params: &ChainParams,
     h: &Header,
@@ -166,6 +177,11 @@ pub fn check_header(
 ) -> Result<PowCheck, HeaderError> {
     if h.prev != params.block_id(parent) {
         return Err(HeaderError::BadLink);
+    }
+    if let Some(cp) = params.checkpoint_at(height) {
+        if params.block_id(h) != cp {
+            return Err(HeaderError::Checkpoint);
+        }
     }
     let t = target_from_bits(h.bits).ok_or(HeaderError::BadBits)?;
     if t == U256::ZERO {
@@ -748,6 +764,28 @@ mod tests {
         let g = p.genesis_header().unwrap();
         let forged = Header { version: 0x0400 | 2, prev: p.block_id(&g), merkle_root: Hash256::ZERO, time: g.time + 15, bits: tiny, nonce: 0 };
         assert_eq!(check_header(p, &forged, &g, 1), Ok(PowCheck::NotCheckable));
+    }
+
+    fn child(p: &ChainParams, parent: &Header, time: u32, bits: u32) -> Header {
+        Header { version: 1, prev: p.block_id(parent), merkle_root: Hash256::ZERO, time, bits, nonce: 0 }
+    }
+
+    #[test]
+    fn checkpoints_are_enforced() {
+        let p = &PEPECOIN_TEST;
+        let g = p.genesis_header().unwrap();
+        let h = child(p, &g, g.time + 60, g.bits);
+        assert_eq!(check_header(p, &h, &g, 42_001), Err(HeaderError::Checkpoint));
+        assert_ne!(check_header(p, &h, &g, 42_002), Err(HeaderError::Checkpoint));
+        // The checkpoint's own block passes it.
+        let mut q = PEPECOIN_TEST.clone();
+        let id: &'static str = Box::leak(p.block_id(&h).to_hex().into_boxed_str());
+        q.checkpoints = Box::leak(vec![(42_001, id)].into_boxed_slice());
+        assert_ne!(check_header(&q, &h, &g, 42_001), Err(HeaderError::Checkpoint));
+        assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(499), None);
+        assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(500), Some(500));
+        assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(10_000), Some(600));
+        assert_eq!(PEPECOIN_MAIN.last_checkpoint(10_000), None);
     }
 
     #[test]

@@ -28,6 +28,8 @@ pub enum SyncError {
     BadBlock { hash: Hash256, why: String },
     #[error("reorg of {0} blocks is deeper than the undo window")]
     ReorgTooDeep(u32),
+    #[error("reorg to below the checkpoint at height {0}")]
+    BelowCheckpoint(u32),
     #[error("reorg of {0} blocks onto a branch with no checked proof of work")]
     UnverifiedReorg(u32),
 }
@@ -156,6 +158,12 @@ impl<'a> Syncer<'a> {
         let entries = peer.get_headers(&self.locator()?).map_err(SyncError::Source)?;
         let mut batch: Vec<(Hash256, HeaderRec)> = Vec::with_capacity(entries.len());
         let mut pending: HashMap<Hash256, HeaderRec> = HashMap::new();
+        // No fork may start below the highest checkpoint our best header has passed.
+        let best_height = match self.db.best_header(c)? {
+            Some(b) => self.db.header(c, &b)?.map(|r| r.height).unwrap_or(0),
+            None => 0,
+        };
+        let floor = self.params.last_checkpoint(best_height);
         for e in entries {
             let hash = self.params.block_id(&e.header);
             if pending.contains_key(&hash) || self.db.header(c, &hash)?.is_some() {
@@ -170,6 +178,9 @@ impl<'a> Syncer<'a> {
             };
             let height = parent.height + 1;
             let bad = |why: String| SyncError::BadHeader { height, why };
+            if let Some(cp) = floor.filter(|cp| height < *cp) {
+                return Err(bad(format!("forks below the checkpoint at height {cp}")));
+            }
             let check = check_header(self.params, &e.header, &parent.header, height).map_err(|x| bad(x.to_string()))?;
             match check {
                 PowCheck::AuxPow => {
@@ -262,6 +273,9 @@ impl<'a> Syncer<'a> {
             let depth = tip.height - fork;
             if depth > crate::db::UNDO_DEPTH {
                 return Err(SyncError::ReorgTooDeep(depth));
+            }
+            if let Some(cp) = self.params.last_checkpoint(tip.height).filter(|cp| fork < *cp) {
+                return Err(SyncError::BelowCheckpoint(cp));
             }
             if depth > UNVERIFIED_REORG_DEPTH && !self.has_checked_work(fork, &path)? {
                 return Err(SyncError::UnverifiedReorg(depth));
@@ -409,7 +423,7 @@ mod tests {
     use super::*;
     use arcade_chain::encode::write_varint;
     use arcade_chain::hash::merkle_root;
-    use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN};
+    use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN, LITECOIN_MAIN};
     use arcade_chain::pow::{try_pow_hash, PowRule};
     use arcade_chain::{Format, Header, Tx};
 
@@ -579,5 +593,49 @@ mod tests {
         let sha = extend(&g, 0, n + 1, 0x0202, EASY, 2, Some(PowAlgo::Sha256d));
         sync(&s, &mut Src::new(&[&sha])).unwrap();
         assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, sha.last().unwrap().hash());
+    }
+
+    fn checked_params(g: &Block, tweak: impl FnOnce(&mut ChainParams)) -> &'static ChainParams {
+        params(&LITECOIN_MAIN, g, |p| {
+            p.pow = PowRule::Single(PowAlgo::Sha256d);
+            tweak(p)
+        })
+    }
+
+    #[test]
+    fn checkpoints_hold_in_sync() {
+        let g = genesis();
+        let sha = Some(PowAlgo::Sha256d);
+        let honest = extend(&g, 0, 5, 1, EASY, 1, sha);
+        let cp: &'static str = Box::leak(honest[2].hash().to_hex().into_boxed_str());
+        let p = checked_params(&g, |p| p.checkpoints = Box::leak(vec![(3, cp)].into_boxed_slice()));
+
+        // Another block at the checkpoint's height is refused.
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let other3 = extend(&honest[1], 2, 1, 1, EASY, 2, sha);
+        let r = sync(&s, &mut Src::new(&[&[g.clone()], &honest[..2], &other3]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 3, why }) if why.contains("checkpoint")), "{r:?}");
+
+        // Past the checkpoint, a heavier branch forking below it is refused.
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+        let below = extend(&honest[0], 1, 10, 1, EASY, 3, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&below]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 2, why }) if why.contains("checkpoint")), "{r:?}");
+        // And if such a branch is stored anyway, the tip does not go back below the checkpoint.
+        let mut parent = db.header(p.chain_no, &honest[0].hash()).unwrap().unwrap();
+        let mut recs = Vec::new();
+        for b in &below {
+            let rec = HeaderRec { b: 0, height: parent.height + 1, status: STATUS_HEADER, work: ChainDb::child_work(&parent, b.header.bits), header: b.header, auxpow: vec![] };
+            parent = rec.clone();
+            recs.push((b.hash(), rec));
+        }
+        db.put_headers(p.chain_no, &recs).unwrap();
+        assert_eq!(db.best_header(p.chain_no).unwrap(), Some(below.last().unwrap().hash()));
+        let r = s.sync_blocks(&mut Src::new(&[&below]), 100, 50);
+        assert!(matches!(r, Err(SyncError::BelowCheckpoint(3))), "{r:?}");
+        assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, honest[4].hash());
     }
 }

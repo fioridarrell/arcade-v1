@@ -390,18 +390,24 @@ fn main() {
             .unwrap();
     }
     if mesh {
-        let mut seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
-        // Every arcade we learned of before is a seed too.
+        let seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
+        // Every arcade we learned of before is tried too, as an address we heard of (public
+        // addresses only; seeds and --peer may be anything).
+        let mut heard: Vec<(String, &'static str)> = Vec::new();
         if !no_seeds {
+            meshsvc::prune_peers(&node);
             for p in node.app.peers().unwrap_or_default() {
                 let a = if p.host.starts_with("wss://") { p.host.clone() } else if p.host.contains(':') { format!("[{}]:{}", p.host, p.port) } else { format!("{}:{}", p.host, p.port) };
-                if !seeds.contains(&a) {
-                    seeds.push(a);
+                if !seeds.contains(&a) && !extra_peers.contains(&a) && !heard.iter().any(|(x, _)| *x == a) {
+                    heard.push((a, if p.source == "chain" { "chain" } else { "gossip" }));
                 }
             }
         }
         for a in seeds.into_iter().chain(extra_peers) {
             meshsvc::dial(&node, a);
+        }
+        for (a, src) in heard {
+            meshsvc::dial_heard(&node, a, src);
         }
         // Arcades that announce themselves on chain (MESH records), checked every 10 minutes.
         if !no_seeds {

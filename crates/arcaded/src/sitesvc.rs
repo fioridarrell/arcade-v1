@@ -360,6 +360,28 @@ pub(crate) mod tests {
         arcade_ledger::address::address_of(&p2pkh(tag), t.p).unwrap()
     }
 
+    /// One test arcade shared by tests that need a node but not a fresh one: each setup()
+    /// maps a chain database, and many at once run out of address space (Mdbx OutOfMemory).
+    pub(crate) struct Shared {
+        pub(crate) node: std::sync::Arc<Node>,
+        pub(crate) p: &'static ChainParams,
+        /// Addresses of tags 1 and 2 (see T).
+        pub(crate) a: [String; 2],
+    }
+
+    pub(crate) fn shared() -> &'static Shared {
+        static S: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+        S.get_or_init(|| {
+            let t = setup();
+            let a = [addr(&t, 1), addr(&t, 2)];
+            let T { _dir, node, p, .. } = t;
+            std::mem::forget(_dir); // kept for the whole test run
+            let node = std::sync::Arc::new(node);
+            let _ = node.me.set(std::sync::Arc::downgrade(&node));
+            Shared { node, p, a }
+        })
+    }
+
     #[test]
     fn coins_of_several_addresses() {
         let t = setup();

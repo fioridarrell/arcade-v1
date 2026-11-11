@@ -51,7 +51,7 @@ pub fn run(node: Arc<Node>) {
             if key == me || linked.contains(&key) || (addr.starts_with("wss://") && direct.contains(&key)) {
                 continue;
             }
-            crate::meshsvc::dial(&node, addr);
+            crate::meshsvc::dial_heard(&node, addr, "chain");
         }
         std::thread::sleep(Duration::from_secs(60));
     }

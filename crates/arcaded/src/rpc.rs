@@ -258,7 +258,9 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
         "importaddress" => {
             let a = param(0).as_str().unwrap_or("").to_string();
             arcade_ledger::address::script_for_address(p, &a).ok_or_else(|| err(-5, "Invalid address"))?;
-            watch().insert((p.chain_no, a));
+            if !watch_add(&caller(), p.chain_no, &a, now()) {
+                return Err(err(-4, "too many watched addresses"));
+            }
             Ok(Value::Null)
         }
         "listunspent" => {
@@ -269,12 +271,12 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             let maxconf = param(1).as_u64().unwrap_or(9_999_999);
             let addrs: Vec<String> = match param(2).as_array() {
                 Some(a) => a.iter().filter_map(|x| x.as_str().map(String::from)).collect(),
-                None => watch().iter().filter(|(cc, _)| *cc == c).map(|(_, a)| a.clone()).collect(),
+                None => watched(&caller(), c),
             };
             let mut out = Vec::new();
             for a in addrs {
                 let Some(sc) = arcade_ledger::address::script_for_address(p, &a) else { return Err(err(-5, format!("Invalid address: {a}"))) };
-                watch().insert((c, a.clone()));
+                watch_add(&caller(), c, &a, now());
                 for (op, value, height) in db.coins_for_script(p, &sc).map_err(e)? {
                     let conf = (tip.height + 1).saturating_sub(height) as u64;
                     if conf < minconf || conf > maxconf || db.mempool_spender(c, &op).map_err(e)?.is_some() {
@@ -297,7 +299,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             // The watched addresses' history, newest first (what a watch-only wallet lists).
             let count = param(1).as_u64().unwrap_or(10) as usize;
             let skip = param(2).as_u64().unwrap_or(0) as usize;
-            let addrs: Vec<String> = watch().iter().filter(|(cc, _)| *cc == c).map(|(_, a)| a.clone()).collect();
+            let addrs: Vec<String> = watched(&caller(), c);
             let mut rows: Vec<(u32, Value)> = Vec::new();
             for a in addrs {
                 let Some(sc) = arcade_ledger::address::script_for_address(p, &a) else { continue };
@@ -326,10 +328,68 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
     }
 }
 
-/// Addresses a client asked about (importaddress / listunspent): what listtransactions lists.
-fn watch() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<(u16, String)>> {
-    static W: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<(u16, String)>>> = std::sync::OnceLock::new();
+use arcade_app::now;
+
+/// Addresses one caller watches at most, and all callers together.
+const MAX_WATCH_PER: usize = 1000;
+const MAX_WATCH: usize = 50_000;
+/// A caller's addresses are forgotten after this long without a call that uses them.
+const WATCH_IDLE: u64 = 7 * 86400;
+
+thread_local! {
+    /// Who the calls on this thread are for: a mesh peer's node id while its link is served
+    /// (crate::meshsvc::serve), else "" (this arcade's own RPC).
+    static CALLER: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
+fn caller() -> String {
+    CALLER.with(|c| c.borrow().clone())
+}
+
+/// Run `f` with the calls on this thread answered for mesh peer `peer`.
+pub fn as_caller<T>(peer: &str, f: impl FnOnce() -> T) -> T {
+    let old = CALLER.with(|c| std::mem::replace(&mut *c.borrow_mut(), peer.to_string()));
+    let r = f();
+    CALLER.with(|c| *c.borrow_mut() = old);
+    r
+}
+
+type Watched = std::collections::HashMap<String, (u64, std::collections::BTreeSet<(u16, String)>)>;
+
+/// Addresses each caller asked about (importaddress / listunspent): what listunspent without
+/// addresses and listtransactions list, for that caller only.
+fn watch() -> std::sync::MutexGuard<'static, Watched> {
+    static W: std::sync::OnceLock<std::sync::Mutex<Watched>> = std::sync::OnceLock::new();
     W.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Watch an address for `who`; false when that would pass a cap (nothing changes then).
+fn watch_add(who: &str, c: u16, a: &str, t: u64) -> bool {
+    add_to(&mut watch(), who, c, a, t)
+}
+
+fn add_to(w: &mut Watched, who: &str, c: u16, a: &str, t: u64) -> bool {
+    w.retain(|_, (at, _)| at.saturating_add(WATCH_IDLE) > t);
+    let total: usize = w.values().map(|(_, s)| s.len()).sum();
+    let e = w.entry(who.to_string()).or_default();
+    e.0 = t;
+    let k = (c, a.to_string());
+    if e.1.contains(&k) {
+        return true;
+    }
+    if e.1.len() >= MAX_WATCH_PER || total >= MAX_WATCH {
+        return false;
+    }
+    e.1.insert(k);
+    true
+}
+
+/// The addresses `who` watches on chain `c`.
+fn watched(who: &str, c: u16) -> Vec<String> {
+    let mut w = watch();
+    let Some(e) = w.get_mut(who) else { return Vec::new() };
+    e.0 = now();
+    e.1.iter().filter(|(cc, _)| *cc == c).map(|(_, a)| a.clone()).collect()
 }
 
 /// A transaction as Core's verbose getrawtransaction / decoderawtransaction shows it.
@@ -374,4 +434,51 @@ fn block_of(node: &Node, p: &arcade_chain::params::ChainParams, b: u32) -> Optio
     let hash = p.block_id(&arcade_chain::Header::parse(&h));
     let rec = node.chain.header(c, &hash).ok()??;
     Some((hash, rec.height))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn each_caller_lists_only_its_own_addresses() {
+        let t = crate::sitesvc::tests::shared();
+        let (a, b) = (t.a[0].clone(), t.a[1].clone());
+        let peer_a = "aa".repeat(32);
+        let peer_b = "bb".repeat(32);
+        as_caller(&peer_a, || call_on(&t.node, t.p, "importaddress", &[json!(a)])).unwrap();
+        as_caller(&peer_b, || call_on(&t.node, t.p, "importaddress", &[json!(b)])).unwrap();
+        let listed = |peer: &str| -> Vec<String> {
+            let v = as_caller(peer, || call_on(&t.node, t.p, "listtransactions", &[json!("*"), json!(100)])).unwrap();
+            v.as_array().unwrap().iter().map(|r| r["address"].as_str().unwrap().to_string()).collect()
+        };
+        let la = listed(&peer_a);
+        assert!(!la.is_empty() && la.iter().all(|x| *x == a), "{la:?}");
+        let lb = listed(&peer_b);
+        assert!(!lb.is_empty() && lb.iter().all(|x| *x == b), "{lb:?}");
+        // This arcade's own RPC asked about neither.
+        assert!(listed("").is_empty());
+    }
+
+    #[test]
+    fn watched_addresses_are_capped_and_expire() {
+        let mut w = Watched::default();
+        for i in 0..MAX_WATCH_PER {
+            assert!(add_to(&mut w, "a", 77, &format!("x{i}"), 1000));
+        }
+        assert!(!add_to(&mut w, "a", 77, "one-more", 1000), "per caller");
+        assert!(add_to(&mut w, "a", 77, "x0", 1000), "a known one is fine");
+        // In all: many callers stop at MAX_WATCH.
+        let mut n = MAX_WATCH_PER;
+        for i in 0.. {
+            if !add_to(&mut w, &format!("c{}", i / 900), 77, &format!("y{i}"), 1000) {
+                break;
+            }
+            n += 1;
+        }
+        assert_eq!(n, MAX_WATCH);
+        // Unused for WATCH_IDLE: forgotten at the next add.
+        assert!(add_to(&mut w, "b", 77, "z", 1000 + WATCH_IDLE));
+        assert_eq!(w.len(), 1);
+    }
 }

@@ -1,17 +1,17 @@
 //! Headers-first sync from P2P peers into a ChainDb.
 //!
-//! 1. Headers: ask for headers after our best, check each (link, difficulty step, work),
-//!    store with cumulative work; `best` follows the most work. A header whose
+//! 1. Headers: ask for headers after our best, check each (link, checkpoints, difficulty,
+//!    time, work), store with cumulative work; `best` follows the most work. A header whose
 //!    work isn't checked counts only the chain's minimum work (ChainParams::header_work).
 //! 2. Blocks: walk from the best header back to the connected chain (the fork point),
 //!    disconnect anything above the fork, then fetch and connect blocks forward in
 //!    batches, each batch one commit.
 
 use crate::db::{ChainDb, HeaderRec, Tip, STATUS_HEADER};
-use arcade_chain::params::{check_block_work, check_header, ChainParams, PowCheck};
+use arcade_chain::params::{check_block_work, check_context, check_header, ChainParams, PowCheck, MEDIAN_TIME_SPAN};
 use arcade_chain::p2p::{HeaderEntry, Peer};
 use arcade_chain::pow::{meets_target, pow_hash, work_from_bits, PowAlgo, U256};
-use arcade_chain::{Block, Hash256};
+use arcade_chain::{Block, Hash256, Header};
 use std::collections::HashMap;
 
 #[derive(Debug, thiserror::Error)]
@@ -164,6 +164,10 @@ impl<'a> Syncer<'a> {
             None => 0,
         };
         let floor = self.params.last_checkpoint(best_height);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+        // The headers under the one being checked, parent first (for the time and difficulty
+        // rules); slid along while the batch runs in order, looked up again when it doesn't.
+        let mut below: (Hash256, Vec<Header>) = (Hash256::ZERO, Vec::new());
         for e in entries {
             let hash = self.params.block_id(&e.header);
             if pending.contains_key(&hash) || self.db.header(c, &hash)?.is_some() {
@@ -182,6 +186,10 @@ impl<'a> Syncer<'a> {
                 return Err(bad(format!("forks below the checkpoint at height {cp}")));
             }
             let check = check_header(self.params, &e.header, &parent.header, height).map_err(|x| bad(x.to_string()))?;
+            if below.0 != e.header.prev || below.1.is_empty() {
+                below = (e.header.prev, self.headers_below(&pending, e.header.prev)?);
+            }
+            check_context(self.params, &e.header, height, &below.1, now).map_err(|x| bad(x.to_string()))?;
             match check {
                 PowCheck::AuxPow => {
                     let a = e.auxpow.as_ref().ok_or_else(|| bad("AuxPoW flag without data".into()))?;
@@ -208,12 +216,36 @@ impl<'a> Syncer<'a> {
             };
             pending.insert(hash, rec.clone());
             batch.push((hash, rec));
+            below.0 = hash;
+            below.1.insert(0, e.header);
+            below.1.truncate(MEDIAN_TIME_SPAN);
         }
         let n = batch.len() as u32;
         if n > 0 {
             self.db.put_headers(c, &batch)?;
         }
         Ok(n)
+    }
+
+    /// Up to MEDIAN_TIME_SPAN headers ending at `prev`, newest first, from this batch or the store.
+    fn headers_below(&self, pending: &HashMap<Hash256, HeaderRec>, prev: Hash256) -> Result<Vec<Header>> {
+        let mut v = Vec::with_capacity(MEDIAN_TIME_SPAN);
+        let mut h = prev;
+        while v.len() < MEDIAN_TIME_SPAN {
+            let rec = match pending.get(&h) {
+                Some(r) => r.clone(),
+                None => match self.db.header(self.c(), &h)? {
+                    Some(r) => r,
+                    None => break,
+                },
+            };
+            v.push(rec.header);
+            if rec.height == 0 {
+                break;
+            }
+            h = rec.header.prev;
+        }
+        Ok(v)
     }
 
     /// Does any header on `path` (above the block at height `fork`) have a checked proof of work?
@@ -637,5 +669,27 @@ mod tests {
         let r = s.sync_blocks(&mut Src::new(&[&below]), 100, 50);
         assert!(matches!(r, Err(SyncError::BelowCheckpoint(3))), "{r:?}");
         assert_eq!(db.tip(p.chain_no).unwrap().unwrap().hash, honest[4].hash());
+    }
+
+    #[test]
+    fn header_times_are_checked_in_sync() {
+        let g = genesis();
+        let sha = Some(PowAlgo::Sha256d);
+        let p = checked_params(&g, |_| {});
+        let (_d, db) = open();
+        let s = Syncer::new(&db, p);
+        let honest = extend(&g, 0, 12, 1, EASY, 1, sha);
+        sync(&s, &mut Src::new(&[&[g.clone()], &honest])).unwrap();
+        let tip = honest.last().unwrap();
+        // The median of the last 11 (blocks 2..=12) is block 7's time.
+        let old = block(tip.hash(), 1, honest[6].header.time, EASY, 50, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&[old]]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 13, why }) if why.contains("median")), "{r:?}");
+        let ok = block(tip.hash(), 1, honest[6].header.time + 1, EASY, 51, sha);
+        assert_eq!(s.sync_headers_once(&mut Src::new(&[&[ok]])).unwrap(), 1);
+        let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_secs() as u32;
+        let future = block(tip.hash(), 1, now + 3 * 3600, EASY, 52, sha);
+        let r = s.sync_headers_once(&mut Src::new(&[&[future]]));
+        assert!(matches!(&r, Err(SyncError::BadHeader { height: 13, why }) if why.contains("ahead")), "{r:?}");
     }
 }

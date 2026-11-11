@@ -109,6 +109,13 @@ impl ChainParams {
     }
 }
 
+/// How far ahead of our clock a header's time may be (MAX_FUTURE_BLOCK_TIME, two hours, as
+/// in every chain here; Kotia's own limit for staked blocks is tighter, never looser).
+pub const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
+
+/// A header's time must be after the median of this many blocks before it.
+pub const MEDIAN_TIME_SPAN: usize = 11;
+
 /// The arcade's header-link rule (rawchain.py MAX_EASIER): a block's target may be at most
 /// 4x its parent's; getting harder is never limited; on min-difficulty chains a block at or
 /// under powLimit is always fine.
@@ -128,6 +135,10 @@ pub enum HeaderError {
     UnknownAlgo,
     #[error("not the checkpoint's block")]
     Checkpoint,
+    #[error("time is not after the median of the last {MEDIAN_TIME_SPAN} blocks")]
+    TimeTooOld,
+    #[error("time is more than two hours ahead of our clock")]
+    TimeTooNew,
 }
 
 pub fn too_easy(params: &ChainParams, bits: u32, parent_bits: u32) -> bool {
@@ -220,6 +231,25 @@ pub fn check_block_work(params: &ChainParams, b: &crate::block::Block, height: u
         Some(_) => Err(HeaderError::BadPow),
         None => Ok(PowCheck::NotCheckable),
     }
+}
+
+/// The rules that look past the parent, or at the clock: the header's time must be after the
+/// median of the last [`MEDIAN_TIME_SPAN`] blocks' times and at most [`MAX_FUTURE_BLOCK_TIME`]
+/// ahead of `now` (unix seconds). `below` is the chain under the header, parent first; the
+/// median rule is skipped when its blocks aren't all there (it needs min(11, height) of them).
+pub fn check_context(_params: &ChainParams, h: &Header, height: u32, below: &[Header], now: u64) -> Result<(), HeaderError> {
+    let need = MEDIAN_TIME_SPAN.min(height as usize);
+    if need > 0 && below.len() >= need {
+        let mut times: Vec<u32> = below[..need].iter().map(|x| x.time).collect();
+        times.sort_unstable();
+        if h.time <= times[need / 2] {
+            return Err(HeaderError::TimeTooOld);
+        }
+    }
+    if h.time as u64 > now + MAX_FUTURE_BLOCK_TIME as u64 {
+        return Err(HeaderError::TimeTooNew);
+    }
+    Ok(())
 }
 
 pub static PEPECOIN_TEST: ChainParams = ChainParams {
@@ -786,6 +816,28 @@ mod tests {
         assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(500), Some(500));
         assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(10_000), Some(600));
         assert_eq!(PEPECOIN_MAIN.last_checkpoint(10_000), None);
+    }
+
+    #[test]
+    fn header_time_rules() {
+        let p = &LITECOIN_MAIN;
+        let now = 2_000_000_000u64;
+        // Parent first: times 1100, 1090, ..., 1000 (median 1050).
+        let below: Vec<Header> = (0..11u32).rev().map(|i| child(p, &p.genesis_header().unwrap(), 1000 + 10 * i, 0x1e0fffff)).collect();
+        let at = |t: u32| child(p, &below[0], t, 0x1e0fffff);
+        assert_eq!(check_context(p, &at(1050), 100, &below, now), Err(HeaderError::TimeTooOld));
+        assert_eq!(check_context(p, &at(1051), 100, &below, now), Ok(()));
+        // Under 11 blocks: the median of what there is (height 3: three blocks, median 1090).
+        assert_eq!(check_context(p, &at(1090), 3, &below[..3], now), Err(HeaderError::TimeTooOld));
+        // Ancestors missing: the median rule is skipped, never guessed.
+        assert_eq!(check_context(p, &at(1000), 100, &below[..5], now), Ok(()));
+        // Two hours ahead of our clock at most.
+        let t = (now + MAX_FUTURE_BLOCK_TIME as u64) as u32;
+        assert_eq!(check_context(p, &at(t), 100, &below, now), Ok(()));
+        assert_eq!(check_context(p, &at(t + 1), 100, &below, now), Err(HeaderError::TimeTooNew));
+        // The real Pepecoin testnet genesis is in the past.
+        let g = PEPECOIN_TEST.genesis_header().unwrap();
+        assert_eq!(check_context(&PEPECOIN_TEST, &g, 0, &[], now), Ok(()));
     }
 
     #[test]

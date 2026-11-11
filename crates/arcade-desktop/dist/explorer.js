@@ -521,11 +521,12 @@
   let collSort = "newest";
   async function vCollections() {
     const size = 24, page = pageOf();
-    const r = await xapi("explorer.collections", { chain: chain.key, sort: collSort, offset: (page - 1) * size, n: size });
+    const r = await xapi("explorer.collections", { chain: chain.key, sort: collSort, offset: (page - 1) * size, n: size, ...(await imgArgs()) });
     const sorts = h("div", { class: "x-types" }, [["newest", "Newest"], ["oldest", "Oldest"], ["name", "Name"], ["size", "Size"]].map(([k, t]) =>
       h("button", { type: "button", class: "chip-btn" + (collSort === k ? " on" : ""), onclick: () => { collSort = k; go("collections", null); } }, t)));
     const note = r.reading ? h("p", { class: "x-note" }, `Still reading: ${r.note}`) : h("p", { class: "x-note" }, r.note || "");
-    const grid = r.items.length ? h("div", { class: "x-grid" }, r.items.map((c) => h("div", { class: "x-ins", onclick: () => go("collection", c.kind === "known" ? `known:${c.slug}` : c.id) }, cover(c.cover, c.name),
+    const grid = r.items.length ? h("div", { class: "x-grid" }, r.items.map((c) => h("div", { class: "x-ins", onclick: () => go("collection", c.kind === "known" ? `known:${c.slug}` : c.id) },
+      c.cover_content ? preview({ content: c.cover_content, ct: c.cover_ct, n: c.name }) : cover(c.cover, c.name),
       h("div", { class: "cap" }, h("b", {}, c.name), h("span", { class: "faint" }, c.kind === "known" && c.state !== "held" ? `${fmt(c.supply)} · Nintondo` : `${fmt(c.count)}${c.supply != null && c.count !== c.supply ? ` of ${fmt(c.supply)}` : ""}`)))))
       : h("div", { class: "x-empty" }, "No collections on this chain yet.");
     // Nintondo's known collections (Dogecoin, Pepecoin, Bellscoin): asked only when switched on here.

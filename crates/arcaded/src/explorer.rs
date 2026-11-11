@@ -393,7 +393,16 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         "explorer.ord_outpoints" => crate::ordsafe::answer(node, x.p, req),
         "explorer.collections" => {
             x.need("collections")?;
-            crate::collsvc::list(node, x.p, req)
+            let mut v = crate::collsvc::list(node, x.p, req)?;
+            // Each row's cover (an inscription here): a preview, as the inscriptions list's.
+            for r in v["items"].as_array_mut().into_iter().flatten() {
+                let Some(id) = r["cover"].as_str().map(String::from) else { continue };
+                if let Some(rec) = ord::inscription(&x.node.chain, x.p, &id) {
+                    r["cover_content"] = image_link(&x, &rec, &id, 96 << 10).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
+                    r["cover_ct"] = rec["ct"].clone();
+                }
+            }
+            Ok(v)
         }
         "explorer.collection" => {
             x.need("collections")?;

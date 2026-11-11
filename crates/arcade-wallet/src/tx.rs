@@ -182,6 +182,24 @@ fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time
 
 /// Sign every input with `key`: P2PKH coins with the legacy signature hash, P2WPKH coins with
 /// BIP143 (a witness of signature and key). The tx is written with a witness when any input
+
+/// The Dogecoin family (Dogecoin Core 1.14 and the chains built on it) charges its relay fee per STARTED
+/// kilobyte: a 14,783-byte transaction pays 15 x the rate, and a peer drops one that pays a byte-exact
+/// 14.783 x (the node's own RPC doesn't check, so it looks fine there; 2026-11-11, an app inscription's
+/// later pieces were never relayed).
+pub fn per_started_kb(p: &ChainParams) -> bool {
+    matches!(p.key, "doge" | "pep" | "peptest" | "lky" | "bel" | "wjk" | "flop")
+}
+
+/// The fee a transaction of `size` bytes pays at `fee_per_kb` on chain `p`.
+pub fn fee_for_size(p: &ChainParams, size: u64, fee_per_kb: u64) -> u64 {
+    if per_started_kb(p) {
+        (size / 1000 + 1) * fee_per_kb
+    } else {
+        (size * fee_per_kb).div_ceil(1000)
+    }
+}
+
 /// has one (chains that allow SegWit only). Inputs that are neither are refused.
 pub fn sign_keyhash(p: &ChainParams, version: i32, utxos: &[Utxo], outs: &[TxOutSpec], key: &SecretKey, time: u32) -> Result<Tx, String> {
     let pk: PublicKey = PublicKey::from_secret_key(SECP256K1, key);
@@ -318,7 +336,7 @@ pub fn build_send_keyhash(
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let fee_for = |c: &[Utxo]| {
         let w = c.iter().filter(|u| p2wpkh_hash(&u.script).is_some()).count();
-        (estimate_vsize(c.len() - w, w, &[to_script.len(), change_script.len()]) as u64 * fee_per_kb).div_ceil(1000)
+        fee_for_size(p, estimate_vsize(c.len() - w, w, &[to_script.len(), change_script.len()]) as u64, fee_per_kb)
     };
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
@@ -379,7 +397,7 @@ pub fn build_claim(
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
-    let fee_for = |n_in: usize| (estimate_size(n_in, &[ret.len(), 25]) as u64 * fee_per_kb).div_ceil(1000);
+    let fee_for = |n_in: usize| fee_for_size(p, estimate_size(n_in, &[ret.len(), 25]) as u64, fee_per_kb);
     for u in sorted {
         chosen.push(u.clone());
         have += u.value;
@@ -474,7 +492,7 @@ pub fn build_arcade(
     let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let lens: Vec<usize> = outs.iter().map(|o| o.script.len()).chain(std::iter::once(25)).collect();
-    let fee_for = |n_in: usize| (estimate_size(n_in, &lens) as u64 * fee_per_kb).div_ceil(1000);
+    let fee_for = |n_in: usize| fee_for_size(p, estimate_size(n_in, &lens) as u64, fee_per_kb);
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
     for u in sorted {
@@ -551,7 +569,7 @@ pub fn build_send(
         arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
     let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
-    let fee_for = |n_in: usize| (estimate_size(n_in, &[to_script.len(), 25]) as u64 * fee_per_kb).div_ceil(1000);
+    let fee_for = |n_in: usize| fee_for_size(p, estimate_size(n_in, &[to_script.len(), 25]) as u64, fee_per_kb);
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
     for u in sorted {
@@ -571,6 +589,20 @@ pub fn build_send(
         outs.push(TxOutSpec { value: change, script: change_script });
     }
     Ok(sign_p2pkh(p, &chosen, &outs, key, time))
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+    use arcade_chain::params::{DIGIBYTE_TEST, PEPECOIN_TEST};
+
+    #[test]
+    fn the_dogecoin_family_pays_per_started_kilobyte() {
+        // The app inscription's pieces (2026-11-11): 14,783 bytes needs 0.15 PEP, not 0.14783.
+        assert_eq!(fee_for_size(&PEPECOIN_TEST, 14_783, 1_000_000), 15_000_000);
+        assert_eq!(fee_for_size(&PEPECOIN_TEST, 223, 1_000_000), 1_000_000);
+        assert_eq!(fee_for_size(&DIGIBYTE_TEST, 14_783, 1_000_000), 14_783_000);
+    }
 }
 
 #[cfg(test)]
@@ -701,8 +733,9 @@ mod tests {
         assert_eq!(atx.sender, me);
         assert_eq!(atx.reference.as_deref(), Some(me.as_str()));
         assert_eq!(tags::parse(&atx.payload), Some(Ok(tags::TagOp::Claim("martin".into()))));
+        // Under 1 kB on Pepecoin: one started kilobyte at 0.01 a kB (fee_for_size).
         let fee = 100_000_000 - tx.outputs[1].value;
-        assert!(fee > 0 && fee < 1_000_000, "fee {fee}");
+        assert_eq!(fee, 1_000_000, "fee {fee}");
     }
 
     #[test]

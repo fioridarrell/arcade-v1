@@ -212,7 +212,7 @@ fn build(node: &Node, p: &ChainParams, sk: &arcade_wallet::SecretKey, first: Vec
     // The Dogecoin family's soft dust: each output under 0.01 adds 0.01 to the fee a peer asks before it relays the
     // transaction (the node's own RPC doesn't ask, so a short fee looks fine there and is dropped on the network).
     let soft = if soft_dust(p) { outs.iter().filter(|o| o.value > 0 && o.value < SOFT_DUST).count() as u64 * SOFT_DUST } else { 0 };
-    let fee = |n: usize| (size(n) * per_kb).div_ceil(1000).max(STEP_FEE / 3) + soft;
+    let fee = |n: usize| arcade_wallet::tx::fee_for_size(p, size(n), per_kb).max(STEP_FEE / 3) + soft;
     for c in sorted {
         if have >= need + fee(ins.len()) + dust {
             break;
@@ -239,7 +239,7 @@ fn build(node: &Node, p: &ChainParams, sk: &arcade_wallet::SecretKey, first: Vec
 const SOFT_DUST: u64 = 1_000_000;
 /// Chains with the Dogecoin family's soft-dust fee rule.
 fn soft_dust(p: &ChainParams) -> bool {
-    matches!(p.key, "pep" | "peptest" | "doge" | "lky" | "bel" | "wjk" | "flop" | "kot")
+    arcade_wallet::tx::per_started_kb(p)
 }
 
 // ---------------- legs ----------------

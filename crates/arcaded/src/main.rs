@@ -13,6 +13,7 @@ mod announce;
 mod api;
 mod apikeys;
 mod arcborrow;
+mod arcseg;
 mod arcsvc;
 mod borrow;
 mod appsvc;

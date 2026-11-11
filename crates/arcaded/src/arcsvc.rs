@@ -296,6 +296,7 @@ fn take(node: &Node, svc: &Svc, block: Block) -> Result<Accepted, ChainError> {
         eprintln!("arc: block log: {e}");
     }
     if let Accepted::Tip { undone, .. } = &got {
+        crate::arcseg::forget(&block.items);
         st.since = Instant::now();
         // The transactions of blocks the chain left wait again, oldest first.
         let st = &mut *st;
@@ -348,6 +349,10 @@ fn seed_proof(chain: &LocalChain) -> Option<TimeProof> {
 /// This arcade's block on the tip, as its ticket allows: the coinbase pays what is owed,
 /// then the fees of the waiting transactions the block takes to `pay`.
 fn write_block(chain: &LocalChain, pool: &Pool, pay: Option<&[u8]>, secret: &[u8; 32], ticket: &Ticket, seed: Option<TimeProof>, now: u64) -> Block {
+    // The storage items waiting (crate::arcseg) that this block can carry, in group order.
+    let mut items = chain.storage().fitting(&crate::arcseg::waiting(), ticket.height);
+    items.sort_by_key(|i| i.tag() >> 4);
+    let items = chain.storage().fitting(&items, ticket.height);
     let time = now.max(chain.tip().time + 1);
     let mut outputs = chain.payouts();
     // Room for the transactions: the block's, less the coinbase with a fee output.
@@ -359,7 +364,7 @@ fn write_block(chain: &LocalChain, pool: &Pool, pay: Option<&[u8]>, secret: &[u8
         outputs.push((fees, script.to_vec()));
     }
     txs.insert(0, coins::coinbase(ticket.height, &ticket.prev, b"", &outputs));
-    ticket.seal(chain.net(), secret, time, txs, Vec::new(), StandIn.prove(&ticket.challenge, ticket.steps), seed)
+    ticket.seal(chain.net(), secret, time, txs, items, StandIn.prove(&ticket.challenge, ticket.steps), seed)
 }
 
 /// The writer: draw on each new tip, wait as long as the draw's proof of time would take,
@@ -519,6 +524,24 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         last_up: Mutex::new(None),
     });
     *SVC.write().unwrap() = Some(svc.clone());
+    {
+        // The catalog from this arcade's side (crate::arcseg): a round a minute.
+        let (n, s2) = (node.clone(), svc.clone());
+        std::thread::Builder::new()
+            .name("arc catalog".into())
+            .spawn(move || loop {
+                if s2.stop.load(Ordering::Relaxed) {
+                    return;
+                }
+                let (catalog, weight) = {
+                    let st = s2.st.lock().unwrap();
+                    (st.chain.storage().catalog().clone(), st.chain.storage().weight(&me))
+                };
+                crate::arcseg::round(&n, &s2.net, &catalog, weight);
+                std::thread::sleep(Duration::from_secs(if crate::arcseg::busy() { 2 } else { 60 }));
+            })
+            .map_err(|e| e.to_string())?;
+    }
     if weight > 0 {
         let n = node.clone();
         std::thread::Builder::new().name("arc writer".into()).spawn(move || run_writer(n, svc)).map_err(|e| e.to_string())?;
@@ -702,6 +725,9 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             }
         }
         "txs" => on_txs(svc, link, f)?,
+        "it" => {
+            crate::arcseg::on_items(&svc.net, &f.blob);
+        }
         _ => {}
     }
     Ok(())
@@ -892,6 +918,12 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
     if !news.is_empty() {
         let mut f = frame(svc, "inv", json!({}));
         f.blob = blob_of(&news);
+        link.send(&f)?;
+    }
+    // Storage items waiting for a block (crate::arcseg).
+    if let Some(blob) = crate::arcseg::due_for(&link.peer_id) {
+        let mut f = frame(svc, "it", json!({}));
+        f.blob = blob;
         link.send(&f)?;
     }
     ask_txs(svc, link)
@@ -1126,6 +1158,47 @@ pub fn block(req: &Value) -> Result<Value, String> {
 
 /// `arc.submit`: a signed transaction (`hex`) into the pool, from where it goes to the
 /// other arcades and into a block.
+/// `arc.catalog`: the segments the chain lists, the entries that wait (and who stands behind
+/// each), and this arcade's side of it (crate::arcseg).
+pub fn catalog(node: &Node) -> Result<Value, String> {
+    let svc = svc().ok_or("the ARCADE chain isn't running here")?;
+    let st = svc.st.lock().unwrap();
+    let cat = st.chain.storage().catalog();
+    let hex = |h: &[u8; 32]| hex::encode(h);
+    let entry = |e: &arcade_arc::block::CatalogEntry| json!({"chain": e.chain, "family": e.family, "first": e.first, "last": e.last, "bytes": e.bytes, "root": hex(&e.root), "poster": hex(&e.poster)});
+    let mut listed = Vec::new();
+    for chain in svc.net.listed {
+        for (_, _, l) in cat.spans(chain, arcade_arc::segment::FAMILY_BLOCKS) {
+            if let Some(l) = l {
+                let mut v = entry(&l.entry);
+                v["id"] = json!(hex(&l.id));
+                v["height"] = json!(l.height);
+                listed.push(v);
+            }
+        }
+    }
+    let waiting: Vec<Value> = cat
+        .all_waiting()
+        .map(|(id, c)| {
+            let mut v = entry(&c.entry);
+            v["id"] = json!(hex(id));
+            v["behind"] = json!(c.behind.iter().map(hex).collect::<Vec<_>>());
+            v
+        })
+        .collect();
+    Ok(json!({"segment_bytes": cat.segment_bytes(), "listed": listed, "waiting": waiting, "here": crate::arcseg::status(node, &svc.net, cat.segment_bytes())}))
+}
+
+/// `arc.segment_root {chain, first, last}`: the root this arcade makes for those heights of a
+/// chain it keeps.
+pub fn segment_root(node: &Node, req: &Value) -> Result<Value, String> {
+    let key = req["chain"].as_str().ok_or("give a chain")?;
+    let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't kept here"))?;
+    let (first, last) = (req["first"].as_u64().ok_or("give first")?, req["last"].as_u64().ok_or("give last")?);
+    let (bytes, root) = crate::arcseg::root_of(node, p, first, last).ok_or("those blocks aren't all here")?;
+    Ok(json!({"chain": key, "first": first, "last": last, "bytes": bytes, "root": hex::encode(root)}))
+}
+
 pub fn submit(req: &Value) -> Result<Value, String> {
     let svc = svc().ok_or("the ARCADE chain isn't running here")?;
     let raw = req["hex"].as_str().and_then(|h| hex::decode(h).ok()).ok_or("hex required")?;

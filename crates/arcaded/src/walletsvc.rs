@@ -213,7 +213,7 @@ pub fn wallet(node: &Node) -> Value {
     let mut sums: std::collections::BTreeMap<u32, u64> = Default::default();
     for a in &addrs {
         if let Some(script) = arcade_ledger::address::p2pkh_script_for_address(p, a) {
-            let coins = if p.chain_no == node.params.chain_no { crate::claims::spendable(node, &script) } else { crate::borrow::spendable(node, p, &script) };
+            let coins = if p.chain_no == node.params.chain_no { crate::claims::spendable(node, &script) } else { crate::ordsafe::keep_free(node, p, crate::borrow::spendable(node, p, &script)) };
             spendable += coins.iter().map(|u| u.value).sum::<u64>();
         }
         for (pid, u) in holdings(node, a) {

@@ -174,6 +174,8 @@ pub fn send(node: &Node, chain: Option<&str>, to: &str, cents: i64, broadcast: b
             }
         }
     }
+    // Fee coins that carry an inscription stay where they are.
+    let dgb = crate::ordsafe::keep_free(node, p, dgb);
     let held: Vec<Held> = w.held.iter().map(|(u, c, _)| Held { coin: u.clone(), cents: *c }).collect();
     let b = arcade_wallet::dd::build_send(p, &sk, &held, &dgb, &scripts[0].1, &to_key, cents)?;
     let mut out = json!({"chain": p.key, "txid": b.tx.txid.to_hex(), "from": w.address, "to": to, "cents": cents,
@@ -239,6 +241,7 @@ pub(crate) fn trade_coins(node: &Node, p: &'static ChainParams) -> Result<(arcad
             }
         }
     }
+    let dgb = crate::ordsafe::keep_free(node, p, dgb);
     let held: Vec<Held> = w.held.iter().map(|(u, c, _)| Held { coin: u.clone(), cents: *c }).collect();
     let (_, _, dd_script) = dd_address(p, &w.pk).ok_or("no DigiDollar address for this key")?;
     Ok((sk, held, dgb, dd_script, scripts[0].1.clone()))

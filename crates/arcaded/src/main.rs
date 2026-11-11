@@ -40,6 +40,7 @@ mod miner;
 mod meshsvc;
 mod ddmarket;
 mod marketsvc;
+mod swaps;
 mod meshview;
 mod mempoolshare;
 mod msgsvc;
@@ -280,6 +281,7 @@ fn main() {
     chains::start_home(&node).expect("home indexes");
     chains::start_saved(&node);
     borrow::start(node.clone());
+    swaps::start(node.clone());
     ordtypes::init(&node);
     namesites::init(&node);
     // A home chain far behind (a fresh install): installed from copies when the mesh has them.

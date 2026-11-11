@@ -1445,6 +1445,21 @@ impl ChainDb {
         })
     }
 
+    /// Drop one pooled transaction (one this arcade made that the network never took: a swap's claim or refund is
+    /// then built again). Whether it was there.
+    pub fn mempool_remove(&self, params: &ChainParams, txid: &Hash256) -> Result<bool> {
+        let c = params.chain_no;
+        self.wstore(c)?.write(|w| {
+            let k = k_txs(c, &txid.t12());
+            let Some(v) = w.get(MEMPOOL, &k)? else { return Ok(false) };
+            if let Ok(tx) = Tx::parse_with(&v[8..], &params.format) {
+                remove_pooled(w, c, &tx)?;
+            }
+            w.del(MEMPOOL, &k)?;
+            Ok(true)
+        })
+    }
+
     /// Drop pooled transactions older than `max_age` seconds.
     pub fn mempool_expire(&self, params: &ChainParams, now: u64, max_age: u64) -> Result<u32> {
         let c = params.chain_no;

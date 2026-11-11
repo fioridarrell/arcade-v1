@@ -81,7 +81,7 @@ impl Num {
         }
     }
     /// value * 10^dec, which must be integral.
-    fn units(&self, dec: u32) -> Option<u128> {
+    pub fn units(&self, dec: u32) -> Option<u128> {
         if self.scale <= dec {
             self.m.checked_mul(p10(dec - self.scale)?)
         } else {
@@ -288,6 +288,12 @@ impl OrdHook for TokensHook {
 }
 
 // ---------------- reads ----------------
+
+/// A live transfer note (inscribed, not moved yet): {tick, amt, owner, reveal}, by its inscription id.
+pub fn note(db: &ChainDb, c: u16, iid: &[u8; 36]) -> Option<Value> {
+    let raw = db.store(c).read(|r| r.get(XFER, &KeyBuf::new().u16(c).bytes(iid).done())).ok().flatten()?;
+    serde_json::from_slice(&raw).ok()
+}
 
 pub fn tick(db: &ChainDb, c: u16, t: &str) -> Option<Value> {
     db.store(c).read(|r| r.get(TICK, &k_tick(c, &t.to_lowercase()))).ok()?.and_then(|v| serde_json::from_slice(&v).ok())

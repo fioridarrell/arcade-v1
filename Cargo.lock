@@ -241,6 +241,7 @@ name = "arcade-wallet"
 version = "0.1.0"
 dependencies = [
  "arcade-chain",
+ "arcade-chaindb",
  "arcade-ledger",
  "base64 0.23.1",
  "bip39",

@@ -403,6 +403,32 @@ fn holdings(node: &Node) -> Value {
         a["amount"] = json!(u);
         out.push(a);
     }
+    // DRC-20 / PRC-20 on the home chain (whole tokens, as a decimal string).
+    for a in &ours {
+        for (tick, overall, transferable) in arcade_ledger::tokens::balances(&node.chain, c(node), a) {
+            let free = overall.parse::<u128>().unwrap_or(0).saturating_sub(transferable.parse::<u128>().unwrap_or(0));
+            out.push(json!({"network": node.params.key, "kind": "token20", "asset": tick, "name": tick.to_uppercase(), "units": free.to_string(), "decimals": 18,
+                            "amount": (free / 10u128.pow(18)).to_string()}));
+        }
+    }
+    // The coin of every other installed chain.
+    let extra: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+    for key in &extra {
+        let Some(p) = arcade_chain::params::by_key(key) else { continue };
+        if let Ok((_, pk)) = node.app.tag_key(p, 0).map(|(k, sk)| (k, arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk))) {
+            let mut sum = 0u64;
+            for (_, script) in crate::coinsend::key_scripts(p, &pk) {
+                for (op, value, _) in node.chain.coins_for_script(p, &script).unwrap_or_default() {
+                    if node.chain.mempool_spender(p.chain_no, &op).ok().flatten().is_none() {
+                        sum += value;
+                    }
+                }
+            }
+            if !matches!(p.key, "dgb" | "dgbtest") {
+                out.push(json!({"network": p.key, "kind": "coin", "asset": crate::explorer::unit(p), "name": crate::explorer::unit(p), "amount": sum}));
+            }
+        }
+    }
     for chain in ["dgbtest", "dgb"] {
         let Some(p) = crate::ddmarket::dd_chain(chain) else { continue };
         if !node.extra.lock().unwrap().contains_key(chain) {
@@ -479,6 +505,9 @@ pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, St
         "terms" => terms_read(node, q),
         "mine" => Ok(mine(node)),
         "holdings" => Ok(holdings(node)),
+        // Swaps of any leg for any leg (swaps.rs): every open order this arcade and its links know, and this
+        // wallet's own orders and swaps.
+        "swaps" => Ok(json!({"book": crate::swaps::book(node), "mine": crate::swaps::own_orders(node), "running": crate::swaps::swaps(node), "me": node.id_hex()})),
         _ => Err(format!("{name} is not a market read")),
     }
 }
@@ -570,7 +599,34 @@ fn holder(node: &Node, pid: u32, units: u64) -> Option<String> {
 }
 
 /// The terms of a market request, checked against the book now: (what it says, the maker paid if a take).
+fn leg_words(l: &Value) -> String {
+    let amt = l["amount"].as_str().unwrap_or("");
+    match l["kind"].as_str().unwrap_or("") {
+        "coin" => format!("{} {}", arcade_ledger::amount::token_plain(true, amt.parse().unwrap_or(0)), l["chain"].as_str().unwrap_or("").to_uppercase()),
+        "dd" => format!("${} DigiDollar", amt.parse::<u64>().unwrap_or(0) / 100),
+        "token20" => format!("{amt} {}", l["asset"].as_str().unwrap_or("").to_uppercase()),
+        "token" => format!("{amt} units of token #{}", l["asset"].as_str().unwrap_or("")),
+        "ord" => format!("inscription {}", l["asset"].as_str().unwrap_or("")),
+        k => k.to_string(),
+    }
+}
+
+fn swap_terms(node: &Node, m: &Value) -> Result<(String, Option<String>), String> {
+    match m["op"].as_str().unwrap_or("") {
+        "swap_place" => Ok((format!("a swap order: give {} for {}, locked by script on both chains when somebody takes it", leg_words(&m["give"]), leg_words(&m["get"])), None)),
+        "swap_take" => {
+            let o = crate::swaps::book(node).into_iter().find(|o| o["id"] == m["order"] && (m["node"].is_null() || o["node"] == m["node"])).ok_or("that swap order is not on the book now")?;
+            Ok((format!("a swap: give {} for {}. Your side is locked first, for longer; each side gets its own back if the other stops", leg_words(&o["get"]), leg_words(&o["give"])), o["node"].as_str().map(String::from)))
+        }
+        "swap_cancel" => Ok(("a cancel of your swap order".into(), None)),
+        op => Err(format!("{op} is not a swap write")),
+    }
+}
+
 fn terms(node: &Node, m: &Value) -> Result<(String, Option<String>), String> {
+    if m["op"].as_str().is_some_and(|o| o.starts_with("swap_")) {
+        return swap_terms(node, m);
+    }
     if let Some(chain) = dd_network(m) {
         return dd_terms(node, chain, m);
     }
@@ -718,6 +774,18 @@ fn dd_terms(node: &Node, chain: &str, m: &Value) -> Result<(String, Option<Strin
 
 /// What a market request does when approved, as the card shows it: (txid or order id, fee, outputs).
 pub fn build_request(node: &Node, m: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
+    if m["op"].as_str().is_some_and(|o| o.starts_with("swap_")) {
+        terms(node, m)?;
+        if !send {
+            return Ok((String::new(), 0, vec![]));
+        }
+        let r = match m["op"].as_str().unwrap_or("") {
+            "swap_place" => crate::swaps::place(node, &m["give"], &m["get"])?,
+            "swap_take" => crate::swaps::take(node, m["node"].as_str().unwrap_or(""), m["order"].as_str().unwrap_or(""))?,
+            _ => crate::swaps::cancel(node, m["order"].as_str().unwrap_or(""))?,
+        };
+        return Ok((format!("swap:{}", r["id"].as_str().unwrap_or("")), 0, vec![]));
+    }
     if let Some(chain) = dd_network(m) {
         let p = crate::ddmarket::dd_chain(chain).ok_or("not a DigiDollar chain")?;
         terms(node, m)?;

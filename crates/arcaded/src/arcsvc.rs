@@ -444,7 +444,7 @@ pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
         let _changing = CHANGING.lock().unwrap();
         run(node, def)?;
     } else {
-        eprintln!("arc: local test chain {} (block 0 {genesis}) can be installed in Chains & Coins", net.key);
+        eprintln!("arc: the ARCADE test chain {} (block 0 {genesis}) can be installed in Chains & Coins", net.key);
     }
     Ok(())
 }

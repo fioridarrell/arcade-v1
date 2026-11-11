@@ -68,7 +68,7 @@ pub fn run(node: Arc<Node>) {
         mesh_bootstrap(&node, &syncer);
     }
     loop {
-        let Some(mut peer) = node.coin_candidates(p).iter().find_map(|a| Peer::connect_with(p, a, Duration::from_secs(20), true).ok())
+        let Some(mut peer) = Node::dial_first(p, &node.coin_candidates(p), true)
         else {
             set_state(&node, "no coin peer reachable; retrying".into());
             std::thread::sleep(Duration::from_secs(15));

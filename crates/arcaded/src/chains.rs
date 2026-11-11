@@ -11,7 +11,7 @@
 //! rebuilds ord. Removing ord removes it too.
 
 use crate::node::Node;
-use arcade_chain::p2p::Peer;
+
 use arcade_chain::params::{by_key, ChainParams, ALL_CHAINS};
 use arcade_chaindb::sync::Syncer;
 use arcade_ledger::ord::{ord_start, OrdIndexer, RIDERS};
@@ -1085,7 +1085,7 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
                 last_mesh = std::time::Instant::now();
             }
         }
-        let Some(mut peer) = node.coin_candidates(p).iter().find_map(|a| Peer::connect(p, a, Duration::from_secs(20)).ok()) else {
+        let Some(mut peer) = Node::dial_first(p, &node.coin_candidates(p), false) else {
             set(format!("no {} peer reachable; retrying", p.name));
             // New blocks come from the arcade mesh then: the indexes still walk what is stored.
             walk_indexes(&node, &run, 40);

@@ -35,6 +35,35 @@ pub fn fee_policy(p: &ChainParams) -> FeePolicy {
     }
 }
 
+/// An inscription's coin usually holds its postage: 100,000 satoshis (0.001 of a coin) on the
+/// chains the ord index reads, and rarely more. A coin this small that the ord index can't
+/// vouch for yet is left out of ordinary sends.
+pub const POSTAGE: u64 = 100_000;
+
+/// Why an ordinary send must leave a coin alone, if it must: the ord index says it carries an
+/// inscription, or the index hasn't reached the coin (`height` None: not in a block yet) and
+/// it is small enough to be one. Chains without the ord index here: never.
+pub fn ord_hold(node: &Node, p: &ChainParams, op: &arcade_chain::OutPoint, value: u64, height: Option<u32>) -> Result<Option<&'static str>, String> {
+    if !node.chain.indexers_for(p.chain_no).contains(&"ord.v1") {
+        return Ok(None);
+    }
+    let to = node.chain.indexed_to(p.chain_no, "ord.v1").map_err(|e| e.to_string())?;
+    if matches!((height, to), (Some(h), Some(t)) if t >= h) {
+        let inscribed = arcade_ledger::ord::carries(&node.chain, p, &op.txid, op.vout).map_err(|e| e.to_string())?;
+        return Ok(inscribed.then_some("it carries an inscription"));
+    }
+    Ok((value <= POSTAGE).then_some("the ord index hasn't reached it yet, and it is small enough to carry an inscription"))
+}
+
+/// A send's error, with the coins left out for their inscriptions said.
+fn with_held(e: String, held: &[(u64, &str)]) -> String {
+    if held.is_empty() {
+        return e;
+    }
+    let total: u64 = held.iter().map(|h| h.0).sum();
+    format!("{e} ({} coin{} worth {total} left out: {})", held.len(), if held.len() == 1 { "" } else { "s" }, held[0].1)
+}
+
 /// Chains where the wallet receives at a native SegWit (bech32) address. DigiByte's "D..."
 /// addresses are the same strings as Dogecoin's (version byte 30, and V1.0 derives both from
 /// one key), so DigiByte receives at "dgb1..." instead; its "D..." address is still watched.
@@ -91,12 +120,15 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
         keys.push(node.app.tag_key(p, 0).map_err(|e| e.to_string())?.0);
     }
     let mut best: Option<(u32, Vec<(String, Vec<u8>)>, Vec<Utxo>, u64)> = None;
+    // Coins left out because of inscriptions: (value, why), per key looked at.
+    let mut held_by: Vec<(u32, Vec<(u64, &str)>)> = Vec::new();
     for k in keys {
         let Ok(pk) = hex::decode(&k.pubkey).map_err(|_| ()).and_then(|b| PublicKey::from_slice(&b).map_err(|_| ())) else { continue };
         let scripts = key_scripts(p, &pk);
         let mut coins = Vec::new();
+        let mut held = Vec::new();
         for (_, sc) in &scripts {
-            for (op, value, _h) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
+            for (op, value, h) in node.chain.coins_for_script(p, sc).map_err(|e| e.to_string())? {
                 // Not spent by a waiting transaction, and not an immature coinbase.
                 if node.chain.mempool_spender(p.chain_no, &op).map_err(|e| e.to_string())?.is_some() {
                     continue;
@@ -106,9 +138,15 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
                         continue;
                     }
                 }
+                // Never an inscription's coin by accident (see ord_hold).
+                if let Some(why) = ord_hold(node, p, &op, value, Some(h))? {
+                    held.push((value, why));
+                    continue;
+                }
                 coins.push(Utxo { outpoint: op, value, script: sc.clone() });
             }
         }
+        held_by.push((k.index, held));
         let total: u64 = coins.iter().map(|u| u.value).sum();
         let picked = from.is_some_and(|f| scripts.iter().any(|(a, _)| a == f));
         if picked {
@@ -129,7 +167,8 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
                 return Err("this imported wallet's kind can't be spent here yet (only legacy compressed and p2wpkh)".into());
             }
             let mut coins = Vec::new();
-            for (op, value, _h) in node.chain.coins_for_script(p, &sc).map_err(|e| e.to_string())? {
+            let mut held = Vec::new();
+            for (op, value, h) in node.chain.coins_for_script(p, &sc).map_err(|e| e.to_string())? {
                 if node.chain.mempool_spender(p.chain_no, &op).map_err(|e| e.to_string())?.is_some() {
                     continue;
                 }
@@ -138,21 +177,27 @@ pub fn send(node: &Node, key: Option<&str>, to: &str, amount: u64, from: Option<
                         continue;
                     }
                 }
+                if let Some(why) = ord_hold(node, p, &op, value, Some(h))? {
+                    held.push((value, why));
+                    continue;
+                }
                 coins.push(Utxo { outpoint: op, value, script: sc.clone() });
             }
-            Some((sk, vec![(f.to_string(), sc)], coins))
+            Some((sk, vec![(f.to_string(), sc)], coins, held))
         }
         _ => None,
     };
-    let (sk, scripts, coins) = match imported {
+    let (sk, scripts, coins, held) = match imported {
         Some(x) => x,
         None => {
             let (index, scripts, coins, _) = best.ok_or("this wallet has no address on that chain")?;
-            (node.app.tag_key(p, index).map_err(|e| e.to_string())?.1, scripts, coins)
+            let held = held_by.into_iter().find(|h| h.0 == index).map(|h| h.1).unwrap_or_default();
+            (node.app.tag_key(p, index).map_err(|e| e.to_string())?.1, scripts, coins, held)
         }
     };
     let fp = fee_policy(p);
-    let tx = arcade_wallet::tx::build_send_keyhash(p, &to_script, amount, &sk, &coins, &scripts[0].1, fp.fallback_per_kb.max(fp.floor_per_kb), fp.dust, arcade_app::now() as u32)?;
+    let tx = arcade_wallet::tx::build_send_keyhash(p, &to_script, amount, &sk, &coins, &scripts[0].1, fp.fallback_per_kb.max(fp.floor_per_kb), fp.dust, arcade_app::now() as u32)
+        .map_err(|e| with_held(e, &held))?;
     let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
     let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
     let vsize = (tx.encode_legacy().len() * 3 + tx.raw.len()).div_ceil(4);
@@ -187,5 +232,41 @@ mod tests {
         assert!(warning(&DIGIBYTE_MAIN, &dgb[0].0).is_none());
         assert!(warning(&DOGECOIN_MAIN, &doge[0].0).is_none());
         assert_eq!(key_scripts(&PEPECOIN_TEST, &pk).len(), 1);
+    }
+
+    #[test]
+    fn coins_with_inscriptions_are_left_out() {
+        use crate::sitesvc::tests::{addr, p2pkh, setup};
+        use arcade_chain::{Hash256, OutPoint};
+        let t = setup();
+        let c = t.p.chain_no;
+        // Block 2 paid 3000 to address 2 and 1900 to address 1.
+        let (two, one) = (OutPoint { txid: t.spend.txid, vout: 0 }, OutPoint { txid: t.spend.txid, vout: 1 });
+        let spendable = |tag: u8| crate::claims::spendable(&t.node, &p2pkh(tag)).len();
+        // No ord index here: nothing changes.
+        assert_eq!(ord_hold(&t.node, t.p, &two, 3000, Some(2)), Ok(None));
+        assert_eq!(spendable(2), 1);
+        t.node.chain.add_indexer(c, std::sync::Arc::new(arcade_ledger::ord::OrdIndexer::new(&[]))).unwrap();
+        // The index is behind block 2: small coins are held, a big one (or an older one) is not.
+        t.node.chain.set_indexed_to(c, "ord.v1", Some(1)).unwrap();
+        assert!(ord_hold(&t.node, t.p, &two, 3000, Some(2)).unwrap().unwrap().contains("hasn't reached"));
+        assert_eq!(ord_hold(&t.node, t.p, &two, POSTAGE + 1, Some(2)), Ok(None));
+        assert!(ord_hold(&t.node, t.p, &two, 3000, None).unwrap().is_some(), "a waiting coin isn't indexed");
+        assert_eq!((spendable(1), spendable(2)), (0, 0));
+        // Caught up, and an inscription sits on address 2's coin: only that one is held.
+        t.node.chain.set_indexed_to(c, "ord.v1", Some(2)).unwrap();
+        let iid = arcade_ledger::ord::iid_bytes(&Hash256([5; 32]), 0);
+        let loc = arcade_store::KeyBuf::new().u16(c).bytes(&two.txid.0).u32(two.vout).u64(0).bytes(&iid).done();
+        t.node.chain.wstore(c).unwrap().write(|w| w.put(arcade_ledger::ord::LOC, &loc, &[])).unwrap();
+        assert_eq!(ord_hold(&t.node, t.p, &two, 3000, Some(2)), Ok(Some("it carries an inscription")));
+        assert_eq!(ord_hold(&t.node, t.p, &one, 1900, Some(2)), Ok(None));
+        assert_eq!((spendable(1), spendable(2)), (1, 0));
+        // tx.coins lists it apart, out of the total.
+        let a = addr(&t, 2);
+        let v = crate::sitesvc::coins(&t.node, &json!({"addresses": [a.clone()]})).unwrap();
+        assert_eq!(v["addresses"][&a]["confirmed"].as_array().unwrap().len(), 0);
+        assert_eq!(v["addresses"][&a]["total"], 0);
+        assert_eq!(v["addresses"][&a]["held"][0]["coin"]["value"], 3000);
+        assert_eq!(with_held("not enough coins".into(), &[(3000, "it carries an inscription")]), "not enough coins (1 coin worth 3000 left out: it carries an inscription)");
     }
 }

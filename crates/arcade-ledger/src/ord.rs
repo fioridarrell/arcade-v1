@@ -836,6 +836,20 @@ pub fn count(db: &ChainDb, c: u16) -> u64 {
         .unwrap_or(0)
 }
 
+/// Whether an output carries any inscription (the location map is whole on every arcade that
+/// keeps the ord index, Shared storage included).
+pub fn carries(db: &ChainDb, p: &ChainParams, txid: &Hash256, vout: u32) -> Result<bool> {
+    let c = p.chain_no;
+    let mut any = false;
+    db.store(c).read(|r| {
+        r.for_each_prefix(LOC, &loc_prefix(c, txid, vout), |_, _| {
+            any = true;
+            Ok(false)
+        })
+    })?;
+    Ok(any)
+}
+
 /// Inscriptions held at an address's outputs: for each unspent output of the script, its loc rows.
 pub fn held_by(db: &ChainDb, p: &ChainParams, script: &[u8]) -> Result<Vec<String>> {
     let c = p.chain_no;

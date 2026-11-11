@@ -325,7 +325,7 @@ fn handle(node: &Node, mut s: TcpStream, site: Option<&PathBuf>) {
             return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());
         }
         // A market write (marketsvc.rs, docs/MARKET.md step 2) files a request like a send does.
-        let market_op = path.strip_prefix("/r/market/").filter(|op| matches!(*op, "place" | "cancel" | "take"));
+        let market_op = path.strip_prefix("/r/market/").filter(|op| matches!(*op, "place" | "cancel" | "take" | "swap_place" | "swap_take" | "swap_cancel"));
         if r.method == "POST" && (path == "/r/send" || market_op.is_some()) {
             // The page is the app frame that asked (its Referer: /app/<chain>/<txid>).
             let page = r.headers.get("referer").and_then(|v| v.as_str()).and_then(|u| u.split('?').next()).and_then(|u| u.rsplit('/').next()).filter(|t| crate::udpsvc::is_hex(t, 64)).map(String::from);

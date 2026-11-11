@@ -836,6 +836,27 @@ pub fn count(db: &ChainDb, c: u16) -> u64 {
         .unwrap_or(0)
 }
 
+/// The inscriptions on one coin (ids), from the index's locations.
+pub fn on_coin(db: &ChainDb, p: &ChainParams, op: &arcade_chain::OutPoint) -> Vec<String> {
+    let c = p.chain_no;
+    db.store(c)
+        .read(|r| r.scan_prefix(LOC, &loc_prefix(c, &op.txid, op.vout)))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, _)| iid_str(&key[key.len() - 36..]))
+        .collect()
+}
+
+/// Where an inscription is now: (its coin, its offset in the coin).
+pub fn location(db: &ChainDb, p: &ChainParams, id: &str) -> Option<(arcade_chain::OutPoint, u64)> {
+    let c = p.chain_no;
+    let iid = resolve(db, c, id)?;
+    let at = db.store(c).read(|r| r.get(AT, &k(c, &iid))).ok()??;
+    let mut t = [0u8; 32];
+    t.copy_from_slice(&at[..32]);
+    Some((arcade_chain::OutPoint { txid: Hash256(t), vout: be_u32(&at, 32) }, be_u64(&at, 36)))
+}
+
 /// Inscriptions held at an address's outputs: for each unspent output of the script, its loc rows.
 pub fn held_by(db: &ChainDb, p: &ChainParams, script: &[u8]) -> Result<Vec<String>> {
     let c = p.chain_no;

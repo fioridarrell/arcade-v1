@@ -199,6 +199,9 @@ pub fn answer(node: &Node, arg: &str) -> Result<Value, String> {
     let q: Value = serde_json::from_str(arg).map_err(|_| "bad question".to_string())?;
     let chain = q["chain"].as_str().unwrap_or("");
     let p = dd_chain(chain).ok_or("not a DigiDollar chain")?;
+    if q["op"].as_str().is_some_and(|o| o.starts_with('s')) {
+        return crate::swaps::answer(node, &q); // any leg for any leg (swaps.rs)
+    }
     if q["op"].as_str().is_some_and(|o| o.starts_with('t')) {
         return crate::t20swap::answer(node, &q); // DRC-20 / PRC-20 for DGB (t20swap.rs)
     }

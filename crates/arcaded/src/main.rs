@@ -40,6 +40,7 @@ mod miner;
 mod meshsvc;
 mod ddmarket;
 mod marketsvc;
+mod swaps;
 mod t20swap;
 mod xswap;
 mod meshview;
@@ -283,6 +284,7 @@ fn main() {
     borrow::start(node.clone());
     xswap::start(node.clone());
     t20swap::start(node.clone());
+    swaps::start(node.clone());
     ordtypes::init(&node);
     namesites::init(&node);
     // A home chain far behind (a fresh install): installed from copies when the mesh has them.

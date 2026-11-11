@@ -150,7 +150,7 @@ cmds! {
     "explorer.inscriptions" Public "chain?, offset?, limit?" "Inscriptions, newest first.";
     "explorer.inscription" Public "chain?, id" "One inscription.";
     "explorer.tokens" Public "chain?, offset?, limit?" "Tokens.";
-    "explorer.token" Public "chain?, tick" "One token.";
+    "explorer.token" Public "chain?, tick, offset?, n?" "One token and a page of its holders, biggest first (n: 25, at most 100; total: how many hold it).";
     "explorer.names" Public "chain?" "Names.";
     "explorer.name" Public "chain?, name" "One name.";
     "explorer.maps" Public "chain?" "Maps.";

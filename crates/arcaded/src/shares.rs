@@ -600,10 +600,24 @@ fn addr_of(node: &Node, id: &str) -> Option<String> {
 
 /// Ask the arcades holding `unit` of `kind` until one answers.
 pub fn ask_holders(node: &Node, p: &ChainParams, kind: &str, unit: u64, what: &str, arg: &str) -> Result<(Value, String), String> {
+    ask_holders_with(node, p, kind, unit, what, arg, json!({}))
+}
+
+/// [`ask_holders`] with more fields in the question (a page: `offset`, `n`). An arcade from
+/// before a field was added leaves it out of its answer.
+pub fn ask_holders_with(node: &Node, p: &ChainParams, kind: &str, unit: u64, what: &str, arg: &str, more: Value) -> Result<(Value, String), String> {
     let mut last = format!("no arcade on the mesh holds that part of {} right now", p.name);
+    let mut q = json!({"net": p.net, "what": what, "arg": arg});
+    if let Value::Object(m) = more {
+        for (k, v) in m {
+            if !v.is_null() {
+                q[k] = v;
+            }
+        }
+    }
     for id in holders(node, p.net, kind, unit) {
         let Some(addr) = addr_of(node, &id) else { continue };
-        match ask(node, &addr, json!({"net": p.net, "what": what, "arg": arg})) {
+        match ask(node, &addr, q.clone()) {
             Ok((v, _)) => return Ok((v, id)),
             Err(e) => last = e,
         }
@@ -622,7 +636,7 @@ pub fn answer(node: &Node, link: &mut Link, h: &Value) -> Result<(), LinkError> 
                 let v = arcade_ledger::ord::inscription(&node.chain, p, arg).ok_or("not held here")?;
                 Ok(v)
             }
-            "tick" => crate::explorer::handle(node, "explorer.token", &json!({"chain": p.key, "tick": arg, "local": true})),
+            "tick" => crate::explorer::handle(node, "explorer.token", &json!({"chain": p.key, "tick": arg, "local": true, "offset": h["offset"], "n": h["n"]})),
             // Another arcade's Explorer question (V1.0 mesh explorer): answered only from what
             // this arcade holds itself (never asked on), public explorer commands only.
             "x" => {

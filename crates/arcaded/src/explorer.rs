@@ -8,7 +8,7 @@
 //!   explorer.inscriptions {before?, n?}    newest first, with previews
 //!   explorer.inscription  {id}             details + content (as a data URL, capped)
 //!   explorer.tokens   {after?, n?}         token ticks
-//!   explorer.token    {tick}               a tick and its top holders
+//!   explorer.token    {tick, offset?, n?}  a tick and a page of its holders (biggest first)
 //!   explorer.names / explorer.maps {after?, n?}, explorer.name {name}, explorer.map {claim}
 //!   explorer.site {name} / explorer.sites {all?}   a name's site, the names with one (namesites.rs)
 //!   explorer.mempool                       unconfirmed transactions
@@ -74,6 +74,23 @@ impl Ctx<'_> {
     fn c(&self) -> u16 {
         self.p.chain_no
     }
+}
+
+/// A token's holder rows (`tok.v1.holder`, key = prefix + address, value {"o", "t"}): how many
+/// hold some, and the page from `off` of up to `size`, biggest balance first, then by address so
+/// pages never overlap. Each: (balance, address, transferable).
+fn holder_page(rows: &[(Vec<u8>, Vec<u8>)], pre: usize, off: usize, size: usize) -> (usize, Vec<(u128, String, String)>) {
+    let mut hs: Vec<(u128, String, String)> = rows
+        .iter()
+        .filter_map(|(k, b)| {
+            let b: Value = serde_json::from_slice(b).ok()?;
+            let o: u128 = b["o"].as_str()?.parse().ok()?;
+            (o > 0).then(|| (o, String::from_utf8_lossy(&k[pre..]).into_owned(), b["t"].as_str().unwrap_or("0").to_string()))
+        })
+        .collect();
+    let count = hs.len();
+    hs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    (count, hs.into_iter().skip(off).take(size).collect())
 }
 
 fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
@@ -461,27 +478,24 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let local = tokens::tick(&x.node.chain, x.c(), &t);
             let held = crate::shares::groups_of(&x.node.share_of(x.p.key)["tok"]);
             if local.is_none() && held.as_ref().is_some_and(|g| !g.contains(&tokens::tick_group(&t))) {
-                let (mut v, from) = crate::shares::ask_holders(x.node, x.p, "tok", tokens::tick_group(&t) as u64, "tick", &t)?;
+                let page = json!({"offset": req["offset"], "n": req["n"]});
+                let (mut v, from) = crate::shares::ask_holders_with(x.node, x.p, "tok", tokens::tick_group(&t) as u64, "tick", &t, page)?;
                 v["from_arcade"] = json!(from);
                 return Ok(v);
             }
             let mut v = local.ok_or_else(|| format!("no token {t}"))?;
+            // Every holder, biggest first, a page at a time (`offset`, `n`: 25 by default).
             let pre = KeyBuf::new().u16(x.c()).var(t.as_bytes()).done();
-            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::HOLDER, &pre, 5000)).map_err(e)?;
-            let more = rows.len() >= 5000;
-            let mut hs: Vec<(u128, String, String)> = rows
-                .iter()
-                .filter_map(|(k, b)| {
-                    let b: Value = serde_json::from_slice(b).ok()?;
-                    let o: u128 = b["o"].as_str()?.parse().ok()?;
-                    (o > 0).then(|| (o, String::from_utf8_lossy(&k[pre.len()..]).into_owned(), b["t"].as_str().unwrap_or("0").to_string()))
-                })
-                .collect();
-            let count = hs.len();
-            hs.sort_by(|a, b| b.0.cmp(&a.0));
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix(tokens::HOLDER, &pre)).map_err(e)?;
+            let off = req["offset"].as_u64().unwrap_or(0) as usize;
+            let size = n(25, 100) as usize;
+            let (count, hs) = holder_page(&rows, pre.len(), off, size);
             v["tick"] = json!(t);
-            v["holders"] = json!(if more { format!("{count}+") } else { count.to_string() });
-            v["top"] = json!(hs.iter().take(25).map(|(o, a, tr)| json!({"address": a, "tag": tag_of(&x, a), "overall": o.to_string(), "transferable": tr})).collect::<Vec<_>>());
+            v["holders"] = json!(count.to_string());
+            v["total"] = json!(count);
+            v["offset"] = json!(off);
+            v["n"] = json!(size);
+            v["top"] = json!(hs.iter().map(|(o, a, tr)| json!({"address": a, "tag": tag_of(&x, a), "overall": o.to_string(), "transferable": tr})).collect::<Vec<_>>());
             Ok(v)
         }
         "explorer.site" => {
@@ -1272,4 +1286,36 @@ fn ledger_questions_go_to_arcades_keeping_the_ledger() {
         assert_eq!(needed_index(c), Some("ledger"), "{c}");
     }
     assert_eq!(needed_index("explorer.tx"), None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every holder can be read, a page at a time, biggest first; none twice, none left out
+    /// (the Explorer showed only the 25 biggest).
+    #[test]
+    fn every_token_holder_pages() {
+        let pre = b"PRE".to_vec();
+        let row = |addr: &str, o: u128| {
+            let mut k = pre.clone();
+            k.extend_from_slice(addr.as_bytes());
+            (k, json!({"o": o.to_string(), "t": "0"}).to_string().into_bytes())
+        };
+        // 60 holders, three with the same balance, and one that holds nothing any more.
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = (0..60).map(|i| row(&format!("addr{i:02}"), if i < 3 { 500 } else { 1000 + i as u128 })).collect();
+        rows.push(row("gone", 0));
+        let (count, first) = holder_page(&rows, pre.len(), 0, 25);
+        assert_eq!(count, 60, "every holder is counted, not only the first page");
+        assert_eq!(first.len(), 25);
+        assert_eq!((first[0].0, first[0].1.as_str()), (1059, "addr59"));
+        let mut seen = Vec::new();
+        for off in (0..count).step_by(25) {
+            seen.extend(holder_page(&rows, pre.len(), off, 25).1.into_iter().map(|h| h.1));
+        }
+        assert_eq!(seen.len(), 60);
+        assert_eq!(seen.iter().collect::<std::collections::HashSet<_>>().len(), 60, "no holder on two pages");
+        assert_eq!(&seen[57..], &["addr00", "addr01", "addr02"], "the same balance by address, smallest last");
+        assert!(holder_page(&rows, pre.len(), 60, 25).1.is_empty());
+    }
 }

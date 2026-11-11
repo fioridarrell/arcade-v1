@@ -10,7 +10,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade status                  sync, tag index, mesh links
   arcade peers                   mesh links
   arcade wallet create           new wallet; shows the 12-word recovery phrase ONCE
-  arcade wallet restore <words>  restore from a recovery phrase
+  arcade wallet restore          restore from a recovery phrase (typed at a prompt, not shown)
   arcade wallet phrase           show the recovery phrase
   arcade wallet keys             tag keys, addresses, balances
   arcade tag check <tag>         is @tag free?
@@ -158,7 +158,7 @@ fn setup(sock: &std::path::Path) {
                     break;
                 }
                 "r" | "R" => {
-                    let words = ask("      your 12 words: ");
+                    let words = read_hidden("      your 12 words (not shown): ").unwrap_or_else(|_| ask("      your 12 words: "));
                     match call(sock, json!({"cmd": "wallet.create", "phrase": words})) {
                         Ok(_) => { println!("      wallet restored"); break; }
                         Err(e) => println!("      {e}"),
@@ -214,6 +214,42 @@ fn setup(sock: &std::path::Path) {
     println!("      run  arcade  for every command; the desktop app shows the same arcade.\n\nSetup complete.");
 }
 
+/// The phrase for `wallet restore`: typed at a prompt that doesn't show it, or (with a warning:
+/// it stays in the shell's history and shows in the process list) given on the command line.
+fn restore_phrase(words: &[&str], typed: impl FnOnce() -> std::io::Result<String>) -> Result<String, String> {
+    if !words.is_empty() {
+        eprintln!("warning: words on the command line stay in your shell's history and show in the process list; next time run `arcade wallet restore` and type them at the prompt");
+        return Ok(words.join(" "));
+    }
+    let phrase = typed().map_err(|e| format!("could not read the words: {e}"))?.split_whitespace().collect::<Vec<_>>().join(" ");
+    if phrase.is_empty() {
+        return Err("no words given".into());
+    }
+    Ok(phrase)
+}
+
+fn stty(tty: &std::fs::File, arg: &str) -> std::io::Result<()> {
+    let ok = std::process::Command::new("stty").arg(arg).stdin(tty.try_clone()?).status()?.success();
+    if ok { Ok(()) } else { Err(std::io::Error::other("stty failed")) }
+}
+
+/// A line typed at the terminal without showing it; from standard input when there is no
+/// terminal (`arcade wallet restore < file`).
+fn read_hidden(prompt: &str) -> std::io::Result<String> {
+    let mut line = String::new();
+    let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim().to_string());
+    };
+    write!(tty, "{prompt}")?;
+    tty.flush()?;
+    stty(&tty, "-echo")?;
+    let got = BufReader::new(tty.try_clone()?).read_line(&mut line);
+    let _ = stty(&tty, "echo");
+    let _ = writeln!(tty);
+    got.map(|_| line.trim().to_string())
+}
+
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
     let sock = home(&args).join("arcaded.sock");
@@ -234,7 +270,13 @@ fn main() {
         ["status"] => json!({"cmd": "status"}),
         ["peers"] => json!({"cmd": "peers"}),
         ["wallet", "create"] => json!({"cmd": "wallet.create"}),
-        ["wallet", "restore", words @ ..] if !words.is_empty() => json!({"cmd": "wallet.create", "phrase": words.join(" ")}),
+        ["wallet", "restore", words @ ..] => match restore_phrase(words, || read_hidden("Your recovery phrase (not shown as you type): ")) {
+            Ok(phrase) => json!({"cmd": "wallet.create", "phrase": phrase}),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        },
         ["wallet", "phrase"] => json!({"cmd": "wallet.phrase"}),
         ["wallet", "keys"] => json!({"cmd": "wallet.keys"}),
         ["tag", "check", t] => json!({"cmd": "tag.check", "tag": t}),
@@ -362,5 +404,29 @@ fn main() {
     } else {
         eprintln!("error: {}", v["error"].as_str().unwrap_or("unknown"));
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restore_asks_for_the_words_when_none_are_given() {
+        let mut asked = false;
+        let p = restore_phrase(&[], || {
+            asked = true;
+            Ok("  one two\tthree \n".into())
+        });
+        assert_eq!(p.unwrap(), "one two three");
+        assert!(asked);
+        assert!(restore_phrase(&[], || Ok("\n".into())).is_err(), "nothing typed");
+        assert!(restore_phrase(&[], || Err(std::io::Error::other("no terminal"))).is_err());
+    }
+
+    #[test]
+    fn restore_still_takes_words_on_the_command_line() {
+        let p = restore_phrase(&["one", "two", "three"], || panic!("no prompt when the words are given"));
+        assert_eq!(p.unwrap(), "one two three");
     }
 }

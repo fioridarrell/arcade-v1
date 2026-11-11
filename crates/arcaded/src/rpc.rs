@@ -442,8 +442,8 @@ mod tests {
 
     #[test]
     fn each_caller_lists_only_its_own_addresses() {
-        let t = crate::sitesvc::tests::setup();
-        let (a, b) = (crate::sitesvc::tests::addr(&t, 1), crate::sitesvc::tests::addr(&t, 2));
+        let t = crate::sitesvc::tests::shared();
+        let (a, b) = (t.a[0].clone(), t.a[1].clone());
         let peer_a = "aa".repeat(32);
         let peer_b = "bb".repeat(32);
         as_caller(&peer_a, || call_on(&t.node, t.p, "importaddress", &[json!(a)])).unwrap();

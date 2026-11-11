@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn a_ui_frame_that_does_not_verify_changes_nothing() {
-        let t = crate::sitesvc::tests::setup();
+        let t = crate::sitesvc::tests::shared();
         let sk = ed25519_dalek::SigningKey::from_bytes(&[0x51; 32]);
         let from = hex::encode(sk.verifying_key().to_bytes());
         let mut h = json!({"t": "ui", "op": "hi", "to": "ab".repeat(32), "from": from, "n": "0011223344556677",

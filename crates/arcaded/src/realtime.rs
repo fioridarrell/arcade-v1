@@ -169,7 +169,7 @@ fn verify(h: &Value, blob: &[u8]) -> bool {
 #[cfg(test)]
 #[test]
 fn subs_are_capped_per_link_and_routes_in_all() {
-    let t = crate::sitesvc::tests::setup();
+    let t = crate::sitesvc::tests::shared();
     let sub = |i: u32, rooms: &[String]| {
         let mut k = [9u8; 32];
         k[..4].copy_from_slice(&i.to_be_bytes());

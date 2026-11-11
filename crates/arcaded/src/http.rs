@@ -549,9 +549,10 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         // An app on another chain than the home chain (the chain in its pass): its reads answer
         // on that chain (crate::pagechain); this arcade's wallet sends on the home chain only.
         // A program reading for an app on another chain names it (X-Arcade-Chain: <key>): its reads answer on
-        // that chain, as an app page's pass makes them. Reads only (a program's requests are GET/HEAD).
+        // that chain, as an app page's pass makes them (any chain a pass may name: kept, borrowed, or asked of
+        // the mesh). Reads only (a program's requests are GET/HEAD).
         let program_chain = if program {
-            r.headers.get("x-arcade-chain").and_then(|v| v.as_str()).and_then(|k| node.chain_params(k.trim()))
+            r.headers.get("x-arcade-chain").and_then(|v| v.as_str()).and_then(|k| arcade_chain::params::by_key(k.trim()))
         } else {
             None
         };

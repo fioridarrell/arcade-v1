@@ -477,12 +477,14 @@ lock offered below the Thaw Day height, refused.
 ## Coin icons
 
 Inscribed on Pepecoin testnet, 2026-11-10 (JKC and SHIC 2026-11-11, each from its project's own logo in its
-core repo), PNG 96 x 96, by a test account (none of Martin's addresses).
+core repo; ARCADE and ARCADE testnet 2026-11-11, the desktop's green and purple cabinets), PNG 96 x 96, by a test account (none of Martin's addresses).
 `assets` gives these as `icon` for a chain's coin. Each was read back from an original arcade and from
 V1.0 with the source file's SHA-256.
 
 | Coin | Inscription |
 |---|---|
+| ARCADE | `698fa4a636e90278ef6ca3f1b26806e634b9ee323d0350003f2a472a2fa50455` |
+| ARCADE testnet | `e2982d87007506fab2380fbc5cd2003c6ac09b304a670772063affb2a8abf49f` |
 | BEL | `aeb761003d131b0ec643713b9663e00034345bbb4bf9d40744867892b5425ec2` |
 | DD | `44a1c86f8cacccc7227eb4f2fd3ae85ece5a07e99a21cc1157e26bca3d8fa20a` |
 | DD testnet | `e5d1b9dd393681c87170417f3dd9e8245fef7877eb7796a608288f9168433594` |
@@ -516,6 +518,17 @@ On test chains only, between two test arcades in a private network, from test ac
   and ord legs. Live: PEP for DGB, DD for PEP, SWPT (a test PRC-20) for DGB, an inscription for PEP; refunds
   of each side after its time, a token lock and a ledger-token lock each returned to their owner.
 - **One taker at a time:** an order is held for the taker who asked for its terms; a second is refused.
+- **The ARCADE chain's coin** (`arc`, `arctest`) as a leg, for any other leg. ARCADE's scripts take the P2SH
+  hash lock and its signatures are V1.0's legacy ones, but its time locks are block heights only (no clock
+  time). So an ARCADE lock ends at a height worked out from the swap's clock time and the chain's pace over
+  its last 60 blocks: the taker's lock is 4 times the order's time and the maker accepts it only if it lasts
+  3 times even with blocks twice as fast; the maker's lock is 1 time against the taker's 4, so it ends first
+  unless blocks run 3 times slower than lately. Refunds there wait for the height, not the clock. Its waiting
+  transactions are in its own pool (arcsvc). A unit test spends the lock by ARCADE's own script rules (claim,
+  refund at its height, and a refund for an earlier height refused). Live, on a local ARCADE test chain and
+  DigiByte testnet: 100 ARCADEtest for 50 DGBtest (maker's lock on ARCADE) and the reverse (taker's lock on
+  ARCADE), both claimed by both sides; a taker's ARCADE lock refunded at its height when the maker never
+  locked.
 - **Relay:** a swap transaction is sent again, unconfirmed parents first, until a block holds it; outputs
   under the Dogecoin family's 0.01 soft-dust line pay its extra 0.01 each, or peers drop them.
 

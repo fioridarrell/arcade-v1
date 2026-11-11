@@ -18,7 +18,7 @@
 //! tried without waiting hours.
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, ChainParams};
+use arcade_chain::params::ChainParams;
 use arcade_chain::{Hash256, OutPoint, Tx};
 use arcade_ledger::engine as led;
 use arcade_wallet::ddlock::{self, Lock};
@@ -60,8 +60,8 @@ fn list(node: &Node, kind: &str) -> Vec<Value> {
     node.app.store.read(|r| r.scan_prefix(arcade_app::META, format!("{kind}:").as_bytes())).unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_slice(&v).ok()).collect()
 }
 fn chain(node: &Node, k: &str) -> Result<&'static ChainParams, String> {
-    let p = by_key(k).ok_or_else(|| format!("unknown chain {k}"))?;
-    if p.chain_no != node.params.chain_no && !node.extra.lock().unwrap().contains_key(p.key) {
+    let p = crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?;
+    if !crate::chains::kept(node, p) {
         return Err(format!("{} is not installed here: a swap's legs are read on this arcade's own copy", p.name));
     }
     Ok(p)
@@ -82,16 +82,72 @@ fn tx_of(node: &Node, p: &ChainParams, txid: &Hash256) -> Option<Tx> {
     if let Ok(Some((raw, _))) = node.chain.tx_raw(p, txid) {
         return Tx::parse_with(&raw, &p.format).ok();
     }
+    if crate::arcsvc::runs(p) {
+        return crate::arcsvc::waiting(usize::MAX).into_iter().filter_map(|raw| Tx::parse_with(&raw, &p.format).ok()).find(|t| &t.txid == txid);
+    }
     node.chain.mempool(p.chain_no).ok()?.into_iter().filter_map(|(_, raw)| Tx::parse_with(&raw, &p.format).ok()).find(|t| &t.txid == txid)
+}
+/// The waiting transaction spending `op`, in the chain's own pool.
+fn pool_spender(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<Hash256> {
+    if crate::arcsvc::runs(p) {
+        return crate::arcsvc::spender(op);
+    }
+    node.chain.mempool_spender(p.chain_no, op).ok().flatten()
 }
 fn spender(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<Tx> {
     if let Ok(Some((b, pos, _))) = node.chain.spender(p, op) {
         return tx_of(node, p, &node.chain.txid_at(p, b, pos).ok().flatten()?);
     }
-    tx_of(node, p, &node.chain.mempool_spender(p.chain_no, op).ok().flatten()?)
+    tx_of(node, p, &pool_spender(node, p, op)?)
 }
 fn h256(v: &Value) -> Result<Hash256, String> {
     Hash256::from_hex(v.as_str().unwrap_or("")).map_err(|_| "bad txid".to_string())
+}
+
+// ---------------- the ARCADE chain ----------------
+//
+// The ARCADE chain (crates/arcade-arc) runs its own pool, and its time locks are block heights only (it has no
+// clock-time locks: arcade-arc script.rs, OP_CHECKLOCKTIMEVERIFY). So a lock on it ends at a height, worked out
+// from the clock time the swap gives that lock and the chain's own recent pace, with margins either way:
+// a taker's lock (the long one) is made 4 times the order's time and the maker accepts it at 3 times, counting
+// blocks twice as fast as lately; a maker's lock is 1 time, while the taker's clock lock is 4, so the maker's
+// height comes first unless blocks run 3 times slower than lately. Its signatures are V1.0's legacy ones, so
+// the hash lock (htlc.rs) is spent as on the Dogecoin family.
+
+/// A chain whose locks are block heights (the ARCADE chain).
+fn by_height(p: &ChainParams) -> bool {
+    arcade_chain::params::ARCADE_CHAINS.iter().any(|(_, k)| *k == p.key)
+}
+/// How many times the order's time a taker's lock lasts: 4 when a leg is on the ARCADE chain (see above), else 2.
+fn taker_factor(o: &Value) -> u32 {
+    let h = |l: &Value| crate::chains::find(l["chain"].as_str().unwrap_or("")).is_some_and(by_height);
+    if h(&o["give"]) || h(&o["get"]) { 4 } else { 2 }
+}
+fn tip_height(node: &Node, p: &ChainParams) -> u32 {
+    node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0)
+}
+/// Seconds per block over the last 60 blocks here (at least 1), else the ARCADE chain's 150.
+fn block_secs(node: &Node, p: &ChainParams) -> u32 {
+    let tip = tip_height(node, p);
+    let time = |h: u32| node.chain.hash_at(p.chain_no, h).ok().flatten().and_then(|id| node.chain.header(p.chain_no, &id).ok().flatten()).map(|r| r.header.time);
+    if tip > 60 {
+        if let (Some(a), Some(b)) = (time(tip - 60), time(tip)) {
+            return (b.saturating_sub(a) / 60).max(1);
+        }
+    }
+    arcade_arc::params::BLOCK_SECONDS as u32
+}
+/// The height a lock on `p` ends at for `secs` from now.
+fn height_for(node: &Node, p: &ChainParams, secs: u32) -> u32 {
+    tip_height(node, p) + secs.div_ceil(block_secs(node, p)).max(6)
+}
+/// Whether a lock's end has come: its height is mined over (a refund can go in the next block), or its time is past.
+fn ended(node: &Node, p: &ChainParams, spec_time: u32) -> bool {
+    if by_height(p) {
+        tip_height(node, p) >= spec_time
+    } else {
+        now() > spec_time + 600
+    }
 }
 
 /// Send a transaction on a chain: through this arcade's own pool on its home chain, else to the chain's peers. It is
@@ -110,7 +166,7 @@ fn relay(node: &Node) {
     for (k, v) in rows {
         let name = String::from_utf8_lossy(&k[9..]).to_string();
         let Some((chain, txid)) = name.split_once(':') else { continue };
-        let (Some(p), Ok(h)) = (by_key(chain), Hash256::from_hex(txid)) else { continue };
+        let (Some(p), Ok(h)) = (crate::chains::find(chain), Hash256::from_hex(txid)) else { continue };
         let at = u32::from_le_bytes(v[..4].try_into().unwrap_or([0; 4]));
         if depth(node, p, &h) >= 1 || now() > at + 86_400 {
             let _ = node.app.store.write(|w| w.del(arcade_app::META, &k));
@@ -120,7 +176,10 @@ fn relay(node: &Node) {
             continue;
         }
         if let Ok(tx) = Tx::parse_with(&v[4..], &p.format) {
-            if p.chain_no == node.params.chain_no {
+            if crate::arcsvc::runs(p) {
+                // Its own pool hands it on; one it holds already is refused, which is fine.
+                let _ = crate::arcsvc::send_raw(&tx.raw);
+            } else if p.chain_no == node.params.chain_no {
                 // Its unconfirmed parents first, oldest first: a peer drops a child whose parent it hasn't seen.
                 for parent in ancestors(node, p, &tx) {
                     node.tx_outbox.lock().unwrap().push(parent);
@@ -155,6 +214,9 @@ fn ancestors(node: &Node, p: &ChainParams, tx: &Tx) -> Vec<Vec<u8>> {
 }
 
 fn relay_once(node: &Node, p: &ChainParams, tx: &Tx) -> Result<String, String> {
+    if crate::arcsvc::runs(p) {
+        return Ok(crate::arcsvc::send_raw(&tx.raw)?.0.to_hex());
+    }
     if p.chain_no == node.params.chain_no {
         if !crate::mempoolshare::add(node, p, tx) {
             return Err("refused: its coins are spent by another waiting transaction".into());
@@ -182,7 +244,8 @@ fn coins(node: &Node, p: &ChainParams, pk: &PublicKey) -> Vec<Utxo> {
                 .coins_for_script(p, &script)
                 .unwrap_or_default()
                 .into_iter()
-                .filter(|(op, _, _)| node.chain.mempool_spender(p.chain_no, op).ok().flatten().is_none())
+                .filter(|(op, _, _)| pool_spender(node, p, op).is_none())
+                .filter(|(op, _, _)| !node.chain.coin(p, op).ok().flatten().is_some_and(|c| c.coinbase && c.height + p.coinbase_maturity > tip_height(node, p)))
                 .map(|(op, value, _)| Utxo { outpoint: op, value, script: script.clone() })
                 .collect()
         };
@@ -271,6 +334,9 @@ fn leg_ok(node: &Node, leg: &Value) -> Result<&'static ChainParams, String> {
     let kind = leg["kind"].as_str().unwrap_or("");
     if !KINDS.contains(&kind) {
         return Err(format!("a leg is one of {KINDS:?}"));
+    }
+    if by_height(p) && kind != "coin" {
+        return Err("on the ARCADE chain a leg is its coin".into());
     }
     if kind == "dd" && !matches!(p.key, "dgb" | "dgbtest") {
         return Err("DigiDollars are on dgb or dgbtest".into());
@@ -582,8 +648,13 @@ fn specs(s: &Value) -> Result<(Spec, Spec), String> {
         hex::decode(s[who][ch].as_str().unwrap_or("")).map_err(|_| format!("no {who} key on {ch}"))
     };
     // The taker locks the order's `get`: the maker claims it. The maker locks `give`: the taker claims it.
-    let taker = Spec { hash, claimer: k("maker_keys", "get")?, refunder: k("taker_keys", "get")?, time: s["taker_time"].as_u64().unwrap_or(0) as u32 };
-    let maker = Spec { hash, claimer: k("taker_keys", "give")?, refunder: k("maker_keys", "give")?, time: s["maker_time"].as_u64().unwrap_or(0) as u32 };
+    // A lock on the ARCADE chain ends at its height, any other at its clock time.
+    let end = |leg: &str, clock: &str, height: &str| {
+        let h = crate::chains::find(s["order"][leg]["chain"].as_str().unwrap_or("")).is_some_and(by_height);
+        s[if h { height } else { clock }].as_u64().unwrap_or(0) as u32
+    };
+    let taker = Spec { hash, claimer: k("maker_keys", "get")?, refunder: k("taker_keys", "get")?, time: end("get", "taker_time", "taker_height") };
+    let maker = Spec { hash, claimer: k("taker_keys", "give")?, refunder: k("maker_keys", "give")?, time: end("give", "maker_time", "maker_height") };
     Ok((taker, maker))
 }
 
@@ -606,6 +677,20 @@ fn maker_begin(node: &Node, q: &Value) -> Result<Value, String> {
     let mut s = json!({"id": id, "role": "maker", "order": o, "peer": q["taker"], "maker_keys": keys_for(node, &[&o["give"], &o["get"]])?,
                        "taker_keys": q["taker_keys"], "taker_time": taker_time, "maker_time": now() + maker_secs(),
                        "taker_lock": q["taker_lock"], "maker_lock": {"step": "start"}, "step": "locking", "at": arcade_app::now()});
+    // On the ARCADE chain: the taker's height must last 3 times the order's time even with blocks twice as fast as
+    // lately; this side's own lock ends at the height of 1 time (see by_height).
+    let gp = leg_ok(node, &o["get"])?;
+    if by_height(gp) {
+        let h = q["taker_height"].as_u64().ok_or("give the lock height")? as u32;
+        if h < tip_height(node, gp) + (3 * maker_secs()).div_ceil(block_secs(node, gp)) {
+            return Err("that lock ends too soon".into());
+        }
+        s["taker_height"] = json!(h);
+    }
+    let gv = leg_ok(node, &o["give"])?;
+    if by_height(gv) {
+        s["maker_height"] = json!(height_for(node, gv, maker_secs()));
+    }
     let (tspec, _) = specs(&s)?;
     match seen(node, &o["get"], &tspec, &s["taker_lock"]) {
         Ok(true) => {}
@@ -637,9 +722,14 @@ pub fn take(node: &Node, maker: &str, order: &str) -> Result<Value, String> {
     let secret: [u8; 32] = arcade_mesh::random::bytes();
     let id = hex::encode(Sha256::digest(secret));
     let secs = quote["maker_secs"].as_u64().unwrap_or(4 * 3600) as u32;
-    let s = json!({"id": id, "role": "taker", "order": o, "peer": maker, "secret": hex::encode(secret), "maker_keys": quote["maker_keys"],
-                   "taker_keys": keys_for(node, &[&o["give"], &o["get"]])?, "taker_time": now() + 2 * secs,
+    let f = taker_factor(&o);
+    let mut s = json!({"id": id, "role": "taker", "order": o, "peer": maker, "secret": hex::encode(secret), "maker_keys": quote["maker_keys"],
+                   "taker_keys": keys_for(node, &[&o["give"], &o["get"]])?, "taker_time": now() + f * secs,
                    "taker_lock": {"step": "start"}, "step": "locking", "at": arcade_app::now()});
+    let gp = leg_ok(node, &o["get"])?;
+    if by_height(gp) {
+        s["taker_height"] = json!(height_for(node, gp, f * secs));
+    }
     put(node, "swap", &s);
     Ok(public(&s))
 }
@@ -662,7 +752,7 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
     let t = now();
     if s["role"] == "taker" {
         // The taker's own lock comes back after its time if the swap never finished.
-        if s["step"] != "claimed" && s["taker_lock"]["step"] == "locked" && t > tspec.time + 600 {
+        if s["step"] != "claimed" && s["taker_lock"]["step"] == "locked" && ended(node, leg_ok(node, &get_leg)?, tspec.time) {
             if spent_secret(node, &get_leg, &tspec, &s["taker_lock"])?.is_none() {
                 s["refund_tx"] = json!(spend(node, &get_leg, &tspec, &s["taker_lock"], None)?);
                 s["step"] = json!("refunded");
@@ -683,7 +773,7 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
                     return Ok(());
                 }
                 let q = json!({"op": "slocked", "chain": "dgbtest", "order": s["order"]["id"], "hash": s["id"], "taker": node.id_hex(),
-                               "taker_keys": s["taker_keys"], "taker_time": s["taker_time"], "taker_lock": s["taker_lock"]});
+                               "taker_keys": s["taker_keys"], "taker_time": s["taker_time"], "taker_height": s["taker_height"], "taker_lock": s["taker_lock"]});
                 match ask(node, s["peer"].as_str().unwrap_or(""), q) {
                     Ok(_) => s["step"] = json!("waiting"),
                     Err(e) => s["last"] = json!(e),
@@ -698,8 +788,9 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
                 // The maker's lock time comes from its own record here; never claim too close to it.
                 let mut mspec = mspec;
                 mspec.time = a["maker_lock"]["time"].as_u64().unwrap_or(0) as u32;
-                s["maker_time"] = json!(mspec.time);
-                if mspec.time < t + 120 {
+                let gv = leg_ok(node, &give)?;
+                s[if by_height(gv) { "maker_height" } else { "maker_time" }] = json!(mspec.time);
+                if if by_height(gv) { mspec.time <= tip_height(node, gv) + 3 } else { mspec.time < t + 120 } {
                     s["last"] = json!("the maker's lock ends too soon to claim safely");
                     return Ok(());
                 }
@@ -726,11 +817,10 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
         }
         "locking" => {
             let mut st = s["maker_lock"].clone();
-            let mut mspec = mspec;
-            mspec.time = s["maker_time"].as_u64().unwrap_or(0) as u32;
             lock_step(node, &give, &mspec, &mut st)?;
             if st["step"] == "locked" {
-                st["time"] = s["maker_time"].clone();
+                // The lock's end as its script has it: a height on the ARCADE chain, else a clock time.
+                st["time"] = json!(mspec.time);
                 s["step"] = json!("locked");
             }
             s["maker_lock"] = st;
@@ -741,7 +831,7 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
                 s["step"] = json!("claimed");
             }
             Some(None) => s["step"] = json!("refunded"),
-            None if t > mspec.time + 600 => {
+            None if ended(node, leg_ok(node, &give)?, mspec.time) => {
                 s["refund_tx"] = json!(spend(node, &give, &mspec, &s["maker_lock"], None)?);
                 s["step"] = json!("refunded");
             }
@@ -769,4 +859,39 @@ pub fn start(node: Arc<Node>) {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod arcade_lock_tests {
+    use arcade_chain::{Hash256, OutPoint, Tx};
+    use arcade_wallet::htlc::{self, Htlc};
+    use arcade_wallet::secp256k1::{PublicKey, SecretKey, SECP256K1};
+    use sha2::{Digest, Sha256};
+
+    /// The hash lock as swaps make it, spent on the ARCADE chain: its claim and its refund (a height lock) pass
+    /// ARCADE's own script rules (arcade-arc script.rs), and a refund before its height doesn't.
+    #[test]
+    fn hash_lock_spends_by_arcade_rules() {
+        let p = arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &Hash256::ZERO);
+        let (a, b) = (SecretKey::from_slice(&[3u8; 32]).unwrap(), SecretKey::from_slice(&[4u8; 32]).unwrap());
+        let pk = |k: &SecretKey| PublicKey::from_secret_key(SECP256K1, k).serialize().to_vec();
+        let secret = [9u8; 32];
+        let lock = Htlc { hash: Sha256::digest(secret).into(), claimer: pk(&a), refunder: pk(&b), time: 1_000 };
+        let coin = [(OutPoint { txid: Hash256([7; 32]), vout: 0 }, 50_000_000u64)];
+        let to = arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk(&a)));
+        let outs = htlc::pay_out(&coin, &to, htlc::SPEND_FEE).unwrap();
+        let check = |raw: &[u8]| {
+            let tx = Tx::parse_with(raw, &p.format).unwrap();
+            let mut n = 0;
+            (arcade_arc::script::verify_input(&tx, 0, &lock.script(), &mut n), tx)
+        };
+        let (ok, _) = check(&htlc::claim(p, &lock, &coin, outs.clone(), &secret, &a).unwrap());
+        assert!(ok.is_ok(), "claim: {ok:?}");
+        let (ok, tx) = check(&htlc::refund(p, &lock, &coin, outs.clone(), &b).unwrap());
+        assert!(ok.is_ok(), "refund: {ok:?}");
+        assert!(!arcade_arc::coins::unlocked(&tx, 1_000) && arcade_arc::coins::unlocked(&tx, 1_001));
+        let early = Htlc { time: 999, ..lock.clone() };
+        let (ok, _) = check(&htlc::refund(p, &early, &coin, outs, &b).unwrap());
+        assert!(ok.is_err(), "a refund signed for an earlier height must not spend this lock");
+    }
 }

@@ -133,12 +133,26 @@ pub fn learn(node: &Node, net: &str, addrs: &[(String, u64)], src: &str) {
 /// recently heard of first), then those that failed but have rested. Resting ones are left out.
 /// ARCADE_COIN_PEERS=host:port,...: coin peers tried before any other (tests on one machine,
 /// where a test arcade's only way to a chain is a local node).
-fn forced() -> Vec<String> {
-    std::env::var("ARCADE_COIN_PEERS").map(|v| v.split(',').map(str::trim).filter(|a| !a.is_empty()).map(String::from).collect()).unwrap_or_default()
+/// An entry may name its chain, `net=host:port` (e.g. `test=127.0.0.1:44874,dgbtest=127.0.0.1:12033`); a bare
+/// one is for every chain.
+pub(crate) fn forced(net: &str) -> Vec<String> {
+    std::env::var("ARCADE_COIN_PEERS")
+        .map(|v| {
+            v.split(',')
+                .map(str::trim)
+                .filter_map(|a| match a.split_once('=') {
+                    Some((n, h)) => (n == net).then_some(h),
+                    None => Some(a),
+                })
+                .filter(|a| !a.is_empty())
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 pub fn candidates(node: &Node, net: &str) -> Vec<String> {
-    let first = forced();
+    let first = forced(net);
     if !first.is_empty() {
         return first;
     }

@@ -45,6 +45,7 @@
     assets: function (a) { return read('assets', a); },
     terms: function (a) { return read('terms', a); },
     mine: function (a) { return read('mine', a); },
+    holdings: function (a) { return read('holdings', a); },
     /* {give, get}: an order resting on the book at the price give/get. */
     place: function (a) { return write('place', a); },
     /* {order}: take back one of this wallet's orders. */

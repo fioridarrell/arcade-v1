@@ -559,12 +559,8 @@ pub(crate) fn file_market(node: &Node, page: &str, what: &str, to: Option<String
 fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
     let p = node.params;
     if r["kind"] == "market" {
-        let (tx, from, fee) = crate::marketsvc::build(node, &r["market"], send)?;
-        let outs: Vec<Value> = tx.outputs.iter().map(|o| {
-            let a = arcade_ledger::address::address_of(&o.script_pubkey, p);
-            json!({"address": a, "value": o.value, "mine": a.as_deref().is_some_and(|a| a == from), "data": a.is_none()})
-        }).collect();
-        return Ok((tx.txid.to_hex(), fee, outs));
+        // An order, cancel or take (marketsvc.rs): (txid, fee, outputs) as the card shows them.
+        return crate::marketsvc::build_request(node, &r["market"], send);
     }
     let to = r["to"].as_str().unwrap_or("");
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or("bad address")?;

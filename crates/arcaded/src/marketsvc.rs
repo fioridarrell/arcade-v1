@@ -381,10 +381,79 @@ fn mine(node: &Node) -> Value {
     json!({"orders": mine, "swaps": [], "listings": [], "offers": []})
 }
 
+/// What this wallet can pay with, per market: the home coin and tokens (free units), and on an installed
+/// DigiByte chain its DigiDollars (cents) and DGB (satoshis).
+fn holdings(node: &Node) -> Value {
+    let ours = crate::walletsvc::ours(node);
+    let mut coin = 0u64;
+    for a in &ours {
+        if let Some(sc) = arcade_ledger::address::p2pkh_script_for_address(node.params, a) {
+            coin += crate::claims::spendable(node, &sc).iter().map(|u| u.value).sum::<u64>();
+        }
+    }
+    let mut tokens: std::collections::BTreeMap<u32, u64> = Default::default();
+    for a in &ours {
+        for (pid, u) in led::holdings(&node.chain, c(node), a) {
+            *tokens.entry(pid).or_default() += u;
+        }
+    }
+    let mut out = vec![json!({"network": node.params.key, "kind": "coin", "asset": "coin", "amount": coin, "name": crate::explorer::unit(node.params)})];
+    for (pid, u) in tokens {
+        let mut a = asset(node, pid);
+        a["amount"] = json!(u);
+        out.push(a);
+    }
+    for chain in ["dgbtest", "dgb"] {
+        let Some(p) = crate::ddmarket::dd_chain(chain) else { continue };
+        if !node.extra.lock().unwrap().contains_key(chain) {
+            continue;
+        }
+        if let Ok((_, held, dgb, ..)) = crate::ddsvc::trade_coins(node, p) {
+            let unit = if chain == "dgb" { "DGB" } else { "DGBtest" };
+            out.push(json!({"network": chain, "kind": "dd", "asset": "DD", "name": "DigiDollar", "divisible": false, "decimals": 0, "unit_cents": 100, "amount": held.iter().map(|h| h.cents).sum::<i64>()}));
+            out.push(json!({"network": chain, "kind": "coin", "asset": unit, "name": unit, "amount": dgb.iter().map(|u| u.value).sum::<u64>()}));
+        }
+    }
+    json!(out)
+}
+
 /// One read by name, with its arguments (the socket API and /r/market/<name>).
 pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, String> {
     match name {
-        "markets" | "pairs" => Ok(json!(markets(node))),
+        "markets" | "pairs" => {
+            let mut all = markets(node);
+            for chain in ["dgbtest", "dgb"] {
+                let installed = node.extra.lock().unwrap().contains_key(chain);
+                if !installed {
+                    continue;
+                }
+                let n = crate::ddmarket::book(node, chain).map(|b| b.len()).unwrap_or(0);
+                let unit = if chain == "dgb" { "DGB" } else { "DGBtest" };
+                all.push(json!({"base": {"network": chain, "kind": "dd", "asset": "DD", "name": "DigiDollar", "divisible": false, "decimals": 0, "unit_cents": 100},
+                                "quote": {"network": chain, "kind": "coin", "asset": unit, "name": unit, "divisible": true},
+                                "venue": "dd", "last": Value::Null, "change_24h": Value::Null, "volume_24h": 0, "orders": n}));
+            }
+            Ok(json!(all))
+        }
+        "book" if q.get("base").and_then(|v| v.as_str()).is_some_and(|s| s.eq_ignore_ascii_case("dd")) || q.get("quote").and_then(|v| v.as_str()).is_some_and(|s| s.eq_ignore_ascii_case("dd")) => {
+            let chain = q.get("network").and_then(|v| v.as_str()).unwrap_or("dgbtest");
+            let orders = crate::ddmarket::book(node, chain)?;
+            // DD as the base, priced in DGB per dollar: asks are makers selling dollars, bids makers buying.
+            let row = |o: &Value| {
+                let (c, d) = (o["cents"].as_i64().unwrap_or(1).max(1), o["dgb"].as_u64().unwrap_or(0));
+                json!({"order": o["order"], "maker": o["node"], "base": o["left"], "quote": (d as u128 * o["left"].as_i64().unwrap_or(0) as u128 / c as u128) as u64,
+                       "price": {"num": d, "den": c, "each": d as f64 / c as f64}, "pending": false, "taking": 0,
+                       "venue": "dd", "live": true, "partial": true, "min": 100, "step": 100, "node": o["node"], "mine": o["mine"]})
+            };
+            let mut asks: Vec<Value> = orders.iter().filter(|o| o["side"] == "sell").map(row).collect();
+            let mut bids: Vec<Value> = orders.iter().filter(|o| o["side"] == "buy").map(row).collect();
+            asks.sort_by(|a, b| a["price"]["each"].as_f64().partial_cmp(&b["price"]["each"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+            bids.sort_by(|a, b| b["price"]["each"].as_f64().partial_cmp(&a["price"]["each"].as_f64()).unwrap_or(std::cmp::Ordering::Equal));
+            let unit = if chain == "dgb" { "DGB" } else { "DGBtest" };
+            Ok(json!({"base": {"network": chain, "kind": "dd", "asset": "DD", "name": "DigiDollar", "divisible": false, "decimals": 0, "unit_cents": 100, "icon": coin_icon(if chain == "dgb" { "dd" } else { "ddtest" })},
+                      "quote": {"network": chain, "kind": "coin", "asset": unit, "name": unit, "divisible": true, "icon": coin_icon(chain)},
+                      "asks": asks, "bids": bids, "spread": Value::Null}))
+        }
         "book" => {
             let (base, quote) = pair_of(node, q)?;
             let (orders, pool) = standing(node, num(q, "pool", 1) != 0);
@@ -409,6 +478,7 @@ pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, St
         "assets" => Ok(json!(assets(node, q.get("q").and_then(|v| v.as_str()).unwrap_or("")))),
         "terms" => terms_read(node, q),
         "mine" => Ok(mine(node)),
+        "holdings" => Ok(holdings(node)),
         _ => Err(format!("{name} is not a market read")),
     }
 }
@@ -501,6 +571,9 @@ fn holder(node: &Node, pid: u32, units: u64) -> Option<String> {
 
 /// The terms of a market request, checked against the book now: (what it says, the maker paid if a take).
 fn terms(node: &Node, m: &Value) -> Result<(String, Option<String>), String> {
+    if let Some(chain) = dd_network(m) {
+        return dd_terms(node, chain, m);
+    }
     match m["op"].as_str().unwrap_or("") {
         "place" => {
             let (sale, sa) = write_side(node, &m["give"])?;
@@ -574,6 +647,135 @@ fn take_terms(node: &Node, m: &Value) -> Result<(Order, u64, u64), String> {
     Ok((o, units, need))
 }
 
+// ---------------- DigiDollar for DGB (ddmarket.rs) ----------------
+
+/// The DigiByte chain a market request names when it trades DigiDollars: `network` dgb or dgbtest, or a
+/// side whose asset is "DD".
+fn dd_network(m: &Value) -> Option<&'static str> {
+    let net = m["network"].as_str().unwrap_or("");
+    let dd_side = [&m["give"]["asset"], &m["get"]["asset"]].iter().any(|a| a.as_str().is_some_and(|s| s.eq_ignore_ascii_case("dd")));
+    match net {
+        "dgb" | "dgbtest" => Some(crate::ddmarket::dd_chain(net).map(|p| p.key).unwrap_or("dgbtest")),
+        _ if dd_side => Some("dgbtest"),
+        _ => None,
+    }
+    .filter(|_| dd_side || m["op"] != "place")
+}
+
+fn dollars(c: i64) -> String {
+    format!("${}.{:02} DigiDollar", c / 100, c % 100)
+}
+
+fn dgb_words(chain: &str, sats: u64) -> String {
+    format!("{} {}", arcade_ledger::amount::token_plain(true, sats), if chain == "dgb" { "DGB" } else { "DGBtest" })
+}
+
+/// A DigiDollar place: (maker side "sell"|"buy", cents, DGB satoshis).
+fn dd_place_terms(m: &Value) -> Result<(&'static str, i64, u64), String> {
+    let is_dd = |v: &Value| v["asset"].as_str().is_some_and(|s| s.eq_ignore_ascii_case("dd"));
+    let n = |v: &Value| units_of(&v["amount"]).ok_or("an amount is a whole number above zero (cents for DD, satoshis for DGB)");
+    if is_dd(&m["give"]) && !is_dd(&m["get"]) {
+        Ok(("sell", n(&m["give"])? as i64, n(&m["get"])?))
+    } else if is_dd(&m["get"]) && !is_dd(&m["give"]) {
+        Ok(("buy", n(&m["get"])? as i64, n(&m["give"])?))
+    } else {
+        Err("a DigiDollar order gives DD for DGB or DGB for DD".into())
+    }
+}
+
+/// The order a DigiDollar take names, from its maker's book.
+fn dd_order(node: &Node, chain: &str, m: &Value) -> Result<Value, String> {
+    let id = m["order"].as_str().unwrap_or("");
+    crate::ddmarket::book(node, chain)?
+        .into_iter()
+        .find(|o| o["order"] == id && m["node"].as_str().is_none_or(|n| n.is_empty() || o["node"] == n))
+        .ok_or_else(|| "that DigiDollar order is not on the book now".to_string())
+}
+
+fn dd_terms(node: &Node, chain: &str, m: &Value) -> Result<(String, Option<String>), String> {
+    match m["op"].as_str().unwrap_or("") {
+        "place" => {
+            let (side, cents, dgb) = dd_place_terms(m)?;
+            let said = if side == "sell" { format!("sell {} for {}", dollars(cents), dgb_words(chain, dgb)) } else { format!("buy {} for {}", dollars(cents), dgb_words(chain, dgb)) };
+            Ok((format!("a DigiDollar order to {said}. This arcade fills it by itself, part or whole ($1 or more), until it is filled or cancelled"), None))
+        }
+        "take" => {
+            let o = dd_order(node, chain, m)?;
+            let cents = units_of(&m["amount"]).ok_or("give the dollars to fill, in cents")? as i64;
+            crate::ddmarket::fill_ok(&o, cents)?;
+            let price = crate::ddmarket::fill_price(&o, cents);
+            let said = if o["side"] == "sell" { format!("buy {} for {}", dollars(cents), dgb_words(chain, price)) } else { format!("sell {} for {}", dollars(cents), dgb_words(chain, price)) };
+            Ok((format!("a DigiDollar trade: {said}, in one transaction both sides sign"), o["node"].as_str().map(String::from)))
+        }
+        "cancel" => {
+            let id = m["order"].as_str().unwrap_or("");
+            let o = crate::ddmarket::orders(node, Some(chain), false).into_iter().find(|o| o["id"] == id).ok_or("that is not an open DigiDollar order of this arcade's")?;
+            Ok((format!("a cancel of your DigiDollar order ({} left)", dollars(o["left"].as_i64().unwrap_or(0))), None))
+        }
+        op => Err(format!("{op} is not a market write")),
+    }
+}
+
+/// What a market request does when approved, as the card shows it: (txid or order id, fee, outputs).
+pub fn build_request(node: &Node, m: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
+    if let Some(chain) = dd_network(m) {
+        let p = crate::ddmarket::dd_chain(chain).ok_or("not a DigiDollar chain")?;
+        terms(node, m)?;
+        return match m["op"].as_str().unwrap_or("") {
+            "place" => {
+                if !send {
+                    return Ok((String::new(), 0, vec![]));
+                }
+                let (side, cents, dgb) = dd_place_terms(m)?;
+                let o = crate::ddmarket::place(node, chain, side, cents, dgb, m["expires"].as_u64())?;
+                Ok((format!("order:{}", o["id"].as_str().unwrap_or("")), 0, vec![]))
+            }
+            "cancel" => {
+                if send {
+                    crate::ddmarket::cancel(node, m["order"].as_str().unwrap_or(""))?;
+                }
+                Ok((String::new(), 0, vec![]))
+            }
+            _ => {
+                let o = dd_order(node, chain, m)?;
+                let maker = o["node"].as_str().unwrap_or("").to_string();
+                let cents = units_of(&m["amount"]).ok_or("give the dollars to fill, in cents")? as i64;
+                let (tx_outs, txid, fee) = if send {
+                    let (tx, fee) = crate::ddmarket::take(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents)?;
+                    (tx.outputs.iter().map(|o| (o.value, o.script_pubkey.clone())).collect::<Vec<_>>(), tx.txid.to_hex(), fee)
+                } else {
+                    let (_, u, ..) = crate::ddmarket::ask_fill(node, chain, &maker, m["order"].as_str().unwrap_or(""), cents)?;
+                    (u.outs.iter().map(|o| (o.value, o.script.clone())).collect(), String::new(), u.fee)
+                };
+                let (_, _, _, dd_script, change) = crate::ddsvc::trade_coins(node, p)?;
+                let outs = tx_outs
+                    .iter()
+                    .map(|(v, s)| {
+                        let dollars = *v == 0 && s.len() == 34 && s[0] == 0x51 && s[1] == 0x20;
+                        let a = if dollars {
+                            s[2..34].try_into().ok().map(|k: [u8; 32]| arcade_ledger::digidollar::address(&k, p.key == "dgbtest"))
+                        } else {
+                            arcade_ledger::address::wallet_address_of(s, p)
+                        };
+                        json!({"address": a, "value": v, "mine": s == &change || s == &dd_script, "data": s.first() == Some(&0x6a), "dollars": dollars})
+                    })
+                    .collect();
+                Ok((txid, fee, outs))
+            }
+        };
+    }
+    let (tx, from, fee) = build(node, m, send)?;
+    let outs: Vec<Value> = tx
+        .outputs
+        .iter()
+        .map(|o| {
+            let a = arcade_ledger::address::address_of(&o.script_pubkey, node.params);
+            json!({"address": a, "value": o.value, "mine": a.as_deref().is_some_and(|a| a == from), "data": a.is_none()})
+        })
+        .collect();
+    Ok((tx.txid.to_hex(), fee, outs))
+}
+
 /// POST /r/market/<op>: file a market request in the wallet's approval queue.
 pub fn file(node: &Node, page: &str, op: &str, body: &Value) -> (u16, Value) {
     let mut m = body.clone();
@@ -582,7 +784,8 @@ pub fn file(node: &Node, page: &str, op: &str, body: &Value) -> (u16, Value) {
         Ok(t) => t,
         Err(e) => return (400, json!({"ok": false, "error": e})),
     };
-    let market = json!({"op": op, "give": m["give"], "get": m["get"], "order": m["order"], "amount": m["amount"]});
+    let market = json!({"op": op, "give": m["give"], "get": m["get"], "order": m["order"], "amount": m["amount"],
+                        "network": m["network"], "node": m["node"], "expires": m["expires"]});
     crate::walletsvc::file_market(node, page, &what, to, market)
 }
 

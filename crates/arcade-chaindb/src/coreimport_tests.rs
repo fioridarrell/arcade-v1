@@ -335,7 +335,7 @@ fn the_re_check_on_disk_matches_replay() {
 fn coins_not_in_our_blocks_are_refused() {
     let e = env(20);
     let c = e.p.chain_no;
-    let attacker = script(250, 0);
+    let stranger = script(250, 0);
     let forgeries: Vec<(&str, Box<dyn Fn(&mut Vec<ImportCoin>)>)> = vec![
         ("a higher value", Box::new(|v: &mut Vec<ImportCoin>| v[5].value += 1)),
         ("another script", Box::new(|v: &mut Vec<ImportCoin>| v[5].script = script(250, 0))),
@@ -364,7 +364,7 @@ fn coins_not_in_our_blocks_are_refused() {
         assert!(r.is_err(), "{what}");
         assert_eq!((table(&db, OUTPUTS), db.tip(c).unwrap()), before, "{what}: nothing written");
         assert!(db.state_text(c, TRUSTED).unwrap().is_none() && db.import_pending(c).unwrap().is_none(), "{what}");
-        assert!(db.coins_for_script(e.p, &attacker).unwrap().is_empty() && db.balance_for_script(c, &attacker).unwrap() == 0, "{what}");
+        assert!(db.coins_for_script(e.p, &stranger).unwrap().is_empty() && db.balance_for_script(c, &stranger).unwrap() == 0, "{what}");
         // The honest set goes in.
         let mut it = e.coins.clone().into_iter();
         db.import_coins(e.p, &path, 20, &mut || Ok(it.next()), "{}", &tmp, &AtomicBool::new(false), &mut |_| {}).unwrap();
@@ -388,13 +388,13 @@ fn coins_by_position_are_checked_against_their_blocks() {
             }
         }
     }
-    let attacker = script(251, 0);
+    let stranger = script(251, 0);
     let mut fake_value = recs.clone();
     fake_value[4].3 *= 1000;
     let mut fake_script = recs.clone();
-    fake_script[4].5 = attacker.clone();
+    fake_script[4].5 = stranger.clone();
     let mut fake_vout = recs.clone();
-    fake_vout.push((3, 0, 9, 5_000_000, true, attacker.clone()));
+    fake_vout.push((3, 0, 9, 5_000_000, true, stranger.clone()));
     let mut spendable_return = recs.clone();
     spendable_return.push((4, 0, 0, 0, false, vec![0x6a]));
     for (what, set, ok) in [("honest", &recs, true), ("value", &fake_value, false), ("script", &fake_script, false), ("vout", &fake_vout, false), ("op_return", &spendable_return, false)] {
@@ -413,7 +413,7 @@ fn coins_by_position_are_checked_against_their_blocks() {
             assert!(db.state_text(c, TRUSTED).unwrap().is_some(), "unspent is still the copy's word until re-checked");
         } else {
             assert!(table(&db, OUTPUTS) == before, "{what}: nothing written");
-            assert!(db.coins_for_script(e.p, &attacker).unwrap().is_empty() && db.balance_for_script(c, &attacker).unwrap() == 0);
+            assert!(db.coins_for_script(e.p, &stranger).unwrap().is_empty() && db.balance_for_script(c, &stranger).unwrap() == 0);
         }
     }
 }

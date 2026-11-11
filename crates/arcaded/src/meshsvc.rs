@@ -742,7 +742,7 @@ mod tests {
     #[test]
     fn only_public_addresses_are_dialed_from_gossip() {
         for (h, p) in [
-            ("127.0.0.1", 8421), ("10.1.2.3", 8421), ("172.16.0.9", 8421), ("192.168.1.25", 8421), ("169.254.1.1", 8421),
+            ("127.0.0.1", 8421), ("10.1.2.3", 8421), ("172.16.0.9", 8421), ("192.168.7.9", 8421), ("169.254.1.1", 8421),
             ("100.64.0.1", 8421), ("224.0.0.1", 8421), ("0.0.0.0", 8421), ("255.255.255.255", 8421), ("240.0.0.1", 8421),
             ("::1", 8421), ("::", 8421), ("fc00::1", 8421), ("fd12::1", 8421), ("fe80::1", 8421), ("::ffff:127.0.0.1", 8421),
             ("::ffff:192.168.0.1", 8421), ("localhost", 8421), ("db.local", 8421), ("x.internal", 8421), ("box", 8421),
@@ -756,21 +756,21 @@ mod tests {
         assert_eq!(heard_addr("arcade.example.com", 8421).as_deref(), Some("arcade.example.com:8421"));
         assert_eq!(heard_addr("wss://arcade.example.com/mesh", 443).as_deref(), Some("wss://arcade.example.com/mesh"));
         assert!(heard_dial_ok("8.8.8.8:8421") && heard_dial_ok("[2001:4860::1]:8421") && heard_dial_ok("wss://arcade.example.com/mesh"));
-        assert!(!heard_dial_ok("192.168.1.25:8421") && !heard_dial_ok("[::1]:8421") && !heard_dial_ok("wss://127.0.0.1/mesh"));
+        assert!(!heard_dial_ok("192.168.7.9:8421") && !heard_dial_ok("[::1]:8421") && !heard_dial_ok("wss://127.0.0.1/mesh"));
     }
 
     #[test]
     fn gossip_of_private_addresses_is_neither_kept_nor_dialed() {
         let node = &crate::sitesvc::tests::shared().node;
         let h = json!({"t": "addrs", "a": [
-            {"h": "127.0.0.1", "p": 1, "id": "aa"}, {"h": "192.168.1.25", "p": 8421, "id": "bb"},
+            {"h": "127.0.0.1", "p": 1, "id": "aa"}, {"h": "192.168.7.9", "p": 8421, "id": "bb"},
             {"h": "wss://10.0.0.1/mesh", "p": 443, "id": "cc"}, {"h": "fe80::1", "p": 8421, "id": ""},
         ]});
         on_addrs(node, &"ee".repeat(32), &h);
         let peers = node.app.peers().unwrap();
         assert!(!peers.iter().any(|p| ["aa", "bb", "cc"].contains(&p.id.as_str()) || p.host.contains("10.0.0.1") || p.host == "fe80::1"), "nothing kept");
         let d = node.dialing.lock().unwrap();
-        assert!(!d.iter().any(|a| a.contains("127.0.0.1") || a.contains("192.168.1.25") || a.contains("10.0.0.1") || a.contains("fe80")), "nothing dialed");
+        assert!(!d.iter().any(|a| a.contains("127.0.0.1") || a.contains("192.168.7.9") || a.contains("10.0.0.1") || a.contains("fe80")), "nothing dialed");
     }
 
     #[test]

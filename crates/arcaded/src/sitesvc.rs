@@ -98,10 +98,17 @@ pub fn coins(node: &Node, req: &Value) -> R {
     let mut out = serde_json::Map::new();
     for (a, script) in &want {
         let mut confirmed = Vec::new();
+        let mut immature = Vec::new();
         let mut total = 0u64;
         for (op, value, height) in node.chain.coins_for_script(p, script).map_err(|e| e.to_string())? {
             if spent_in_pool.contains(&op) {
                 continue; // a waiting transaction spends it already
+            }
+            // A mining reward too young to spend: listed apart, not counted (the coin's network
+            // refuses a spend of it).
+            if node.chain.coin(p, &op).ok().flatten().is_some_and(|c| crate::mempoolshare::immature(p, c.coinbase, c.height, tip)) {
+                immature.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "spendable_after": height + p.coinbase_maturity}));
+                continue;
             }
             total += value;
             confirmed.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": tip.saturating_sub(height) + 1}));
@@ -132,7 +139,7 @@ pub fn coins(node: &Node, req: &Value) -> R {
                 keep
             });
         }
-        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total, "held_back": held_back}));
+        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total, "held_back": held_back, "immature": immature}));
     }
     Ok(json!({"chain": p.key, "height": tip, "addresses": out}))
 }
@@ -432,6 +439,27 @@ pub(crate) mod tests {
             let _ = node.me.set(std::sync::Arc::downgrade(&node));
             Shared { node, p, a }
         })
+    }
+
+    /// A mining reward too young to spend is not offered as a coin, and a transaction that spends
+    /// it is refused (the coin's network refuses it: bad-txns-premature-spend-of-coinbase).
+    #[test]
+    fn an_immature_mining_reward_is_not_spendable() {
+        let t = setup();
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap();
+        let reward = tx(&[], &[(7000, p2pkh(8))], 8);
+        t.node.chain.connect_blocks(t.p, &[block(tip.hash, vec![reward.clone()], 9)]).unwrap();
+        let a = addr(&t, 8);
+        let v = coins(&t.node, &json!({"addresses": [a]})).unwrap();
+        let ca = &v["addresses"][&a];
+        assert_eq!(ca["confirmed"].as_array().unwrap().len(), 0);
+        assert_eq!(ca["total"], 0);
+        assert_eq!(ca["immature"][0]["value"], 7000);
+        assert_eq!(ca["immature"][0]["spendable_after"], tip.height + 1 + t.p.coinbase_maturity);
+        let spend = tx(&[(reward.txid, 0)], &[(6000, p2pkh(4))], 0);
+        let why = broadcast(&t.node, &json!({"hex": hex::encode(&spend.raw)})).unwrap_err();
+        assert!(why.contains("isn't mature"), "{why}");
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty());
     }
 
     #[test]

@@ -99,7 +99,7 @@ fn confirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
                 continue;
             }
             if let Ok(Some(coin)) = node.chain.coin(p, &op) {
-                if coin.coinbase && coin.height + p.coinbase_maturity > tip {
+                if crate::mempoolshare::immature(p, coin.coinbase, coin.height, tip) {
                     continue; // immature
                 }
                 out.push(Utxo { outpoint: op, value, script: script.to_vec() });

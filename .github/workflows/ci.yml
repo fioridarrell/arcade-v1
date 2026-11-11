@@ -32,7 +32,7 @@ jobs:
 
       - name: Test
         shell: pwsh
-        run: cargo test --locked --workspace --exclude arcade-desktop -- --test-threads=4
+        run: cargo test --locked --workspace --exclude arcade-desktop -- --test-threads=2
 
       - name: Release build
         shell: pwsh

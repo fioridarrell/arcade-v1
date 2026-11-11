@@ -103,7 +103,7 @@ That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release 
 - **arcade**, the command line (`arcade status`, `arcade setup`, ...);
 - **Arcade V1.0**, the desktop app, in the Start menu. The window uses Microsoft Edge WebView2, which Windows 11 already has. If yours doesn't, the installer adds the WebView2 runtime.
 
-Programs go in `%LOCALAPPDATA%\Programs\Arcade`. Data goes in `%LOCALAPPDATA%\arcade` (not `~/.local/share/arcade`). The ports are the same as on Linux: **8420** (http), **8421** (mesh) and **3478** (STUN). A port that's already taken moves to the next free one; STUN turns off (`0`) if 3478 is taken.
+Programs go in `%LOCALAPPDATA%\Programs\Arcade`. Data goes in `%LOCALAPPDATA%\arcade` (not `~/.local/share/arcade`). The ports are the same as on Linux: **8420** (http), **8421** (mesh) and **3478** (STUN). A port that's already taken moves to the next free one; STUN turns off (`0`) if 3478 is taken. Each database file can grow to 512 GiB on Windows (the library reserves that address space up front; on Linux the ceiling stays 4 TiB and is not reserved).
 
 Open **Arcade V1.0** from the Start menu, or run `arcade setup` in a new terminal. Either way you then make a new wallet, or restore one from its 12 words, and claim your @handle. The service connects to the mesh and syncs Pepecoin testnet by itself.
 

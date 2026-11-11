@@ -102,6 +102,19 @@ pub fn answer_on(node: &Node, p: &'static ChainParams, calls: &[Value]) -> Vec<V
         .collect()
 }
 
+/// A transaction a borrower relays: pooled, shared and sent to the coin's peers only when it
+/// passes the same checks as one from the mesh. Returns whether it was taken.
+fn on_tx(node: &Node, p: &'static ChainParams, raw: &[u8]) -> bool {
+    let Ok(tx) = arcade_chain::Tx::parse_with(raw, &p.format) else { return false };
+    if crate::mempoolshare::check(node, p, &tx).is_err() || !crate::mempoolshare::add(node, p, &tx) {
+        return false;
+    }
+    if p.chain_no == node.params.chain_no {
+        node.tx_outbox.lock().unwrap().push(raw.to_vec());
+    }
+    true
+}
+
 pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> Result<(), LinkError> {
     let h = &f.head;
     match h["op"].as_str().unwrap_or("") {
@@ -130,13 +143,7 @@ pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> R
             send(link, id, res, z)
         }
         "tx" if lent_net(node, &h["net"]).is_some() => {
-            let p = lent_net(node, &h["net"]).unwrap();
-            if let Ok(tx) = arcade_chain::Tx::parse_with(&f.blob, &p.format) {
-                let _ = crate::mempoolshare::add(node, p, &tx);
-                if p.chain_no == node.params.chain_no {
-                    node.tx_outbox.lock().unwrap().push(f.blob.clone());
-                }
-            }
+            on_tx(node, lent_net(node, &h["net"]).unwrap(), &f.blob);
             Ok(())
         }
         _ => Ok(()), // offers and subs from others: not needed by a node that has its own chain
@@ -179,5 +186,22 @@ mod tests {
         assert_eq!(inflate(&bomb), Err("request too large".to_string()));
         assert_eq!(inflate_max(&bomb, MAX_ANSWER).unwrap().len(), MAX_ASKED + 1);
         assert_eq!(inflate(&deflate(b"[]")).unwrap(), b"[]");
+    }
+
+    #[test]
+    fn a_relayed_transaction_is_checked_first() {
+        use arcade_wallet::tx::{sign_keyhash, TxOutSpec};
+        let (t, coins) = crate::mempoolshare::tests::funded();
+        let outs = vec![TxOutSpec { value: 1400, script: crate::sitesvc::tests::p2pkh(5) }];
+        let good = sign_keyhash(t.p, 1, &coins[..1], &outs, &crate::mempoolshare::tests::key(), 0).unwrap();
+        // The same transaction with one byte of its witness signature changed.
+        let mut raw = good.raw.clone();
+        let at = raw.len() - 4 - 34 - 20;
+        raw[at] ^= 1;
+        assert!(!on_tx(&t.node, t.p, &raw));
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty());
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty(), "not sent on");
+        assert!(on_tx(&t.node, t.p, &good.raw));
+        assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[good.raw.clone()]);
     }
 }

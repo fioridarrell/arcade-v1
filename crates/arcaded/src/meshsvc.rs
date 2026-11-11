@@ -263,7 +263,11 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     crate::udpsvc::link_up(node, link);
     let mut last_me = std::time::Instant::now();
     let mut last_offer = crate::coreshare::offer(node).map(|o| o.head["nets"].clone()).unwrap_or(Value::Null);
-    let r = serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer);
+    // Core-style calls over this link (coreshare) are answered for this peer: the addresses
+    // it watches are its own.
+    let r = crate::rpc::as_caller(&peer, || {
+        serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
+    });
     crate::udpsvc::link_down(&peer);
     crate::realtime::link_down(&peer, conn);
     r

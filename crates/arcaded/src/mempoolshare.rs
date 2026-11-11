@@ -86,6 +86,17 @@ pub fn on_frame(node: &Node, head: &Value) {
 
 /// Is `tx` fit for the pool here (see the module notes)?
 pub fn check(node: &Node, p: &ChainParams, tx: &Tx) -> Result<(), String> {
+    match sort(node, p, tx)? {
+        None => Ok(()),
+        Some((n, e)) => Err(format!("input {n}: {e}")),
+    }
+}
+
+/// `check`, except that an input of a kind this arcade can't check is not a refusal: Ok(None)
+/// when every input checked out (fit for the pool), Ok(Some(that input)) when everything else is
+/// in order but some input couldn't be checked. Such a transaction may be passed on to the
+/// coin's own peers, whose nodes check every script (`pass_on`), but is never pooled or shared.
+pub fn sort(node: &Node, p: &ChainParams, tx: &Tx) -> Result<Option<(usize, arcade_wallet::verify::Refused)>, String> {
     let c = p.chain_no;
     if tx.is_coinbase() {
         return Err("coinbase".into());
@@ -130,15 +141,12 @@ pub fn check(node: &Node, p: &ChainParams, tx: &Tx) -> Result<(), String> {
         return Err("outputs exceed inputs".into());
     }
     // Every input must verify, and an input whose kind of coin can't be checked here (another
-    // P2SH script, bare multisig, P2WSH, a Taproot script path) is refused too. A pooled spend
-    // is first-seen: it hides the coin from this arcade's own sends, shows as a pending payment
-    // and makes a tag claim look taken, so an unchecked one must not get in. Such
+    // P2SH script, bare multisig, P2WSH, a Taproot script path) keeps it out of the pool too. A
+    // pooled spend is first-seen: it hides the coin from this arcade's own sends, shows as a
+    // pending payment and makes a tag claim look taken, so an unchecked one must not get in. Such
     // transactions still reach every arcade once a block confirms them, or through the coin's
-    // own peers (whose nodes check every script), just not from other arcades.
-    if let Err((n, e)) = arcade_wallet::verify::all(p, tx, &utxos) {
-        return Err(format!("input {n}: {e}"));
-    }
-    Ok(())
+    // own peers (whose nodes check every script, `pass_on`), just not from other arcades.
+    arcade_wallet::verify::each(p, tx, &utxos).map_err(|(n, e)| format!("input {n}: {e}"))
 }
 
 /// How many distinct waiting ancestors a transaction with these pooled parents has (counting
@@ -274,4 +282,22 @@ pub(crate) mod tests {
         let good = sign_keyhash(t.p, 1, &coins, &[TxOutSpec { value: 2800, script: p2pkh(5) }], &key(), 0).unwrap();
         assert_eq!(check(&t.node, t.p, &good), Err("the pool is full".into()));
     }
+}
+
+/// Send `raw` to the coin's own network without pooling it: the home chain's through its P2P
+/// link, an installed chain we lend straight to a few of its own peers.
+pub fn pass_on(node: &Node, p: &'static ChainParams, raw: Vec<u8>) {
+    if p.chain_no == node.params.chain_no {
+        node.tx_outbox.lock().unwrap().push(raw);
+        return;
+    }
+    let peers: Vec<String> = node.coin_candidates(p).into_iter().take(4).collect();
+    std::thread::spawn(move || {
+        for a in peers {
+            if let Ok(mut peer) = arcade_chain::p2p::Peer::connect(p, &a, std::time::Duration::from_secs(10)) {
+                let _ = peer.send_tx(&raw);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    });
 }

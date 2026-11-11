@@ -323,6 +323,23 @@ pub fn all(p: &ChainParams, tx: &Tx, spent: &[Utxo]) -> Result<(), (usize, Refus
     (0..tx.inputs.len()).try_for_each(|i| input(p, tx, spent, i).map_err(|e| (i, e)))
 }
 
+/// Check every input, going on past those of a kind this module can't check: Ok(None) when every
+/// input checked out, Ok(Some(first one not checked)) when some couldn't be checked and none
+/// failed, Err on the first input that failed.
+pub fn each(p: &ChainParams, tx: &Tx, spent: &[Utxo]) -> Result<Option<(usize, Refused)>, (usize, Refused)> {
+    let mut unchecked = None;
+    for i in 0..tx.inputs.len() {
+        match input(p, tx, spent, i) {
+            Ok(()) => {}
+            Err(e @ Refused::Unknown(_)) => {
+                unchecked.get_or_insert((i, e));
+            }
+            Err(e) => return Err((i, e)),
+        }
+    }
+    Ok(unchecked)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -430,6 +447,10 @@ mod tests {
         let wp = vec![coin(1, 10_000, arcade_ledger::address::p2wpkh_script(&pkh(&k)))];
         assert!(matches!(input(p, &t, &wp, 0), Err(Refused::Unknown(_))));
         assert_eq!(all(p, &t, &mine), Ok(()));
+        // `each` goes on past what it can't check: a P2SH reveal is passable, a bad redeem script isn't.
+        assert!(matches!(each(p, &u, &sh), Ok(Some((0, Refused::Unknown(_))))));
+        assert!(matches!(each(p, &u, &other), Err((0, Refused::Bad(_)))));
+        assert_eq!(each(p, &t, &mine), Ok(None));
     }
 
     /// The prize pool's two ways out: pool + referee, or the creator alone.

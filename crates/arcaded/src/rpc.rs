@@ -196,26 +196,18 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
                 return Ok(json!(tx.txid.to_hex()));
             }
             // As a node would: its coins exist and are unspent, the sums add up, signatures verify.
+            // A transaction with an input of a kind this arcade can't check goes on to the coin's
+            // own peers, whose nodes check it, without being pooled here.
             if !crate::borrow::is_borrowed(p.key) {
-                crate::mempoolshare::check(node, p, &tx).map_err(|why| err(-26, why))?;
+                if crate::mempoolshare::sort(node, p, &tx).map_err(|why| err(-26, why))?.is_some() {
+                    crate::mempoolshare::pass_on(node, p, raw);
+                    return Ok(json!(tx.txid.to_hex()));
+                }
             }
             if !crate::mempoolshare::add(node, p, &tx) {
                 return Err(err(-26, "txn-mempool-conflict"));
             }
-            if p.chain_no == node.params.chain_no {
-                node.tx_outbox.lock().unwrap().push(raw);
-            } else {
-                // An installed chain we lend: straight to a few of its own P2P peers.
-                let peers: Vec<String> = node.coin_candidates(p).into_iter().take(4).collect();
-                std::thread::spawn(move || {
-                    for a in peers {
-                        if let Ok(mut peer) = arcade_chain::p2p::Peer::connect(p, &a, std::time::Duration::from_secs(10)) {
-                            let _ = peer.send_tx(&raw);
-                            std::thread::sleep(std::time::Duration::from_secs(2));
-                        }
-                    }
-                });
-            }
+            crate::mempoolshare::pass_on(node, p, raw);
             Ok(json!(tx.txid.to_hex()))
         }
         "getblockchaininfo" => {

@@ -152,13 +152,23 @@ fn query(node: &Node, p: &'static ChainParams, raw: Vec<u8>, z: bool) -> Result<
 /// passes the same checks as one from the mesh. Returns whether it was taken.
 fn on_tx(node: &Node, p: &'static ChainParams, raw: &[u8]) -> bool {
     let Ok(tx) = arcade_chain::Tx::parse_with(raw, &p.format) else { return false };
-    if crate::mempoolshare::check(node, p, &tx).is_err() || !crate::mempoolshare::add(node, p, &tx) {
-        return false;
+    match crate::mempoolshare::sort(node, p, &tx) {
+        Ok(None) => {
+            if !crate::mempoolshare::add(node, p, &tx) {
+                return false;
+            }
+            if p.chain_no == node.params.chain_no {
+                node.tx_outbox.lock().unwrap().push(raw.to_vec());
+            }
+            true
+        }
+        // A borrower's inscription reveal and the like: on to the coin's own peers, not into the pool.
+        Ok(Some(_)) => {
+            crate::mempoolshare::pass_on(node, p, raw.to_vec());
+            true
+        }
+        Err(_) => false,
     }
-    if p.chain_no == node.params.chain_no {
-        node.tx_outbox.lock().unwrap().push(raw.to_vec());
-    }
-    true
 }
 
 pub fn handle(node: &Node, link: &mut Link, reqs: &mut Requests, f: &Frame) -> Result<(), LinkError> {
@@ -268,5 +278,42 @@ mod tests {
         assert!(t.node.tx_outbox.lock().unwrap().is_empty(), "not sent on");
         assert!(on_tx(&t.node, t.p, &good.raw));
         assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[good.raw.clone()]);
+    }
+
+    /// A spend of a P2SH coin whose script this arcade can't check (an inscription reveal, say)
+    /// goes on to the coin's own peers but never into the pool; one with the wrong script doesn't.
+    #[test]
+    fn a_relayed_transaction_it_cannot_check_is_passed_on_not_pooled() {
+        use crate::sitesvc::tests::{block, p2pkh, tx};
+        let (t, _) = crate::mempoolshare::tests::funded();
+        let redeem = [0x51u8, 0x75, 0x51]; // a script other than wrapped SegWit or a prize pool
+        let sh = arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(&redeem));
+        let fund = tx(&[(t.spend.txid, 1)], &[(1800, sh)], 7);
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap();
+        t.node.chain.connect_blocks(t.p, &[block(tip.hash, vec![tx(&[], &[(5000, p2pkh(3))], 8), fund.clone()], 5)]).unwrap();
+        let spend = |script_sig: &[u8]| {
+            let mut o = 1i32.to_le_bytes().to_vec();
+            o.push(1);
+            o.extend_from_slice(&fund.txid.0);
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o.push(script_sig.len() as u8);
+            o.extend_from_slice(script_sig);
+            o.extend_from_slice(&u32::MAX.to_le_bytes());
+            o.push(1);
+            o.extend_from_slice(&1500u64.to_le_bytes());
+            let out = p2pkh(5);
+            o.push(out.len() as u8);
+            o.extend_from_slice(&out);
+            o.extend_from_slice(&0u32.to_le_bytes());
+            o
+        };
+        let reveal = spend(&[3, 0x51, 0x75, 0x51]);
+        assert!(on_tx(&t.node, t.p, &reveal));
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty(), "not pooled");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[reveal.clone()], "passed on");
+        // The wrong redeem script for the coin: a failed check, not passed on.
+        t.node.tx_outbox.lock().unwrap().clear();
+        assert!(!on_tx(&t.node, t.p, &spend(&[1, 0x52])));
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty());
     }
 }

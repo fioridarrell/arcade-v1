@@ -311,12 +311,25 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `realtime.join` | `/api/v1/realtime/join` | local | page, room, game?, member?, cred? | Join a room over the mesh as this arcade's player (game defaults to the page): a token, me and the members. A website joins for its user with member (their address, or a guest id) and cred {a, x, s} signed over realtime.cert's words. |
+| `realtime.join` | `/api/v1/realtime/join` | local | page, room, game?, member?, cred?, fast? | Join a room over the mesh as this arcade's player (game defaults to the page): a token, me and the members; fast: true also takes the fast lane (realtime.fast). A website joins for its user with member (their address, or a guest id) and cred {a, x, s} signed over realtime.cert's words. |
 | `realtime.cert` | `/api/v1/realtime/cert` | public | address | The words an address signs (Core signmessage) to play through this arcade, and their expiry: a website's user signs them in the browser and the site passes {a: address, x: expires, s: signature} to realtime.join. |
 | `realtime.send` | `/api/v1/realtime/send` | local | token, data?, b64? | Send to everyone in the room: text or base64 bytes, at most 512 bytes, about 5 a second. |
 | `realtime.leave` | `/api/v1/realtime/leave` | local | token | Leave the room. |
 | `realtime.poll` | `/api/v1/realtime/poll` | local | token, wait? | Room events for this seat (join, leave, message), waiting up to wait ms (15000 at most); a seat not polled for 30 s is let go. |
+| `realtime.fast` | `/api/v1/realtime/fast` | local | token, to, data?, b64?, reliable? | Send to some players of the room over the fast lane between arcades (a seat joined with fast): text or base64 bytes, at most 16 KB, about 240 a second; to names the players (up to 64). Reaches those who play here or through an arcade with a lane up (realtime.lanes); unreliable sends waiting to go out are replaced by the newest, reliable ones keep their order. Heard as fast events. |
+| `realtime.media` | `/api/v1/realtime/media` | local | token, to, b64 | A piece of the app window's encoded camera, microphone or screen (up to 60 KB) for some players of the room, over direct links between arcades only; dropped when the link is behind. Heard as mchunk events (the window's own, never the page's). |
+| `realtime.lanes` | `/api/v1/realtime/lanes` | local | token | Which players of the seat's room the fast lane reaches now (up), and how (routes: direct link or relay). |
+| `referee.get` | `/api/v1/referee/get` | read | — | The referee arcade this one asks for seeds when a page names none, and whose key /r/verified trusts by default: {url, pubkey}, or {} when none is set. |
+| `referee.set` | `/api/v1/referee/set` | admin | url | Name the referee arcade (https://...): its key is read from its /r/referee. An empty url clears it. |
 | `realtime.status` | `/api/v1/realtime/status` | read | — | Rooms this arcade has players in, and the routes it knows to other arcades' rooms. |
+
+### Ring
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `ring.send` | `/api/v1/ring/send` | local | page, to, line?, link? | Ring an address from this arcade's player, for the app whose page asks (arcade.realtime.ring): rung, and why not. It reaches them only if they have Notifications on for that app and the caller in their address book. The line (80 characters at most) and link (200) share what one room message carries (about 145 bytes); longer is an error. |
+| `ring.waiting` | `/api/v1/ring/waiting` | local | — | What is ringing this arcade's player now; asking also says the app is open, so it can be rung here (the arcade holds its ring room only while this is asked within 20 s and some app has Notifications on). |
+| `ring.get` | `/api/v1/ring/get` | local | id, page | The ring an app was opened from (arcade.realtime.ringed), for that app only: from, tag, link, line, at. |
 
 ### Inscribe
 

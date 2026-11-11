@@ -22,16 +22,105 @@ fn tag_of(node: &Node, a: &str) -> Option<String> {
 
 // ---------------- inscriptions as pages see them ----------------
 
-/// The original's describe() shape; "json" is filled in verbatim by `text()`.
+/// The collection an inscription joined: (collection, edition), nulls when it joined none.
+fn membership(node: &Node, txid: &str) -> (Value, Value) {
+    let key = KeyBuf::new().u16(c(node)).bytes(txid.as_bytes()).done();
+    let row: Option<Value> = node.chain.store(c(node)).read(|r| r.get(led::COLLECTION, &key)).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok());
+    match row {
+        Some(r) => (r["collection"].clone(), r["edition"].clone()),
+        None => (Value::Null, Value::Null),
+    }
+}
+
+/// The original's describe() shape; "json" is filled in verbatim by `text()`. `held` is the
+/// original's "this arcade can produce the content": the chain's own transactions carry it.
 fn describe(node: &Node, v: &Value) -> Value {
     let raw = v["json"].as_str().unwrap_or("").to_string();
-    let coll = Value::Null;
-    let ours = ours(node);
+    let (coll, edition) = membership(node, v["txid"].as_str().unwrap_or(""));
     json!({"id": v["txid"], "number": v["number"], "creator": v["creator"], "owner": v["owner"],
            "creatortag": v["creator"].as_str().and_then(|a| tag_of(node, a)), "ownertag": v["owner"].as_str().and_then(|a| tag_of(node, a)),
            "block": v["block_height"], "contenttype": v["content_type"], "length": v["content_len"], "sha256": v["sha256"],
-           "transactions": v["chunks"], "held": v["owner"].as_str().is_some_and(|o| ours.iter().any(|a| a == o)),
-           "json": "\u{1}JSON\u{1}", "rawjson": raw, "collection": coll, "edition": Value::Null})
+           "transactions": v["chunks"], "held": v["chunks"].as_u64().unwrap_or(0) > 0,
+           "json": "\u{1}JSON\u{1}", "rawjson": raw, "collection": coll, "edition": edition})
+}
+
+// ---------------- collections ----------------
+
+/// Every collection item row: {txid, creator, collection, edition, name}.
+fn collection_items(node: &Node) -> Vec<Value> {
+    node.chain
+        .store(c(node))
+        .read(|r| r.scan_prefix(led::COLLECTION, &KeyBuf::new().u16(c(node)).done()))
+        .unwrap_or_default()
+        .into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice(&v).ok())
+        .collect()
+}
+
+fn insc(node: &Node, txid: &str) -> Option<Value> {
+    arcade_ledger::content::inscription(&node.chain, c(node), txid)
+}
+
+/// One collection's inscriptions in edition order (#1 first; pieces with no edition last, by number).
+fn collection_rows(node: &Node, items: &[Value], creator: &str, name: &str) -> Vec<(Option<i64>, Value)> {
+    let mut rows: Vec<(Option<i64>, Value)> = items
+        .iter()
+        .filter(|i| i["creator"] == creator && i["collection"] == name)
+        .filter_map(|i| Some((i["edition"].as_i64(), insc(node, i["txid"].as_str()?)?)))
+        .collect();
+    rows.sort_by_key(|(e, v)| (e.is_none(), e.unwrap_or(0), v["number"].as_u64().unwrap_or(0)));
+    rows
+}
+
+/// The original's describe_collection() shape.
+fn collection_summary(creator: &str, name: &str, rows: &[(Option<i64>, Value)]) -> Value {
+    let numbers = || rows.iter().filter_map(|(_, v)| v["number"].as_u64());
+    let editions = || rows.iter().filter_map(|(e, _)| *e);
+    let cover = rows.first().map(|(_, v)| v);
+    let supply = cover.map(|v| arcade_ledger::collections::declared_supply(v["json"].as_str().unwrap_or(""))).filter(|n| *n > 0);
+    json!({"creator": creator, "name": name, "count": rows.len(), "firstnumber": numbers().min(), "lastnumber": numbers().max(),
+           "firstedition": editions().min(), "lastedition": editions().max(),
+           "cover": cover.map(|v| v["txid"].clone()), "covertype": cover.map(|v| v["content_type"].clone()), "supply": supply})
+}
+
+/// Every (creator, collection), newest first by its first inscription.
+fn collection_list(node: &Node, creator: Option<&str>) -> Vec<Value> {
+    let items = collection_items(node);
+    let mut names: Vec<(String, String)> = items
+        .iter()
+        .filter(|i| creator.is_none_or(|c| i["creator"] == c))
+        .filter_map(|i| Some((i["creator"].as_str()?.to_string(), i["collection"].as_str()?.to_string())))
+        .collect();
+    names.sort();
+    names.dedup();
+    let mut out: Vec<Value> = names
+        .iter()
+        .map(|(cr, n)| collection_summary(cr, n, &collection_rows(node, &items, cr, n)))
+        .filter(|s| s["count"].as_u64().unwrap_or(0) > 0)
+        .collect();
+    out.sort_by(|a, b| b["firstnumber"].as_u64().cmp(&a["firstnumber"].as_u64()));
+    out
+}
+
+/// How often each trait value occurs across a collection (`attributes` as [{trait_type, value}]).
+fn collection_traits(rows: &[(Option<i64>, Value)]) -> Value {
+    let text = |v: &Value| match v {
+        Value::String(s) => s.clone(),
+        Value::Null => String::new(),
+        o => o.to_string(),
+    };
+    let mut counts: std::collections::BTreeMap<String, std::collections::BTreeMap<String, u64>> = Default::default();
+    for (_, v) in rows {
+        let Ok(j) = serde_json::from_str::<Value>(v["json"].as_str().unwrap_or("")) else { continue };
+        for t in j["attributes"].as_array().into_iter().flatten().filter(|t| t.is_object()) {
+            let kind: String = text(&t["trait_type"]).chars().take(100).collect();
+            if kind.is_empty() {
+                continue;
+            }
+            *counts.entry(kind).or_default().entry(text(&t["value"]).chars().take(100).collect()).or_default() += 1;
+        }
+    }
+    json!(counts)
 }
 
 /// JSON text with each row's "json" as the inscription's own text, verbatim (key order kept).
@@ -250,6 +339,36 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
         },
         ["doginals", a] => (200, json!({"address": a, "unknown": 0, "items": []}).to_string()),
         ["collection-item", _, _] => missing("no collection this arcade knows names it"),
+        ["collections"] => {
+            let list = collection_list(node, qs("creator").as_deref());
+            let page: Vec<&Value> = list.iter().skip(qn("offset", 0) as usize).take(qn("limit", 100).clamp(1, 500) as usize).collect();
+            (200, json!(page).to_string())
+        }
+        ["collections", "count"] => (200, json!({"count": collection_list(node, qs("creator").as_deref()).len()}).to_string()),
+        ["collection", creator, name] => {
+            let (creator, name) = (&crate::http::pct_decode(&creator.replace('+', "%2B")), &crate::http::pct_decode(&name.replace('+', "%2B")));
+            let rows = collection_rows(node, &collection_items(node), creator, name);
+            if rows.is_empty() {
+                return missing("no such collection");
+            }
+            let mut out = collection_summary(creator, name, &rows);
+            let items: Vec<Value> = rows.iter().skip(qn("offset", 0) as usize).take(qn("limit", 100).clamp(1, 500) as usize).map(|(_, v)| describe(node, v)).collect();
+            if qn("traits", 0) != 0 {
+                out["traits"] = collection_traits(&rows);
+            }
+            // The items carry their own JSON verbatim; the summary goes around them.
+            let head = out.to_string();
+            (200, format!("{},\"items\":{}}}", &head[..head.len() - 1], text(&json!(items))))
+        }
+        ["prizepool", _] | ["claimpools", _] | ["claimpool", _] => {
+            let (status, v) = crate::prizesvc::route(node, &seg).unwrap_or((404, json!({"error": "not found"})));
+            (status, v.to_string())
+        }
+        ["verified", judge] => {
+            let after = qs("after").and_then(|a| a.parse::<i64>().ok()).unwrap_or(-1);
+            let (status, v) = crate::refereesvc::verified(node, judge, qs("referee").as_deref(), after, qn("limit", 50));
+            (status, v.to_string())
+        }
         ["state", piece] => (200, state_of(node, piece, None).to_string()),
         ["state", fam, piece] => (200, state_of(node, piece, Some(fam)).to_string()),
         ["pending", a] => {
@@ -260,7 +379,7 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
     }
 }
 
-fn tx_status(node: &Node, txid: &str) -> Option<Value> {
+pub(crate) fn tx_status(node: &Node, txid: &str) -> Option<Value> {
     let cc = c(node);
     let h = arcade_chain::Hash256::from_hex(txid).ok()?;
     if let Some((b, _)) = node.chain.tx_location(node.params, &h).ok().flatten() {
@@ -321,7 +440,8 @@ fn resolve_to(node: &Node, to: &str) -> Result<String, String> {
         return arcade_ledger::index::tag_row(&node.chain, c(node), &t.to_lowercase()).map_err(|e| e.to_string())?.map(|r| r.address).ok_or_else(|| format!("nobody holds @{t}"));
     }
     match arcade_ledger::address::decode_base58check(to) {
-        Some(_) if arcade_ledger::address::p2pkh_hash_of(node.params, to).is_some() => Ok(to.to_string()),
+        // A key's address or a script's (a refereed prize pool lives at one).
+        Some(_) if arcade_ledger::address::script_for_address(node.params, to).is_some() => Ok(to.to_string()),
         Some(_) => Err("that is an address on another chain".into()),
         None => Err("not an address: give an address or an @tag".into()),
     }
@@ -420,7 +540,7 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
 fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
     let p = node.params;
     let to = r["to"].as_str().unwrap_or("");
-    let to_script = arcade_ledger::address::p2pkh_script_for_address(p, to).ok_or("bad address")?;
+    let to_script = arcade_ledger::address::script_for_address(p, to).ok_or("bad address")?;
     let units = r["units"].as_u64().unwrap_or(0);
     // Which of our addresses pays (and holds what moves).
     let from = match r["kind"].as_str().unwrap_or("") {

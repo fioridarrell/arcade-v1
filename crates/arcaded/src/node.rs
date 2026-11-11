@@ -208,6 +208,9 @@ impl Node {
     /// then shared, fixed and seeded ones. Peers resting after failures are left out.
     pub fn coin_candidates(&self, p: &arcade_chain::params::ChainParams) -> Vec<String> {
         let mut v = crate::peerbook::candidates(self, p.net);
+        if std::env::var("ARCADE_COIN_PEERS").is_ok_and(|x| !x.trim().is_empty()) {
+            return v; // only the peers named (crate::peerbook::forced)
+        }
         for a in self.coin_candidates_static(p) {
             if !v.contains(&a) && !crate::peerbook::is_resting(self, p.net, &a) {
                 v.push(a);

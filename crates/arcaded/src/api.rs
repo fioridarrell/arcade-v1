@@ -250,7 +250,11 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "apps.owner_send" => crate::walletsvc::owner_send(node, &s("page").ok_or("page required")?, &req["request"]),
         "realtime.join" => {
             let who = s("member").filter(|m| !m.is_empty()).map(|m| (m, Some(req["cred"].clone()).filter(|c| !c.is_null())));
-            crate::realtime::join_as(node, &s("page").ok_or("page required")?, &s("game").unwrap_or_default(), &s("room").ok_or("room required")?, who)
+            let j = crate::realtime::join_as(node, &s("page").ok_or("page required")?, &s("game").unwrap_or_default(), &s("room").ok_or("room required")?, who)?;
+            if req["fast"] == true {
+                crate::realtime::fast::want_fast(j["token"].as_str().unwrap_or(""));
+            }
+            Ok(j)
         }
         "realtime.cert" => crate::realtime::cert(node, &s("address").ok_or("address required")?),
         "tx.coins" => crate::sitesvc::coins(node, req),
@@ -261,6 +265,28 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "realtime.leave" => crate::realtime::leave(node, &s("token").ok_or("token required")?),
         "realtime.poll" => crate::realtime::poll(&s("token").ok_or("token required")?, req["wait"].as_u64().unwrap_or(0)),
         "realtime.status" => Ok(crate::realtime::status(node)),
+        "realtime.fast" => {
+            let to: Vec<String> = req["to"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::realtime::fast::send(node, &s("token").ok_or("token required")?, req["data"].as_str(), req["b64"].as_str(), &to, req["reliable"] == true)
+        }
+        "realtime.media" => {
+            let to: Vec<String> = req["to"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::realtime::fast::media(node, &s("token").ok_or("token required")?, &s("b64").ok_or("b64 required")?, &to)
+        }
+        "trade.leg" => crate::tradesvc::leg(node, &req["give"], &req["take"], &s("buyer").unwrap_or_default()),
+        "trade.open" => crate::tradesvc::open(node, &s("sealed").unwrap_or_default()),
+        "trade.fill" => crate::tradesvc::fill(node, &req["leg"], &req["expect"], &s("peer").unwrap_or_default(), req["send"] == true),
+        "trade.items" => crate::tradesvc::items(node),
+        "trade.watch" => Ok(crate::tradesvc::watch(node, &s("txid").unwrap_or_default(), s("inscription").as_deref(), s("owner").as_deref())),
+        "trade.who" => crate::tradesvc::who(node, &s("address").unwrap_or_default()),
+        "prize.seed" => crate::prizesvc::seed(node, &s("page").unwrap_or_default(), req),
+        "prize.claim" => crate::prizesvc::claim(node, &s("page").unwrap_or_default(), req, req["send"] == true),
+        "referee.get" => Ok(crate::refereesvc::setting(node)),
+        "referee.set" => crate::refereesvc::set(node, &s("url").unwrap_or_default()),
+        "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
+        "ring.send" => crate::ringsvc::send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &s("line").unwrap_or_default(), &s("link").unwrap_or_default()),
+        "ring.waiting" => Ok(crate::ringsvc::waiting(node)),
+        "ring.get" => Ok(crate::ringsvc::get(node, &s("id").ok_or("id required")?, &s("page").ok_or("page required")?)),
         "apps.node" => match s("op").as_deref().unwrap_or("") {
             "identity" => crate::msgsvc::node_identity(node),
             "send" => crate::msgsvc::node_send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &req["body"]),

@@ -258,14 +258,14 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     let mut last_ping = std::time::Instant::now();
     let mut sent_outbox = 0usize;
     let peer = link.peer_id.clone();
-    crate::realtime::link_up(node, &peer);
+    let conn = crate::realtime::link_up(node, &peer);
     // UDP beside this link (docs/compat/UDP.md); nothing changes while it is off.
     crate::udpsvc::link_up(node, link);
     let mut last_me = std::time::Instant::now();
     let mut last_offer = crate::coreshare::offer(node).map(|o| o.head["nets"].clone()).unwrap_or(Value::Null);
-    let r = serve_loop(node, link, addr, &peer, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer);
+    let r = serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer);
     crate::udpsvc::link_down(&peer);
-    crate::realtime::link_down(&peer);
+    crate::realtime::link_down(&peer, conn);
     r
 }
 
@@ -275,6 +275,7 @@ fn serve_loop(
     link: &mut Link,
     addr: &str,
     peer: &str,
+    conn: u64,
     cr_reqs: &mut crate::coreshare::Requests,
     last_ping: &mut std::time::Instant,
     sent_outbox: &mut usize,
@@ -296,7 +297,7 @@ fn serve_loop(
             link.send(&Frame::new(f))?;
         }
         // Room traffic for this link (routed, not flooded).
-        for f in crate::realtime::take(peer) {
+        for f in crate::realtime::take(peer, conn) {
             link.send(&f)?;
         }
         // UDP path: ask, switch over, fall back; proofs and introductions for this link.
@@ -335,8 +336,10 @@ fn serve_loop(
             crate::udpsvc::keepalive(link)?;
             *last_ping = std::time::Instant::now();
         }
-        // Wait briefly for a frame, so queued room frames go out within ~50 ms.
-        if !link.ready(Duration::from_millis(50))? {
+        // Wait briefly for a frame, so queued room frames go out within ~50 ms (2 ms while the
+        // fast lane is busy).
+        let wait = if crate::realtime::fast::busy() { 2 } else { 50 };
+        if !link.ready(Duration::from_millis(wait))? {
             continue;
         }
         let f = match link.recv() {
@@ -376,7 +379,7 @@ fn serve_loop(
             "sh" if f.head["op"] == "q" => crate::shares::answer(node, link, &f.head)?,
             "sh" if f.head["op"] == "a" => crate::shares::on_answer(&link.peer_id, &f),
             "bk" => serve_bk(node, link, addr, &f.head)?,
-            "pub" | "sub" => crate::realtime::on_frame(node, peer, &f),
+            "pub" | "sub" | "fx" => crate::realtime::on_frame(node, peer, conn, &f),
             "ud" | "st" | "ui" => crate::udpsvc::on_frame(node, link, &f)?,
             "ka" => {} // TCP keepalive while frames go over UDP
             "cb" => crate::coreboot::on_frame(node, link, &f)?,

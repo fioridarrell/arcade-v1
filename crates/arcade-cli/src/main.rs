@@ -1,8 +1,8 @@
 //! `arcade`: command line for a running arcaded (whiteboard step 12).
 
+use arcade_local::UnixStream;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 const HELP: &str = "arcade — Arcade V1.0
 
@@ -44,24 +44,13 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade mine start [threads]    mine Pepecoin testnet on this PC (pays your wallet)
   arcade mine stop | status
 
-  --home DIR   arcade data folder (default: $ARCADE_HOME or ~/.local/share/arcade)";
+  --home DIR   arcade data folder (default: $ARCADE_HOME, else %LOCALAPPDATA%\\arcade on Windows, ~/.local/share/arcade on Linux)";
 
 fn home(args: &[String]) -> std::path::PathBuf {
     if let Some(i) = args.iter().position(|a| a == "--home") {
         return args[i + 1].clone().into();
     }
-    if let Some(h) = std::env::var_os("ARCADE_HOME") {
-        return h.into();
-    }
-    // The installed service lives in /var/lib/arcade.
-    let system = std::path::Path::new("/var/lib/arcade");
-    if system.join("arcaded.sock").exists() || system.join("arcade.mdbx").exists() {
-        return system.to_path_buf();
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
-    base.join("arcade")
+    arcade_local::default_home()
 }
 
 fn call(sock: &std::path::Path, req: Value) -> Result<Value, String> {
@@ -115,6 +104,9 @@ fn setup(sock: &std::path::Path) {
     match call(sock, json!({"cmd": "status"})) {
         Ok(_) => println!("      the arcade service is running"),
         Err(e) => {
+            #[cfg(windows)]
+            println!("      {e}\n      start it from the Arcade V1.0 login task, or run arcaded, then run  arcade setup  again");
+            #[cfg(not(windows))]
             println!("      {e}\n      start it with:  sudo systemctl enable --now arcaded   then run  arcade setup  again");
             std::process::exit(2);
         }
@@ -203,9 +195,24 @@ fn setup(sock: &std::path::Path) {
     }
 
     step(10, "Start at boot");
-    let enabled = std::process::Command::new("systemctl").args(["is-enabled", "arcaded"]).output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
-    println!("      {}", if enabled { "arcaded starts at boot" } else { "not enabled: sudo systemctl enable arcaded" });
+    #[cfg(windows)]
+    {
+        let enabled = std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", "Arcade V1.0"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        println!(
+            "      {}",
+            if enabled { "arcaded starts at login (Task Scheduler: Arcade V1.0)" } else { "not enabled: run scripts\\install.ps1" }
+        );
+    }
+    #[cfg(not(windows))]
+    {
+        let enabled = std::process::Command::new("systemctl").args(["is-enabled", "arcaded"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
+        println!("      {}", if enabled { "arcaded starts at boot" } else { "not enabled: sudo systemctl enable arcaded" });
+    }
 
     step(11, "Share bootstraps");
     println!("      your arcade serves its chain to other arcades on the mesh (always on)");
@@ -216,7 +223,7 @@ fn setup(sock: &std::path::Path) {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let sock = home(&args).join("arcaded.sock");
+    let sock = arcade_local::socket_path(&home(&args));
     if let Some(i) = args.iter().position(|a| a == "--home") {
         args.drain(i..i + 2);
     }

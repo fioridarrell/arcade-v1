@@ -2,16 +2,24 @@
 //! Used by the `arcade` CLI and the desktop app.
 
 use crate::node::Node;
+use arcade_local::{UnixListener, UnixStream};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 
 pub fn serve(node: Arc<Node>, path: std::path::PathBuf) {
+    if let Err(e) = arcade_local::check_socket_path(&path) {
+        panic!("bind API socket: {e}");
+    }
     let _ = std::fs::remove_file(&path);
-    let l = UnixListener::bind(&path).expect("bind API socket");
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660) /* service user + arcade group */);
+    let l = UnixListener::bind(&path).unwrap_or_else(|e| panic!("bind API socket {}: {e}", path.display()));
+    // Group-readable on Linux (the service user and the arcade group). On Windows the
+    // socket lives in the user's own local app data, which other users cannot read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+    }
     for s in l.incoming().flatten() {
         let node = node.clone();
         std::thread::spawn(move || handle(node, s));

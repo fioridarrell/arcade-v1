@@ -23,13 +23,22 @@ pub enum KeyError {
 /// A fresh 12-word phrase.
 pub fn new_phrase() -> String {
     let mut entropy = Zeroizing::new([0u8; 16]);
-    getrandom(&mut entropy[..]);
+    os_random(&mut entropy[..]);
     bip39::Mnemonic::from_entropy(&entropy[..]).expect("16 bytes is valid entropy").to_string()
 }
 
-fn getrandom(buf: &mut [u8]) {
-    use std::io::Read;
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).expect("system randomness");
+fn os_random(buf: &mut [u8]) {
+    // Linux keeps reading the kernel's random device. Windows uses the system CSPRNG
+    // and never continues with zeros.
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).expect("system randomness");
+    }
+    #[cfg(windows)]
+    {
+        getrandom::getrandom(buf).expect("system randomness");
+    }
 }
 
 /// Normalise and check a phrase the user typed (words, checksum).

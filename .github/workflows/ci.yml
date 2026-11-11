@@ -1,0 +1,39 @@
+# Windows build and tests. The release workflow (release.yml) builds the zip that
+# scripts/install.ps1 downloads; this job runs on pull requests and on the windows branch
+# so a break shows up before a tag.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main, windows]
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: LLVM (libclang for libmdbx)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1.8"
+
+      - name: MSVC headers for bindgen
+        shell: pwsh
+        run: . .\scripts\msvc-env.ps1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --locked --workspace --exclude arcade-desktop -- --test-threads=4
+
+      - name: Release build
+        shell: pwsh
+        run: cargo build --release --locked -p arcaded -p arcade-cli -p arcade-desktop

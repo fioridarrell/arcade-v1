@@ -1,29 +1,19 @@
 //! Arcade V1.0 desktop app: a window over the local arcaded API (same socket as the CLI).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use arcade_local::UnixStream;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 fn home() -> std::path::PathBuf {
-    if let Some(h) = std::env::var_os("ARCADE_HOME") {
-        return h.into();
-    }
-    let system = std::path::Path::new("/var/lib/arcade");
-    if system.join("arcaded.sock").exists() {
-        return system.to_path_buf();
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
-    base.join("arcade")
+    arcade_local::default_home_for_app()
 }
 
 /// Forward one request to arcaded and return its answer (off the UI thread: some wait, such as
 /// realtime.poll).
 #[tauri::command(async)]
 fn api(req: Value) -> Value {
-    let sock = home().join("arcaded.sock");
+    let sock = arcade_local::socket_path(&home());
     let mut s = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(e) => return json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())}),

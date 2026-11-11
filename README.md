@@ -30,7 +30,7 @@ A build installs what it needs with apt (`build-essential pkg-config clang libcl
 
 ### Making a release
 
-Push a tag such as `v0.1.1`, or run the **release** workflow on GitHub (Actions → release → Run workflow). It builds for x86_64 and aarch64 on Ubuntu 22.04 and attaches `arcade-v1-linux-<arch>.tar.gz` and its `.sha256` to the release. The installer always takes the latest release.
+Push a tag such as `v0.1.1`, or run the **release** workflow on GitHub (Actions → release → Run workflow). It builds for x86_64 and aarch64 on Ubuntu 22.04 and for x86_64 on Windows, and attaches `arcade-v1-linux-<arch>.tar.gz`, `arcade-v1-windows-x86_64.zip`, and each file's `.sha256` to the release. The installers always take the latest release.
 
 ### After it's installed
 
@@ -88,3 +88,63 @@ curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scr
 ```
 
 This removes everything: the programs, the app and its menu entry, the background service, **and your data in `~/.local/share/arcade`**: your wallet and its 12 words, imported wallets, messages and chains. It asks you to type `DELETE` first. If your wallet holds anything, write down your 12 words before (`arcade --home ~/.local/share/arcade wallet phrase`); on a new install you restore it from them on the Home tab.
+
+## Install on Windows
+
+Windows 10 or 11, 64-bit. Paste this into PowerShell:
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fioridarrell/arcade-v1/windows/scripts/install.ps1'))"
+```
+
+That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release of this fork, checks its sha256, and installs it for your user. Nothing is compiled, and it does not ask for an administrator password. It installs:
+
+- **arcaded**, the arcade service, started now and at every login (Task Scheduler → **Arcade V1.0**);
+- **arcade**, the command line (`arcade status`, `arcade setup`, ...);
+- **Arcade V1.0**, the desktop app, in the Start menu. The window uses Microsoft Edge WebView2, which Windows 11 already has. If yours doesn't, the installer adds the WebView2 runtime.
+
+Programs go in `%LOCALAPPDATA%\Programs\Arcade`. Data goes in `%LOCALAPPDATA%\arcade` (not `~/.local/share/arcade`). The ports are the same as on Linux: **8420** (http), **8421** (mesh) and **3478** (STUN). A port that's already taken moves to the next free one; STUN turns off (`0`) if 3478 is taken.
+
+Open **Arcade V1.0** from the Start menu, or run `arcade setup` in a new terminal. Either way you then make a new wallet, or restore one from its 12 words, and claim your @handle. The service connects to the mesh and syncs Pepecoin testnet by itself.
+
+Run the same command again to update. Your wallet, its 12 words, your @handle, messages and chains are kept. The service is asked to finish what it was writing (that can take a few minutes while a chain is catching up) and is then started on the new programs. If the app was open, close it and open it again.
+
+### Options
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\install.ps1 --no-desktop --home D:\arcade-data
+```
+
+| Option | Meaning |
+|---|---|
+| `--no-desktop` | Don't install the desktop app. |
+| `--build` | Compile from source instead of downloading a release. |
+| `--home DIR` | Data folder (default `%LOCALAPPDATA%\arcade`). |
+| `--http-port N`, `--mesh-port N`, `--stun-port N` | Ports. The defaults are 8420, 8421 and 3478. |
+
+`ARCADE_BUILD=1` is the same as `--build`. `ARCADE_NO_OPEN=1` does not open the app at the end of a first install.
+
+The login task starts `arcaded` with no console window. To see its log, stop the task and run `%LOCALAPPDATA%\Programs\Arcade\arcaded.exe` in a terminal. To ask a running service to finish writing and exit, create the file `%LOCALAPPDATA%\arcade\arcaded.stop` (the installer does this before it replaces the program).
+
+### Building from source on Windows
+
+A source build needs three things the prebuilt download does not: the [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) workload **Desktop development with C++**, [LLVM](https://github.com/llvm/llvm-project/releases) (libclang, so libmdbx can generate its bindings), and Rust. `--build` installs Rust and tries to install LLVM with winget. It does not install Visual Studio for you.
+
+From a clone, in PowerShell:
+
+```powershell
+. .\scripts\msvc-env.ps1
+cargo build --release --locked -p arcaded -p arcade-cli -p arcade-desktop
+```
+
+`msvc-env.ps1` has to be dot-sourced. It points bindgen at the MSVC headers. The three programs are `target\release\arcaded.exe`, `arcade.exe` and `arcade-desktop.exe`. Linux behavior is unchanged: the same `cargo build --release` on Linux still builds the GTK/WebKit app.
+
+If the desktop crate fails to compile, the service and the command line are still the arcade. `scripts\install.ps1 --build --no-desktop` installs those two and says so.
+
+### Uninstall
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fioridarrell/arcade-v1/windows/scripts/uninstall.ps1'))"
+```
+
+This removes the programs, the Start menu shortcut, the login task, **and your data in `%LOCALAPPDATA%\arcade`**: your wallet and its 12 words, imported wallets, messages and chains. It asks you to type `DELETE` first. If your wallet holds anything, write the 12 words down before (`arcade wallet phrase`). On a new install you restore it from them on the Home tab. Nothing is removed if you type anything else.

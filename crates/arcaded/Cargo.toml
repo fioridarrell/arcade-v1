@@ -6,6 +6,7 @@ license.workspace = true
 
 [dependencies]
 arcade-app = { version = "0.1.0", path = "../arcade-app" }
+arcade-local = { version = "0.1.0", path = "../arcade-local" }
 arcade-chain = { version = "0.1.0", path = "../arcade-chain" }
 arcade-chaindb = { version = "0.1.0", path = "../arcade-chaindb" }
 arcade-ledger = { version = "0.1.0", path = "../arcade-ledger" }
@@ -32,6 +33,9 @@ serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
 secp256k1 = "0.29"
+
+[target.'cfg(windows)'.dependencies]
+socket2 = "0.5"
 
 [features]
 default = ["oldimport"]

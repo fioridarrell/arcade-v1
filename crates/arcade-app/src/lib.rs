@@ -2,7 +2,8 @@
 //! Back this file (and `secret.key`) up. See docs/PLAN.md §5.2.
 //!
 //! Secrets (recovery phrase, node identity) are encrypted at rest with XChaCha20-Poly1305
-//! under a random key in `secret.key` (mode 0600). No password, by design (2026-11-07).
+//! under a random key in `secret.key` (mode 0600 on Linux; a user-only ACL on Windows).
+//! No password, by design (2026-11-07).
 
 use arcade_store::{KeyBuf, Migration, Schema, Store, StoreError, TableDef};
 use chacha20poly1305::aead::{Aead, KeyInit};
@@ -148,10 +149,23 @@ pub fn now() -> u64 {
 }
 
 fn random<const N: usize>() -> [u8; N] {
-    use std::io::Read;
     let mut b = [0u8; N];
-    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b)).expect("system randomness");
+    fill_random(&mut b);
     b
+}
+
+fn fill_random(buf: &mut [u8]) {
+    // Linux keeps reading the kernel's random device, as before. Windows has no
+    // /dev/urandom; getrandom uses the system CSPRNG and refuses to return zeros.
+    #[cfg(not(windows))]
+    {
+        use std::io::Read;
+        std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(buf)).expect("system randomness");
+    }
+    #[cfg(windows)]
+    {
+        getrandom::getrandom(buf).expect("system randomness");
+    }
 }
 
 pub struct AppDb {
@@ -458,11 +472,98 @@ impl AppDb {
     }
 }
 
-fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
+/// Write `data` to a new file that only this user can read. Linux: mode 0600.
+/// Windows: the inherited ACL is replaced with one grant for the current user.
+pub fn write_private(path: &Path, data: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
-    f.write_all(data)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(path)?;
+        return f.write_all(data);
+    }
+    #[cfg(windows)]
+    {
+        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(path)?;
+        f.write_all(data)?;
+        drop(f);
+        if let Err(e) = restrict_to_current_user(path) {
+            let _ = std::fs::remove_file(path);
+            return Err(e);
+        }
+        Ok(())
+    }
+}
+
+/// `D:P(A;;FA;;;CU)` — protected DACL, full access for the current user only.
+#[cfg(windows)]
+fn restrict_to_current_user(path: &Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    #[link(name = "advapi32")]
+    extern "system" {
+        fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            s: *const u16,
+            revision: u32,
+            sd: *mut *mut std::ffi::c_void,
+            size: *mut u32,
+        ) -> i32;
+        fn GetSecurityDescriptorDacl(
+            sd: *mut std::ffi::c_void,
+            present: *mut i32,
+            dacl: *mut *mut std::ffi::c_void,
+            defaulted: *mut i32,
+        ) -> i32;
+        fn SetNamedSecurityInfoW(
+            name: *mut u16,
+            object_type: u32,
+            info: u32,
+            owner: *mut std::ffi::c_void,
+            group: *mut std::ffi::c_void,
+            dacl: *mut std::ffi::c_void,
+            sacl: *mut std::ffi::c_void,
+        ) -> u32;
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LocalFree(p: *mut std::ffi::c_void) -> *mut std::ffi::c_void;
+    }
+    let sddl: Vec<u16> = "D:P(A;;FA;;;CU)\0".encode_utf16().collect();
+    let mut sd = std::ptr::null_mut();
+    let ok = unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.as_ptr(), 1, &mut sd, std::ptr::null_mut())
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let mut present = 0i32;
+    let mut dacl = std::ptr::null_mut();
+    let mut defaulted = 0i32;
+    let ok = unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) };
+    if ok == 0 || present == 0 || dacl.is_null() {
+        unsafe { LocalFree(sd) };
+        return Err(std::io::Error::new(std::io::ErrorKind::Other, "could not build a user-only access list"));
+    }
+    let mut wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+    const SE_FILE_OBJECT: u32 = 1;
+    const DACL_SECURITY_INFORMATION: u32 = 4;
+    const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
+    let err = unsafe {
+        SetNamedSecurityInfoW(
+            wide.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            dacl,
+            std::ptr::null_mut(),
+        )
+    };
+    unsafe { LocalFree(sd) };
+    if err != 0 {
+        Err(std::io::Error::from_raw_os_error(err as i32))
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -515,9 +616,17 @@ mod tests {
         assert_eq!(db.node_identity().unwrap().verifying_key(), id);
         assert_eq!(db.phrase().unwrap(), phrase);
         assert_eq!(db.tag_keys(PEPECOIN_TEST.chain_no).unwrap()[0].address, addr);
-        use std::os::unix::fs::PermissionsExt;
-        let mode = std::fs::metadata(d.path().join("secret.key")).unwrap().permissions().mode();
-        assert_eq!(mode & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(d.path().join("secret.key")).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+        #[cfg(windows)]
+        {
+            let meta = std::fs::metadata(d.path().join("secret.key")).unwrap();
+            assert!(meta.is_file() && meta.len() > 0);
+        }
         // The phrase is not stored in the clear.
         let raw = std::fs::read(d.path().join("arcade.mdbx")).unwrap();
         let first = phrase.split(' ').next().unwrap();

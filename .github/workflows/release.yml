@@ -1,11 +1,13 @@
-# Prebuilt Linux downloads for the one-line installer (scripts/install.sh).
+# Prebuilt downloads for the installers (scripts/install.sh, scripts/install.ps1).
 #
 # Push a tag like v0.1.1 (or run this workflow by hand with a version) and it builds arcaded, arcade and
-# arcade-desktop for x86_64 and aarch64 on Ubuntu 22.04 (glibc 2.35: runs on Ubuntu 22.04+, Mint 21+, Debian 12+),
-# packs each with the icon and scripts/install-linux.sh, and attaches them to the GitHub release:
-#   arcade-v1-linux-x86_64.tar.gz   (+ .sha256)
-#   arcade-v1-linux-aarch64.tar.gz  (+ .sha256)
-# install.sh downloads releases/latest/download/arcade-v1-linux-<arch>.tar.gz and checks its sha256.
+# arcade-desktop for x86_64 and aarch64 on Ubuntu 22.04 (glibc 2.35: runs on Ubuntu 22.04+, Mint 21+, Debian 12+)
+# and for x86_64 on Windows (MSVC; runs on Windows 10/11 x64), packs each with the icon and the matching
+# installer, and attaches them to the GitHub release:
+#   arcade-v1-linux-x86_64.tar.gz      (+ .sha256)
+#   arcade-v1-linux-aarch64.tar.gz     (+ .sha256)
+#   arcade-v1-windows-x86_64.zip       (+ .sha256)
+# install.sh downloads arcade-v1-linux-<arch>.tar.gz. install.ps1 downloads arcade-v1-windows-x86_64.zip.
 name: release
 
 on:
@@ -77,8 +79,56 @@ jobs:
           name: arcade-v1-linux-${{ matrix.arch }}
           path: arcade-v1-linux-${{ matrix.arch }}.tar.gz*
 
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: LLVM (libclang for libmdbx)
+        uses: KyleMayes/install-llvm-action@v2
+        with:
+          version: "18.1.8"
+
+      - name: MSVC headers for bindgen
+        shell: pwsh
+        run: . .\scripts\msvc-env.ps1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Test
+        shell: pwsh
+        run: cargo test --locked --workspace --exclude arcade-desktop -- --test-threads=4
+
+      - name: Build
+        shell: pwsh
+        run: |
+          $env:ARCADE_VERSION = if ('${{ github.event.inputs.version }}') { '${{ github.event.inputs.version }}' } else { '${{ github.ref_name }}' }
+          cargo build --release --locked -p arcaded -p arcade-cli -p arcade-desktop
+
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = 'arcade-v1-windows-x86_64'
+          New-Item -ItemType Directory -Force -Path "$name\bin","$name\scripts" | Out-Null
+          Copy-Item target\release\arcaded.exe,target\release\arcade.exe,target\release\arcade-desktop.exe "$name\bin\"
+          Copy-Item crates\arcade-desktop\icons\icon.png,crates\arcade-desktop\icons\icon.ico $name
+          Copy-Item scripts\install.ps1,scripts\uninstall.ps1 "$name\scripts\"
+          git rev-parse HEAD | Set-Content "$name\COMMIT" -Encoding ascii -NoNewline
+          if (Test-Path "$name.zip") { Remove-Item "$name.zip" -Force }
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$pwd\$name.zip.sha256", "$hash  $name.zip`n")
+          Get-ChildItem "$name.zip*" | Format-Table Name,Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: arcade-v1-windows-x86_64
+          path: arcade-v1-windows-x86_64.zip*
+
   release:
-    needs: build
+    needs: [build, windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/download-artifact@v4
@@ -91,9 +141,9 @@ jobs:
         run: |
           ls -la
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$TAG" arcade-v1-linux-* --clobber -R "$GITHUB_REPOSITORY"
+            gh release upload "$TAG" arcade-v1-linux-* arcade-v1-windows-* --clobber -R "$GITHUB_REPOSITORY"
           else
-            gh release create "$TAG" arcade-v1-linux-* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
+            gh release create "$TAG" arcade-v1-linux-* arcade-v1-windows-* -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Arcade V1.0 $TAG" \
-              --notes "Prebuilt Linux downloads (x86_64, aarch64). Install: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash"
+              --notes "Prebuilt downloads: Linux (x86_64, aarch64) and Windows 10/11 x64. Linux: curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash  —  Windows: see README, Install on Windows."
           fi

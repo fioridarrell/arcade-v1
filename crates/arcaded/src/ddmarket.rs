@@ -199,6 +199,9 @@ pub fn answer(node: &Node, arg: &str) -> Result<Value, String> {
     let q: Value = serde_json::from_str(arg).map_err(|_| "bad question".to_string())?;
     let chain = q["chain"].as_str().unwrap_or("");
     let p = dd_chain(chain).ok_or("not a DigiDollar chain")?;
+    if q["op"].as_str().is_some_and(|o| o.starts_with('x')) {
+        return crate::xswap::answer(node, &q); // cross-chain swaps (xswap.rs)
+    }
     match q["op"].as_str().unwrap_or("") {
         "book" => Ok(json!({"node": node.id_hex(), "orders": orders(node, Some(p.key), false).iter().map(public).collect::<Vec<_>>()})),
         "fill" => lay_out(node, p, &q),

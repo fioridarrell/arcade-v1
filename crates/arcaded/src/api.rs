@@ -486,6 +486,11 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
         c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
+        // Cross-chain DigiDollar swaps (xswap.rs), driven from the socket while the page API comes.
+        "xswap.place" => crate::xswap::place(node, &s("dd").unwrap_or_else(|| "dgbtest".into()), req["cents"].as_i64().ok_or("cents required")?, req["price"].as_u64().ok_or("price required")?),
+        "xswap.book" => Ok(json!(crate::xswap::book(node))),
+        "xswap.take" => crate::xswap::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?, req["cents"].as_i64().ok_or("cents required")?),
+        "xswap.list" => Ok(json!(crate::xswap::swaps(node))),
         "chains.offers" => Ok(json!(node.offers.lock().unwrap().iter().map(|(id, o)| json!({"node": id, "addr": o.addr, "at": o.at, "bk": o.bk, "cr": o.cr})).collect::<Vec<_>>())),
         "chains.peers" => {
             let p = arcade_chain::params::by_key(&s("key").ok_or("key required")?).ok_or("unknown chain")?;

@@ -48,6 +48,9 @@ struct Ctx<'a> {
     node: &'a Node,
     p: &'static ChainParams,
     indexes: Vec<String>,
+    /// Inscription lists give images as a link to this arcade's /ord/<chain>/<id> instead of
+    /// their bytes (asked by this computer's UI only; see `handle_with`).
+    img_links: bool,
 }
 
 impl Ctx<'_> {
@@ -79,7 +82,7 @@ fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
     } else {
         node.extra.lock().unwrap().get(p.key).map(|r| r.indexes.clone()).ok_or_else(|| format!("{} is not installed", p.name))?
     };
-    Ok(Ctx { node, p, indexes })
+    Ok(Ctx { node, p, indexes, img_links: false })
 }
 
 /// Explorer questions another arcade may answer for us (all public, read-only).
@@ -175,7 +178,14 @@ fn missing_index(e: &str) -> Option<String> {
 /// mesh should be available in the explorer). Such answers carry "_mesh": {node, tag}; they
 /// are that arcade's word, not checked here.
 pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
-    let local = handle_here(node, cmd, req);
+    handle_with(node, cmd, req, false)
+}
+
+/// [`handle`], for this computer's own UI: with `img_links`, inscription lists made here give
+/// images as links (`content.src`) the UI loads one by one, so the list comes back at once.
+/// Answers from other arcades keep the bytes (their links would point at them).
+pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    let local = handle_here(node, cmd, req, img_links);
     if req["local"] == true || !FORWARDABLE.contains(&cmd) {
         return local;
     }
@@ -266,8 +276,9 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
     }
 }
 
-fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
-    let x = ctx(node, req)?;
+fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    let mut x = ctx(node, req)?;
+    x.img_links = img_links;
     // Not kept here, or kept but still catching up (borrowed meanwhile, the home chain
     // included): the borrowed chain answers what it can; indexes still come from here or
     // the mesh.
@@ -357,7 +368,11 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let mut v = match ord::inscription(&x.node.chain, x.p, q) {
                 Some(v) => {
                     let mut v = v;
-                    v["content"] = content(&x, v["id"].as_str().unwrap_or(""), 4 << 20);
+                    let id = v["id"].as_str().unwrap_or("").to_string();
+                    v["content"] = content(&x, &id, 4 << 20);
+                    if x.img_links && v["content"]["kind"] == "html" {
+                        v["content"]["src"] = json!(format!("/content/{id}"));
+                    }
                     v
                 }
                 None => {
@@ -385,7 +400,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let off = req["offset"].as_u64().unwrap_or(0) as usize;
             let want = n(50, 200) as usize;
             let pre = KeyBuf::new().u16(x.c()).done();
-            let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::TICK, &pre, off + want)).map_err(e)?;
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, off + want)).map_err(e)?;
             Ok(json!({"protocol": tokens::protocol(x.p).map(|t| t.0).unwrap_or("tokens"), "total": tokens::tick_count(&x.node.chain, x.c()),
                 "offset": off, "items": rows.into_iter().skip(off).filter_map(|(k, v)| {
                 let mut v: Value = serde_json::from_slice(&v).ok()?;
@@ -405,7 +420,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             }
             let mut v = local.ok_or_else(|| format!("no token {t}"))?;
             let pre = KeyBuf::new().u16(x.c()).var(t.as_bytes()).done();
-            let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::HOLDER, &pre, 5000)).map_err(e)?;
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::HOLDER, &pre, 5000)).map_err(e)?;
             let more = rows.len() >= 5000;
             let mut hs: Vec<(u128, String, String)> = rows
                 .iter()
@@ -430,7 +445,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let (off, want) = (req["offset"].as_u64().unwrap_or(0) as usize, n(50, 200) as usize);
             let rows = match s("after") {
                 Some(a) => scan_after(&x, names::WIN, pre.clone(), Some(a), want),
-                None => x.node.chain.store.read(|r| r.scan_prefix_limit(names::WIN, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
+                None => x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(names::WIN, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
             };
             Ok(json!({"counts": counts, "total": counts[0], "offset": off, "items": rows.iter().map(|(k, v)| name_row(pre.len(), k, v)).collect::<Vec<_>>()}))
         }
@@ -453,7 +468,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
             let (off, want) = (req["offset"].as_u64().unwrap_or(0) as usize, n(50, 200) as usize);
             let rows = match s("after") {
                 Some(a) => scan_after(&x, maps::MAP, pre, Some(a), want),
-                None => x.node.chain.store.read(|r| r.scan_prefix_limit(maps::MAP, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
+                None => x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(maps::MAP, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
             };
             Ok(json!({"total": total, "offset": off, "items": rows.iter().map(|(k, v)| map_row(k, v)).collect::<Vec<_>>()}))
         }
@@ -469,7 +484,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
         "explorer.ledger_tokens" => {
             x.need("ledger")?;
             let off = req["offset"].as_u64().unwrap_or(0) as usize;
-            let total = x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY, &x.c().to_be_bytes())).map(|v| v.len()).unwrap_or(0);
+            let total = x.node.chain.store(x.c()).read(|r| r.scan_prefix(led::PROPERTY, &x.c().to_be_bytes())).map(|v| v.len()).unwrap_or(0);
             Ok(json!({"total": total, "offset": off, "items": ledger_tokens_page(&x, off, n(50, 200) as usize)}))
         }
         "explorer.ledger_token" => { x.need("ledger")?; ledger_token(&x, req["id"].as_u64().or_else(|| s("id").and_then(|v| v.parse().ok())).ok_or("give a token id")? as u32) }
@@ -499,7 +514,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value) -> R {
 use arcade_ledger::engine as led;
 
 fn ledger_count(x: &Ctx) -> u64 {
-    x.node.chain.store.read(|r| r.last_with_prefix(led::BY_NUMBER, &x.c().to_be_bytes())).ok().flatten()
+    x.node.chain.store(x.c()).read(|r| r.last_with_prefix(led::BY_NUMBER, &x.c().to_be_bytes())).ok().flatten()
         .map(|(k, _)| be_u64(&k, 2) + 1).unwrap_or(0)
 }
 
@@ -538,7 +553,7 @@ fn ledger_tokens(x: &Ctx, n: usize) -> Vec<Value> {
 
 fn ledger_tokens_page(x: &Ctx, off: usize, n: usize) -> Vec<Value> {
     // Newest first: the creation-height index, read backwards.
-    let mut rows = x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY_BY_BLOCK, &x.c().to_be_bytes())).unwrap_or_default();
+    let mut rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix(led::PROPERTY_BY_BLOCK, &x.c().to_be_bytes())).unwrap_or_default();
     rows.reverse();
     rows.iter().skip(off).take(n).filter_map(|(k, _)| {
         let pid = u32::from_be_bytes(k[k.len() - 4..].try_into().ok()?);
@@ -563,7 +578,7 @@ fn ledger_token(x: &Ctx, pid: u32) -> R {
 
 fn ledger_summary(x: &Ctx) -> R {
     let c = x.c();
-    let count = |t: &str| x.node.chain.store.read(|r| r.scan_prefix(t, &c.to_be_bytes())).map(|v| v.len()).unwrap_or(0);
+    let count = |t: &str| x.node.chain.store(c).read(|r| r.scan_prefix(t, &c.to_be_bytes())).map(|v| v.len()).unwrap_or(0);
     Ok(json!({
         "tokens": count(led::PROPERTY), "inscriptions": ledger_count(x), "collections": count(led::COLLECTION),
         "tags": count(arcade_ledger::index::TAG), "orders": count(led::BOOK), "trades": count(led::TAKE),
@@ -585,7 +600,7 @@ fn tag_of(x: &Ctx, a: &str) -> Option<String> {
 
 fn scan_after(x: &Ctx, table: &str, pre: Vec<u8>, after: Option<String>, n: usize) -> Vec<(Vec<u8>, Vec<u8>)> {
     // Simple paging: skip rows up to and including the `after` key text.
-    let rows = x.node.chain.store.read(|r| r.scan_prefix_limit(table, &pre, n + 2000)).unwrap_or_default();
+    let rows = x.node.chain.store_for(&pre).read(|r| r.scan_prefix_limit(table, &pre, n + 2000)).unwrap_or_default();
     let start = match after {
         Some(a) => rows.iter().position(|(k, _)| String::from_utf8_lossy(&k[pre.len()..]).ends_with(&a)).map(|i| i + 1).unwrap_or(0),
         None => 0,
@@ -597,7 +612,7 @@ fn geneses(x: &Ctx, height: u32) -> Option<u32> {
     if !x.has("ord") {
         return None;
     }
-    let v = x.node.chain.store.read(|r| r.get(ord::BLOCK, &KeyBuf::new().u16(x.c()).u32(height).done())).ok()??;
+    let v = x.node.chain.store(x.c()).read(|r| r.get(ord::BLOCK, &KeyBuf::new().u16(x.c()).u32(height).done())).ok()??;
     Some(u32::from_be_bytes(v[64..68].try_into().ok()?))
 }
 
@@ -610,6 +625,37 @@ fn block_row(x: &Ctx, height: u32) -> Option<Value> {
 
 fn blocks(x: &Ctx, before: u32, n: u32) -> Vec<Value> {
     (before.saturating_sub(n)..before).rev().filter_map(|h| block_row(x, h)).collect()
+}
+
+/// An image's or an HTML page's preview as a link to it on this arcade, from its record alone
+/// (no read of the chain), when the UI asked for links: images with their own body up to
+/// `cap` (/ord/<chain>/<id>), HTML (/content/<id>, run in a sandboxed frame; Martin
+/// 2026-11-10).
+fn image_link(x: &Ctx, rec: &Value, id: &str, cap: usize) -> Option<Value> {
+    if !x.img_links || !rec["delegate"].is_null() {
+        return None;
+    }
+    let ct = rec["ct"].as_str().unwrap_or("");
+    let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
+    let size = rec["size"].as_u64()?;
+    if base == "text/html" && size > 0 {
+        return Some(json!({"type": ct, "kind": "html", "src": format!("/content/{id}"), "size": size}));
+    }
+    if !base.starts_with("image/") || size == 0 || size > cap as u64 {
+        return None;
+    }
+    Some(json!({"type": ct, "kind": "image", "src": format!("/ord/{}/{id}", x.p.key), "size": size}))
+}
+
+/// A list item with no preview (video, audio, models, ...): its type and size from the record,
+/// without rebuilding its bytes from the chain (a video's many pieces took seconds each).
+fn no_preview(rec: &Value) -> Option<Value> {
+    let ct = rec["ct"].as_str().unwrap_or("");
+    let base = ct.split(';').next().unwrap_or("").trim().to_lowercase();
+    if !rec["delegate"].is_null() || base.is_empty() || base.starts_with("text/") || base == "application/json" || base.starts_with("image/") {
+        return None;
+    }
+    Some(json!({"type": ct, "kind": "other", "size": rec["size"]}))
 }
 
 /// Text or image preview of an inscription's content (empty for other types).
@@ -654,29 +700,7 @@ pub fn type_matches(ct: &str, ty: &str) -> bool {
 
 /// The content-type group of `ct` (see [`type_matches`]).
 pub fn type_group(ct: &str) -> &'static str {
-    let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
-    let group = |b: &str| -> &'static str {
-        if b == "image/svg+xml" {
-            "svg"
-        } else if b.starts_with("image/") {
-            "image"
-        } else if b == "text/html" {
-            "html"
-        } else if b == "application/json" || b.ends_with("+json") {
-            "json"
-        } else if b.starts_with("text/") {
-            "text"
-        } else if b.starts_with("audio/") {
-            "audio"
-        } else if b.starts_with("video/") {
-            "video"
-        } else if b.starts_with("model/") {
-            "model"
-        } else {
-            "other"
-        }
-    };
-    group(&base)
+    arcade_ledger::ordtypes::GROUP_NAMES[arcade_ledger::ordtypes::group_of(ct) as usize]
 }
 
 /// Newest inscriptions below `before` of one content type: (items, where to go on from,
@@ -711,7 +735,7 @@ fn latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
                 Some(v) => {
                     let mut v = v;
                     let id = v["id"].as_str().unwrap_or("").to_string();
-                    v["content"] = content(x, &id, 96 << 10);
+                    v["content"] = image_link(x, &v, &id, 96 << 10).or_else(|| no_preview(&v)).unwrap_or_else(|| content(x, &id, 96 << 10));
                     v
                 }
                 // Shared storage: records of other groups come from the arcades holding them.
@@ -762,7 +786,7 @@ fn summary(x: &Ctx) -> R {
     }
     if x.has("maps") {
         let rows = scan_after(x, maps::MAP, KeyBuf::new().u16(c).done(), None, 6);
-        v["maps"] = json!(x.node.chain.store.count(maps::MAP).unwrap_or(0));
+        v["maps"] = json!(x.node.chain.store(c).count(maps::MAP).unwrap_or(0));
         v["map_rows"] = json!(rows.iter().map(|(k, b)| map_row(k, b)).collect::<Vec<_>>());
     }
     Ok(v)
@@ -829,7 +853,7 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
     let spent = x.node.chain.spender(x.p, &op).ok().flatten().and_then(|(b, p, vin)| x.node.chain.tx_at(x.p, b, p).ok().flatten().map(|t| json!({"txid": t.txid.to_hex(), "vin": vin})));
     let ins: Vec<String> = if x.has("ord") {
         let pre = KeyBuf::new().u16(x.c()).bytes(&txid.0).u32(vout).done();
-        x.node.chain.store.read(|r| r.scan_prefix_limit(ord::LOC, &pre, 50)).unwrap_or_default().iter().map(|(k, _)| ord::iid_str(&k[k.len() - 36..])).collect()
+        x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(ord::LOC, &pre, 50)).unwrap_or_default().iter().map(|(k, _)| ord::iid_str(&k[k.len() - 36..])).collect()
     } else {
         vec![]
     };
@@ -1052,20 +1076,20 @@ fn search(x: &Ctx, q: &str) -> R {
     }
     if x.has("names") {
         let pre = KeyBuf::new().u16(c).u8(0).bytes(w.as_bytes()).done();
-        for (k, v) in x.node.chain.store.read(|r| r.scan_prefix_limit(names::WIN, &pre, 25)).unwrap_or_default() {
+        for (k, v) in x.node.chain.store(c).read(|r| r.scan_prefix_limit(names::WIN, &pre, 25)).unwrap_or_default() {
             let name = String::from_utf8_lossy(&k[3..]).into_owned();
             items.push(json!({"kind": "name", "id": name, "label": name, "what": format!("name · inscription #{}", be_u64(&v, 0))}));
         }
     }
     if x.has("tokens") {
         let pre = KeyBuf::new().u16(c).bytes(w.as_bytes()).done();
-        for (k, _) in x.node.chain.store.read(|r| r.scan_prefix_limit(tokens::TICK, &pre, 25)).unwrap_or_default() {
+        for (k, _) in x.node.chain.store(c).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, 25)).unwrap_or_default() {
             let t = String::from_utf8_lossy(&k[2..]).into_owned();
             items.push(json!({"kind": "token", "id": t, "label": t, "what": format!("{} token", tokens::protocol(x.p).map(|p| p.0).unwrap_or("").to_uppercase())}));
         }
     }
     if x.has("ledger") {
-        for (_, v) in x.node.chain.store.read(|r| r.scan_prefix(led::PROPERTY, &c.to_be_bytes())).unwrap_or_default() {
+        for (_, v) in x.node.chain.store(c).read(|r| r.scan_prefix(led::PROPERTY, &c.to_be_bytes())).unwrap_or_default() {
             let Ok(pr) = serde_json::from_slice::<Value>(&v) else { continue };
             let name = pr["name"].as_str().unwrap_or("");
             if name.to_lowercase().contains(&w) {

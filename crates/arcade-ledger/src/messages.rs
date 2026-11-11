@@ -154,7 +154,7 @@ fn put_post(l: &arcade_chaindb::undo::Logged, c: u16, h: u32, pos: u32, txid: &s
 pub fn candidates(db: &arcade_chaindb::ChainDb, c: u16, after: Option<(u32, u32)>, limit: usize) -> Result<Vec<(u32, u32, Value)>> {
     let pre = KeyBuf::new().u16(c).done();
     let start = after.map(|(h, p)| hp(c, h, p));
-    let rows = db.store.read(|r| r.scan_after(CAND, &pre, start.as_deref(), limit))?;
+    let rows = db.store(c).read(|r| r.scan_after(CAND, &pre, start.as_deref(), limit))?;
     Ok(rows
         .into_iter()
         .filter_map(|(k, v)| Some((u32::from_be_bytes(k[2..6].try_into().ok()?), u32::from_be_bytes(k[6..10].try_into().ok()?), serde_json::from_slice(&v).ok()?)))
@@ -164,24 +164,24 @@ pub fn candidates(db: &arcade_chaindb::ChainDb, c: u16, after: Option<(u32, u32)
 /// Every row of a table for a chain (small tables: posts, acts, machine records).
 pub fn rows(db: &arcade_chaindb::ChainDb, table: &str, c: u16) -> Result<Vec<Value>> {
     let pre = KeyBuf::new().u16(c).done();
-    Ok(db.store.read(|r| r.scan_prefix(table, &pre))?.into_iter().filter_map(|(_, v)| serde_json::from_slice(&v).ok()).collect())
+    Ok(db.store(c).read(|r| r.scan_prefix(table, &pre))?.into_iter().filter_map(|(_, v)| serde_json::from_slice(&v).ok()).collect())
 }
 
 /// A post by txid.
 pub fn post(db: &arcade_chaindb::ChainDb, c: u16, txid: &str) -> Option<Value> {
-    db.store.read(|r| {
+    db.store(c).read(|r| {
         let Some(k) = r.get(POST_TX, &txkey(c, txid))? else { return Ok(None) };
         Ok(r.get(POST, &k)?.and_then(|v| serde_json::from_slice(&v).ok()))
     }).ok().flatten()
 }
 
 pub fn file(db: &arcade_chaindb::ChainDb, c: u16, txid: &str) -> Option<Vec<u8>> {
-    db.store.read(|r| r.get(FILE, &txkey(c, txid))).ok().flatten()
+    db.store(c).read(|r| r.get(FILE, &txkey(c, txid))).ok().flatten()
 }
 
 /// Feed acts aimed at a txid, oldest first.
 pub fn acts_on(db: &arcade_chaindb::ChainDb, c: u16, target: &str) -> Vec<Value> {
-    db.store
+    db.store(c)
         .read(|r| {
             let keys = r.scan_prefix(ACT_TO, &txkey(c, target))?;
             let mut out = Vec::new();
@@ -199,6 +199,6 @@ pub fn acts_on(db: &arcade_chaindb::ChainDb, c: u16, target: &str) -> Vec<Value>
 }
 
 pub fn counts(db: &arcade_chaindb::ChainDb, c: u16) -> Value {
-    let n = |t: &str| db.store.read(|r| Ok(r.scan_prefix(t, &KeyBuf::new().u16(c).done())?.len())).unwrap_or(0);
+    let n = |t: &str| db.store(c).read(|r| Ok(r.scan_prefix(t, &KeyBuf::new().u16(c).done())?.len())).unwrap_or(0);
     json!({"candidates": n(CAND), "posts": n(POST), "acts": n(ACT), "machine": n(MACHINE), "chunks_waiting": n(GCHUNK)})
 }

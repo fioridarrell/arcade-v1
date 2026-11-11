@@ -258,6 +258,19 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `chains.index_copy_start` | `/api/v1/chains/index_copy_start` | admin | key, index, from? | Fetch an index copy now from the best offer (index = ledger or ord; from = one arcade's node id): it is taken in only if 2 or more other arcades agree with it. |
 | `chains.index_copy_cancel` | `/api/v1/chains/index_copy_cancel` | admin | key, index | Stop fetching an index copy (its pieces are deleted). |
 
+### Share
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `share.held` | `/api/v1/share/held` | public | — | V1.0 copies of chain parts held here (blocks, coins, ord, tokens, names, maps, ledger, profiles, messages): id, height, rows, size; and those being made. |
+| `share.offers` | `/api/v1/share/offers` | public | key | V1.0 copies other arcades hold for a chain, per part: id, height, how many made it themselves and how many hold it. |
+| `share.fetch` | `/api/v1/share/fetch` | admin | key, fam, id? | Fetch a part's copy from every arcade holding it at once: the newest one 2 or more arcades made themselves (or the id given). Pieces are checked against the manifest; the copy is then held and served here too. |
+| `share.install` | `/api/v1/share/install` | admin | key | Install an added chain (or the home chain) from V1.0 copies: its blocks and coins made by 2 or more arcades at the same checkpoint, fetched from every holder and taken in as they come (no replay); the coins are trusted until re-checked. |
+| `share.install_cancel` | `/api/v1/share/install_cancel` | admin | key | Stop installing a chain from copies. |
+| `share.cancel` | `/api/v1/share/cancel` | admin | key, fam | Stop fetching a copy (its pieces are deleted). |
+| `share.auto` | `/api/v1/share/auto` | admin | key, on | Make copies of every part of a chain at each checkpoint (about a day of its blocks) while at the tip; off by default (copies take disk). |
+| `share.make` | `/api/v1/share/make` | admin | key, fam | Make a V1.0 copy of one part of an installed chain now, from one frozen view of the database (in the background; see share.held). |
+
 ### Borrow
 
 | method | route | needs | params | what |

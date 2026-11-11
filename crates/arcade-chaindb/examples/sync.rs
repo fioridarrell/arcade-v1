@@ -50,5 +50,5 @@ fn main() {
     }
     let tip = db.tip(p.chain_no).unwrap().unwrap();
     println!("done in {:?}: tip {} at {}, outputs {}, txs {}", t.elapsed(), tip.hash, tip.height,
-        db.store.count(arcade_chaindb::schema::OUTPUTS).unwrap(), db.store.count(arcade_chaindb::schema::TXS).unwrap());
+        db.count_all(arcade_chaindb::schema::OUTPUTS).unwrap(), db.count_all(arcade_chaindb::schema::TXS).unwrap());
 }

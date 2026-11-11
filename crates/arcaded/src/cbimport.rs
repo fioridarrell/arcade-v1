@@ -772,8 +772,8 @@ mod tests {
             assert_eq!(rep.read, n);
             assert_eq!(db.tip(c).unwrap(), reference.tip(c).unwrap());
             for t in [arcade_chaindb::schema::OUTPUTS, arcade_chaindb::schema::TXS, arcade_chaindb::schema::HEIGHT] {
-                let a = db.store.read(|r| r.scan_prefix(t, b"")).unwrap();
-                let b = reference.store.read(|r| r.scan_prefix(t, b"")).unwrap();
+                let a = db.store(c).read(|r| r.scan_prefix(t, b"")).unwrap();
+                let b = reference.store(c).read(|r| r.scan_prefix(t, b"")).unwrap();
                 assert!(a == b, "{t} from {upto}");
             }
             assert!(db.build_addresses(p, &tmp, &stop, &mut |_| {}).unwrap());

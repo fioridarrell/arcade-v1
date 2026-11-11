@@ -32,10 +32,9 @@ pub fn group_of(table: &str) -> Option<&'static str> {
 
 /// Measure every installed chain once (can take a while on a big chain; runs in the background).
 pub fn measure(node: &Node) -> Result<BTreeMap<String, Value>, String> {
-    let store = &node.chain.store;
     let mut chains: Vec<&'static arcade_chain::params::ChainParams> = vec![node.params];
     chains.extend(node.extra.lock().unwrap().values().map(|r| r.params));
-    let disk: BTreeMap<String, u64> = store.table_sizes().map_err(|e| e.to_string())?.into_iter().map(|(n, _, b)| (n, b)).collect();
+    let disk: BTreeMap<String, u64> = node.chain.table_sizes_all().map_err(|e| e.to_string())?.into_iter().map(|(n, _, b)| (n, b)).collect();
     // logical[table][chain key] = key+value bytes
     let mut logical: BTreeMap<String, BTreeMap<&'static str, u64>> = BTreeMap::new();
     for table in disk.keys() {
@@ -44,10 +43,12 @@ pub fn measure(node: &Node) -> Result<BTreeMap<String, Value>, String> {
         }
         for p in &chains {
             let pre = p.chain_no.to_be_bytes().to_vec();
+            let store = node.chain.store(p.chain_no);
             let mut after: Option<Vec<u8>> = None;
             let mut total = 0u64;
             loop {
-                let (_, b, last) = store.read(|r| r.sum_prefix(table, &pre, after.as_deref(), 200_000)).map_err(|e| e.to_string())?;
+                // A table this chain's file doesn't have holds none of its rows.
+                let Ok((_, b, last)) = store.read(|r| r.sum_prefix(table, &pre, after.as_deref(), 200_000)) else { break };
                 total += b;
                 match last {
                     Some(k) => after = Some(k),

@@ -240,21 +240,21 @@ pub fn broadcast(node: &Node, req: &Value) -> R {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arcade_chain::encode::write_varint;
     use arcade_chain::hash::merkle_root;
     use arcade_chain::{Block, Hash256, Header};
     use std::sync::Mutex;
 
-    fn p2pkh(tag: u8) -> Vec<u8> {
+    pub(crate) fn p2pkh(tag: u8) -> Vec<u8> {
         let mut s = vec![0x76, 0xa9, 0x14];
         s.extend_from_slice(&[tag; 20]);
         s.extend_from_slice(&[0x88, 0xac]);
         s
     }
 
-    fn tx(inputs: &[(Hash256, u32)], outputs: &[(u64, Vec<u8>)], nonce: u32) -> Tx {
+    pub(crate) fn tx(inputs: &[(Hash256, u32)], outputs: &[(u64, Vec<u8>)], nonce: u32) -> Tx {
         let mut o = Vec::new();
         o.extend_from_slice(&1i32.to_le_bytes());
         if inputs.is_empty() {
@@ -283,7 +283,7 @@ mod tests {
         Tx::parse(&o).unwrap()
     }
 
-    fn block(prev: Hash256, txs: Vec<Tx>, time: u32) -> Block {
+    pub(crate) fn block(prev: Hash256, txs: Vec<Tx>, time: u32) -> Block {
         let ids: Vec<_> = txs.iter().map(|t| t.txid).collect();
         let header = Header { version: 1, prev, merkle_root: merkle_root(&ids), time, bits: 0x207fffff, nonce: 0 };
         let mut raw = header.encode().to_vec();
@@ -294,17 +294,17 @@ mod tests {
         Block::parse(&raw).unwrap()
     }
 
-    struct T {
+    pub(crate) struct T {
         _dir: tempfile::TempDir,
-        node: Node,
-        p: &'static ChainParams,
+        pub(crate) node: Node,
+        pub(crate) p: &'static ChainParams,
         /// Coinbase of block 1: 5000 to address A (tag 1).
-        cb1: Tx,
+        pub(crate) cb1: Tx,
         /// Block 2: A pays 3000 to B (tag 2), 1900 change to A.
-        spend: Tx,
+        pub(crate) spend: Tx,
     }
 
-    fn setup() -> T {
+    pub(crate) fn setup() -> T {
         let dir = tempfile::tempdir().unwrap();
         let g = block(Hash256::ZERO, vec![tx(&[], &[(50, p2pkh(0))], 0)], 1);
         let mut pp = arcade_chain::params::PEPECOIN_TEST.clone();
@@ -340,6 +340,7 @@ mod tests {
             home_mode: "full".into(),
             asks: Mutex::new(Default::default()),
             asks_done: Mutex::new(Default::default()),
+            asks_sent: Mutex::new(Default::default()),
             pending_spent: Mutex::new(Default::default()),
             block_outbox: Mutex::new(Vec::new()),
             miner: Default::default(),
@@ -355,7 +356,7 @@ mod tests {
         T { _dir: dir, node, p, cb1, spend }
     }
 
-    fn addr(t: &T, tag: u8) -> String {
+    pub(crate) fn addr(t: &T, tag: u8) -> String {
         arcade_ledger::address::address_of(&p2pkh(tag), t.p).unwrap()
     }
 

@@ -1182,6 +1182,15 @@ pub fn spendable(node: &Node, p: &ChainParams, script: &[u8]) -> Vec<Utxo> {
     out
 }
 
+/// Does the borrowed copy of a chain know a transaction: it waits at a lender, or one of the
+/// coins read for this arcade's addresses came from it?
+pub fn knows_tx(node: &Node, p: &ChainParams, txid: &Hash256) -> bool {
+    if ST.pool.lock().unwrap().get(p.key).is_some_and(|m| m.contains_key(txid)) {
+        return true;
+    }
+    coin_rows(node, p.key).iter().any(|(op, _)| op.txid == *txid)
+}
+
 /// borrow.coins: the wallet's coins on a borrowed chain.
 pub fn coins(node: &Node, key: &str) -> R {
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;

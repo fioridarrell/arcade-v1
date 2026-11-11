@@ -182,7 +182,7 @@ pub fn lookup(db: &ChainDb, c: u16, name: &str) -> Vec<(String, u64, String)> {
     let q = py_strip(name).to_lowercase();
     let mut out = Vec::new();
     for (i, rule) in RULES.iter().enumerate() {
-        if let Ok(Some(v)) = db.store.read(|r| r.get(WIN, &win_key(c, i, &q))) {
+        if let Ok(Some(v)) = db.store(c).read(|r| r.get(WIN, &win_key(c, i, &q))) {
             if v.len() == 44 {
                 out.push((rule.to_string(), u64::from_be_bytes(v[..8].try_into().unwrap()), iid_str(&v[8..])));
             }
@@ -195,7 +195,7 @@ pub fn lookup(db: &ChainDb, c: u16, name: &str) -> Vec<(String, u64, String)> {
 pub fn counts(db: &ChainDb, c: u16) -> [u64; 3] {
     let mut out = [0; 3];
     for (i, o) in out.iter_mut().enumerate() {
-        *o = db.store.read(|r| r.scan_prefix(WIN, &KeyBuf::new().u16(c).u8(i as u8).done())).map(|v| v.len() as u64).unwrap_or(0);
+        *o = db.store(c).read(|r| r.scan_prefix(WIN, &KeyBuf::new().u16(c).u8(i as u8).done())).map(|v| v.len() as u64).unwrap_or(0);
     }
     out
 }

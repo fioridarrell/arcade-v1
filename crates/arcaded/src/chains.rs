@@ -62,7 +62,7 @@ pub(crate) fn tables_of(index: &str) -> Vec<String> {
         "ledger" => arcade_ledger::engine::LedgerIndexer.tables_named(),
         "profiles" => s(&[arcade_ledger::index::PROFILE, arcade_ledger::index::LINKED]),
         "messages" => s(arcade_ledger::messages::TABLES),
-        "ord" => s(arcade_ledger::ord::TABLES),
+        "ord" => s(&[arcade_ledger::ord::TABLES, arcade_ledger::ord::DERIVED].concat()),
         "names" => s(&[arcade_ledger::names::CLAIM, arcade_ledger::names::WIN]),
         "maps" => s(&[arcade_ledger::maps::MAP]),
         "tokens" => s(&[arcade_ledger::tokens::TICK, arcade_ledger::tokens::BAL, arcade_ledger::tokens::HOLDER, arcade_ledger::tokens::XFER]),
@@ -556,6 +556,8 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
     let c = r.params.chain_no;
     let name = r.params.name;
     std::thread::spawn(move || {
+        // Let the chain's threads see the stop first: a chain's own file is deleted whole.
+        std::thread::sleep(std::time::Duration::from_secs(10));
         while n.chain.remove_chain_batch(c, 20_000).map(|x| x > 0).unwrap_or(false) {}
         let _ = n.app.event("chains", &format!("removed {name} and its data"));
     });

@@ -148,8 +148,10 @@ fn stop_cleanly_on_signal(node: Arc<Node>) {
                 // Waits for a batch still writing to commit first: its cache flush is only
                 // in the database once that batch commits.
                 for (c, r) in node.chain.flush_all_for_stop() {
-                    if let Err(e) = r {
-                        eprintln!("arcaded: chain {c}: coin cache not written: {e}");
+                    match r {
+                        Err(e) if c == u16::MAX => eprintln!("arcaded: a chain file not synced: {e}"),
+                        Err(e) => eprintln!("arcaded: chain {c}: coin cache not written: {e}"),
+                        Ok(()) => {}
                     }
                 }
                 eprintln!("arcaded: stopped ({:.1}s)", t.elapsed().as_secs_f64());
@@ -251,6 +253,7 @@ fn main() {
         home_mode: opt("--home-mode").filter(|m| m == "shared").unwrap_or_else(|| "full".into()),
         asks: Mutex::new(Default::default()),
         asks_done: Mutex::new(Default::default()),
+        asks_sent: Mutex::new(Default::default()),
         pending_spent: Mutex::new(Default::default()),
         block_outbox: Mutex::new(Vec::new()),
         miner: Default::default(),

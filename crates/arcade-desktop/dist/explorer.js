@@ -34,6 +34,15 @@
   const has = (ix) => !!sum && (sum.indexes.includes(ix) || (sum.mesh_indexes || []).includes(ix));
   // Pages (or parts) answered by another arcade say so.
   let meshFrom = null;
+  // This arcade's HTTP server: inscription lists ask for images as links to it (img: "links")
+  // and each picture loads on its own, so the list itself comes back at once.
+  let httpBase = null;
+  const imgArgs = async () => {
+    if (httpBase === null) {
+      try { httpBase = (await api("rpc.info")).url.replace(/\/rpc$/, ""); } catch { httpBase = ""; }
+    }
+    return httpBase ? { img: "links" } : {};
+  };
   const xapi = async (cmd, args) => {
     const r = await api(cmd, args);
     if (r && r._mesh) meshFrom = r._mesh;
@@ -67,7 +76,7 @@
     const row = (c) => h("button", { class: c.key === chain?.key ? "on" : "", onclick: () => pick(c) }, coinEl(c), h("span", {}, c.name));
     m.replaceChildren(...chains.filter((c) => c.installed || c.borrowed).map(row));
   }
-  function pick(c) { chain = c; close(); paintSelector(); sum = null; go("home"); announce(); }
+  function pick(c) { remember(); chain = c; close(); paintSelector(); sum = null; go("home", null, false); announce(); }
   // Every tab follows the picked chain.
   function announce() { window.dispatchEvent(new CustomEvent("arcade:chain", { detail: chain })); }
   function close() { $("cs-menu").hidden = true; $("cs-btn").setAttribute("aria-expanded", "false"); }
@@ -84,9 +93,21 @@
   function preview(i, big) {
     const t = h("div", { class: big ? "x-big" : "x-thumb" });
     const c = i.content || {};
-    if (c.kind === "image") t.append(h("img", { src: c.data, alt: `inscription ${i.n}`, loading: "lazy" }));
-    else if (c.kind === "text") t.append(h("pre", {}, c.text.slice(0, big ? 20000 : 400)));
-    else t.append(h("div", { class: "x-ph" }, c.kind === "html" ? "HTML (not run here)" : c.kind === "missing" ? "content not stored" : (c.type || "binary")));
+    if (c.kind === "image") {
+      const img = h("img", { src: c.src && httpBase ? httpBase + c.src : c.data, alt: `inscription ${i.n}`, loading: "lazy", decoding: "async" });
+      img.onerror = () => img.replaceWith(h("div", { class: "x-ph" }, "image not available"));
+      t.append(img);
+    }
+    else if (c.kind === "html" && c.src && httpBase) {
+      // Run sandboxed: an opaque origin, scripts only (no forms, popups or top navigation),
+      // loading only from this arcade (its CSP). An inscription's own page runs at once; a
+      // thumbnail (drawn at 4x and scaled down, not taking clicks) waits for one of the
+      // HTML_MAX places while it is on screen.
+      if (big) t.append(htmlFrame(c.src, i.n, false));
+      else { t._src = c.src; t._n = i.n; t.append(htmlWaiting()); htmlObs.observe(t); }
+    }
+    else if (c.kind === "text" || c.kind === "html") t.append(h("pre", {}, (c.text || "").slice(0, big ? 20000 : 400)));
+    else t.append(h("div", { class: "x-ph" }, c.kind === "missing" ? "content not stored" : (c.type || "binary")));
     if (!big) t.append(h("span", { class: "tag" }, (i.ct || "").split(";")[0] || "no type"));
     return t;
   }
@@ -96,37 +117,97 @@
       h("div", { class: "x-mid" }, h("div", { class: "x-hash" }, b.hash),
         h("div", { class: "chips" }, b.txs != null ? h("span", { class: "chip" }, `${b.txs} tx`) : "", b.inscriptions ? h("span", { class: "chip ins" }, `${b.inscriptions} inscription${b.inscriptions > 1 ? "s" : ""}`) : "")))));
   }
+  // HTML thumbnails take turns (Martin 2026-11-10: nine at a time, more overwhelms the page):
+  // at most HTML_MAX run at once, only those on screen; one that scrolls away or leaves the
+  // page stops, and the next waiting one starts.
+  const HTML_MAX = 9;
+  const htmlLive = new Set(), htmlWait = [];
+  const htmlFrame = (src, n, mini) => h("iframe", { class: mini ? "x-html mini" : "x-html", src: httpBase + src, sandbox: "allow-scripts allow-pointer-lock", referrerpolicy: "no-referrer", title: `inscription ${n}` });
+  const htmlWaiting = () => h("div", { class: "x-ph x-wait" }, "HTML · waits its turn");
+  function htmlStart(t) {
+    t.querySelector(".x-wait")?.replaceWith(htmlFrame(t._src, t._n, true));
+    htmlLive.add(t);
+  }
+  function htmlStop(t) {
+    if (!htmlLive.delete(t)) return;
+    t.querySelector("iframe.x-html")?.replaceWith(htmlWaiting());
+  }
+  function htmlPump() {
+    for (const t of [...htmlLive]) if (!t.isConnected) { htmlLive.delete(t); htmlObs.unobserve(t); }
+    for (let k = htmlWait.length - 1; k >= 0; k--) if (!htmlWait[k].isConnected) { htmlObs.unobserve(htmlWait[k]); htmlWait.splice(k, 1); }
+    while (htmlLive.size < HTML_MAX && htmlWait.length) htmlStart(htmlWait.shift());
+  }
+  const htmlObs = new IntersectionObserver((entries) => {
+    for (const e of entries) {
+      const t = e.target, k = htmlWait.indexOf(t);
+      if (e.isIntersecting) { if (!htmlLive.has(t) && k < 0) htmlWait.push(t); }
+      else { if (k >= 0) htmlWait.splice(k, 1); htmlStop(t); }
+    }
+    htmlPump();
+  });
+  // A new page drops the frames of the old one (their elements leave the document).
+  new MutationObserver(() => htmlPump()).observe(document.body, { childList: true, subtree: true });
+
+  // The content on its own, full size, in a new arcade window (path on this arcade's server).
+  function contentLink(path, title) {
+    if (!httpBase || !path) return "";
+    return h("button", { class: "x-open", title: "Open the content in a new window", onclick: (ev) => {
+      ev.stopPropagation();
+      invoke("open_content", { url: httpBase + path, title }).catch((e) => alert(String(e)));
+    } }, "↗");
+  }
   function insGrid(list) {
     if (!list.length) return h("div", { class: "x-empty" }, "No inscriptions yet.");
     return h("div", { class: "x-grid" }, list.map((i) => h("div", { class: "x-ins", onclick: () => go("inscription", i.id) }, preview(i),
-      h("div", { class: "cap" }, h("b", {}, `#${fmt(i.n)}`), h("span", { class: "faint" }, fmt(i.h))))));
+      h("div", { class: "cap" }, h("b", {}, `#${fmt(i.n)}`), h("span", { class: "faint" }, fmt(i.h)), i.from_arcade ? "" : contentLink(`/content/${i.id}`, `Inscription #${fmt(i.n)}`)))));
   }
+  // An arcade-ledger inscription's HTML runs from /app/<chain>/<txid> (its sandboxed page).
+  const ledgerItem = (i) => {
+    const c = { ...(i.content || {}) };
+    if (c.kind === "html" && chain) c.src = `/app/${chain.key}/${i.txid}`;
+    return { content: c, ct: i.content_type, n: i.number };
+  };
   function table(head, rows) {
     return h("div", { class: "x-tbl" }, h("table", {}, h("thead", {}, h("tr", {}, head.map(([t, num]) => h("th", { class: num ? "num" : "" }, t)))),
       h("tbody", {}, rows.map((r) => h("tr", { class: r.go ? "click" : "", onclick: r.go || null }, r.cells.map(([v, num]) => h("td", { class: num ? "num" : "" }, v)))))));
   }
   // Pages: the page number lives in the address arg as "p<N>" (1 = newest).
   const pageOf = () => (arg && /^p\d+$/.test(arg) ? Math.max(1, Number(arg.slice(1))) : 1);
+  // Pages of a list (Martin 2026-11-10: buttons must not change size or place). Seven number
+  // slots of one width (the widest page number of this list), the current page in the middle
+  // one; First, Prev, Next and Last always in place (greyed at the ends); the count and the Go
+  // box on their own line. Go takes a page, or with gotoPage "#" and an inscription number.
+  function windowOf(page, pages) {
+    if (pages <= 7) return Array.from({ length: 7 }, (_, k) => (k < pages ? k + 1 : null));
+    if (page <= 4) return [1, 2, 3, 4, 5, "…", pages];
+    if (page >= pages - 3) return [1, "…", pages - 4, pages - 3, pages - 2, pages - 1, pages];
+    return [1, "…", page - 1, page, page + 1, "…", pages];
+  }
   function pager(total, size, page, where, gotoLabel, gotoPage) {
     const pages = Math.max(1, Math.ceil(total / size));
     page = Math.min(page, pages);
-    const btn = (label, p, on) => h("button", { class: "pg" + (on ? " on" : ""), disabled: p < 1 || p > pages || (on && true), onclick: () => go(where, `p${p}`) }, label);
-    const nums = [];
-    const lo = Math.max(1, page - 2), hi = Math.min(pages, page + 2);
-    if (lo > 1) { nums.push(btn("1", 1)); if (lo > 2) nums.push(h("span", { class: "pg-gap" }, "…")); }
-    for (let i = lo; i <= hi; i++) nums.push(btn(fmt(i), i, i === page));
-    if (hi < pages) { if (hi < pages - 1) nums.push(h("span", { class: "pg-gap" }, "…")); nums.push(btn(fmt(pages), pages)); }
-    const box = h("input", { type: "text", inputmode: "numeric", placeholder: gotoLabel || "page", "aria-label": gotoLabel || "Go to page" });
+    const to = (p) => go(where, `p${Math.min(pages, Math.max(1, p))}`);
+    const nav = (cls, label, p, title, short) => h("button", { type: "button", class: cls, disabled: p < 1 || p > pages || p === page, title, "aria-label": title, "data-short": short || "", onclick: () => to(p) }, label);
+    const slots = windowOf(page, pages).map((v) =>
+      v === null ? h("button", { type: "button", class: "slot empty", tabindex: "-1", "aria-hidden": "true" }, "0")
+      : v === "…" ? h("button", { type: "button", class: "slot gap", tabindex: "-1", "aria-hidden": "true" }, "…")
+      : h("button", { type: "button", class: "slot" + (v === page ? " on" : ""), disabled: v === page, "aria-current": v === page ? "page" : false, onclick: () => to(v) }, fmt(v)));
+    const box = h("input", { type: "text", inputmode: "numeric", placeholder: gotoPage ? `page or #${(gotoLabel || "number").replace(/\s*#$/, "")}` : "page", "aria-label": gotoPage ? "Go to a page, or # and a number" : "Go to a page" });
+    const err = h("span", { class: "pg-err", "aria-live": "polite" });
     const jump = () => {
-      const v = Number(String(box.value).replace(/[,#\s]/g, ""));
-      if (!Number.isFinite(v) || box.value === "") return;
-      const p = gotoPage ? gotoPage(v) : v;
-      go(where, `p${Math.min(pages, Math.max(1, p))}`);
+      const raw = String(box.value).trim(), v = Number(raw.replace(/[,#\s]/g, ""));
+      if (!raw || !Number.isFinite(v) || v < 0) { err.textContent = gotoPage ? "Type a page number, or # and a number." : "Type a page number."; return; }
+      to(gotoPage && raw.startsWith("#") ? gotoPage(v) : v);
     };
     box.onkeydown = (e) => { if (e.key === "Enter") jump(); };
-    return h("div", { class: "x-pager" },
-      h("div", { class: "pg-nums" }, btn("« First", 1, false), btn("‹ Prev", page - 1, false), ...nums, btn("Next ›", page + 1, false), btn("Last »", pages, false)),
-      h("div", { class: "pg-info" }, `Page ${fmt(page)} of ${fmt(pages)} · ${fmt(total)} in all`, h("span", { class: "pg-go" }, box, h("button", { class: "pg", onclick: jump }, "Go"))));
+    return h("div", { class: "pgr", style: `--slot: calc(${fmt(pages).length + 1.5}ch + 10px)` },
+      h("div", { class: "pgr-bar" },
+        nav("edge", "|‹", 1, "First page"), nav("step", "‹ Prev", page - 1, "Previous page", "‹"),
+        h("div", { class: "pgr-slots" }, ...slots),
+        nav("step", "Next ›", page + 1, "Next page", "›"), nav("edge", "›|", pages, "Last page")),
+      h("div", { class: "pgr-foot" },
+        h("span", { class: "pgr-where" }, `Page ${fmt(page)} of ${fmt(pages)} · ${fmt(total)} in all`), err,
+        h("span", { class: "pgr-go" }, box, h("button", { type: "button", onclick: jump }, "Go"))));
   }
   const sect = (title, more, body) => h("section", { class: "x-sect" }, h("header", {}, h("h2", {}, title), more ? link("View all →", more) : ""), body);
   const kv = (rows) => h("div", { class: "x-kv" }, rows.filter(Boolean).flatMap(([k, v]) => [h("div", { class: "k" }, k), h("div", {}, v)]));
@@ -213,7 +294,7 @@
   const TYPE_TOTALS = {};
   function typeChips() {
     const key = chain.key;
-    const box = h("div", { class: "x-types" }, INS_TYPES.map(([v, label]) => h("button", { class: "chip-btn" + (insType === v ? " on" : ""), "data-t": v || "all", onclick: () => { insType = v; oldKey = ""; go("inscriptions"); } }, label)));
+    const box = h("div", { class: "x-types" }, INS_TYPES.map(([v, label]) => h("button", { class: "chip-btn" + (insType === v ? " on" : ""), "data-t": v || "all", onclick: () => { remember(); insType = v; oldKey = ""; go("inscriptions", null, false); } }, label)));
     const paint = (r) => {
       for (const b of box.querySelectorAll("button")) {
         const t = b.dataset.t, n = t === "all" ? r.total : r.types?.[t];
@@ -236,7 +317,7 @@
     if (oldKey !== key) { oldKey = key; oldAcc = r.items; oldNext = r.next_before ?? null; }
     const more = oldNext != null ? h("div", { class: "row" }, h("button", { onclick: async (ev) => {
       ev.target.disabled = true; ev.target.textContent = "Looking…";
-      const rr = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, before: oldNext, n: 36 });
+      const rr = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, before: oldNext, n: 36, ...(await imgArgs()) });
       oldAcc = oldAcc.concat(rr.items); oldNext = rr.next_before ?? null;
       render();
     } }, `Show older (looked down to #${fmt(oldNext)})`)) : h("p", { class: "x-note" }, "That's all of them.");
@@ -245,12 +326,13 @@
       oldAcc.length ? insGrid(oldAcc) : h("div", { class: "x-empty" }, oldNext != null ? "None in the newest ones looked at yet." : "None."), more));
   }
   async function vInscriptions() {
-    const size = 36, page = pageOf();
+    // HTML pages run live: nine to a page (Martin 2026-11-10), the rest 36.
+    const size = insType === "html" ? 9 : 36, page = pageOf();
     const first = await xapi("explorer.inscriptions", { chain: chain.key, n: 1 });
     const total = first.total;
     if (insType) {
       // Paged like the full list (newest first), with the type's own total.
-      const r = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, offset: (page - 1) * size, n: size });
+      const r = await xapi("explorer.inscriptions", { chain: chain.key, type: insType, offset: (page - 1) * size, n: size, ...(await imgArgs()) });
       const label = INS_TYPES.find((t) => t[0] === insType)[1];
       if (r.type_total == null) return oldTyped(r, label);
       const tt = r.type_total;
@@ -258,7 +340,7 @@
       return sect(`${label} · ${fmt(tt)}${r.counting ? "+" : ""}`, null, h("div", {}, typeChips(), note, pager(tt, size, page, "inscriptions"),
         r.items.length ? insGrid(r.items) : h("div", { class: "x-empty" }, "None."), pager(tt, size, page, "inscriptions")));
     }
-    const r = await xapi("explorer.inscriptions", { chain: chain.key, before: Math.max(0, total - (page - 1) * size), n: size });
+    const r = await xapi("explorer.inscriptions", { chain: chain.key, before: Math.max(0, total - (page - 1) * size), n: size, ...(await imgArgs()) });
     const toPage = (num) => Math.floor((total - 1 - num) / size) + 1;
     return sect(`Inscriptions · ${fmt(total)}`, null, h("div", {}, typeChips(), pager(total, size, page, "inscriptions", "inscription #", toPage), insGrid(r.items), pager(total, size, page, "inscriptions", "inscription #", toPage)));
   }
@@ -288,7 +370,7 @@
   function ledgerGrid(list) {
     if (!list.length) return h("div", { class: "x-empty" }, "No arcade inscriptions yet.");
     return h("div", { class: "x-grid" }, list.map((i) => h("div", { class: "x-ins", onclick: () => go("linsc", i.txid) },
-      preview({ content: i.content, ct: i.content_type, n: i.number }), h("div", { class: "cap" }, h("b", {}, `#${fmt(i.number)}`), h("span", { class: "faint" }, fmt(i.block_height))))));
+      preview(ledgerItem(i)), h("div", { class: "cap" }, h("b", {}, `#${fmt(i.number)}`), h("span", { class: "faint" }, fmt(i.block_height)), chain ? contentLink(`/app/${chain.key}/${i.txid}`, `Arcade inscription #${fmt(i.number)}`) : ""))));
   }
   function ledgerTokens(list) {
     if (!list.length) return h("div", { class: "x-empty" }, "No arcade tokens yet.");
@@ -331,8 +413,8 @@
   async function vLInsc() {
     const i = await xapi("explorer.ledger_inscription", { chain: chain.key, id: arg });
     return h("div", {}, crumbs(link("Arcade ledger", "ledger"), link("Inscriptions", "linscs"), `#${fmt(i.number)}`),
-      head(`Arcade inscription #${fmt(i.number)}`, h("span", { class: "chip arc" }, (i.content_type || "").split(";")[0] || "no type")),
-      h("div", { class: "x-split" }, preview({ content: i.content, ct: i.content_type, n: i.number }, true),
+      head(`Arcade inscription #${fmt(i.number)}`, h("span", { class: "chip arc" }, (i.content_type || "").split(";")[0] || "no type"), contentLink(`/app/${chain.key}/${i.txid}`, `Arcade inscription #${fmt(i.number)}`)),
+      h("div", { class: "x-split" }, preview(ledgerItem(i), true),
         kv([["Txid", link(short(i.txid, 14, 8), "tx", i.txid, "mono")], ["Owner", addrLink(i.owner, i.owner_tag)], ["Creator", addrLink(i.creator, i.creator_tag)],
           ["Inscribed", link(`block ${fmt(i.block_height)}`, "block", String(i.block_height))], ["Content type", i.content_type || "—"], ["Size", `${fmt(i.content_len)} bytes · ${i.chunks} chunk${i.chunks === 1 ? "" : "s"}`],
           ["sha256", h("span", { class: "mono" }, i.sha256 || "")], i.json && ["JSON", h("span", { class: "mono" }, JSON.stringify(i.json).slice(0, 300))]])));
@@ -381,10 +463,10 @@
         : h("div", { class: "x-empty" }, "No transactions."));
   }
   async function vInscription() {
-    const i = await xapi("explorer.inscription", { chain: chain.key, id: arg });
+    const i = await xapi("explorer.inscription", { chain: chain.key, id: arg, ...(await imgArgs()) });
     const ct = (i.ct || "").split(";")[0];
     return h("div", {}, crumbs(link("Inscriptions", "inscriptions"), `#${fmt(i.n)}`),
-      head(`Inscription #${fmt(i.n)}`, h("span", { class: "chip ins" }, ct || "no type"), i.burned != null ? pill("burned", false) : ""),
+      head(`Inscription #${fmt(i.n)}`, h("span", { class: "chip ins" }, ct || "no type"), i.burned != null ? pill("burned", false) : "", i.from_arcade || i._mesh ? "" : contentLink(`/content/${i.id}`, `Inscription #${fmt(i.n)}`)),
       h("div", { class: "x-split" }, preview(i, true),
         kv([["Id", h("span", { class: "mono" }, i.id)], ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
           i.at && ["Location", link(short(i.at, 12, 10), "tx", i.at.split(":")[0], "mono")], ["Inscribed", link(`block ${fmt(i.h)}`, "block", String(i.h))],
@@ -460,14 +542,43 @@
       meshFrom = page === "home" ? sumFrom : null;
       const v = await VIEWS[page]();
       if (my !== seq) return;
-      $("x-view").replaceChildren(v);
+      $("x-view").replaceChildren(backBar(), v);
       paintNav();
     } catch (e) {
       if (my !== seq) return;
-      $("x-view").replaceChildren(h("div", { class: "x-empty bad" }, e.message), h("div", { class: "row" }, h("button", { onclick: () => go("home") }, "Back to the overview")));
+      $("x-view").replaceChildren(backBar(), h("div", { class: "x-empty bad" }, e.message), h("div", { class: "row" }, h("button", { onclick: () => go("home") }, "Back to the overview")));
     }
   }
-  function go(p, a = null) { page = p; arg = a; render(); window.scrollTo({ top: 0 }); }
+  // Where you've been (Martin 2026-11-10: always a Back to the page you were on): every move
+  // through go() is kept, with the chain, the type filter and where the page was scrolled to.
+  const HIST = [];
+  // The page of each list you were last on (per chain): going up to a list from a detail page
+  // (its section button or its crumb) opens that page, not the first one.
+  const LAST = {};
+  const here = () => ({ chain: chain?.key, page, arg, insType, y: window.scrollY });
+  function remember() { if (chain) { HIST.push(here()); if (HIST.length > 200) HIST.shift(); } }
+  function go(p, a = null, keep = true) {
+    if (a === null && DETAIL_PARENT[page] && chain && LAST[`${chain.key}|${p}`] != null) a = LAST[`${chain.key}|${p}`];
+    if (keep) remember();
+    page = p; arg = a;
+    if (chain && !DETAIL_PARENT[p]) LAST[`${chain.key}|${p}`] = a;
+    render(); window.scrollTo({ top: 0 });
+  }
+  async function back() {
+    const s = HIST.pop();
+    if (!s) return;
+    if (s.chain && chain && s.chain !== chain.key) {
+      const c = chains.find((x) => x.key === s.chain);
+      if (c) { chain = c; sum = null; paintSelector(); announce(); }
+    }
+    page = s.page; arg = s.arg; insType = s.insType; oldKey = "";
+    await render();
+    window.scrollTo({ top: s.y || 0 });
+  }
+  const backBar = () => HIST.length ? h("div", { class: "x-back" }, h("button", { class: "pg", onclick: back, title: "Back to the page you were on (Alt+←)" }, "← Back")) : "";
+  // Alt+Left and the mouse's back button go back too, while the Explorer is open.
+  document.addEventListener("keydown", (ev) => { if (ev.altKey && ev.key === "ArrowLeft" && $("explorer").classList.contains("on")) { ev.preventDefault(); back(); } });
+  document.addEventListener("mouseup", (ev) => { if (ev.button === 3 && $("explorer").classList.contains("on")) { ev.preventDefault(); back(); } });
 
   $("x-q").addEventListener("keydown", async (ev) => {
     if (ev.key !== "Enter") return;

@@ -66,6 +66,43 @@ fn open_app(app: tauri::AppHandle, id: String, title: String, frame: String) -> 
         .map_err(|e| e.to_string())
 }
 
+/// Open an inscription's content full size in its own window (the Explorer's ↗; Martin
+/// 2026-11-10): the page straight from this arcade's server, which serves it sandboxed (an
+/// opaque origin, scripts only). The window has no access to the arcade API (only the main
+/// window and app windows do). One window per address; opening it again brings it forward.
+#[tauri::command]
+fn open_content(app: tauri::AppHandle, url: String, title: String) -> Result<(), String> {
+    use std::hash::{Hash, Hasher};
+    use tauri::Manager;
+    let ok = url.strip_prefix("http://127.0.0.1:").and_then(|r| r.split_once('/')).is_some_and(|(port, path)| {
+        let id_ok = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_alphanumeric());
+        port.parse::<u16>().is_ok()
+            && match path.split('/').collect::<Vec<_>>().as_slice() {
+                ["content", id] => id_ok(id),
+                ["app", chain, id] | ["ord", chain, id] => chain.bytes().all(|b| b.is_ascii_lowercase()) && id_ok(id),
+                _ => false,
+            }
+    });
+    if !ok {
+        return Err("only content from this arcade opens here".into());
+    }
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    url.hash(&mut h);
+    let label = format!("content-{:016x}", h.finish());
+    if let Some(w) = app.get_webview_window(&label) {
+        let _ = w.unminimize();
+        return w.set_focus().map_err(|e| e.to_string());
+    }
+    let u: tauri::Url = url.parse().map_err(|e| format!("{e}"))?;
+    tauri::WebviewWindowBuilder::new(&app, label, tauri::WebviewUrl::External(u))
+        .title(&title)
+        .inner_size(900.0, 900.0)
+        .min_inner_size(240.0, 240.0)
+        .build()
+        .map(|w| heal(&w))
+        .map_err(|e| e.to_string())
+}
+
 /// If a window's web process dies (it crashed, or the system ended it), reload the page instead
 /// of leaving the window blank.
 fn heal(w: &tauri::WebviewWindow) {
@@ -104,7 +141,7 @@ fn main() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![api, open_app])
+        .invoke_handler(tauri::generate_handler![api, open_app, open_content])
         .run(tauri::generate_context!())
         .expect("error while running the Arcade app");
 }

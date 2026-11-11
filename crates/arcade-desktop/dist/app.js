@@ -60,7 +60,7 @@ async function drawStart() {
   const askedText = () => !st.wallet ? `It's asked for by itself as soon as your wallet exists.`
     : used ? `Received, and used to publish your @handle.`
     : coinsHere ? `Here: ${homeCoins(st.balance)}. That pays for publishing your @handle.`
-    : st.faucet && st.faucet.status === "paid" ? `Sent to you by another arcade${st.faucet.txid ? ` (transaction ${st.faucet.txid.slice(0, 12)}…)` : ""}. ${catchUp() || "It shows here in a moment."}`
+    : st.faucet && st.faucet.status === "paid" ? `Another arcade says it sent it${st.faucet.txid ? ` (transaction ${st.faucet.txid.slice(0, 12)}…)` : ""}. ${catchUp() || "It shows here once that payment arrives; if it doesn't, your arcade asks again by itself."}`
     : st.faucet ? `Asked the arcade mesh for it ${ago(st.faucet.at) === "just now" ? "just now" : ago(st.faucet.at) + " ago"}; another arcade sends it, usually within a minute or two. Nothing to do: it's used as soon as it arrives, even before a block confirms it.${catchUp() ? " " + catchUp() : ""}`
     : `It's asked for by itself in a moment.`;
   if (sig === drawStart.sig) {

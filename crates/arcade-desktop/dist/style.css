@@ -419,3 +419,36 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .start-phrase { margin: 8px 0; }
 .start-check { display: flex; align-items: center; gap: 6px; margin-top: 4px; }
 .start-claim input { max-width: 14em; }
+
+/* HTML inscriptions, run sandboxed in a frame; a thumbnail is drawn at 4x and scaled down. */
+.x-thumb iframe.x-html.mini { position: absolute; top: 0; left: 0; width: 400%; height: 400%; transform: scale(.25); transform-origin: 0 0; border: 0; pointer-events: none; background: #fff; }
+.x-big iframe.x-html { width: 100%; height: 100%; border: 0; background: #fff; }
+/* Open the content in a new window (cards and inscription pages). */
+.x-open { margin-left: auto; font: inherit; font-size: 12px; line-height: 1; padding: 2px 6px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel-2); color: var(--muted); cursor: pointer; }
+.x-open:hover { border-color: var(--accent); color: var(--accent); }
+.x-dhead .x-open { margin-left: 8px; font-size: 14px; padding: 4px 9px; }
+.x-back { margin: 0 0 10px; }
+
+/* The pager (explorer.js pager): every control keeps its place and width. */
+.pgr { display: grid; gap: 8px; margin: 10px 0; }
+.pgr-bar { display: grid; grid-template-columns: auto auto 1fr auto auto; gap: 6px; align-items: center; }
+.pgr-slots { display: grid; grid-auto-flow: column; grid-auto-columns: var(--slot); gap: 4px; justify-content: center; }
+.pgr button { font-family: inherit; font-size: 13px; line-height: 1; height: 32px; padding: 0; border-radius: 8px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.pgr .edge { width: 34px; font-size: 15px; }
+.pgr .step { width: 76px; }
+.pgr .slot { width: var(--slot); padding: 0 4px; overflow: hidden; text-overflow: ellipsis; }
+.pgr .slot.on { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 650; }
+.pgr .slot.on:disabled { opacity: 1; }
+.pgr .slot.gap { border-color: transparent; background: transparent; color: var(--muted); cursor: default; }
+.pgr .slot.empty { visibility: hidden; }
+.pgr button:disabled { opacity: .35; }
+.pgr-foot { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13px; color: var(--muted); flex-wrap: wrap; }
+.pgr-where { font-variant-numeric: tabular-nums; }
+.pgr-go { display: inline-flex; gap: 6px; align-items: center; }
+.pgr-go input { width: 11em; height: 32px; box-sizing: border-box; padding: 0 8px; font-size: 13px; font-variant-numeric: tabular-nums; }
+.pgr-go button { width: 44px; }
+.pg-err { color: var(--bad); }
+@media (max-width: 560px) {
+  .pgr .step { width: 34px; font-size: 0; }
+  .pgr .step::before { content: attr(data-short); font-size: 15px; }
+}

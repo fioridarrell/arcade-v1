@@ -52,7 +52,7 @@ fn main() {
             let mut i = 0u64;
             while i < n {
                 let end = (i + 2_000_000).min(n);
-                db.store
+                db.wstore(C).unwrap()
                     .write(|w| {
                         for j in i..end {
                             let x = j as u128 * step + (rng.next() as u128 % step);
@@ -75,7 +75,7 @@ fn main() {
             let mut rows: Vec<([u8; 12], [u8; 8])> = (0..m as u64).map(|i| (rng.t12(), bp(5_000_000_000 + i))).collect();
             rows.sort_unstable();
             let t0 = Instant::now();
-            db.store
+            db.wstore(C).unwrap()
                 .write(|w| {
                     if a[1] == "old" {
                         for (t12, v) in &rows {
@@ -93,12 +93,12 @@ fn main() {
         "lookup" => {
             let n: u64 = a[3].parse().unwrap();
             let db = ChainDb::open(&path).unwrap();
-            let total = db.store.count(TXS).unwrap();
+            let total = db.count_all(TXS).unwrap();
             let step = (u128::MAX >> 32) / total as u128;
             let mut rng = Rng(42);
             let t0 = Instant::now();
             let mut found = 0u64;
-            db.store
+            db.store(C)
                 .read(|r| {
                     for _ in 0..n {
                         let j = rng.next() % total;

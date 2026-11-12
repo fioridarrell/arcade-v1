@@ -59,6 +59,7 @@ mod grpsvc;
 mod feedsvc;
 mod node;
 mod ordsafe;
+mod ordsend;
 mod peerbook;
 mod psync;
 mod realtime;

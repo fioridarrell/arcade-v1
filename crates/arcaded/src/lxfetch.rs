@@ -476,6 +476,7 @@ fn new_job(node: &Node, p: &ChainParams, id: String, h: u64, auto: bool, from: O
 
 /// The background loop: start copies when far behind, collect votes, take finished copies in.
 pub fn run(node: Arc<Node>) {
+    st().refused.extend(crate::dxfetch::cancelled_ids(&node.home, "ledger"));
     loop {
         std::thread::sleep(Duration::from_secs(2));
         for p in ledger_chains(&node) {
@@ -716,6 +717,11 @@ pub fn start(node: &Node, key: &str, from: Option<String>) -> Result<Value, Stri
     if s.jobs.get(p.net).is_some_and(|j| !matches!(j.phase.as_str(), "done" | "refused")) {
         return Err("a ledger copy is already being fetched for this chain".into());
     }
+    // Asked for by the operator: copies cancelled before may be fetched again.
+    for id in crate::dxfetch::cancelled_ids(&node.home, "ledger") {
+        s.refused.remove(&id);
+    }
+    crate::dxfetch::clear_cancelled(&node.home, "ledger");
     let (id, h, peers) = best_offer(&s, p.net, tip_h, from.as_deref()).ok_or("no arcade offers a whole ledger copy at or below this arcade's tip")?;
     s.jobs.insert(p.net.to_string(), new_job(node, p, id.clone(), h, false, from));
     Ok(json!({"started": true, "id": id, "height": h, "holders": peers}))
@@ -727,11 +733,14 @@ pub fn cancel(node: &Node, key: &str) -> Result<Value, String> {
     match s.jobs.get(p.net) {
         Some(j) if j.phase == "converting" => Err("the copy is being taken in; it can't be stopped now".into()),
         Some(j) => {
-            let dir = j.dir.clone();
+            let (dir, id) = (j.dir.clone(), j.id.clone());
             s.jobs.remove(p.net);
+            // Not fetched again by itself (the auto start would pick the same offer at once).
+            s.refused.insert(id.clone());
             drop(s);
+            crate::dxfetch::add_cancelled(&node.home, "ledger", &id);
             let _ = std::fs::remove_dir_all(dir);
-            let _ = node.app.event("chains", &format!("{}: ledger copy fetch cancelled", p.key));
+            let _ = node.app.event("chains", &format!("{}: ledger copy fetch cancelled; copy {} won't be fetched again by itself", p.key, short(&id)));
             Ok(json!({"cancelled": true}))
         }
         None => Ok(json!({"cancelled": false})),

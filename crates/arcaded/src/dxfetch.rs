@@ -545,6 +545,7 @@ fn new_job(node: &Node, p: &ChainParams, id: String, h: u64, auto: bool, from: O
 
 pub fn run(node: Arc<Node>) {
     clear_stale_dirs(&node.home.join("import"));
+    st().refused.extend(cancelled_ids(&node.home, "ord"));
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let nets = ord_chains(&node);
@@ -891,9 +892,51 @@ pub fn start(node: &Node, key: &str, from: Option<String>) -> Result<Value, Stri
     if s.jobs.get(p.net).is_some_and(|j| !matches!(j.phase.as_str(), "done" | "refused" | "failed")) {
         return Err("an ord snapshot is already being fetched for this chain".into());
     }
+    // Asked for by the operator: snapshots cancelled before may be fetched again.
+    for id in cancelled_ids(&node.home, "ord") {
+        s.refused.remove(&id);
+    }
+    clear_cancelled(&node.home, "ord");
     let (id, h, peers) = best_offer(&s, p.net, max_h, from.as_deref()).ok_or("no arcade offers a whole ord snapshot at or below this arcade's tip")?;
     s.jobs.insert(p.net.to_string(), new_job(node, p, id.clone(), h, false, from));
     Ok(json!({"started": true, "id": id, "height": h, "holders": peers}))
+}
+
+// ---------------- cancelled copies ----------------
+//
+// A copy the operator cancelled is not fetched again by itself, in this run or after a restart
+// (one line "<index> <id>" per copy in import/cancelled-copies); starting a fetch by hand
+// clears that index's list. Shared with crate::lxfetch ("ledger").
+
+fn cancelled_file(home: &std::path::Path) -> PathBuf {
+    home.join("import").join("cancelled-copies")
+}
+
+/// The copy ids of `index` the operator cancelled.
+pub(crate) fn cancelled_ids(home: &std::path::Path, index: &str) -> Vec<String> {
+    std::fs::read_to_string(cancelled_file(home))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.split_once(' '))
+        .filter(|(ix, id)| *ix == index && !id.is_empty())
+        .map(|(_, id)| id.trim().to_string())
+        .collect()
+}
+
+pub(crate) fn add_cancelled(home: &std::path::Path, index: &str, id: &str) {
+    let mut lines: Vec<String> = std::fs::read_to_string(cancelled_file(home)).unwrap_or_default().lines().map(String::from).collect();
+    let line = format!("{index} {id}");
+    if !lines.contains(&line) {
+        lines.push(line);
+    }
+    let _ = std::fs::create_dir_all(home.join("import"));
+    let _ = std::fs::write(cancelled_file(home), lines.join("\n") + "\n");
+}
+
+pub(crate) fn clear_cancelled(home: &std::path::Path, index: &str) {
+    let Ok(text) = std::fs::read_to_string(cancelled_file(home)) else { return };
+    let keep: Vec<&str> = text.lines().filter(|l| l.split_once(' ').is_none_or(|(ix, _)| ix != index)).collect();
+    let _ = if keep.is_empty() { std::fs::remove_file(cancelled_file(home)) } else { std::fs::write(cancelled_file(home), keep.join("\n") + "\n") };
 }
 
 pub fn cancel(node: &Node, key: &str) -> Result<Value, String> {
@@ -902,11 +945,14 @@ pub fn cancel(node: &Node, key: &str) -> Result<Value, String> {
     match s.jobs.get(p.net) {
         Some(j) if j.phase == "converting" => Err("the snapshot is being taken in; it can't be stopped now".into()),
         Some(j) => {
-            let dir = j.dir.clone();
+            let (dir, id) = (j.dir.clone(), j.id.clone());
             s.jobs.remove(p.net);
+            // Not fetched again by itself (the auto start would pick the same offer at once).
+            s.refused.insert(id.clone());
             drop(s);
+            add_cancelled(&node.home, "ord", &id);
             let _ = std::fs::remove_dir_all(dir);
-            let _ = node.app.event("chains", &format!("{}: ord snapshot fetch cancelled", p.key));
+            let _ = node.app.event("chains", &format!("{}: ord snapshot fetch cancelled; snapshot {} won't be fetched again by itself", p.key, short(&id)));
             Ok(json!({"cancelled": true}))
         }
         None => Ok(json!({"cancelled": false})),
@@ -994,6 +1040,32 @@ mod tests {
         assert!(!phase_holds("refused", t, None, t));
         assert!(!phase_holds("failed", t, None, t));
         assert!(!phase_holds("done", t, None, t));
+    }
+
+    #[test]
+    fn a_cancelled_snapshot_is_not_offered_again() {
+        let d = tempfile::tempdir().unwrap();
+        let home = d.path();
+        let net = arcade_chain::params::by_key("pep").map(|p| p.net).unwrap_or("main");
+        let id = hex::encode([7u8; 32]);
+        let mut s = State::default();
+        s.heard.insert(("peer".into(), net.to_string()), (now(), json!({"sn3": {"id": id, "h": 50_000, "have": "all"}})));
+        assert_eq!(best_offer(&s, net, u64::MAX, None).map(|o| o.0), Some(id.clone()), "offered before the cancel");
+        // Cancelled: remembered on disk, and refused again after a restart.
+        add_cancelled(home, "ord", &id);
+        add_cancelled(home, "ord", &id);
+        add_cancelled(home, "ledger", "abcd");
+        assert_eq!(cancelled_ids(home, "ord"), vec![id.clone()]);
+        let mut s2 = State::default();
+        s2.heard = s.heard.clone();
+        s2.refused.extend(cancelled_ids(home, "ord"));
+        assert!(best_offer(&s2, net, u64::MAX, None).is_none(), "a cancelled snapshot isn't offered");
+        // Starting by hand clears that index's list only.
+        clear_cancelled(home, "ord");
+        assert!(cancelled_ids(home, "ord").is_empty());
+        assert_eq!(cancelled_ids(home, "ledger"), vec!["abcd".to_string()]);
+        clear_cancelled(home, "ledger");
+        assert!(!cancelled_file(home).exists());
     }
 
     #[test]

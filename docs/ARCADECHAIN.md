@@ -581,3 +581,17 @@ What Martin asked for, word for word in substance: "Each coin should just have a
 - **Testnet:** restarts with 64 MiB segments so small chains (Pepecoin testnet) take part.
 
 Build order: the sealed-only store for blocks; the switch and its card line; index journals (ord first); the ARCADE chain's single copy; the testnet restart and release.
+
+### 14.18 Taken from Darrell's blueprint (Martin 2026-11-11, to build)
+
+Martin read Darrell's "Arcade Coin Blueprint" (registered CPU mining, committee-signed 6-hour tallies, buckets for chain nodes, indexers, storage, serving and relay, bonds) and chose four of its ideas for this chain. The rest stays as designed here: blocks are drawn by proven storage and paced by the proof of time (no CPU race); pay is computed by every arcade from the chain itself and enforced by the coinbase rule (no committee, no new Script opcodes); held-back pay released by audits is the deterrent (no bonds, so no founders' allocation: no premine).
+
+1. **Indexes earn.** Each index is sealed and earns as its own family of segments in a fixed journal form (§14.17), so an indexer is paid for index data every arcade can check, as storage is.
+2. **Serving earns, via the serving check (§5.4).** Checkers drawn at random ask a replica's holder for random leaves; a replica accrues pay only while its serving checks pass. This covers what the blueprint calls chain-node uptime and serving, without self-reported uptime or request receipts.
+3. **Bookkeeping.**
+   - Each payout is rounded down to a whole unit; the leftover units go one each to the largest remainders, ties broken by key.
+   - A share too small to pay (under the dust amount) is carried forward to that address's next payout, not lost.
+   - **Fees join the pot** and are shared by weight like the block reward (this replaces "fees to the block writer"): writers are drawn at random, so fees kept by the writer would reach runners unevenly.
+4. **Transaction order is not the writer's choice.** A block's transactions are ordered by `H(block seed ‖ txid)`, every transaction after the ones it spends from the same block, so no writer can front-run or reorder for advantage. (Blueprint risk 5.)
+
+Not taken, possibly later: a "my work" panel and a network page (city and country only); a maintenance button; a cap per key on recent blocks; a legal review before mainnet. Not taken: pay for relay bytes or request receipts (easy to fake by trading traffic with oneself); 2/3 finality signatures.

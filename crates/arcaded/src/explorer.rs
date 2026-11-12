@@ -122,6 +122,44 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
 ];
 
+/// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
+/// explorer reads Arcade V1.0's own Explorer makes, so an app can show the same explorer. Mesh-internal
+/// questions (sites, ledger bytes, pages, app cards, outpoints) are not among them.
+pub const PAGE_READS: &[&str] = &[
+    "chains.list", "explorer.summary", "explorer.blocks", "explorer.block", "explorer.tx", "explorer.address",
+    "explorer.inscriptions", "explorer.inscription", "explorer.inscription_types", "explorer.tokens", "explorer.token",
+    "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held", "explorer.names",
+    "explorer.name", "explorer.maps", "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens",
+    "explorer.ledger_token", "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag",
+    "explorer.search",
+];
+
+/// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
+/// its arguments one JSON object as the desktop's Explorer sends them (a height stays text, as
+/// explorer.block needs). Answers {"ok": true, "result": ...} or {"ok": false, "error": ...}, as /api/v1
+/// does. None for any other path.
+pub fn page_read(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> Option<(u16, Value)> {
+    let name = path.strip_prefix("/r/explorer/")?;
+    let cmd = if name == "chains" { "chains.list".to_string() } else { format!("explorer.{name}") };
+    let public = crate::commands::find(&cmd).is_some_and(|c| c.perm == crate::commands::Perm::Public);
+    if !PAGE_READS.contains(&cmd.as_str()) || !public {
+        return Some((404, json!({"ok": false, "error": format!("the explorer has no read called {name}")})));
+    }
+    let mut req = match q.get("args") {
+        None => serde_json::Map::new(),
+        Some(Value::String(a)) => match serde_json::from_str::<Value>(a) {
+            Ok(Value::Object(o)) => o,
+            _ => return Some((400, json!({"ok": false, "error": "args must be a JSON object"}))),
+        },
+        Some(_) => return Some((400, json!({"ok": false, "error": "args must be a JSON object"}))),
+    };
+    req.insert("cmd".into(), json!(cmd));
+    Some(match crate::api::dispatch(node, &Value::Object(req)) {
+        Ok(v) => (200, json!({"ok": true, "result": v})),
+        Err(e) => (400, json!({"ok": false, "error": e})),
+    })
+}
+
 /// Page routes another arcade may answer for an app on a chain it keeps: every public read
 /// under /r/ but the asking arcade's own (its wallet, its send requests). The path must be in
 /// its one plain form: no empty, "." or ".." part, no query in it (the query comes apart), so

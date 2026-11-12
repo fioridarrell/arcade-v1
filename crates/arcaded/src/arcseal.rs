@@ -17,7 +17,6 @@ use arcade_arc::params::Net;
 use arcade_arc::sloth::{self, DATA_LEAF, SEALED_LEAF};
 use arcade_chain::params::ChainParams;
 use serde_json::{json, Value};
-use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -38,6 +37,52 @@ pub struct Replica {
 
 /// What a sealing run is doing: (segment id hex, leaves done, leaves in all).
 static SEALING: Mutex<Option<(String, u64, u64)>> = Mutex::new(None);
+
+/// Positioned read/write. Linux uses the kernel's `pread`/`pwrite`. Windows has the same
+/// operations under different names (`seek_read` / `seek_write`).
+fn read_exact_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(f, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut rest = &mut *buf;
+        let mut at = offset;
+        while !rest.is_empty() {
+            let n = f.seek_read(rest, at)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"));
+            }
+            at += n as u64;
+            rest = &mut rest[n..];
+        }
+        Ok(())
+    }
+}
+
+fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_all_at(f, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut rest = buf;
+        let mut at = offset;
+        while !rest.is_empty() {
+            let n = f.seek_write(rest, at)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"));
+            }
+            at += n as u64;
+            rest = &rest[n..];
+        }
+        Ok(())
+    }
+}
 
 pub fn dir_of(node: &Node, net: &Net, segment: &Hash) -> PathBuf {
     node.home.join("arc").join(net.key).join("sealed").join(hex::encode(segment))
@@ -126,7 +171,7 @@ fn seal_into(node: &Node, p: &ChainParams, dir: &std::path::Path, segment: Hash,
         let mut l = [0u8; DATA_LEAF];
         let at = i * DATA_LEAF as u64;
         let n = (bytes - at).min(DATA_LEAF as u64) as usize;
-        data.read_exact_at(&mut l[..n], at)?;
+        read_exact_at(&data, &mut l[..n], at)?;
         Ok(l)
     };
     // 2. Seal every leaf, on every core; each leaf goes to its place in sealed.bin.
@@ -156,7 +201,7 @@ fn seal_into(node: &Node, p: &ChainParams, dir: &std::path::Path, segment: Hash,
                         }
                     }
                 }
-                if let Err(e) = sealed.write_all_at(&out, start * SEALED_LEAF as u64) {
+                if let Err(e) = write_all_at(&sealed, &out, start * SEALED_LEAF as u64) {
                     *failed.lock().unwrap() = Some(e.to_string());
                     return;
                 }
@@ -180,7 +225,7 @@ fn seal_into(node: &Node, p: &ChainParams, dir: &std::path::Path, segment: Hash,
     let mut s = [0u8; SEALED_LEAF];
     for i in 0..leaves {
         let d = merkle::leaf_hash(&leaf_at(i).map_err(io)?);
-        sealed.read_exact_at(&mut s, i * SEALED_LEAF as u64).map_err(io)?;
+        read_exact_at(&sealed, &mut s, i * SEALED_LEAF as u64).map_err(io)?;
         let h = merkle::leaf_hash(&s);
         data_tree.push_hash(d);
         sealed_tree.push_hash(h);
@@ -219,7 +264,7 @@ impl Replica {
     pub fn data_leaf(&self, owner: &[u8; 32], i: u64) -> Result<[u8; DATA_LEAF], String> {
         let mut s = [0u8; SEALED_LEAF];
         let f = std::fs::File::open(self.dir.join("sealed.bin")).map_err(|e| e.to_string())?;
-        f.read_exact_at(&mut s, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+        read_exact_at(&f, &mut s, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
         sloth::unseal_leaf(owner, &self.segment, i, &s).map_err(|e| format!("leaf {i} doesn't unseal: {e:?}"))
     }
 
@@ -233,7 +278,7 @@ impl Replica {
             .iter()
             .map(|&i| {
                 let mut sealed = [0u8; SEALED_LEAF];
-                f.read_exact_at(&mut sealed, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+                read_exact_at(&f, &mut sealed, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
                 let data = sloth::unseal_leaf(owner, &self.segment, i, &sealed).map_err(|e| format!("leaf {i} doesn't unseal: {e:?}"))?;
                 Ok(Opened {
                     sealed,

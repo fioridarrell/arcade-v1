@@ -13,7 +13,7 @@ use sha2::{Digest, Sha256};
 use std::io::{BufRead, BufReader, Read, Write};
 
 fn call(sock: &str, req: Value) -> Value {
-    let mut s = std::os::unix::net::UnixStream::connect(sock).expect("socket");
+    let mut s = arcade_local::UnixStream::connect(sock).expect("socket");
     writeln!(s, "{req}").unwrap();
     let mut line = String::new();
     BufReader::new(s).read_line(&mut line).unwrap();

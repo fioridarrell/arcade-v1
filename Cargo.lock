@@ -269,6 +269,7 @@ dependencies = [
  "arcade-chain",
  "arcade-chaindb",
  "arcade-ledger",
+ "arcade-local",
  "base64 0.23.1",
  "bip39",
  "getrandom 0.2.17",

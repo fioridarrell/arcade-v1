@@ -30,13 +30,13 @@ use sha2::{Digest, Sha256};
 use std::sync::Arc;
 
 /// A note's coin and an inscription lock's reserve (token20_send.POSTAGE, htlc.DOGINAL_RESERVE).
-const POSTAGE: u64 = 100_000;
+pub(crate) const POSTAGE: u64 = 100_000;
 const RESERVE: u64 = htlc::SPEND_FEE + htlc::DUST;
 /// What each inscribing step leaves the network (soft-dust outputs pay their own 0.01).
-const STEP_FEE: u64 = 3_000_000;
+pub(crate) const STEP_FEE: u64 = 3_000_000;
 /// A ledger token lock's coin: the claim's fee and the receiver's output.
 const LEDGER_COIN: u64 = htlc::SPEND_FEE + 2 * htlc::DUST;
-const CTYPE: &str = "text/plain;charset=utf-8";
+pub(crate) const CTYPE: &str = "text/plain;charset=utf-8";
 const KINDS: &[&str] = &["coin", "dd", "token20", "token", "ord"];
 /// How long an order is held for the taker who asked for its terms, to lock its side and say so.
 const HOLD_SECS: u32 = 30 * 60;
@@ -66,14 +66,14 @@ fn chain(node: &Node, k: &str) -> Result<&'static ChainParams, String> {
     }
     Ok(p)
 }
-fn wallet_key(node: &Node, p: &ChainParams) -> Result<(arcade_wallet::SecretKey, PublicKey), String> {
+pub(crate) fn wallet_key(node: &Node, p: &ChainParams) -> Result<(arcade_wallet::SecretKey, PublicKey), String> {
     let sk = node.app.tag_key(p, 0).map_err(|e| e.to_string())?.1;
     Ok((sk, PublicKey::from_secret_key(SECP256K1, &sk)))
 }
-fn p2pkh_of(pk: &PublicKey) -> Vec<u8> {
+pub(crate) fn p2pkh_of(pk: &PublicKey) -> Vec<u8> {
     arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()))
 }
-fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
+pub(crate) fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
     let Ok(Some((b, _))) = node.chain.tx_location(p, txid) else { return 0 };
     let Some((_, h, _)) = node.chain.block_at(p, b).ok().flatten() else { return 0 };
     node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0).saturating_sub(h) + 1
@@ -153,7 +153,7 @@ fn ended(node: &Node, p: &ChainParams, spec_time: u32) -> bool {
 /// Send a transaction on a chain: through this arcade's own pool on its home chain, else to the chain's peers. It is
 /// remembered and sent again until it is in a block (relay): a peer drops a transaction whose parent it hasn't seen
 /// yet, and nothing would ask again (2026-11-10: three swap locks never reached the network).
-fn send(node: &Node, p: &ChainParams, tx: &Tx) -> Result<String, String> {
+pub(crate) fn send(node: &Node, p: &ChainParams, tx: &Tx) -> Result<String, String> {
     let txid = relay_once(node, p, tx)?;
     let _ = node.app.store.write(|w| w.put(arcade_app::META, format!("swapsend:{}:{txid}", p.key).as_bytes(), &[now().to_le_bytes().as_slice(), &tx.raw].concat()));
     Ok(txid)
@@ -228,13 +228,13 @@ fn relay_once(node: &Node, p: &ChainParams, tx: &Tx) -> Result<String, String> {
     let v = crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key}))?;
     Ok(v["txid"].as_str().unwrap_or("").to_string())
 }
-fn send_raw(node: &Node, p: &ChainParams, raw: &[u8]) -> Result<String, String> {
+pub(crate) fn send_raw(node: &Node, p: &ChainParams, raw: &[u8]) -> Result<String, String> {
     send(node, p, &Tx::parse_with(raw, &p.format).map_err(|e| e.to_string())?)
 }
 
 /// This wallet's spendable coins on a chain: its key's P2PKH (and P2WPKH where it receives SegWit), none spent in
 /// the pool and none carrying an inscription (a fee must never spend an inscribed coin).
-fn coins(node: &Node, p: &'static ChainParams, pk: &PublicKey) -> Vec<Utxo> {
+pub(crate) fn coins(node: &Node, p: &'static ChainParams, pk: &PublicKey) -> Vec<Utxo> {
     let mut out = Vec::new();
     for (_, script) in crate::coinsend::key_scripts(p, pk) {
         let list: Vec<Utxo> = if p.chain_no == node.params.chain_no && script == p2pkh_of(pk) {
@@ -266,7 +266,7 @@ fn fee_kb(node: &Node, p: &ChainParams) -> (u64, u64) {
 
 /// `outs`, then enough of `coins` for them and the fee, change back to `change`: a key-hash transaction signed by
 /// `sk`. `first` are inputs that must come first, in order (an inscription's coin as input 0).
-fn build(node: &Node, p: &ChainParams, sk: &arcade_wallet::SecretKey, first: Vec<Utxo>, coins: Vec<Utxo>, outs: Vec<TxOutSpec>, change: &[u8]) -> Result<Tx, String> {
+pub(crate) fn build(node: &Node, p: &ChainParams, sk: &arcade_wallet::SecretKey, first: Vec<Utxo>, coins: Vec<Utxo>, outs: Vec<TxOutSpec>, change: &[u8]) -> Result<Tx, String> {
     let (per_kb, dust) = fee_kb(node, p);
     let need: u64 = outs.iter().map(|o| o.value).sum();
     let mut ins = first;
@@ -301,9 +301,9 @@ fn build(node: &Node, p: &ChainParams, sk: &arcade_wallet::SecretKey, first: Vec
     Ok(tx)
 }
 
-const SOFT_DUST: u64 = 1_000_000;
+pub(crate) const SOFT_DUST: u64 = 1_000_000;
 /// Chains with the Dogecoin family's soft-dust fee rule.
-fn soft_dust(p: &ChainParams) -> bool {
+pub(crate) fn soft_dust(p: &ChainParams) -> bool {
     arcade_wallet::tx::per_started_kb(p)
 }
 

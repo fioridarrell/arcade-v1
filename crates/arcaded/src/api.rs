@@ -514,7 +514,8 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "token20.send" => crate::tokensend::t20_send(node, &s("chain").ok_or("chain required")?, &s("tick").ok_or("tick required")?, &s("amount").ok_or("amount required")?, &s("to").ok_or("to required")?, req["send"] == true),
         "token20.sends" => Ok(crate::tokensend::t20_sends(node)),
         "ord.send" => crate::ordsend::send(node, s("chain").as_deref(), &s("inscription").ok_or("inscription required")?, &s("to").ok_or("to required")?, req["send"] == true),
-        "swap.place" => crate::swaps::place(node, &req["give"], &req["get"]),
+        "swap.place" => crate::swaps::place(node, &req["give"], &req["get"], &req),
+        "swap.release" => crate::swaps::release(node, &s("order").ok_or("order required")?),
         "swap.book" => Ok(json!(crate::swaps::book(node))),
         // With the legs shown ({give, get}), only on exactly those terms.
         "swap.take" => crate::swaps::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?, req["give"].is_object().then_some(req)),

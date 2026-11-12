@@ -239,6 +239,51 @@ pub fn candles(node: &Node, base: u32, quote: u32, span: u64, count: usize) -> V
         .collect()
 }
 
+/// The market list kept in memory: built by one background thread at most every MARKETS_FRESH, and answered at once
+/// from the newest copy (a first ask waits up to MARKETS_WAIT). 2026-11-12: on an arcade writing a big chain's sync
+/// (the JB20B, Litecoin from scratch) building it waited minutes behind the writes, every request built it again, and
+/// Swap drew no markets at all, in the Apps tab and on the website.
+static MARKETS: std::sync::LazyLock<std::sync::Mutex<(Option<(std::time::Instant, Vec<Value>)>, bool)>> =
+    std::sync::LazyLock::new(Default::default);
+const MARKETS_FRESH: std::time::Duration = std::time::Duration::from_secs(60);
+const MARKETS_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+fn markets_kept(node: &Node) -> Vec<Value> {
+    let start = {
+        let mut g = MARKETS.lock().unwrap();
+        let stale = g.0.as_ref().is_none_or(|(at, _)| at.elapsed() > MARKETS_FRESH);
+        if stale && !g.1 {
+            g.1 = true;
+            true
+        } else {
+            false
+        }
+    };
+    if start {
+        let n = node.self_arc();
+        let (tx, rx) = std::sync::mpsc::channel::<()>();
+        let first = MARKETS.lock().unwrap().0.is_none();
+        std::thread::Builder::new()
+            .name("markets".into())
+            .spawn(move || {
+                let built = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| markets(&n)));
+                let mut g = MARKETS.lock().unwrap();
+                if let Ok(v) = built {
+                    g.0 = Some((std::time::Instant::now(), v));
+                }
+                g.1 = false;
+                drop(g);
+                let _ = tx.send(());
+            })
+            .map_err(|_| MARKETS.lock().unwrap().1 = false)
+            .ok();
+        if first {
+            let _ = rx.recv_timeout(MARKETS_WAIT);
+        }
+    }
+    MARKETS.lock().unwrap().0.as_ref().map(|x| x.1.clone()).unwrap_or_default()
+}
+
 /// Every market: each token against the coin with an order on it or a take of it, and each two-token
 /// pair with an order or a trade. {base, quote, venue, last, change_24h, volume_24h, asks, bids}.
 pub fn markets(node: &Node) -> Vec<Value> {
@@ -355,6 +400,38 @@ pub fn assets(node: &Node, q: &str) -> Vec<Value> {
     out
 }
 
+/// DRC-20 / PRC-20 / WJK-20 (and any chain's token protocol) ticks starting with `q`, on every chain kept here with its
+/// tokens index: what a swap may name as a `token20` leg (Martin 2026-11-12: "add all coins and token to the swaps").
+/// Ticks are stored alphabetically per chain, so this reads at most TOKEN20_MAX rows per chain. Nothing for an empty `q`.
+const TOKEN20_MAX: usize = 20;
+pub fn token20_assets(node: &Node, q: &str) -> Vec<Value> {
+    let q = q.trim().to_lowercase();
+    if q.is_empty() || q.len() > 32 {
+        return Vec::new();
+    }
+    let mut chains: Vec<&'static arcade_chain::params::ChainParams> = Vec::new();
+    if crate::chains::home_indexes(node).iter().any(|i| i == "tokens") {
+        chains.push(node.params);
+    }
+    for r in node.extra.lock().unwrap().values() {
+        if r.indexes.iter().any(|i| i == "tokens") {
+            chains.push(r.params);
+        }
+    }
+    let mut out = Vec::new();
+    for p in chains {
+        let Some((proto, _)) = arcade_ledger::tokens::protocol(p) else { continue };
+        let pre = arcade_store::KeyBuf::new().u16(p.chain_no).bytes(q.as_bytes()).done();
+        let rows = node.chain.store(p.chain_no).read(|r| r.scan_prefix_limit(arcade_ledger::tokens::TICK, &pre, TOKEN20_MAX)).unwrap_or_default();
+        for (k, _) in rows {
+            let tick = String::from_utf8_lossy(&k[2..]).to_string();
+            out.push(json!({"network": p.key, "kind": "token20", "asset": tick, "name": tick.to_uppercase(), "protocol": proto.to_uppercase(),
+                            "decimals": 18, "whole": true}));
+        }
+    }
+    out
+}
+
 /// What a trade of `give` for `get` costs and how it settles here (the page shows it before asking).
 fn terms_read(node: &Node, q: &Map<String, Value>) -> Result<Value, String> {
     let (give, get) = (side(node, q.get("give"))?, side(node, q.get("get"))?);
@@ -453,7 +530,7 @@ fn holdings(node: &Node) -> Value {
 pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, String> {
     match name {
         "markets" | "pairs" => {
-            let mut all = markets(node);
+            let mut all = markets_kept(node);
             for chain in ["dgbtest", "dgb"] {
                 let installed = node.extra.lock().unwrap().contains_key(chain);
                 if !installed {
@@ -507,7 +584,12 @@ pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, St
             let (base, quote) = pair_of(node, q)?;
             Ok(json!(candles(node, base, quote, num(q, "span", 3600), num(q, "count", 48) as usize)))
         }
-        "assets" => Ok(json!(assets(node, q.get("q").and_then(|v| v.as_str()).unwrap_or("")))),
+        "assets" => {
+            let q = q.get("q").and_then(|v| v.as_str()).unwrap_or("");
+            let mut v = assets(node, q);
+            v.extend(token20_assets(node, q));
+            Ok(json!(v))
+        }
         "terms" => terms_read(node, q),
         "mine" => Ok(mine(node)),
         "holdings" => Ok(holdings(node)),
@@ -520,13 +602,18 @@ pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, St
 
 /// A GET under /r/ this module answers: Some((status, JSON text)), or None for another module's path.
 pub fn route(node: &Node, path: &str, q: &Map<String, Value>) -> Option<(u16, String)> {
-    let seg: Vec<&str> = path.trim_start_matches("/r/").split('/').collect();
+    let seg: Vec<&str> = path.strip_prefix("/r/").unwrap_or("").split('/').collect();
     match seg.as_slice() {
         ["book", id] => Some(match id.parse::<u32>().ok().and_then(|pid| r_book(node, pid, q.get("address").and_then(|v| v.as_str()))) {
             Some(v) => (200, v.to_string()),
             None => (404, json!({"error": "no such token"}).to_string()),
         }),
         ["market", name] => Some(match read(node, name, q) {
+            Ok(v) => (200, json!({"ok": true, "result": v}).to_string()),
+            Err(e) => (400, json!({"ok": false, "error": e}).to_string()),
+        }),
+        // The ord marketplace (ordmarket.rs): collections, pieces, and the book's ord asks and bids.
+        ["ords", rest @ ..] => Some(match crate::ordmarket::read(node, rest, q) {
             Ok(v) => (200, json!({"ok": true, "result": v}).to_string()),
             Err(e) => (400, json!({"ok": false, "error": e}).to_string()),
         }),
@@ -622,6 +709,10 @@ fn swap_terms(node: &Node, m: &Value) -> Result<(String, Option<String>), String
         "swap_place" => Ok((format!("a swap order: give {} for {}, locked by script on both chains when somebody takes it", leg_words(&m["give"]), leg_words(&m["get"])), None)),
         "swap_take" => {
             let o = crate::swaps::book(node).into_iter().find(|o| o["id"] == m["order"] && (m["node"].is_null() || o["node"] == m["node"])).ok_or("that swap order is not on the book now")?;
+            // Filed: the legs shown are pinned into the request. At the Approve: still the same on the book.
+            if m["give"].is_object() && !crate::swaps::same_terms(&o, m) {
+                return Err("that swap order's terms changed since the card was drawn".into());
+            }
             Ok((format!("a swap: give {} for {}. Your side is locked first, for longer; each side gets its own back if the other stops", leg_words(&o["get"]), leg_words(&o["give"])), o["node"].as_str().map(String::from)))
         }
         "swap_cancel" => Ok(("a cancel of your swap order".into(), None)),
@@ -787,7 +878,8 @@ pub fn build_request(node: &Node, m: &Value, send: bool) -> Result<(String, u64,
         }
         let r = match m["op"].as_str().unwrap_or("") {
             "swap_place" => crate::swaps::place(node, &m["give"], &m["get"])?,
-            "swap_take" => crate::swaps::take(node, m["node"].as_str().unwrap_or(""), m["order"].as_str().unwrap_or(""))?,
+            // The legs the card showed (pinned when it was filed): the maker's terms must still be those.
+            "swap_take" => crate::swaps::take(node, m["node"].as_str().unwrap_or(""), m["order"].as_str().unwrap_or(""), Some(m))?,
             _ => crate::swaps::cancel(node, m["order"].as_str().unwrap_or(""))?,
         };
         return Ok((format!("swap:{}", r["id"].as_str().unwrap_or("")), 0, vec![]));
@@ -854,6 +946,19 @@ pub fn build_request(node: &Node, m: &Value, send: bool) -> Result<(String, u64,
 pub fn file(node: &Node, page: &str, op: &str, body: &Value) -> (u16, Value) {
     let mut m = body.clone();
     m["op"] = json!(op);
+    if op == "swap_take" {
+        // Pin the legs as the book shows them now (whatever the page said): the card shows these, and the take
+        // at the Approve goes ahead only on exactly these terms.
+        m["give"] = Value::Null;
+        m["get"] = Value::Null;
+        if let Some(o) = crate::swaps::book(node).into_iter().find(|o| o["id"] == m["order"] && (m["node"].is_null() || o["node"] == m["node"])) {
+            m["give"] = o["give"].clone();
+            m["get"] = o["get"].clone();
+            if m["node"].is_null() {
+                m["node"] = o["node"].clone();
+            }
+        }
+    }
     let (what, to) = match terms(node, &m) {
         Ok(t) => t,
         Err(e) => return (400, json!({"ok": false, "error": e})),

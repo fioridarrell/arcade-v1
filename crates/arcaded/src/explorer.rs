@@ -122,12 +122,53 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
 ];
 
+/// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
+/// explorer reads Arcade V1.0's own Explorer makes, so an app can show the same explorer. Mesh-internal
+/// questions (sites, ledger bytes, pages, app cards, outpoints) are not among them.
+pub const PAGE_READS: &[&str] = &[
+    "chains.list", "explorer.summary", "explorer.blocks", "explorer.block", "explorer.tx", "explorer.address",
+    "explorer.inscriptions", "explorer.inscription", "explorer.inscription_types", "explorer.tokens", "explorer.token",
+    "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held", "explorer.names",
+    "explorer.name", "explorer.maps", "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens",
+    "explorer.ledger_token", "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag",
+    "explorer.search",
+];
+
+/// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
+/// its arguments one JSON object as the desktop's Explorer sends them (a height stays text, as
+/// explorer.block needs). Answers {"ok": true, "result": ...} or {"ok": false, "error": ...}, as /api/v1
+/// does. None for any other path.
+pub fn page_read(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> Option<(u16, Value)> {
+    let name = path.strip_prefix("/r/explorer/")?;
+    let cmd = if name == "chains" { "chains.list".to_string() } else { format!("explorer.{name}") };
+    let public = crate::commands::find(&cmd).is_some_and(|c| c.perm == crate::commands::Perm::Public);
+    if !PAGE_READS.contains(&cmd.as_str()) || !public {
+        return Some((404, json!({"ok": false, "error": format!("the explorer has no read called {name}")})));
+    }
+    let mut req = match q.get("args") {
+        None => serde_json::Map::new(),
+        Some(Value::String(a)) => match serde_json::from_str::<Value>(a) {
+            Ok(Value::Object(o)) => o,
+            _ => return Some((400, json!({"ok": false, "error": "args must be a JSON object"}))),
+        },
+        Some(_) => return Some((400, json!({"ok": false, "error": "args must be a JSON object"}))),
+    };
+    req.insert("cmd".into(), json!(cmd));
+    Some(match crate::api::dispatch(node, &Value::Object(req)) {
+        Ok(v) => (200, json!({"ok": true, "result": v})),
+        Err(e) => (400, json!({"ok": false, "error": e})),
+    })
+}
+
 /// Page routes another arcade may answer for an app on a chain it keeps: every public read
-/// under /r/ but the asking arcade's own (its wallet, its send requests).
+/// under /r/ but the asking arcade's own (its wallet, its send requests). The path must be in
+/// its one plain form: no empty, "." or ".." part, no query in it (the query comes apart), so
+/// a path like /r//r/wallet can't reach the wallet past this check.
 fn page_route_ok(path: &str) -> bool {
-    let rest = path.strip_prefix("/r/").unwrap_or("");
-    let first = rest.split(['/', '?']).next().unwrap_or("");
-    !rest.is_empty() && !matches!(first, "wallet" | "send") && !rest.contains("..")
+    let Some(rest) = path.strip_prefix("/r/") else { return false };
+    let parts: Vec<&str> = rest.split('/').collect();
+    let plain = parts.iter().all(|p| !p.is_empty() && *p != "." && *p != ".." && !p.contains(['?', '#', '\\', '%']));
+    plain && !matches!(parts[0], "wallet" | "send" | "r")
 }
 
 /// Mesh answers kept a short while: the Explorer asks the same things again and again
@@ -230,6 +271,46 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
 /// images as links (`content.src`) the UI loads one by one, so the list comes back at once.
 /// Answers from other arcades keep the bytes (their links would point at them).
 pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    let mut out = answer(node, cmd, req, img_links);
+    if img_links {
+        if let Ok(v) = out.as_mut() {
+            link_previews(v);
+        }
+    }
+    out
+}
+
+/// Previews another arcade made (a borrowed chain, or an index asked on the mesh) carry an
+/// HTML page as its text and pictures over 96 KB as their type alone: those would show as raw
+/// HTML and as no picture. This computer's UI gets them as links to this arcade's
+/// /content/<id> instead, which fetches the inscription from the mesh when it isn't kept here
+/// (pictures up to 4 MB, whole pages up to 64 KB), as the previews it makes itself.
+fn link_previews(v: &mut Value) {
+    match v {
+        Value::Array(a) => a.iter_mut().for_each(link_previews),
+        Value::Object(o) => {
+            let id = o.get("id").and_then(|i| i.as_str()).filter(|i| arcade_ledger::sites::is_inscription_id(&i.to_lowercase())).map(String::from);
+            if let (Some(id), Some(Value::Object(c))) = (id, o.get_mut("content")) {
+                let ct = c.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let base = ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase();
+                let kind = c.get("kind").and_then(|k| k.as_str()).unwrap_or("");
+                let size = c.get("size").and_then(|s| s.as_u64()).unwrap_or(0);
+                if c.get("src").is_none() {
+                    if kind == "html" {
+                        c.insert("src".into(), json!(format!("/content/{id}")));
+                    } else if kind == "other" && base.starts_with("image/") && size > 0 && size <= LINK_MAX {
+                        c.insert("kind".into(), json!("image"));
+                        c.insert("src".into(), json!(format!("/content/{id}")));
+                    }
+                }
+            }
+            o.values_mut().for_each(link_previews);
+        }
+        _ => {}
+    }
+}
+
+fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     let local = handle_here(node, cmd, req, img_links);
     if req["local"] == true || !FORWARDABLE.contains(&cmd) {
         return local;
@@ -398,7 +479,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             for r in v["items"].as_array_mut().into_iter().flatten() {
                 let Some(id) = r["cover"].as_str().map(String::from) else { continue };
                 if let Some(rec) = ord::inscription(&x.node.chain, x.p, &id) {
-                    r["cover_content"] = image_link(&x, &rec, &id, 96 << 10).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
+                    r["cover_content"] = image_link(&x, &rec, &id).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
                     r["cover_ct"] = rec["ct"].clone();
                 }
             }
@@ -414,7 +495,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                     it["n"] = rec["n"].clone();
                     it["h"] = rec["h"].clone();
                     it["ct"] = rec["ct"].clone();
-                    it["content"] = image_link(&x, &rec, &id, 96 << 10).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
+                    it["content"] = image_link(&x, &rec, &id).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
                 }
             }
             Ok(v)
@@ -496,11 +577,28 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         }
         "explorer.tokens" => {
             x.need("tokens")?;
-            // Offset paging (ticks in alphabetical order), with the total for the pager.
+            // Offset paging (ticks in alphabetical order), with the total for the pager. `q`: ticks starting with it;
+            // `open`: only ticks still being minted (minted under supply; the Token Minter's suggestions, 2026-11-12).
             let off = req["offset"].as_u64().unwrap_or(0) as usize;
             let want = n(50, 200) as usize;
-            let pre = KeyBuf::new().u16(x.c()).done();
-            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, off + want)).map_err(e)?;
+            let q = s("q").map(|t| t.trim().to_lowercase()).unwrap_or_default();
+            if q.len() > 32 {
+                return Err("a tick is at most 32 characters".into());
+            }
+            let open = req["open"] == true;
+            let pre = KeyBuf::new().u16(x.c()).bytes(q.as_bytes()).done();
+            // With `open` the closed ones are skipped, so read further (bounded) to fill the page.
+            let scan = if open { (off + want).saturating_mul(20).min(20_000) } else { off + want };
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, scan)).map_err(e)?;
+            let rows: Vec<_> = if open {
+                rows.into_iter().filter(|(_, v)| {
+                    let v: Value = serde_json::from_slice(v).unwrap_or(Value::Null);
+                    let big = |k: &str| v[k].as_str().and_then(|x| x.parse::<u128>().ok()).unwrap_or(0);
+                    big("minted") < big("supply")
+                }).collect()
+            } else {
+                rows
+            };
             Ok(json!({"protocol": tokens::protocol(x.p).map(|t| t.0).unwrap_or("tokens"), "total": tokens::tick_count(&x.node.chain, x.c()),
                 "offset": off, "items": rows.into_iter().skip(off).filter_map(|(k, v)| {
                 let mut v: Value = serde_json::from_slice(&v).ok()?;
@@ -762,11 +860,15 @@ fn blocks(x: &Ctx, before: u32, n: u32) -> Vec<Value> {
     (before.saturating_sub(n)..before).rev().filter_map(|h| block_row(x, h)).collect()
 }
 
+/// The largest picture a list links to: the UI loads each one lazily, on its own, so a big JPG
+/// shows as well as a small one (Martin 2026-11-11). Also what /content asks another arcade for.
+const LINK_MAX: u64 = 4 << 20;
+
 /// An image's or an HTML page's preview as a link to it on this arcade, from its record alone
 /// (no read of the chain), when the UI asked for links: images with their own body up to
-/// `cap` (/ord/<chain>/<id>), HTML (/content/<id>, run in a sandboxed frame; Martin
+/// [`LINK_MAX`] (/ord/<chain>/<id>), HTML (/content/<id>, run in a sandboxed frame; Martin
 /// 2026-11-10).
-fn image_link(x: &Ctx, rec: &Value, id: &str, cap: usize) -> Option<Value> {
+fn image_link(x: &Ctx, rec: &Value, id: &str) -> Option<Value> {
     if !x.img_links || !rec["delegate"].is_null() {
         return None;
     }
@@ -776,7 +878,7 @@ fn image_link(x: &Ctx, rec: &Value, id: &str, cap: usize) -> Option<Value> {
     if base == "text/html" && size > 0 {
         return Some(json!({"type": ct, "kind": "html", "src": format!("/content/{id}"), "size": size}));
     }
-    if !base.starts_with("image/") || size == 0 || size > cap as u64 {
+    if !base.starts_with("image/") || size == 0 || size > LINK_MAX {
         return None;
     }
     Some(json!({"type": ct, "kind": "image", "src": format!("/ord/{}/{id}", x.p.key), "size": size}))
@@ -870,7 +972,7 @@ fn latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
                 Some(v) => {
                     let mut v = v;
                     let id = v["id"].as_str().unwrap_or("").to_string();
-                    v["content"] = image_link(x, &v, &id, 96 << 10).or_else(|| no_preview(&v)).unwrap_or_else(|| content(x, &id, 96 << 10));
+                    v["content"] = image_link(x, &v, &id).or_else(|| no_preview(&v)).unwrap_or_else(|| content(x, &id, 96 << 10));
                     v
                 }
                 // Shared storage: records of other groups come from the arcades holding them.
@@ -1128,7 +1230,7 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
             .map(|(pid, units)| {
                 let p = arcade_ledger::engine::property(&x.node.chain, c, pid).ok().flatten().unwrap_or(Value::Null);
                 let div = p["divisible"] == true || p["type"] == 2;
-                json!({"propertyid": pid, "name": p["name"], "units": units, "balance": arcade_ledger::amount::token_plain(div, units)})
+                json!({"propertyid": pid, "name": p["name"], "units": units, "divisible": div, "balance": arcade_ledger::amount::token_plain(div, units)})
             })
             .collect();
         v["ledger_tokens"] = json!(toks);
@@ -1331,7 +1433,35 @@ fn search(x: &Ctx, q: &str) -> R {
 
 #[cfg(test)]
 mod type_tests {
-    use super::type_matches;
+    use super::{link_previews, type_matches, LINK_MAX};
+    use serde_json::json;
+
+    #[test]
+    fn borrowed_previews_link_here() {
+        let id = format!("{}i0", "ab".repeat(32));
+        let mut v = json!({"items": [
+            {"id": id, "content": {"type": "text/html;charset=utf-8", "kind": "html", "text": "<b>hi</b>", "size": 9}},
+            {"id": id, "content": {"type": "image/jpeg", "kind": "other", "size": 479_597}},
+            {"id": id, "content": {"type": "image/png", "kind": "image", "data": "data:image/png;base64,AA==", "size": 1}},
+            {"id": id, "content": {"type": "image/webp", "kind": "other", "size": LINK_MAX + 1}},
+            {"id": id, "content": {"type": "video/mp4", "kind": "other", "size": 10}},
+            {"id": id, "content": {"type": "text/html", "kind": "html", "src": "/content/x", "size": 9}},
+        ]});
+        link_previews(&mut v);
+        let it = &v["items"];
+        assert_eq!(it[0]["content"]["src"], format!("/content/{id}"));
+        assert_eq!(it[0]["content"]["kind"], "html");
+        assert_eq!(it[1]["content"]["kind"], "image");
+        assert_eq!(it[1]["content"]["src"], format!("/content/{id}"));
+        assert!(it[2]["content"]["src"].is_null(), "pictures sent whole stay as they are");
+        assert_eq!(it[3]["content"]["kind"], "other", "over the link limit: no picture");
+        assert_eq!(it[4]["content"]["kind"], "other");
+        assert_eq!(it[5]["content"]["src"], "/content/x", "a link already made stays");
+        // A single inscription's page (explorer.inscription from another arcade).
+        let mut one = json!({"id": id, "content": {"type": "text/html", "kind": "html", "text": "x", "size": 1}});
+        link_previews(&mut one);
+        assert_eq!(one["content"]["src"], format!("/content/{id}"));
+    }
 
     #[test]
     fn content_type_groups() {
@@ -1354,6 +1484,12 @@ fn only_public_page_reads_are_answered_for_another_arcade() {
     assert!(!page_route_ok("/r/"));
     assert!(!page_route_ok("/content/abc"));
     assert!(!page_route_ok("/r/../x"));
+    assert!(!page_route_ok("/r//r/wallet"), "a doubled prefix");
+    assert!(!page_route_ok("/r//r/send/abc"));
+    assert!(!page_route_ok("/r/r/wallet"));
+    assert!(!page_route_ok("/r/inscription//7063"));
+    assert!(!page_route_ok("/r/%77allet"));
+    assert!(!page_route_ok("/r/wallet?x=1"));
 }
 
 #[cfg(test)]

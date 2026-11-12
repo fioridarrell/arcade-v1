@@ -50,6 +50,7 @@ mod meshsvc;
 mod ddmarket;
 mod marketsvc;
 mod swaps;
+mod tokensend;
 mod meshview;
 mod mempoolshare;
 mod msgsvc;
@@ -60,7 +61,9 @@ mod sitesvc;
 mod grpsvc;
 mod feedsvc;
 mod node;
+mod ordmarket;
 mod ordsafe;
+mod ordsend;
 mod peerbook;
 mod psync;
 mod realtime;
@@ -72,8 +75,10 @@ mod ringsvc;
 mod rpc;
 mod sizes;
 mod udpsvc;
+mod turnsvc;
 mod v1copy;
 mod vxshare;
+mod watchdog;
 mod v1import;
 mod shares;
 mod secretbox;
@@ -197,6 +202,8 @@ usage: arcaded [options]
   --no-seeds            don't dial the seed arcades
   --p2p-only            sync from coin peers only, no mesh bootstrap
   --stun-port N|0       STUN port (0: none)
+  --import-node-key FILE  take this node identity (an original arcade's mesh.key: 64 hex digits), so the
+                        arcade keeps its node id; only into a new home (or one with the same key)
   --help, --version     print this or the version and exit
 ";
 
@@ -262,6 +269,22 @@ fn main() {
 
     let app = arcade_app::AppDb::open(&home).expect("open arcade.mdbx");
     let chain = arcade_chaindb::ChainDb::open(home.join("chain.mdbx")).expect("open chain.mdbx");
+    // An original arcade moving to V1.0 keeps its node id: its mesh.key seed becomes the node identity.
+    if let Some(i) = args.iter().position(|a| a == "--import-node-key") {
+        let path = args.get(i + 1).map(std::path::PathBuf::from).unwrap_or_default();
+        let seed = std::fs::read_to_string(&path).ok().and_then(|t| hex::decode(t.trim()).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok());
+        let Some(seed) = seed else {
+            eprintln!("arcaded: --import-node-key {}: not a 64-hex-digit key", path.display());
+            std::process::exit(1);
+        };
+        match app.import_node_identity(&seed) {
+            Ok(k) => eprintln!("arcaded: node identity {} (imported)", hex::encode(k.verifying_key().to_bytes())),
+            Err(e) => {
+                eprintln!("arcaded: --import-node-key: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     let identity = app.node_identity().expect("node identity");
     let node = Arc::new(Node {
         home: home.clone(),
@@ -314,6 +337,7 @@ fn main() {
     chains::start_saved(&node);
     borrow::start(node.clone());
     swaps::start(node.clone());
+    tokensend::start(node.clone());
     ordtypes::init(&node);
     namesites::init(&node);
     // A home chain far behind (a fresh install): installed from copies when the mesh has them.

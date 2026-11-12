@@ -84,18 +84,18 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `mesh.udp` | `/api/v1/mesh/udp` | read | — | UDP hole punching: STUN server and proved addresses, NAT kind, which links run over UDP paths (RTT, packets), introductions. |
-| `mesh.udp_set` | `/api/v1/mesh/udp_set` | admin | on?, lan_dial?, stun_port?, drop? | Turn UDP paths and introductions on or off (ARCADE_MESH_UDP=0 overrides), offer LAN addresses to every peer, set the STUN port for the next start (0 = none); drop = a peer id prefix whose path to fail now (falls back to TCP). |
+| `mesh.udp` | `/api/v1/mesh/udp` | read | — | UDP hole punching: STUN server and proved addresses, NAT kind, which links run over UDP paths (RTT, packets), introductions. `relay`: the media relay (allocations, this month's use, its limit, the address its sockets are reached at). |
+| `mesh.udp_set` | `/api/v1/mesh/udp_set` | admin | on?, lan_dial?, stun_port?, turn?, turn_limit_gb?, drop? | Turn UDP paths and introductions on or off (ARCADE_MESH_UDP=0 overrides), offer LAN addresses to every peer, set the STUN port for the next start (0 = none); drop = a peer id prefix whose path to fail now (falls back to TCP). `turn` turns the media relay on the STUN port on or off, `turn_limit_gb` is its monthly limit (100 by default); both from the next start. |
 | `mesh.overview` | `/api/v1/mesh/overview` | public | — | The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours. |
 
 ### Tx
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `tx.coins` | `/api/v1/tx/coins` | public | addresses, chain? | Spendable coins of up to 500 addresses (confirmed, not spent by a waiting transaction, and unconfirmed outputs), to build a transaction for a browser to sign. Coins carrying an ord inscription, and coins of at most 0.01 that no ord index can vouch for, are listed under `held_back` instead (not in `total`), so a payment built from the list never spends an inscription. Home or installed chain, Addresses index on. |
+| `tx.coins` | `/api/v1/tx/coins` | public | addresses, chain? | Spendable coins of up to 500 addresses (confirmed, not spent by a waiting transaction, and unconfirmed outputs), to build a transaction for a browser to sign. Coins carrying an ord inscription, and coins of at most 0.01 that no ord index can vouch for, are listed under `held_back` instead (not in `total`), so a payment built from the list never spends an inscription. Home or installed chain, Addresses index on. On a borrowed chain (not kept here, or kept but still syncing or indexing, the home chain included) the coins come from a lender's address index, each checked against its block and unspent at the lender (`"borrowed": true`). |
 | `tx.activity` | `/api/v1/tx/activity` | public | addresses, since?, chain? | What changed for up to 500 addresses: history rows above height since, and waiting transactions paying or spending them; height to pass as since next time. |
-| `tx.fee` | `/api/v1/tx/fee` | public | chain? | The fee rate (per 1000 bytes) and dust limit this arcade builds transactions with. |
-| `tx.broadcast` | `/api/v1/tx/broadcast` | post | hex, chain? | Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network. |
+| `tx.fee` | `/api/v1/tx/fee` | public | chain? | The fee rate (per 1000 bytes) and dust limit this arcade's wallet builds transactions with on that chain (kept or borrowed). |
+| `tx.broadcast` | `/api/v1/tx/broadcast` | post | hex, chain? | Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network. On a borrowed chain it goes to the lenders' nodes, which check it; refused by all, it is not sent. |
 
 ### Wallet
 
@@ -238,6 +238,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `explorer.ledger_inscription` | `/api/v1/explorer/ledger_inscription` | public | chain?, id | One arcade ledger inscription. |
 | `explorer.tag` | `/api/v1/explorer/tag` | public | chain?, tag | A @tag's page: addresses (with linked and imported wallets) and balances. |
 | `explorer.search` | `/api/v1/explorer/search` | public | chain?, q | Search: block, tx, address, @tag, inscription, token, name. |
+| `explorer.inscription_types` | `/api/v1/explorer/inscription_types` | public | chain? | How many ord inscriptions of each kind (images, text, HTML, ...) a chain holds. |
 
 ### Chains
 
@@ -316,12 +317,13 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `realtime.join` | `/api/v1/realtime/join` | local | page, room, game?, member?, cred?, fast? | Join a room over the mesh as this arcade's player (game defaults to the page): a token, me and the members; fast: true also takes the fast lane (realtime.fast). A website joins for its user with member (their address, or a guest id) and cred {a, x, s} signed over realtime.cert's words. |
+| `realtime.ice` | `/api/v1/realtime/ice` | local | tag?, lan? | ICE servers for one player (tag tells players apart for the relay's per-login limit): a login on this arcade's media relay where other arcades proved its STUN port open (`lan: true` adds its LAN address, for a player on its own network); relays borrowed from linked arcades when it has none of its own. What a website hands its pages for WebRTC. |
 | `realtime.cert` | `/api/v1/realtime/cert` | public | address | The words an address signs (Core signmessage) to play through this arcade, and their expiry: a website's user signs them in the browser and the site passes {a: address, x: expires, s: signature} to realtime.join. |
 | `realtime.send` | `/api/v1/realtime/send` | local | token, data?, b64? | Send to everyone in the room: text or base64 bytes, at most 512 bytes, about 5 a second. |
 | `realtime.leave` | `/api/v1/realtime/leave` | local | token | Leave the room. |
 | `realtime.poll` | `/api/v1/realtime/poll` | local | token, wait? | Room events for this seat (join, leave, message), waiting up to wait ms (15000 at most); a seat not polled for 30 s is let go. |
 | `realtime.fast` | `/api/v1/realtime/fast` | local | token, to, data?, b64?, reliable? | Send to some players of the room over the fast lane between arcades (a seat joined with fast): text or base64 bytes, at most 16 KB, about 240 a second; to names the players (up to 64). Reaches those who play here or through an arcade with a lane up (realtime.lanes); unreliable sends waiting to go out are replaced by the newest, reliable ones keep their order. Heard as fast events. |
-| `realtime.media` | `/api/v1/realtime/media` | local | token, to, b64 | A piece of the app window's encoded camera, microphone or screen (up to 60 KB) for some players of the room, over direct links between arcades only; dropped when the link is behind. Heard as mchunk events (the window's own, never the page's). |
+| `realtime.media` | `/api/v1/realtime/media` | local | token, to, b64 | A piece of the app window's encoded camera, microphone or screen (up to 60 KB) for some players of the room, over the direct link to their arcade, else through at most two arcades on the room's route that have their media relay on; dropped when a link is behind. Heard as mchunk events (the window's own, never the page's). |
 | `realtime.lanes` | `/api/v1/realtime/lanes` | local | token | Which players of the seat's room the fast lane reaches now (up), and how (routes: direct link or relay). |
 | `referee.get` | `/api/v1/referee/get` | read | — | The referee arcade this one asks for seeds when a page names none, and whose key /r/verified trusts by default: {url, pubkey}, or {} when none is set. |
 | `referee.set` | `/api/v1/referee/set` | admin | url | Name the referee arcade (https://...): its key is read from its /r/referee. An empty url clears it. |
@@ -355,3 +357,19 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `rpc.help` | `/api/v1/rpc/help` | public | — | Every command, its parameters and what it needs. |
 | `rpc.info` | `/api/v1/rpc/info` | local | — | Where the RPC and the web API are, and the cookie file. |
+
+## The explorer for apps
+
+An app page reads the same public explorer data as V1.0's own Explorer through the page API:
+
+    GET /r/explorer/<name>?args=<JSON object, URL-encoded>
+
+answers the public command `explorer.<name>` (`/r/explorer/chains` answers `chains.list`) with
+`{"ok": true, "result": ...}` or `{"ok": false, "error": ...}`, as `/api/v1` does. The arguments are one JSON
+object, exactly as the Explorer sends them (`{"chain": "peptest", "id": "1567902"}`: a height stays text).
+No page pass is needed (public data); like the rest of `/r/`, it answers this computer only and app frames
+(origin `null`) or this arcade's own pages, never other websites. Only the Explorer's own reads are
+answered: `summary`, `blocks`, `block`, `tx`, `address`, `inscriptions`, `inscription`, `inscription_types`,
+`tokens`, `token`, `collections`, `collection`, `collection_of`, `held`, `names`, `name`, `maps`, `map`,
+`mempool`, `ledger`, `ledger_tokens`, `ledger_token`, `ledger_inscriptions`, `ledger_inscription`, `tag`,
+`search`, and `chains`; any other name is 404.

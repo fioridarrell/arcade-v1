@@ -236,7 +236,7 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
     let qs = |k: &str| q.get(k).and_then(|v| v.as_str().map(String::from).or_else(|| v.as_u64().map(|n| n.to_string())));
     let qn = |k: &str, d: u64| q.get(k).and_then(|v| v.as_u64().or_else(|| v.as_str().and_then(|s| s.parse().ok()))).unwrap_or(d);
     let missing = |e: &str| (404, json!({"error": e}).to_string());
-    let seg: Vec<&str> = path.trim_start_matches("/r/").split('/').collect();
+    let seg: Vec<&str> = path.strip_prefix("/r/").unwrap_or("").split('/').collect();
     let cc = c(node);
     match seg.as_slice() {
         ["wallet"] => (200, wallet(node).to_string()),
@@ -634,6 +634,12 @@ fn build(node: &Node, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>)
         node.tx_outbox.lock().unwrap().push(tx.raw.clone());
     }
     Ok((tx.txid.to_hex(), fee, outs))
+}
+
+/// An arcade token send from this wallet itself (the Wallet's Send, not a page's request): built as a page's is,
+/// and broadcast when `send`. (txid, fee, outputs).
+pub fn token_send(node: &Node, pid: u32, units: u64, to: &str, send: bool) -> Result<(String, u64, Vec<Value>), String> {
+    build(node, &json!({"kind": "token", "propertyid": pid, "units": units, "to": to}), send)
 }
 
 /// What a request would send, as built now (for the approval card).

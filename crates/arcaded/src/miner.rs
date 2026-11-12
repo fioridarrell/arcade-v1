@@ -24,6 +24,71 @@ pub struct MinerState {
     pub hashes: AtomicU64,
     pub found: AtomicU64,
     pub started: std::sync::Mutex<Option<Instant>>,
+    /// Why the miner is waiting instead of mining (None: mining, or stopped).
+    pub waiting: std::sync::Mutex<Option<String>>,
+    /// The parent our last sent block built on: one block per height ever goes out (sent_once).
+    pub sent_on: std::sync::Mutex<Option<[u8; 32]>>,
+}
+
+/// How long a found block may take to come back to us on the chain before the miner gives up (2026-11-12: the
+/// Pepecoin testnet nodes banned the GX10's address after an hour of its mining; a block a peer refuses is what
+/// costs an address its peers).
+pub const LAND_WAIT: Duration = Duration::from_secs(120);
+
+/// Why this arcade may not mine now; None when it is at the tip. Mining needs a coin peer this arcade
+/// is synced with ("synced at N"), and no height anyone tells us of (headers, arcades on the mesh,
+/// lenders) above ours. A block found anywhere else builds on an old tip (a fork), or reaches nobody:
+/// found blocks go out to the coin peer only (Martin 2026-11-12: "it can't mine unless it is up to tip").
+pub fn not_at_tip(node: &Node) -> Option<String> {
+    let sync = node.sync_state.lock().unwrap().clone();
+    if !sync.starts_with("synced at ") {
+        return Some(format!("not synced with a coin peer ({sync})"));
+    }
+    let (lag, _) = crate::borrow::home_lag(node);
+    if lag > 0 {
+        return Some(format!("{lag} block(s) behind the best height known"));
+    }
+    None
+}
+
+/// A found block may go out only while it still extends our tip: its parent (header bytes 4..36) is
+/// the tip. One found on a tip that has since moved is stale, and sent it would only fork.
+pub fn extends_tip(node: &Node, raw: &[u8]) -> bool {
+    let tip = node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.hash);
+    raw.len() >= 80 && tip.map(|h| h.0[..] == raw[4..36]).unwrap_or(false)
+}
+
+/// Whether a found block may be sent: it extends our tip, and no block of ours on that parent went out before (one
+/// block per height; 2026-11-12 the GX10 sent two or three siblings for some heights before its ban). Marks it sent.
+pub fn sent_once(node: &Node, raw: &[u8]) -> Result<(), &'static str> {
+    if !extends_tip(node, raw) {
+        return Err("a found block no longer extends the tip: dropped, not sent");
+    }
+    let mut parent = [0u8; 32];
+    parent.copy_from_slice(&raw[4..36]);
+    let mut on = node.miner.sent_on.lock().unwrap();
+    if *on == Some(parent) {
+        return Err("a second block of ours at the same height: dropped, not sent");
+    }
+    *on = Some(parent);
+    Ok(())
+}
+
+/// After a find: wait until the chain moves past `parent` (our block came back, or somebody else's won the height)
+/// before building again, so the miner never makes a second block on the same parent. False when nothing moved in
+/// LAND_WAIT: our block was not taken, and mining stops rather than keep sending what peers refuse.
+fn landed(node: &Node, parent: &Hash256) -> bool {
+    let until = Instant::now() + LAND_WAIT;
+    *node.miner.waiting.lock().unwrap() = Some("waiting for our block to reach the chain".into());
+    while Instant::now() < until && node.miner.running.load(Ordering::Relaxed) {
+        if node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.hash) != Some(*parent) {
+            *node.miner.waiting.lock().unwrap() = None;
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    *node.miner.waiting.lock().unwrap() = None;
+    !node.miner.running.load(Ordering::Relaxed)
 }
 
 use arcade_wallet::tx::push;
@@ -178,6 +243,19 @@ pub fn run(node: Arc<Node>) {
     let _ = node.app.event("mine", &format!("mining to {} with {threads} threads", key.address));
     let mut extranonce: u64 = arcade_app::now() << 16;
     while node.miner.running.load(Ordering::Relaxed) {
+        if let Some(why) = not_at_tip(&node) {
+            let mut w = node.miner.waiting.lock().unwrap();
+            if w.as_deref() != Some(why.as_str()) {
+                let _ = node.app.event("mine", &format!("waiting to mine: {why}"));
+                *w = Some(why);
+            }
+            drop(w);
+            std::thread::sleep(Duration::from_secs(5));
+            continue;
+        }
+        if node.miner.waiting.lock().unwrap().take().is_some() {
+            let _ = node.app.event("mine", "at the tip: mining");
+        }
         extranonce += 1;
         let t = match build(&node, &pay, extranonce) {
             Ok(t) => t,
@@ -209,7 +287,8 @@ pub fn run(node: Arc<Node>) {
                         n += 1;
                         if n % 1024 == 0 {
                             node.miner.hashes.fetch_add(1024, Ordering::Relaxed);
-                            let moved = node.chain.tip(node.params.chain_no).ok().flatten().map(|x| x.hash) != Some(tip);
+                            let moved = node.chain.tip(node.params.chain_no).ok().flatten().map(|x| x.hash) != Some(tip)
+                                || node.miner.waiting.lock().unwrap().is_some();
                             if moved || Instant::now() > deadline || !node.miner.running.load(Ordering::Relaxed) {
                                 stop.store(true, Ordering::Relaxed);
                             }
@@ -235,6 +314,10 @@ pub fn run(node: Arc<Node>) {
                 node.miner.found.fetch_add(1, Ordering::Relaxed);
                 node.block_outbox.lock().unwrap().push(raw);
                 let _ = node.app.event("mine", &format!("found block {} at height {} with {} waiting transaction(s) ({} PEP to {})", b.hash(), t.height, t.txs.len(), subsidy(t.height) / 100_000_000, key.address));
+                if !landed(&node, &t.tip) {
+                    let _ = node.app.event("mine", &format!("block {} did not reach the chain in {} s (a peer may have refused it): mining stopped; find out why before mining again", b.hash(), LAND_WAIT.as_secs()));
+                    node.miner.running.store(false, Ordering::Relaxed);
+                }
             }
             Err(e) => {
                 let _ = node.app.event("mine", &format!("built an invalid block ({e}); stopping"));
@@ -242,5 +325,60 @@ pub fn run(node: Arc<Node>) {
             }
         }
     }
+    *node.miner.waiting.lock().unwrap() = None;
     let _ = node.app.event("mine", "mining stopped");
+}
+
+#[cfg(test)]
+mod tip_tests {
+    use super::{extends_tip, not_at_tip};
+    use crate::sitesvc::tests::setup;
+
+    #[test]
+    fn mines_only_at_the_tip() {
+        let t = setup();
+        // No coin peer synced: never.
+        *t.node.sync_state.lock().unwrap() = "finding a coin peer".into();
+        assert!(not_at_tip(&t.node).unwrap().contains("not synced"));
+        *t.node.sync_state.lock().unwrap() = "no coin peer reachable; at 2 from the mesh, retrying".into();
+        assert!(not_at_tip(&t.node).is_some(), "the mesh alone is not a tip it can mine on");
+        // Synced with a coin peer, nobody higher: mine.
+        *t.node.sync_state.lock().unwrap() = "synced at 2".into();
+        assert_eq!(not_at_tip(&t.node), None);
+        // An arcade on the mesh is further on: wait.
+        let far = crate::node::MeshTip { height: 9, names_digest: None, at: 0, d: None, s: None, from: String::new() };
+        t.node.mesh_tips.lock().unwrap().insert("peer".into(), far);
+        assert!(not_at_tip(&t.node).unwrap().contains("behind"));
+        t.node.mesh_tips.lock().unwrap().clear();
+        t.node.bk_peers.lock().unwrap().insert("peer:8421".into(), 5);
+        assert!(not_at_tip(&t.node).unwrap().contains("behind"));
+        t.node.bk_peers.lock().unwrap().insert("peer:8421".into(), 2);
+        assert_eq!(not_at_tip(&t.node), None);
+    }
+
+    #[test]
+    fn one_block_per_height_goes_out() {
+        let t = setup();
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap().hash;
+        let mut a = vec![0u8; 81];
+        a[4..36].copy_from_slice(&tip.0);
+        let mut b = a.clone();
+        b[80] = 1; // another block on the same parent (a sibling)
+        assert_eq!(super::sent_once(&t.node, &a), Ok(()));
+        assert!(super::sent_once(&t.node, &b).unwrap_err().contains("same height"));
+        a[4] ^= 1;
+        assert!(super::sent_once(&t.node, &a).unwrap_err().contains("no longer extends"));
+    }
+
+    #[test]
+    fn a_found_block_goes_out_only_on_the_tip() {
+        let t = setup();
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap().hash;
+        let mut raw = vec![0u8; 81];
+        raw[4..36].copy_from_slice(&tip.0);
+        assert!(extends_tip(&t.node, &raw));
+        raw[4] ^= 1;
+        assert!(!extends_tip(&t.node, &raw), "an old parent: stale, dropped");
+        assert!(!extends_tip(&t.node, &raw[..40]));
+    }
 }

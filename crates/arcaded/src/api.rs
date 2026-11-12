@@ -109,6 +109,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             }).collect::<Vec<_>>()))
         }
         "dd.wallet" => crate::ddsvc::wallet(node, s("chain").as_deref()),
+        "dd.coins" => crate::ddsvc::coins_of(node, s("chain").as_deref(), &s("pubkey").ok_or("pubkey required (a DigiByte key, 33 bytes of hex)")?),
         "dd.send" => {
             let cents = req["cents"].as_i64().ok_or("cents required (DigiDollar cents: $12.50 is 1250)")?;
             crate::ddsvc::send(node, s("chain").as_deref(), &s("to").ok_or("to required (a DD... or TD... address)")?, cents, req["send"] == true)
@@ -256,6 +257,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             }
             Ok(j)
         }
+        "realtime.ice" => Ok(crate::turnsvc::ice(node, &s("tag").unwrap_or_default(), req["lan"] == true)),
         "realtime.cert" => crate::realtime::cert(node, &s("address").ok_or("address required")?),
         "tx.coins" => crate::sitesvc::coins(node, req),
         "tx.activity" => crate::sitesvc::activity(node, req),
@@ -344,7 +346,8 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             node.miner.hashes.store(0, Ordering::Relaxed);
             let n = node.self_arc();
             std::thread::Builder::new().name("miner".into()).spawn(move || crate::miner::run(n)).unwrap();
-            Ok(json!({"running": true, "threads": threads}))
+            // Started either way; it mines only at the tip and says why it waits (mine.status).
+            Ok(json!({"running": true, "threads": threads, "waiting": crate::miner::not_at_tip(node)}))
         }
         "mine.stop" => {
             node.miner.running.store(false, std::sync::atomic::Ordering::Relaxed);
@@ -359,6 +362,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let h = node.miner.hashes.load(Ordering::Relaxed);
             Ok(json!({
                 "running": node.miner.running.load(Ordering::Relaxed),
+                "waiting": node.miner.waiting.lock().unwrap().clone(),
                 "threads": node.miner.threads.load(Ordering::Relaxed),
                 "hashes": h,
                 "hash_rate": if secs > 0.0 { (h as f64 / secs).round() } else { 0.0 },
@@ -488,10 +492,18 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         }
         c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
         c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
+        // Token sends from this wallet (tokensend.rs): arcade tokens in one transaction; PRC-20 / DRC-20 as a job.
+        "token.send" => crate::tokensend::ledger_send(node, req["propertyid"].as_u64().or_else(|| s("propertyid").and_then(|x| x.parse().ok())).ok_or("propertyid required")? as u32,
+            req["units"].as_u64().or_else(|| s("units").and_then(|x| x.parse().ok())).ok_or("units required (base units)")?, &s("to").ok_or("to required")?, req["send"] == true),
+        "token20.send" => crate::tokensend::t20_send(node, &s("chain").ok_or("chain required")?, &s("tick").ok_or("tick required")?, &s("amount").ok_or("amount required")?, &s("to").ok_or("to required")?, req["send"] == true),
+        "token20.sends" => Ok(crate::tokensend::t20_sends(node)),
+        "ord.send" => crate::ordsend::send(node, s("chain").as_deref(), &s("inscription").ok_or("inscription required")?, &s("to").ok_or("to required")?, req["send"] == true),
         "swap.place" => crate::swaps::place(node, &req["give"], &req["get"]),
         "swap.book" => Ok(json!(crate::swaps::book(node))),
-        "swap.take" => crate::swaps::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?),
+        // With the legs shown ({give, get}), only on exactly those terms.
+        "swap.take" => crate::swaps::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?, req["give"].is_object().then_some(req)),
         "swap.list" => Ok(json!(crate::swaps::swaps(node))),
+        c @ ("swap.quote" | "swap.told" | "swap.status") => crate::swaps::outside(node, &c[5..], &req),
         "chains.offers" => Ok(json!(node.offers.lock().unwrap().iter().map(|(id, o)| json!({"node": id, "addr": o.addr, "at": o.at, "bk": o.bk, "cr": o.cr})).collect::<Vec<_>>())),
         "chains.peers" => {
             let p = arcade_chain::params::by_key(&s("key").ok_or("key required")?).ok_or("unknown chain")?;

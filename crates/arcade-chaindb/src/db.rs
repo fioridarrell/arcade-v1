@@ -504,10 +504,13 @@ pub struct ChainDb {
     /// chain's sealed copies, arcaded's arcseal): (chain, block hash) -> raw block. One copy on
     /// disk: a sealed block's plain body is pruned and read through this.
     sealed: std::sync::RwLock<Option<SealedReader>>,
+    sealed_journal: std::sync::RwLock<Option<SealedJournalReader>>,
 }
 
 /// Reads a sealed block back: (chain number, block hash) -> its raw bytes.
 pub type SealedReader = Arc<dyn Fn(u16, &Hash256) -> Option<Vec<u8>> + Send + Sync>;
+/// Reads a pruned index journal record (chain, family, height) from this arcade's sealed copy.
+pub type SealedJournalReader = Arc<dyn Fn(u16, u8, u32) -> Option<Vec<u8>> + Send + Sync>;
 
 fn ix_key(c: u16, name: &str) -> Vec<u8> {
     k_state(c, &format!("ix:{name}"))
@@ -597,6 +600,7 @@ impl ChainDb {
             cache_bytes: std::sync::atomic::AtomicUsize::new(cache_budget()),
             addr_progress: Default::default(),
             sealed: Default::default(),
+            sealed_journal: Default::default(),
         };
         db.open_own_files()?;
         for c in 0..=255u16 {
@@ -621,6 +625,7 @@ impl ChainDb {
             cache_bytes: std::sync::atomic::AtomicUsize::new(0),
             addr_progress: Default::default(),
             sealed: Default::default(),
+            sealed_journal: Default::default(),
         };
         db.open_own_files()?;
         db.load_runs()?;
@@ -1018,6 +1023,9 @@ impl ChainDb {
                 }
                 let l = Logged::new(w);
                 ix.connect(&BlockCtx { l: &l, params, block: &blk, height: h, prevouts: &prevouts })?;
+                for (family, tables) in ix.journals() {
+                    crate::journal::write(&l, c, family, &tables, h, 0)?;
+                }
                 l.put(STATE, &ix_key(c, name), &h.to_be_bytes())?;
                 let ops = l.into_ops();
                 if h + UNDO_DEPTH > tip.height && h > 0 {
@@ -1057,12 +1065,54 @@ impl ChainDb {
         *self.sealed.write().unwrap() = Some(f);
     }
 
+    pub fn set_sealed_journal_reader(&self, f: SealedJournalReader) {
+        *self.sealed_journal.write().unwrap() = Some(f);
+    }
+
+    /// Block `height`'s journal record of an index family (crate::journal): the stored row,
+    /// or once pruned, from the sealed copy. None when this arcade has no journal for it.
+    pub fn journal(&self, c: u16, family: u8, height: u32) -> Result<Option<Vec<u8>>> {
+        if let Some(v) = self.store(c).read(|r| r.get(JOURNAL, &k_journal(c, family, height)))? {
+            return Ok(Some(v));
+        }
+        let f = self.sealed_journal.read().unwrap().clone();
+        Ok(f.and_then(|f| f(c, family, height)))
+    }
+
+    /// The first height an indexer installed on this chain reads.
+    pub fn indexer_start(&self, params: &ChainParams, name: &str) -> Option<u32> {
+        self.indexers.read().unwrap().iter().find(|(c, i)| *c == params.chain_no && i.name() == name).map(|(_, i)| i.start_height(params))
+    }
+
+    /// The first height from which an index family's journals run here.
+    pub fn journal_from(&self, c: u16, family: u8) -> Result<Option<u32>> {
+        self.store(c).read(|r| Ok(r.get(STATE, &crate::journal::from_key(c, family))?.map(|v| be_u32(&v, 0))))
+    }
+
+    /// After a family's segment is sealed: its plain journal rows go (the sealed copy answers
+    /// for them). Bytes freed.
+    pub fn prune_journals(&self, c: u16, family: u8, first: u32, last: u32) -> Result<u64> {
+        self.wstore(c)?.write(|w| {
+            let mut freed = 0u64;
+            for h in first..=last {
+                let k = k_journal(c, family, h);
+                if let Some(v) = w.get(JOURNAL, &k)? {
+                    freed += v.len() as u64;
+                    w.del(JOURNAL, &k)?;
+                }
+            }
+            Ok(freed)
+        })
+    }
+
     /// A pruned block's bytes from this arcade's sealed copy, checked against its hash.
     fn sealed_raw(&self, c: u16, hash: &Hash256) -> Option<Vec<u8>> {
         let f = self.sealed.read().unwrap().clone()?;
         let raw = f(c, hash)?;
         let h80: [u8; 80] = raw.get(..80)?.try_into().ok()?;
-        (Header::parse(&h80).hash() == *hash).then_some(raw)
+        // A coin's header hashes to its id; the ARCADE chain's stand-in header carries its id.
+        let h = Header::parse(&h80);
+        (h.hash() == *hash || h.merkle_root == *hash).then_some(raw)
     }
 
     /// A pruned block's transaction `p`, from the sealed copy (block number `b`).
@@ -1982,7 +2032,11 @@ fn connect_one(
             None => height == start,
         };
         if due {
+            let from = l.len();
             ix.connect(&BlockCtx { l: &l, params, block: blk, height, prevouts: &prevouts })?;
+            for (family, tables) in ix.journals() {
+                crate::journal::write(&l, c, family, &tables, height, from)?;
+            }
             l.put(STATE, &k, &height.to_be_bytes())?;
         }
     }

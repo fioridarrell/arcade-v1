@@ -25,7 +25,7 @@
 //!
 //! Everything here is kept in memory; the arcade's store is wired in with the node.
 
-use crate::block::{self, Block, BlockError, Equivocation, Header, Item, Key, TimeProof, VrfProof, HEADER_VERSION};
+use crate::block::{self, Block, BlockError, Equivocation, Header, Item, Key, TimeProof, VrfProof};
 use crate::catalog::{self, Catalog};
 use crate::coins::{self, Changes, Coin, TxError};
 use crate::draw;
@@ -91,6 +91,8 @@ pub enum ChainError {
     Checkpoint,
     #[error("the time isn't later than the block before")]
     Time,
+    #[error("the block doesn't carry the rules version of its height")]
+    RulesVersion,
     #[error("the time is more than two minutes ahead of this arcade's clock")]
     AheadOfClock,
     #[error("the difficulty isn't what the rules give")]
@@ -279,7 +281,7 @@ impl Ticket {
             _ => txs,
         };
         let mut header = Header {
-            version: HEADER_VERSION,
+            version: net.rules_at(self.height),
             height: self.height,
             prev: self.prev,
             time,
@@ -309,13 +311,13 @@ pub trait Branch {
 /// `D` for the block after `parent` (§6.2): reset with the first block of each epoch by
 /// the time from the last block of the epoch before the last to the last block of the
 /// last one, with no block left out between the stretches.
-pub fn next_difficulty(parent: &Entry, branch: &impl Branch) -> u128 {
+pub fn next_difficulty(net: &Net, parent: &Entry, branch: &impl Branch) -> u128 {
     let height = parent.height + 1;
     if height % params::EPOCH_BLOCKS != 0 {
         return parent.difficulty;
     }
     let from = branch.at(parent.height.saturating_sub(params::EPOCH_BLOCKS));
-    draw::retarget(parent.difficulty, parent.time - from.time, parent.height - from.height)
+    draw::retarget(parent.difficulty, parent.time - from.time, parent.height - from.height, net.block_seconds)
 }
 
 /// The proof of time behind the next epoch's draw seed (§6.1), on the branch that ends
@@ -356,10 +358,13 @@ pub fn check_header(net: &Net, proofs: &impl TimeProofs, parent: &Entry, branch:
     if header.time <= parent.time {
         return Err(ChainError::Time);
     }
+    if header.version != net.rules_at(header.height) {
+        return Err(ChainError::RulesVersion);
+    }
     if header.time > now.saturating_add(params::MAX_FUTURE_SECONDS) {
         return Err(ChainError::AheadOfClock);
     }
-    if header.difficulty != next_difficulty(parent, branch) {
+    if header.difficulty != next_difficulty(net, parent, branch) {
         return Err(ChainError::Difficulty);
     }
     if header.weight == 0 || header.weight > weight_bound {
@@ -431,6 +436,8 @@ pub struct Chain<T: TimeProofs, S: Storage> {
     /// The first block seen from each writer on each block, to notice a second.
     written: HashMap<(Key, Hash256), Hash256>,
     evidence: Vec<Equivocation>,
+    /// A better branch that waited (BlockError::Waiting): its last block, tried again with retry().
+    waiting: Option<Hash256>,
 }
 
 impl<T: TimeProofs, S: Storage> Chain<T, S> {
@@ -455,7 +462,13 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             checkpoints: checkpoints.iter().copied().collect(),
             written: HashMap::new(),
             evidence: Vec::new(),
+            waiting: None,
         }
+    }
+
+    /// The proofs of time this chain checks with.
+    pub fn proofs(&self) -> &T {
+        &self.proofs
     }
 
     pub fn net(&self) -> &Net {
@@ -601,7 +614,14 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         }
         for (done, id) in path.iter().enumerate() {
             if let Err(error) = self.join(id) {
-                self.condemn(id);
+                // Not decided yet (a fraud proof about a source block this arcade's headers don't reach): not
+                // condemned; the branch is tried again with retry().
+                let waits = matches!(error, ChainError::Block(BlockError::Waiting(_)));
+                if waits {
+                    self.waiting = Some(target);
+                } else {
+                    self.condemn(id);
+                }
                 for _ in 0..done {
                     self.leave();
                 }
@@ -612,6 +632,22 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             }
         }
         Ok(Accepted::Tip { undone, joined: path })
+    }
+
+    /// Try again a branch that waited (BlockError::Waiting) for this arcade to know more: Ok(None) when none waits or
+    /// it's no longer better than the tip.
+    pub fn retry(&mut self) -> Result<Option<Accepted>, ChainError> {
+        let Some(target) = self.waiting.take() else { return Ok(None) };
+        let Some(e) = self.entries.get(&target) else { return Ok(None) };
+        if self.invalid.contains(&target) || !e.beats(self.tip()) {
+            return Ok(None);
+        }
+        self.move_to(target).map(Some)
+    }
+
+    /// Whether a better branch waits for this arcade to know more.
+    pub fn is_waiting(&self) -> bool {
+        self.waiting.is_some()
     }
 
     /// Step 3: the block after the tip, against the coins and the storage records.
@@ -690,7 +726,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         let input = draw::draw_input(&self.net, &seed, height);
         let vrf_proof = vrf::prove(secret, &input);
         let drawn = vrf::verify(&vrf::public_key(secret), &input, &vrf_proof)?;
-        let difficulty = next_difficulty(parent, &self.branch(parent));
+        let difficulty = next_difficulty(&self.net, parent, &self.branch(parent));
         let score = draw::score(&drawn, weight);
         Some(Ticket {
             height,
@@ -1031,6 +1067,8 @@ pub(crate) mod tests {
         refuse(&|b| b.header.prev = Hash256([7; 32]), ChainError::Orphan);
         refuse(&|b| b.header.time = START + 5 * 150, ChainError::Time);
         refuse(&|b| b.header.time = LATE + 121, ChainError::AheadOfClock);
+        // Another rules version than its height's (rules version 1 from block 0 here).
+        refuse(&|b| b.header.version = 2, ChainError::RulesVersion);
         refuse(&|b| b.header.difficulty += 1, ChainError::Difficulty);
         refuse(&|b| b.header.difficulty /= 2, ChainError::Difficulty);
         // More weight than the key has would mean fewer steps.
@@ -1377,7 +1415,7 @@ pub(crate) mod tests {
         let b = block_with(&c, who, vec![Item::Attest(block::Attest { segment: [1; 32], attester: [2; 32], sig: [0; 64] })]);
         assert!(matches!(c.accept(b, LATE), Err(ChainError::Block(BlockError::Invalid(_)))));
         // Anything but a catalog item.
-        let b = block_with(&c, who, vec![Item::RegCommit(block::RegCommit { segment: [1; 32], owner: [2; 32], payout: address(2), replica_root: [3; 32], anchor: 1, nonce: 0, sig: [0; 64] })]);
+        let b = block_with(&c, who, vec![Item::RegCommit(block::RegCommit { owner: [2; 32], payout: address(2), replicas: vec![([1; 32], [3; 32])], anchor: 1, nonce: 0, sig: [0; 64] })]);
         assert_eq!(c.accept(b, LATE), Err(ChainError::Block(BlockError::Invalid("this chain's storage records are a stand-in: only catalog items"))));
         assert_eq!(c.tip().height, 2);
     }

@@ -515,6 +515,15 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.segment_root" => crate::arcsvc::segment_root(node, req),
         "arc.seal" => crate::arcsvc::seal(&node.self_arc(), req),
         "arc.replicas" => crate::arcsvc::replicas(node),
+        // A reveal demand by hand (§2.4): the holders of a listed segment must show its leaves on the chain.
+        "arc.reveal" => {
+            let svc = crate::arcsvc::svc().ok_or("the ARCADE chain isn't running here")?;
+            let seg: [u8; 32] = s("segment").and_then(|x| hex::decode(x).ok()).and_then(|b| b.try_into().ok()).ok_or("segment required (64 hex)")?;
+            let first = req["first"].as_u64().unwrap_or(0);
+            let count = req["count"].as_u64().unwrap_or(16);
+            let id = crate::arcfraud::demand(node, &svc.net(), &seg, first, count)?;
+            Ok(serde_json::json!({"demand": hex::encode(id), "segment": hex::encode(seg), "first": first, "count": count}))
+        }
         "arc.open" => crate::arcsvc::open(node, req),
         "arc.sealing" => crate::arcsvc::sealing(node, req),
         "arc.earn" => crate::arcsvc::earn(node, req),

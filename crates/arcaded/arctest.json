@@ -1,8 +1,8 @@
 {
  "net": "arctest",
- "_note": "The ARCADE testnet built into V1.0 (Martin 2026-11-11). Genesis writers: the GX10 and the JB20B; anyone else joins by sealing a listed segment and registering it. The lists and beacons are placeholders until the genesis list (docs/ARCADECHAIN.md \u00a710) exists.",
+ "_note": "The ARCADE testnet built into V1.0 (Martin 2026-11-11). Genesis writers: the GX10 and the JB20B; anyone else joins by sealing a listed segment and registering it. The lists and beacons are placeholders until the genesis list (docs/ARCADECHAIN.md \u00a710) exists. Restarted 2026-11-12 with 16 MiB segments, the mainnet's size too (small chains such as Pepecoin testnet take part), fees into the pot, seeded transaction order, serving checks and index journals.",
  "genesis": {
-  "time": 1794435060,
+  "time": 1794448260,
   "closed_list": "9d2129f082fcbf9dc431d0f924d6643d68f906abf140459456f8327913006c5c",
   "final_list": "65f88bb715c6baa4efdfcc4fdd106c087ea1475bdff9301c417a53bca1d45e0d",
   "beacon_1": "61f17a562dd36624d26654276663e2b79b7f7e060bb77081ff92f44d5f8f3245",
@@ -23,5 +23,6 @@
    "_who": "JB20B"
   }
  ],
- "steps_per_second": 1000000
+ "steps_per_second": 1000000,
+ "segment_bytes": 16777216
 }

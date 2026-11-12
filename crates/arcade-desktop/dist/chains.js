@@ -286,11 +286,15 @@
     if (!full) line.textContent = `Needs ${st.name} kept in full: its whole database is sealed.`;
     else if (!e.on) line.textContent = `Seal ${st.name}'s whole database (one sealed copy, read by unsealing) and earn ARCADE for holding it.`;
     else {
-      pct = e.of ? Math.min(100, (e.sealed_to * 100) / e.of) : 0;
+      // The blocks and every index together: one percent, one bar.
+      const ix = e.indexes || [];
+      const done = e.sealed_to + ix.reduce((a, i) => a + i.sealed_to, 0), all = e.of + ix.reduce((a, i) => a + i.of, 0);
+      pct = all ? Math.min(100, (done * 100) / all) : 0;
       const share = e.total_weight ? ((e.weight * 100) / e.total_weight).toFixed(2) : "0";
       const sealing = e.sealing ? ` · sealing a segment: ${Math.floor((e.sealing.done * 100) / Math.max(1, e.sealing.of))}%` : "";
+      const ixText = ix.map((i) => ` · ${i.name} to ${fmtN(i.sealed_to)}`).join("");
       line.textContent = e.note ? e.note
-        : `Sealed to block ${fmtN(e.sealed_to)} of ${fmtN(e.of)} · ${pct.toFixed(1)}%${sealing} · earning with ${mib(e.weight)} (${share}% of all weight)`;
+        : `Sealed to block ${fmtN(e.sealed_to)} of ${fmtN(e.of)}${ixText} · ${pct.toFixed(1)}%${sealing} · earning with ${mib(e.weight)} (${share}% of all weight)`;
     }
     fill.style.width = pct + "%";
     box.replaceChildren(title, line, ...(e.on && full ? [bar] : []));

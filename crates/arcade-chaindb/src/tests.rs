@@ -284,6 +284,66 @@ fn indexer_in_commit_undo_and_backfill_agree() {
     assert_eq!(bdb.scan_all("addon.v1.count").unwrap().len(), 1);
 }
 
+/// CountTx with a journal: its table is family 7's.
+struct JournaledCount;
+impl crate::Indexer for JournaledCount {
+    fn name(&self) -> &'static str { "count" }
+    fn tables(&self) -> Vec<arcade_store::TableDef> { CountTx.tables() }
+    fn start_height(&self, p: &ChainParams) -> u32 { CountTx.start_height(p) }
+    fn connect(&self, ctx: &crate::BlockCtx) -> arcade_store::Result<()> {
+        // Written twice and in another order than the journal's: the journal holds the last.
+        ctx.l.put("addon.v1.count", &[0xff], &[ctx.height as u8])?;
+        CountTx.connect(ctx)?;
+        ctx.l.put("addon.v1.count", &[0xff], &[ctx.height as u8, 1])
+    }
+    fn journals(&self) -> Vec<(u8, Vec<&'static str>)> {
+        vec![(7, vec!["addon.v1.count"])]
+    }
+}
+
+#[test]
+fn an_index_journals_each_block_the_same_live_and_backfilled() {
+    let a = fixture();
+    let c = a.p.chain_no;
+    a.db.add_indexer(c, std::sync::Arc::new(JournaledCount)).unwrap();
+    let cb1 = tx(&[], &[(5000, p2pkh(1))], 1);
+    let b1 = block(a.g.hash(), vec![cb1.clone()], 2);
+    let b2 = block(b1.hash(), vec![tx(&[], &[(1, p2pkh(9))], 2), tx(&[(cb1.txid, 0)], &[(4000, p2pkh(2))], 0)], 3);
+    a.db.connect_blocks(a.p, &[b1.clone(), b2.clone()]).unwrap();
+    let j2 = crate::journal::decode(&a.db.journal(c, 7, 2).unwrap().unwrap()).unwrap();
+    let mut want_count = 2u32.to_be_bytes().to_vec();
+    want_count.extend_from_slice(&5000u64.to_be_bytes());
+    assert_eq!(j2, vec![
+        ("addon.v1.count".to_string(), 2u32.to_be_bytes().to_vec(), Some(want_count)),
+        ("addon.v1.count".to_string(), vec![0xff], Some(vec![2, 1])),
+    ]);
+    assert_eq!(a.db.journal_from(c, 7).unwrap(), Some(1));
+    assert_eq!(a.db.journal(c, 7, 0).unwrap(), None, "before the index starts");
+    // A reorg takes the block's journal with it.
+    a.db.disconnect_tip(c).unwrap();
+    assert_eq!(a.db.journal(c, 7, 2).unwrap(), None);
+    a.db.connect_blocks(a.p, &[b2.clone()]).unwrap();
+
+    // The same index added later and backfilled journals the same bytes.
+    let dir = tempfile::tempdir().unwrap();
+    let bdb = ChainDb::open(dir.path().join("c.mdbx")).unwrap();
+    bdb.connect_blocks(a.p, &[a.g.clone(), b1, b2]).unwrap();
+    bdb.add_indexer(c, std::sync::Arc::new(JournaledCount)).unwrap();
+    while bdb.backfill(a.p, "count", 1).unwrap() > 0 {}
+    for h in 1..=2 {
+        assert_eq!(bdb.journal(c, 7, h).unwrap(), a.db.journal(c, 7, h).unwrap());
+    }
+    assert_eq!(bdb.journal_from(c, 7).unwrap(), Some(1));
+
+    // Pruned, a record comes back from the sealed copy (here a stand-in).
+    let kept = a.db.journal(c, 7, 1).unwrap().unwrap();
+    assert!(a.db.prune_journals(c, 7, 1, 1).unwrap() > 0);
+    assert_eq!(a.db.journal(c, 7, 1).unwrap(), None);
+    let k2 = kept.clone();
+    a.db.set_sealed_journal_reader(std::sync::Arc::new(move |_, f, h| (f == 7 && h == 1).then(|| k2.clone())));
+    assert_eq!(a.db.journal(c, 7, 1).unwrap(), Some(kept));
+}
+
 #[test]
 fn remove_chain_deletes_only_that_chain() {
     let f = fixture();

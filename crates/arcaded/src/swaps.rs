@@ -721,12 +721,75 @@ pub fn release(node: &Node, id: &str) -> Result<Value, String> {
     if o["status"] != "open" {
         return Err(format!("that order is {}: a running swap finishes or refunds by itself", o["status"].as_str().unwrap_or("closed")));
     }
+    // What the order's key holds goes back to the payout addresses first (the website's visitor gave it to this key to
+    // place the order): an inscription given, whole and first; an arcade token given, by a ledger send; then the coins.
+    let mut back = Vec::new();
+    if o["own"].is_object() {
+        o["status"] = json!("releasing");
+        put(node, "sorder", &o);
+        for leg in [o["give"].clone(), o["get"].clone()] {
+            let p = leg_ok(node, &leg)?;
+            if back.iter().any(|b: &Value| b["chain"] == p.key) {
+                continue;
+            }
+            match sweep(node, p, &o, if leg == o["give"] { Some(&leg) } else { None }) {
+                Ok(txids) => back.push(json!({"chain": p.key, "txids": txids})),
+                Err(e) => back.push(json!({"chain": p.key, "error": e})),
+            }
+        }
+    }
     o["status"] = json!("released");
+    o["returned"] = json!(back);
     if let Some(m) = o.as_object_mut() {
         m.remove("own");
     }
     put(node, "sorder", &o);
     Ok(o)
+}
+
+/// Everything an own-key order's key holds on `p` back to its payout address there: `give` is the order's own leg on
+/// that chain (its inscription or arcade token first), then every coin. The txids sent.
+fn sweep(node: &Node, p: &'static ChainParams, o: &Value, give: Option<&Value>) -> Result<Vec<String>, String> {
+    let (sk, pk) = key_of(node, p, Some(o))?;
+    let own = crate::coinsend::key_scripts(p, &pk)[0].1.clone();
+    let to = payout(p, Some(o), own.clone());
+    if to == own {
+        return Err("no payout address to send it back to".into());
+    }
+    let mut sent = Vec::new();
+    match give.and_then(|g| g["kind"].as_str()) {
+        Some("ord") => {
+            let id = give.unwrap()["asset"].as_str().unwrap_or("");
+            if let Some((at, 0)) = arcade_ledger::ord::location(&node.chain, p, id) {
+                if let Some(coin) = node.chain.coin(p, &at).ok().flatten().filter(|c| c.script == own || c.script == p2pkh_of(&pk)) {
+                    let first = vec![Utxo { outpoint: at, value: coin.value, script: coin.script.clone() }];
+                    let tx = build(node, p, &sk, first, coins(node, p, &pk), vec![TxOutSpec { value: coin.value, script: to.clone() }], &to)?;
+                    sent.push(send(node, p, &tx)?);
+                    return Ok(sent); // its fee coins went with it, change to the payout address
+                }
+            }
+        }
+        Some("token") => {
+            let g = give.unwrap();
+            let pid: u32 = g["asset"].as_str().and_then(|a| a.parse().ok()).ok_or("bad property")?;
+            let addr = arcade_ledger::address::address_of(&own, p).ok_or("no address")?;
+            let held = led::holdings(&node.chain, p.chain_no, &addr).into_iter().find(|(x, _)| *x == pid).map(|x| x.1).unwrap_or(0);
+            if held > 0 {
+                let mut payload = vec![0, 0, 0, 0];
+                payload.extend_from_slice(&pid.to_be_bytes());
+                payload.extend_from_slice(&held.to_be_bytes());
+                let t = arcade_wallet::tx::build_arcade(p, &payload, vec![TxOutSpec { value: LEDGER_COIN, script: to.clone() }], &sk, &coins(node, p, &pk), crate::claims::FEE_PER_KB, crate::claims::DUST, now()).map_err(|e| e.to_string())?;
+                sent.push(send(node, p, &t)?);
+            }
+        }
+        _ => {}
+    }
+    let left = coins(node, p, &pk);
+    if !left.is_empty() {
+        let tx = build(node, p, &sk, left, vec![], vec![], &to)?;
+        sent.push(send(node, p, &tx)?);
+    }
+    Ok(sent)
 }
 
 /// Take back an open order of this arcade's (a running swap finishes or refunds by itself).

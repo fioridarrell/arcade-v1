@@ -131,11 +131,13 @@ cmds! {
     "group.update" Message "id, changes" "Admins: change admins, description, picture or pinned message.";
     "group.remove" Message "id, members" "Admins: remove members (gives everyone else a new group key).";
     // Feed
-    "feed" Public "order?, channel?, tag?, author?, txid?, limit?, offset?" "Public posts (popular, new or friends) with replies, counts and tips.";
+    "feed" Public "order?, channel?, tag?, author?, txid?, limit?, offset?" "Public posts (popular, new, friends or following) with replies, counts and tips.";
     "feed.channels" Public "" "Channels and how many posts each has.";
     "feed.settings" Read "set?" "Feed settings (hide muted, contacts only); set = {hide_muted, contacts_only} needs post.";
     "feed.post" Post "text?, channel?, file?" "Post publicly (needs a @tag).";
     "feed.act" Post "kind, target, text?, amount?" "Like, unlike, dislike, undislike, reply, share, edit, delete; tip (needs tip; amount in satoshis).";
+    "follows" Public "who" "An account's followers and the accounts it follows (who = @tag or address), with @tags and counts.";
+    "follow" Post "who, on?" "Follow an account (on: false unfollows): a feed act on the home chain from this wallet; the newest between two accounts counts.";
     "feed.file" Public "txid" "A post's file (base64).";
     // Protocol indexes
     "ledger" Public "" "The arcade ledger's fingerprints next to what other arcades report.";

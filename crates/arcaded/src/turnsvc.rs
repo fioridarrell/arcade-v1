@@ -682,6 +682,26 @@ fn to_peer(t: &mut Turn, client: SocketAddr, data: &[u8], peer: SocketAddrV4) {
 
 // ---------------------------------------------------------------- logins for players
 
+/// Media passed on for other arcades (fastlane.rs, app windows' pictures and sound): allowed
+/// while the relay is on and under its month's limit, and counted in it (and in the total rate).
+pub fn charge(bytes: usize) -> bool {
+    let mut g = st().lock().unwrap();
+    let Some(t) = g.as_mut() else { return false };
+    let month = this_month();
+    if month != t.month {
+        t.month = month;
+        t.bytes = 0;
+    }
+    if t.over_limit() || !t.total.take(bytes) {
+        return false;
+    }
+    t.bytes += bytes as u64;
+    if t.saved_at.elapsed() > SAVE_EVERY {
+        t.save();
+    }
+    true
+}
+
 /// A login on this arcade's relay for `tag` (None when the relay is off or over its limit).
 pub fn login(tag: &str) -> Option<(String, String)> {
     let g = st().lock().unwrap();

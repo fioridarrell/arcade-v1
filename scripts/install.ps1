@@ -3,7 +3,7 @@
 # One line (PowerShell). It downloads the newest release, checks the sha256, and installs
 # it. Nothing to compile unless there is no download yet, or you ask with --build:
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fioridarrell/arcade-v1/windows/scripts/install.ps1'))"
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.ps1'))"
 #
 # From a clone of this repo it does the same. --build skips the download and compiles here.
 #
@@ -24,8 +24,8 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 
-$OwnerRepo = if ($env:ARCADE_GITHUB) { $env:ARCADE_GITHUB } else { 'fioridarrell/arcade-v1' }
-$Branch = if ($env:ARCADE_BRANCH) { $env:ARCADE_BRANCH } else { 'windows' }
+$OwnerRepo = if ($env:ARCADE_GITHUB) { $env:ARCADE_GITHUB } else { 'martinseeger2002/arcade-v1' }
+$Branch = if ($env:ARCADE_BRANCH) { $env:ARCADE_BRANCH } else { 'main' }
 $TaskName = 'Arcade V1.0'
 $NoOpen = ($env:ARCADE_NO_OPEN -eq '1')
 

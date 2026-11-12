@@ -8,12 +8,16 @@
 //! - A player is vouched by a cert: their address signs "arcade-realtime\n<net>\n<node>\n<address>
 //!   \n<expires>" (Core signmessage); guests ("guest-" + 8 hex) need none.
 //!
-//! Pages reach rooms through the app window: realtime.join / send / leave / poll.
+//! Pages reach rooms through the app window: realtime.join / send / leave / poll; a room joined
+//! with fast also has the fast lane between arcades (fastlane.rs: realtime.fast / lanes).
+
+#[path = "fastlane.rs"]
+pub mod fast;
 
 use crate::node::Node;
 use arcade_mesh::link::{canonical, Frame};
 use serde_json::{json, Value};
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -30,6 +34,14 @@ const HERE_FULL: u32 = 6;
 const REMOTE_GONE: u64 = 24;
 const SUB_EVERY: Duration = Duration::from_secs(30);
 const ROUTE_LIFE: u64 = 105;
+/// Room routes (room, origin) kept in all; a sub past this adds no new ones.
+const MAX_ROUTES: usize = 16384;
+/// Arcades whose sub we remember hearing.
+const MAX_HEARD: usize = 4096;
+/// Subs taken from one link: 30 a second, 120 at once (every arcade's sub passes each link
+/// every 30 s, so this is ~900 arcades).
+const SUB_LINK_RATE: f64 = 30.0;
+const SUB_LINK_BURST: f64 = 120.0;
 /// A window that stops polling for this long has left its rooms.
 const SEAT_LIFE: Duration = Duration::from_secs(30);
 const OUTQ_MAX: usize = 4000;
@@ -89,6 +101,8 @@ struct Session {
     member: String,
     events: VecDeque<Value>,
     polled: Instant,
+    /// The window asked for the fast lane in this room.
+    fast: bool,
 }
 
 #[derive(Clone)]
@@ -116,6 +130,17 @@ struct St {
     /// origin -> (link its sub came in on, when): the way back to that arcade (node._via),
     /// used to route introductions (crate::udpsvc).
     heard: HashMap<String, (String, u64)>,
+    /// origin -> the fast lane to that arcade (fastlane.rs).
+    lanes: HashMap<String, fast::Lane>,
+    /// "origin:q" of fx frames taken lately (each is taken once), with when (seconds).
+    fx_seen: HashMap<String, u64>,
+    /// peer -> its links' numbers, oldest first. An arcade can hold more than one connection
+    /// to us (borrowing blocks, fetching shares) under the same id: room frames must go out on
+    /// its mesh link only, never on a connection whose reader drops them.
+    conns: HashMap<String, Vec<u64>>,
+    /// peer -> the link its own room frames last came in on: where ours go.
+    via_conn: HashMap<String, u64>,
+    next_conn: u64,
 }
 
 struct Rt {
@@ -139,6 +164,37 @@ fn sign(node: &Node, h: &mut Value, blob: &[u8]) {
 
 fn verify(h: &Value, blob: &[u8]) -> bool {
     arcade_mesh::canon::verify_json(h, STRIP, "o", blob)
+}
+
+#[cfg(test)]
+#[test]
+fn subs_are_capped_per_link_and_routes_in_all() {
+    let t = crate::sitesvc::tests::shared();
+    let sub = |i: u32, rooms: &[String]| {
+        let mut k = [9u8; 32];
+        k[..4].copy_from_slice(&i.to_be_bytes());
+        let sk = ed25519_dalek::SigningKey::from_bytes(&k);
+        let mut h = json!({"t": "sub", "o": hex::encode(sk.verifying_key().to_bytes()), "q": now_us(), "rooms": rooms, "hops": 0});
+        arcade_mesh::canon::sign_json(&sk, &mut h, STRIP, b"");
+        h
+    };
+    // One link, many origins at once: only so many are taken.
+    let mut st = St::default();
+    let one = vec![format!("{:016x}", 1)];
+    let subs: Vec<Value> = (0..400).map(|i| sub(i, &one)).collect();
+    for h in &subs {
+        on_sub(&t.node, &mut st, "L1", h);
+    }
+    let took = st.heard.len();
+    assert!(took <= SUB_LINK_BURST as usize + 30, "took {took} subs from one link at once");
+    // Many links, every sub with MAX_ROOMS rooms: routes stop at the cap.
+    let mut st = St::default();
+    let rooms: Vec<String> = (0..MAX_ROOMS).map(|i| format!("{i:016x}")).collect();
+    for i in 0..20 {
+        on_sub(&t.node, &mut st, &format!("L{i}"), &sub(1000 + i, &rooms));
+    }
+    let total: usize = st.routes.values().map(|r| r.len()).sum();
+    assert!(total <= MAX_ROUTES, "{total} routes");
 }
 
 #[cfg(test)]
@@ -168,12 +224,17 @@ fn next_q(st: &mut St) -> u64 {
 
 /// Token bucket per key: `rate` per second, up to `burst`.
 fn allow(st: &mut St, key: String, rate: f64, burst: f64) -> bool {
+    allow_cost(st, key, rate, burst, 1.0)
+}
+
+/// The same, taking `cost` tokens (bytes, say).
+fn allow_cost(st: &mut St, key: String, rate: f64, burst: f64, cost: f64) -> bool {
     let now = Instant::now();
     let b = st.buckets.entry(key).or_insert((burst, now));
     b.0 = (b.0 + now.duration_since(b.1).as_secs_f64() * rate).min(burst);
     b.1 = now;
-    if b.0 >= 1.0 {
-        b.0 -= 1.0;
+    if b.0 >= cost {
+        b.0 -= cost;
         true
     } else {
         false
@@ -361,12 +422,22 @@ fn send_sub(node: &Node, st: &mut St) {
 
 // ---------------- receiving ----------------
 
-/// A pub or sub frame from the link to arcade `from`.
-pub fn on_frame(node: &Node, from: &str, f: &Frame) {
+/// A pub, sub or fx frame from link `conn` to arcade `from`.
+pub fn on_frame(node: &Node, from: &str, conn: u64, f: &Frame) {
     let mut st = rt().st.lock().unwrap();
+    if st.via_conn.get(from) != Some(&conn) {
+        // The first room frame on this link (or the first since another): ours go here now,
+        // and it hears again which rooms we are in, in case that went to another of its links.
+        let first = st.via_conn.insert(from.to_string(), conn).is_none();
+        if first && !st.locals.is_empty() {
+            let f = own_sub(node, &mut st);
+            queue(&mut st, from, f);
+        }
+    }
     match f.kind() {
         "pub" => on_pub(node, &mut st, from, &f.head, &f.blob),
         "sub" => on_sub(node, &mut st, from, &f.head),
+        "fx" => fast::on_fx(node, &mut st, from, &f.head, &f.blob),
         _ => {}
     }
 }
@@ -386,6 +457,9 @@ fn on_sub(node: &Node, st: &mut St, from: &str, h: &Value) {
     if st.seen.contains_key(&key) || h["hops"].as_u64().unwrap_or(99) >= MAX_HOPS {
         return;
     }
+    if !allow(st, format!("sublink|{from}"), SUB_LINK_RATE, SUB_LINK_BURST) {
+        return;
+    }
     let Some(rooms) = h["rooms"].as_array() else { return };
     if rooms.len() > MAX_ROOMS || rooms.iter().any(|r| r.as_str().is_none_or(|s| s.len() != 16)) {
         return;
@@ -398,7 +472,9 @@ fn on_sub(node: &Node, st: &mut St, from: &str, h: &Value) {
         return;
     }
     st.seen.insert(key, now_s());
-    st.heard.insert(origin.clone(), (from.to_string(), now_s()));
+    if st.heard.len() < MAX_HEARD || st.heard.contains_key(&origin) {
+        st.heard.insert(origin.clone(), (from.to_string(), now_s()));
+    }
     let exp = now_s() + ROUTE_LIFE;
     let wanted: HashSet<String> = rooms.iter().filter_map(|r| r.as_str().map(String::from)).collect();
     for (rid, r) in st.routes.iter_mut() {
@@ -408,9 +484,15 @@ fn on_sub(node: &Node, st: &mut St, from: &str, h: &Value) {
     }
     // A newcomer to one of our rooms hears who is here soon (a full beat).
     let ours: HashMap<String, String> = st.locals.keys().map(|r| (room_id(r), r.clone())).collect();
+    let mut total: usize = st.routes.values().map(|r| r.len()).sum();
     for rid in &wanted {
+        let known = st.routes.get(rid).is_some_and(|r| r.contains_key(&origin));
+        if !known && total >= MAX_ROUTES {
+            continue;
+        }
         let r = st.routes.entry(rid.clone()).or_default();
-        let new = !r.contains_key(&origin);
+        let new = !known;
+        total += new as usize;
         r.insert(origin.clone(), (from.to_string(), exp));
         if new {
             if let Some(room) = ours.get(rid) {
@@ -561,25 +643,57 @@ pub fn route_to(origin: &str, secs: u64) -> Option<String> {
     rt().st.lock().unwrap().heard.get(origin).filter(|(_, at)| now.saturating_sub(*at) < secs).map(|(l, _)| l.clone())
 }
 
-/// Frames waiting for the link to arcade `peer`.
-pub fn take(peer: &str) -> Vec<Frame> {
+/// The link that carries room frames to `peer`: the one its own came in on, else its oldest.
+fn carrier(st: &St, peer: &str) -> Option<u64> {
+    let live = st.conns.get(peer)?;
+    st.via_conn.get(peer).filter(|c| live.contains(c)).or_else(|| live.first()).copied()
+}
+
+/// Frames waiting for arcade `peer`, for link `conn` if it is the one that carries them.
+pub fn take(peer: &str, conn: u64) -> Vec<Frame> {
     let mut st = rt().st.lock().unwrap();
+    if carrier(&st, peer) != Some(conn) {
+        return Vec::new();
+    }
     st.outq.get_mut(peer).map(|q| q.drain(..).collect()).unwrap_or_default()
 }
 
-/// A new link: tell it which rooms we have players in.
-pub fn link_up(node: &Node, peer: &str) {
-    let mut st = rt().st.lock().unwrap();
-    if st.locals.is_empty() {
-        return;
-    }
-    let mut h = json!({"t": "sub", "o": my_id(node), "q": next_q(&mut st), "rooms": st.sub_rooms.clone(), "hops": 0});
+fn own_sub(node: &Node, st: &mut St) -> Frame {
+    let mut h = json!({"t": "sub", "o": my_id(node), "q": next_q(st), "rooms": st.sub_rooms.clone(), "hops": 0});
     sign(node, &mut h, b"");
-    queue(&mut st, peer, Frame::new(h));
+    Frame::new(h)
 }
 
-pub fn link_down(peer: &str) {
+/// A new link to `peer`: its number, for take and link_down; it hears which rooms we are in.
+pub fn link_up(node: &Node, peer: &str) -> u64 {
     let mut st = rt().st.lock().unwrap();
+    st.next_conn += 1;
+    let conn = st.next_conn;
+    st.conns.entry(peer.to_string()).or_default().push(conn);
+    if !st.locals.is_empty() {
+        let f = own_sub(node, &mut st);
+        queue(&mut st, peer, f);
+    }
+    conn
+}
+
+/// Link `conn` to `peer` closed. Its routes and queue go only with the last link to it.
+pub fn link_down(peer: &str, conn: u64) {
+    drop_conn(&mut rt().st.lock().unwrap(), peer, conn);
+}
+
+fn drop_conn(st: &mut St, peer: &str, conn: u64) {
+    if let Some(v) = st.conns.get_mut(peer) {
+        v.retain(|c| *c != conn);
+        if !v.is_empty() {
+            if st.via_conn.get(peer) == Some(&conn) {
+                st.via_conn.remove(peer);
+            }
+            return;
+        }
+    }
+    st.conns.remove(peer);
+    st.via_conn.remove(peer);
     st.outq.remove(peer);
     for r in st.routes.values_mut() {
         r.retain(|_, (hop, _)| hop != peer);
@@ -617,6 +731,7 @@ pub fn run(node: Arc<Node>) {
                 publish(&node, &mut st, &room, "-", "here", None, &p);
             }
         }
+        fast::beat(&node, &mut st);
         // Remote players not heard of for 24 s have gone.
         let mut left: Vec<(String, String, String, Option<Value>)> = Vec::new();
         for (room, by) in st.remote.iter_mut() {
@@ -716,23 +831,67 @@ pub fn join_as(node: &Node, page: &str, game: &str, room: &str, who_as: Option<(
         }
         None => my_player(node, &mut st),
     };
-    let l = st.locals.entry(full.clone()).or_default();
-    let new = !l.members.contains_key(&member);
-    l.members.entry(member.clone()).or_insert(Seat { cred: cred.clone(), sessions: 0 }).sessions += 1;
-    l.due = true;
-    let tok = token();
-    st.sessions.insert(tok.clone(), Session { room: full.clone(), member: member.clone(), events: VecDeque::new(), polled: Instant::now() });
-    if new {
-        // The other windows in the room see us arrive; the mesh hears of it at once.
-        let me = my_id(node);
-        let p = who(node, &me, &member, cred.as_ref());
-        tell(&mut st, &full, Some(&tok), json!({"type": "join", "room": room, "member": p}));
-        publish(node, &mut st, &full, &member, "join", cred.as_ref(), b"");
-    }
+    let tok = sit(node, &mut st, &full, &member, cred.clone());
     let me = who(node, &my_id(node), &member, cred.as_ref());
     let members = members_of(node, &mut st, &full);
     drop(st);
     Ok(json!({"token": tok, "online": true, "me": me, "members": members, "fast": false, "media": false}))
+}
+
+/// Seat `member` in the room `full` for a new session; the token that session polls with.
+fn sit(node: &Node, st: &mut St, full: &str, member: &str, cred: Option<Value>) -> String {
+    let l = st.locals.entry(full.to_string()).or_default();
+    let new = !l.members.contains_key(member);
+    l.members.entry(member.to_string()).or_insert(Seat { cred: cred.clone(), sessions: 0 }).sessions += 1;
+    l.due = true;
+    let tok = token();
+    st.sessions.insert(tok.clone(), Session { room: full.to_string(), member: member.to_string(), events: VecDeque::new(), polled: Instant::now(), fast: false });
+    if new {
+        // The other windows in the room see us arrive; the mesh hears of it at once.
+        let me = my_id(node);
+        let p = who(node, &me, member, cred.as_ref());
+        tell(st, full, Some(&tok), json!({"type": "join", "room": short_room(full), "member": p}));
+        publish(node, st, full, member, "join", cred.as_ref(), b"");
+    }
+    tok
+}
+
+// ---------------- rooms the arcade itself keeps (crate::ringsvc) ----------------
+
+/// Join `full` as a new guest. The name is taken as given, so it can be one no page can join
+/// ("!" is no part of a game's name).
+pub(crate) fn join_guest(node: &Node, full: &str) -> Result<String, String> {
+    if full.is_empty() || full.len() > MAX_ROOM {
+        return Err("that room name is too long".into());
+    }
+    let mut st = rt().st.lock().unwrap();
+    if !st.locals.contains_key(full) && st.locals.len() >= MAX_ROOMS {
+        return Err("this arcade is in too many rooms".into());
+    }
+    let member = format!("guest-{}", arcade_mesh::random::hex(4));
+    Ok(sit(node, &mut st, full, &member, None))
+}
+
+/// Somebody is in `full`: a player here, or another arcade that said so within the route life.
+pub(crate) fn room_live(full: &str) -> bool {
+    let st = rt().st.lock().unwrap();
+    let now = now_s();
+    st.locals.contains_key(full) || st.routes.get(&room_id(full)).is_some_and(|r| r.values().any(|(_, exp)| *exp >= now))
+}
+
+/// `address` signed a cert (expiry `x`, signature `s`) for the arcade `origin`.
+pub(crate) fn cert_ok(node: &Node, origin: &str, address: &str, x: u64, s: &str) -> bool {
+    let mut st = rt().st.lock().unwrap();
+    vet(node, &mut st, origin, address, Some(&json!({"a": address, "x": x, "s": s})))
+}
+
+/// This arcade's own player and cert ({a, x, s}); None with no wallet to sign with.
+pub(crate) fn my_cert(node: &Node) -> Option<(String, Value)> {
+    let mut st = rt().st.lock().unwrap();
+    match my_player(node, &mut st) {
+        (address, Some(cert)) => Some((address, cert)),
+        _ => None,
+    }
 }
 
 fn drop_session(node: &Node, st: &mut St, tok: &str) {
@@ -750,6 +909,9 @@ fn drop_session(node: &Node, st: &mut St, tok: &str) {
     }
     if l.members.is_empty() {
         st.locals.remove(&s.room);
+        // With no player of its own there, this arcade stops hearing who leaves the room:
+        // what it knew of the others goes, and a later join learns them afresh.
+        st.remote.remove(&s.room);
     }
     if last {
         let p = who(node, &my_id(node), &s.member, cred.as_ref());

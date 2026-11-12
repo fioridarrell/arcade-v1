@@ -5,12 +5,12 @@
   const coinEl = (c) => coinLogo(c.key, c.name, "span", "coin");
   const SECTIONS = [
     ["home", "Overview"], ["blocks", "Blocks"], ["mempool", "Mempool"], ["inscriptions", "Inscriptions", "ord"],
-    ["tokens", "Tokens", "tokens"], ["names", "Names", "names"], ["maps", "Maps", "maps"], ["ledger", "Arcade ledger", "ledger"],
+    ["collections", "Collections", "collections"], ["tokens", "Tokens", "tokens"], ["names", "Names", "names"], ["maps", "Maps", "maps"], ["ledger", "Arcade ledger", "ledger"],
     // Runes and dunes join here (with their index keys) when those indexes exist.
   ];
   // Pages and the index each needs; a page comes online only when its index is on the chain.
-  const NEEDS = { inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
-  const DETAIL_PARENT = { block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
+  const NEEDS = { collections: "collections", collection: "collections", inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
+  const DETAIL_PARENT = { collection: "collections", block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
 
   let chains = [], chain = null, sum = null, page = "home", arg = null, seq = 0;
 
@@ -164,7 +164,7 @@
   // An arcade-ledger inscription's HTML runs from /app/<chain>/<txid> (its sandboxed page).
   const ledgerItem = (i) => {
     const c = { ...(i.content || {}) };
-    if (c.kind === "html" && chain) c.src = `/app/${chain.key}/${i.txid}`;
+    if (c.kind === "html" && chain) c.src = `/app/${chain.key}/${i.txid}?pass=1`;
     return { content: c, ct: i.content_type, n: i.number };
   };
   function table(head, rows) {
@@ -183,10 +183,11 @@
     if (page >= pages - 3) return [1, "…", pages - 4, pages - 3, pages - 2, pages - 1, pages];
     return [1, "…", page - 1, page, page + 1, "…", pages];
   }
-  function pager(total, size, page, where, gotoLabel, gotoPage) {
+  // `argOf`: a detail view's own arg for page p (a token's holders), instead of "p<n>".
+  function pager(total, size, page, where, gotoLabel, gotoPage, argOf) {
     const pages = Math.max(1, Math.ceil(total / size));
     page = Math.min(page, pages);
-    const to = (p) => go(where, `p${Math.min(pages, Math.max(1, p))}`);
+    const to = (p) => { const n = Math.min(pages, Math.max(1, p)); go(where, argOf ? argOf(n) : `p${n}`); };
     const nav = (cls, label, p, title, short) => h("button", { type: "button", class: cls, disabled: p < 1 || p > pages || p === page, title, "aria-label": title, "data-short": short || "", onclick: () => to(p) }, label);
     const slots = windowOf(page, pages).map((v) =>
       v === null ? h("button", { type: "button", class: "slot empty", tabindex: "-1", "aria-hidden": "true" }, "0")
@@ -254,7 +255,9 @@
       has("maps") && sect("Maps", "maps", (sum.map_rows || []).length ? table([["Claim"], ["Inscription", 1]], sum.map_rows.map((r) => ({ go: () => go("map", r.claim), cells: [[h("span", { class: "mono" }, r.claim)], [`#${fmt(r.number)}`, 1]] }))) : h("div", { class: "x-empty" }, "No block maps claimed yet.")),
     ].filter(Boolean);
     return h("div", {},
-      sum.borrowed ? h("p", { class: "x-note" }, `This arcade is still catching up on ${chain.name} (block ${fmt(sum.syncing_at)}): the newest blocks and the mempool come from a lender meanwhile.`) : "",
+      sum.borrowed ? h("p", { class: "x-note" }, chain.installed
+        ? `This arcade is still catching up on ${chain.name} (block ${fmt(sum.syncing_at)}): the newest blocks and the mempool come from a lender meanwhile.`
+        : `${chain.name} is borrowed here, not installed: its blocks and the mempool come from a lender.`) : "",
       h("div", { class: "x-stats" }, st.map(([k, v, s]) => h("div", { class: "x-stat" }, h("div", { class: "k" }, k), h("div", { class: "v" }, v), h("div", { class: "s" }, s)))),
       h("div", { class: has("ord") ? "x-cols" : "x-cols one" },
         sect("Latest blocks", "blocks", blockRows(sum.blocks)),
@@ -426,7 +429,10 @@
       kv([["Hash", h("span", { class: "mono" }, b.hash)], ["Time", `${new Date(b.time * 1000).toLocaleString()} · ${ago(b.time)}`],
         ["Transactions", fmt(b.tx_count)], ["Size", `${fmt(b.size)} bytes`], b.inscriptions != null && ["New inscription pieces", fmt(b.inscriptions)],
         ["Previous", link(short(b.prev, 16, 8), "block", b.prev, "mono")], b.next && ["Next", link(short(b.next, 16, 8), "block", b.next, "mono")],
-        ["Bits · nonce · version", h("span", { class: "mono" }, `${b.bits} · ${b.nonce} · ${b.version}`)], ["Merkle root", h("span", { class: "mono" }, b.merkle_root)]]),
+        // An ARCADE block has a writer and a proof of time where a coin's has proof of work.
+        ...(b.arcade ? [["Written by", h("span", { class: "mono" }, b.arcade.writer)], ["Difficulty", h("span", { class: "mono" }, b.arcade.difficulty)],
+          ["Proof of time", `${fmt(b.arcade.steps)} steps`]]
+          : [["Bits · nonce · version", h("span", { class: "mono" }, `${b.bits} · ${b.nonce} · ${b.version}`)], ["Merkle root", h("span", { class: "mono" }, b.merkle_root)]])]),
       h("h2", { class: "x-h2" }, "Transactions"),
       table([["Txid"], [""], ["In · out"], ["Output", 1]], b.txs.map((t) => ({ go: () => go("tx", t.txid), cells: [[h("span", { class: "mono" }, short(t.txid, 18, 8))],
         [t.coinbase ? h("span", { class: "chip" }, "coinbase") : t.inscription ? h("span", { class: "chip ins" }, "inscription") : ""], [`${t.inputs} · ${t.outputs}`], [coins(t.out), 1]] }))),
@@ -457,6 +463,12 @@
       a.tokens && a.tokens.length ? h("div", {}, h("h2", { class: "x-h2" }, "Tokens"), table([["Tick"], ["Balance", 1], ["Transferable", 1]],
         a.tokens.map((t) => ({ go: () => go("token", t.tick), cells: [[h("b", {}, t.tick)], [units(t.overall, t.dec), 1], [units(t.transferable, t.dec), 1]] })))) : "",
       a.inscriptions && a.inscriptions.length ? h("div", {}, h("h2", { class: "x-h2" }, "Inscriptions"), insGrid(a.inscriptions)) : "",
+      // The arcade ledger: arcade tokens and arcade inscriptions this address holds.
+      a.ledger_tokens && a.ledger_tokens.length ? h("div", {}, h("h2", { class: "x-h2" }, "Arcade tokens"), table([["Token"], ["Id", 1], ["Balance", 1]],
+        a.ledger_tokens.map((t) => ({ go: () => go("ltoken", String(t.propertyid)), cells: [[h("b", {}, t.name || `#${t.propertyid}`)], [fmt(t.propertyid), 1], [t.balance, 1]] })))) : "",
+      a.ledger_inscriptions && a.ledger_inscriptions.length ? h("div", {}, h("h2", { class: "x-h2" }, `Arcade inscriptions (${fmt(a.ledger_inscription_count)})`),
+        table([["Number"], ["Type"], ["Txid"]], a.ledger_inscriptions.map((i) => ({ go: () => go("linsc", i.txid),
+          cells: [[`#${fmt(i.number)}`], [(i.content_type || "").split(";")[0]], [h("span", { class: "mono" }, short(i.txid || "", 16, 8))]] })))) : "",
       a.history ? h("h2", { class: "x-h2" }, "History") : "",
       !a.history ? "" : a.history.length ? table([["Block"], ["Txid"], ["Received", 1], ["Sent", 1]], a.history.map((r) => ({ go: r.txid ? () => go("tx", r.txid) : null,
         cells: [[fmt(r.height)], [h("span", { class: "mono" }, short(r.txid || "", 16, 8))], [r.received ? coins(r.received) : "", 1], [r.sent ? coins(r.sent) : "", 1]] })))
@@ -465,25 +477,85 @@
   async function vInscription() {
     const i = await xapi("explorer.inscription", { chain: chain.key, id: arg, ...(await imgArgs()) });
     const ct = (i.ct || "").split(";")[0];
+    // "In collection: Name #k" (collections index, here or on the mesh).
+    const inColl = has("collections") ? (await xapi("explorer.collection_of", { chain: chain.key, id: i.id }).catch(() => null))?.collections || [] : [];
+    const collRow = inColl.length ? ["In collection", h("span", {}, ...inColl.flatMap((x, k) => [k ? " · " : "", link(x.number != null ? `${x.name} #${fmt(x.number)}` : x.name, "collection", x.kind === "known" ? `known:${x.slug}` : x.id)]))] : null;
     return h("div", {}, crumbs(link("Inscriptions", "inscriptions"), `#${fmt(i.n)}`),
       head(`Inscription #${fmt(i.n)}`, h("span", { class: "chip ins" }, ct || "no type"), i.burned != null ? pill("burned", false) : "", i.from_arcade || i._mesh ? "" : contentLink(`/content/${i.id}`, `Inscription #${fmt(i.n)}`)),
       h("div", { class: "x-split" }, preview(i, true),
-        kv([["Id", h("span", { class: "mono" }, i.id)], ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
+        kv([["Id", h("span", { class: "mono" }, i.id)], collRow, ["Holder", i.owner ? addrLink(i.owner, i.owner_tag) : h("span", { class: "faint" }, i.burned != null ? `burned at ${fmt(i.burned)}` : "—")],
           i.at && ["Location", link(short(i.at, 12, 10), "tx", i.at.split(":")[0], "mono")], ["Inscribed", link(`block ${fmt(i.h)}`, "block", String(i.h))],
           ["Content type", i.ct || "—"], ["Size", `${fmt(i.size)} bytes · ${i.pieces} piece${i.pieces === 1 ? "" : "s"}`], i.proto && ["Protocol", i.proto],
           i.delegate && ["Delegate", link(short(i.delegate, 12, 6), "inscription", i.delegate, "mono")], i.parent && ["Parent", link(short(i.parent, 12, 6), "inscription", i.parent, "mono")],
           i.re && ["Reinscription", "yes"], ["Reveal", link(short(i.txs?.[i.txs.length - 1] || "", 12, 8), "tx", i.txs?.[i.txs.length - 1], "mono")]])));
   }
   async function vToken() {
-    const t = await xapi("explorer.token", { chain: chain.key, tick: arg });
+    // The arg is the tick, with "|p<n>" for a page of its holders past the first.
+    const m = /^(.*)\|p(\d+)$/s.exec(arg || "");
+    const tick = m ? m[1] : arg, size = 25, hpage = m ? Math.max(1, Number(m[2])) : 1;
+    const t = await xapi("explorer.token", { chain: chain.key, tick, offset: (hpage - 1) * size, n: size });
+    const total = t.total ?? t.top.length;
+    const hpager = () => total > size ? pager(total, size, hpage, "token", null, null, (p) => (p > 1 ? `${tick}|p${p}` : tick)) : "";
     const pct = Number(BigInt(t.minted || "0") * 1000n / (BigInt(t.supply || "1") || 1n)) / 10;
     return h("div", {}, crumbs(link("Tokens", "tokens"), t.shown || t.tick),
       head(t.shown || t.tick, pct >= 100 ? pill("minted out") : pill(`${pct}% minted`, true)),
       kv([["Supply", units(t.supply, t.dec)], ["Minted", units(t.minted, t.dec)], ["Mint limit", units(t.lim, t.dec)], ["Decimals", String(t.dec)],
         ["Deploy", link(`inscription #${fmt(t.n)}`, "inscription", t.id)], ["Deployer", addrLink(t.deployer)], ["Holders", t.holders]]),
-      h("h2", { class: "x-h2" }, "Top holders"),
-      t.top.length ? table([["Holder"], ["Balance", 1], ["Transferable", 1]], t.top.map((x) => ({ go: () => go("address", x.address), cells: [[addrLink(x.address, x.tag)], [units(x.overall, t.dec), 1], [units(x.transferable, t.dec), 1]] })))
-        : h("div", { class: "x-empty" }, "Nobody holds any yet."));
+      h("h2", { class: "x-h2" }, "Holders"),
+      t.top.length ? h("div", {}, hpager(),
+        table([["#", 1], ["Holder"], ["Balance", 1], ["Transferable", 1]], t.top.map((x, i) => ({ go: () => go("address", x.address), cells: [[fmt((hpage - 1) * size + i + 1), 1], [addrLink(x.address, x.tag)], [units(x.overall, t.dec), 1], [units(x.transferable, t.dec), 1]] }))),
+        hpager())
+        : h("div", { class: "x-empty" }, hpage > 1 ? "No holders on this page." : "Nobody holds any yet."));
+  }
+  // ---------- collections ----------
+  // A collection's cover (an inscription on this chain): its image from this arcade.
+  function cover(id, alt) {
+    const t = h("div", { class: "x-thumb" });
+    if (id && httpBase && chain) {
+      const img = h("img", { src: `${httpBase}/ord/${chain.key}/${id}`, alt, loading: "lazy", decoding: "async" });
+      img.onerror = () => img.replaceWith(h("div", { class: "x-ph" }, "no cover"));
+      t.append(img);
+    } else t.append(h("div", { class: "x-ph" }, "no cover"));
+    return t;
+  }
+  let collSort = "newest";
+  async function vCollections() {
+    const size = 24, page = pageOf();
+    const r = await xapi("explorer.collections", { chain: chain.key, sort: collSort, offset: (page - 1) * size, n: size, ...(await imgArgs()) });
+    const sorts = h("div", { class: "x-types" }, [["newest", "Newest"], ["oldest", "Oldest"], ["name", "Name"], ["size", "Size"]].map(([k, t]) =>
+      h("button", { type: "button", class: "chip-btn" + (collSort === k ? " on" : ""), onclick: () => { collSort = k; go("collections", null); } }, t)));
+    const note = r.reading ? h("p", { class: "x-note" }, `Still reading: ${r.note}`) : h("p", { class: "x-note" }, r.note || "");
+    const grid = r.items.length ? h("div", { class: "x-grid" }, r.items.map((c) => h("div", { class: "x-ins", onclick: () => go("collection", c.kind === "known" ? `known:${c.slug}` : c.id) },
+      c.cover_content ? preview({ content: c.cover_content, ct: c.cover_ct, n: c.name }) : cover(c.cover, c.name),
+      h("div", { class: "cap" }, h("b", {}, c.name), h("span", { class: "faint" }, c.kind === "known" && c.state !== "held" ? `${fmt(c.supply)} · Nintondo` : `${fmt(c.count)}${c.supply != null && c.count !== c.supply ? ` of ${fmt(c.supply)}` : ""}`)))))
+      : h("div", { class: "x-empty" }, "No collections on this chain yet.");
+    // Nintondo's known collections (Dogecoin, Pepecoin, Bellscoin): asked only when switched on here.
+    const known = r.known ? h("p", { class: "x-note" }, h("label", {}, h("input", { type: "checkbox", checked: r.known.asks_nintondo, onchange: async (ev) => {
+        try { await api("collections.known_set", { on: ev.target.checked }); } catch (e) { alert(e.message); } render(); } }),
+      " Ask Nintondo for its known collections (the list once a day; a collection's pieces when it is opened)"), r.known.note ? ` · ${r.known.note}` : "") : "";
+    return sect(`Collections · ${fmt(r.total)}`, null, h("div", {}, sorts, note, known, pager(r.total, size, page, "collections"), grid, pager(r.total, size, page, "collections")));
+  }
+  async function vCollection() {
+    // The arg is the collection's id, with "|p<n>" for a page of its items past the first.
+    const m = /^(.*)\|p(\d+)$/s.exec(arg || "");
+    const id = m ? m[1] : arg, size = 48, cpage = m ? Math.max(1, Number(m[2])) : 1;
+    const which = id.startsWith("known:") ? { slug: id.slice(6) } : { id };
+    const c = await xapi("explorer.collection", { chain: chain.key, ...which, offset: (cpage - 1) * size, n: size, ...(await imgArgs()) });
+    const cpager = () => pager(c.total || 0, size, cpage, "collection", null, null, (p) => (p > 1 ? `${id}|p${p}` : id));
+    const items = c.items.length ? h("div", { class: "x-grid" }, c.items.map((it) => h("div", { class: "x-ins", onclick: () => go("inscription", it.id) },
+      it.content ? preview(it) : h("div", { class: "x-thumb" }, h("div", { class: "x-ph" }, "not held here")),
+      h("div", { class: "cap" }, h("b", {}, `#${fmt(it.number)}`), h("span", { class: "faint" }, it.n != null ? `insc. ${fmt(it.n)}` : "")),
+      Object.keys(it.traits || {}).length ? h("div", { class: "cap faint", title: Object.entries(it.traits).map(([k, v]) => `${k}: ${v}`).join("\n") }, Object.values(it.traits).join(" · ")) : "")))
+      : h("div", { class: "x-empty" }, c.loading ? (c.loading.state === "skipped" ? `Not kept: ${c.loading.why}` : !c.loading.asks_nintondo ? "Not held here: this arcade doesn't ask Nintondo (switch it on in the Collections list)."
+          : `Loading from Nintondo: ${fmt(c.loading.have || 0)} of ${fmt(c.loading.of || 0)} pieces so far. Come back in a moment.`) : "No items on this page.");
+    const status = c.status !== "active" ? pill(c.status, false) : "";
+    return h("div", {}, crumbs(link("Collections", "collections"), c.name), head(c.name, status, h("span", { class: "chip" }, c.kind === "sub1k" ? "built in" : c.kind === "known" ? "Nintondo's list" : "on the chain")),
+      kv([c.description && ["About", c.description], ["Items", c.kind === "known" ? `${fmt(c.count || 0)} held · ${fmt(c.supply)} listed` : `${fmt(c.count)} of ${fmt(c.supply)}${c.missing ? ` · ${fmt(c.missing)} numbers not listed` : ""}`],
+        c.kind === "known" && c.owners != null && ["Holders", fmt(c.owners)], c.kind === "known" && c.fp && ["Fingerprint", h("span", { class: "mono" }, short(c.fp, 12, 6))],
+        c.kind === "registry" && ["Published by", c.publisher ? addrLink(c.publisher) : "—"], c.kind === "registry" && ["Root", link(`inscription #${fmt(c.number)}`, "inscription", c.id)],
+        c.height != null && ["Block", link(fmt(c.height), "block", String(c.height))], c.replaces && ["Replaces", link(short(c.replaces, 12, 6), "collection", c.replaces, "mono")],
+        (c.traits || []).length && ["Traits", c.traits.join(", ")], c.reason && ["Why", c.reason]]),
+      cpager(), items, cpager());
   }
   let lastResults = null;
   async function vResults() {
@@ -513,7 +585,7 @@
     return h("div", {}, crumbs(link("Maps", "maps"), m.claim), head(m.claim),
       kv([["Winning inscription", link(`#${fmt(m.number)}`, "inscription", m.id)], ["Holder", m.owner ? addrLink(m.owner, m.owner_tag) : "—"], ["Block", link(m.claim.split(".")[0], "block", m.claim.split(".")[0])]]));
   }
-  const VIEWS = { home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, ledger: vLedger,
+  const VIEWS = { collections: vCollections, collection: vCollection, home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, ledger: vLedger,
     block: vBlock, tx: vTx, address: vAddress, inscription: vInscription, token: vToken, name: vName, map: vMap,
     ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc, tag: vTag, results: vResults };
 

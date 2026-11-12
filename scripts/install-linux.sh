@@ -107,13 +107,14 @@ else
 
   # --- build ----------------------------------------------------------------------------------------------------------
   say "Building ${PKGS[*]//-p /} (release)..."
-  (cd "$ROOT" && "$CARGO" build --release "${PKGS[@]}")
+  (cd "$ROOT" && "$CARGO" build --release --locked "${PKGS[@]}")
   FROM="$ROOT/target/release"
   ICON_SRC="$ROOT/crates/arcade-desktop/icons/icon.png"
 fi
 
 # --- install --------------------------------------------------------------------------------------------------------
 mkdir -p "$BIN" "$HOME_DIR"
+chmod 700 "$HOME_DIR"   # the wallet, its key file and messages: this user only
 # Stop the service first so its binary can be replaced.
 systemctl --user stop arcaded.service 2>/dev/null || true
 install -m 0755 "$FROM/arcaded" "$BIN/arcaded"
@@ -164,6 +165,8 @@ ExecStart=$BIN/arcaded --home $HOME_DIR --http-port $HTTP_PORT --mesh-port $MESH
 Restart=on-failure
 RestartSec=5
 TimeoutStopSec=300
+UMask=0077
+NoNewPrivileges=yes
 
 [Install]
 WantedBy=default.target

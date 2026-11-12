@@ -514,12 +514,17 @@ pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBo
 /// The directory name of a chain's own file: its key (`chains/doge/chain.mdbx`), or `c<number>`
 /// for a chain number no params know (tests).
 pub fn chain_dir_name(c: u16) -> String {
-    arcade_chain::params::ALL_CHAINS.iter().find(|p| p.chain_no == c).map(|p| p.key.to_string()).unwrap_or_else(|| format!("c{c}"))
+    use arcade_chain::params::{ALL_CHAINS, ARCADE_CHAINS};
+    let known = ALL_CHAINS.iter().find(|p| p.chain_no == c).map(|p| p.key).or_else(|| ARCADE_CHAINS.iter().find(|a| a.0 == c).map(|a| a.1));
+    known.map(String::from).unwrap_or_else(|| format!("c{c}"))
 }
 
 fn chain_no_of_dir(name: &str) -> Option<u16> {
     if let Some(p) = arcade_chain::params::ALL_CHAINS.iter().find(|p| p.key == name) {
         return Some(p.chain_no);
+    }
+    if let Some(a) = arcade_chain::params::ARCADE_CHAINS.iter().find(|a| a.1 == name) {
+        return Some(a.0);
     }
     name.strip_prefix('c').and_then(|n| n.parse().ok())
 }
@@ -1433,6 +1438,19 @@ impl ChainDb {
             .collect())
     }
 
+    /// How many transactions are pooled for a chain, and their bytes (no copies made).
+    pub fn mempool_size(&self, c: u16) -> Result<(u64, u64)> {
+        let (mut n, mut bytes) = (0u64, 0u64);
+        self.store(c).read(|r| {
+            r.for_each_prefix(MEMPOOL, &k_chain(c), |_, v| {
+                n += 1;
+                bytes += v.len().saturating_sub(8) as u64;
+                Ok(true)
+            })
+        })?;
+        Ok((n, bytes))
+    }
+
     /// A pooled transaction's raw bytes by txid.
     pub fn mempool_tx(&self, c: u16, txid: &Hash256) -> Result<Option<Vec<u8>>> {
         Ok(self.store(c).read(|r| r.get(MEMPOOL, &k_txs(c, &txid.t12())))?.map(|v| v[8..].to_vec()))
@@ -1442,6 +1460,21 @@ impl ChainDb {
     pub fn mempool_spender(&self, c: u16, op: &OutPoint) -> Result<Option<Hash256>> {
         self.store(c).read(|r| {
             Ok(r.get(MEMPOOL_SPENDS, &k_out(c, &op.txid.t12(), op.vout))?.map(|v| Hash256(v[..32].try_into().unwrap())))
+        })
+    }
+
+    /// Drop one pooled transaction (one this arcade made that the network never took: a swap's claim or refund is
+    /// then built again). Whether it was there.
+    pub fn mempool_remove(&self, params: &ChainParams, txid: &Hash256) -> Result<bool> {
+        let c = params.chain_no;
+        self.wstore(c)?.write(|w| {
+            let k = k_txs(c, &txid.t12());
+            let Some(v) = w.get(MEMPOOL, &k)? else { return Ok(false) };
+            if let Ok(tx) = Tx::parse_with(&v[8..], &params.format) {
+                remove_pooled(w, c, &tx)?;
+            }
+            w.del(MEMPOOL, &k)?;
+            Ok(true)
         })
     }
 

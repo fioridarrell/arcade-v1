@@ -68,7 +68,7 @@ pub fn run(node: Arc<Node>) {
         mesh_bootstrap(&node, &syncer);
     }
     loop {
-        let Some(mut peer) = node.coin_candidates(p).iter().find_map(|a| Peer::connect_with(p, a, Duration::from_secs(20), true).ok())
+        let Some(mut peer) = Node::dial_first(p, &node.coin_candidates(p), true)
         else {
             set_state(&node, "no coin peer reachable; retrying".into());
             std::thread::sleep(Duration::from_secs(15));
@@ -205,5 +205,14 @@ fn listen(node: &Node, peer: &mut Peer, dur: Duration) -> Result<(), String> {
     })();
     let _ = peer.set_read_timeout(Duration::from_secs(20));
     let _ = node.chain.mempool_expire(p, arcade_app::now(), 14 * 24 * 3600);
+    // Once at start and then every hour: pooled transactions the network would refuse go.
+    static LAST: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+    let due = LAST.lock().unwrap().is_none_or(|t| t.elapsed() > Duration::from_secs(3600));
+    if due {
+        *LAST.lock().unwrap() = Some(std::time::Instant::now());
+        for (txid, why) in crate::mempoolshare::recheck(node, p) {
+            let _ = node.app.event("wallet", &format!("dropped waiting transaction {txid}: {why}"));
+        }
+    }
     res
 }

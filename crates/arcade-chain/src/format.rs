@@ -22,6 +22,9 @@ pub struct Format {
     pub segwit: bool,
     /// Litecoin MWEB: ask peers for blocks with the extension block.
     pub mweb: bool,
+    /// The stored 80-byte header stands in for a block of another shape (the ARCADE chain,
+    /// crates/arcade-arc): the block's id is carried in its merkle root field.
+    pub carried_id: bool,
 }
 
 impl Format {
@@ -33,9 +36,14 @@ impl Format {
         scrypt_id_below_version: 0,
         segwit: true,
         mweb: false,
+        carried_id: false,
     };
     /// Litecoin: SegWit plus the MWEB extension block.
     pub const LITECOIN: Format = Format { mweb: true, ..Format::BITCOIN };
+    /// AuxPoW and SegWit together (Bellscoin 3: both from block 144,000).
+    pub const AUXPOW_SEGWIT: Format = Format { auxpow: true, ..Format::BITCOIN };
+    /// AuxPoW with Litecoin's SegWit and MWEB (Junkcoin 4: AuxPoW from 173,000, MWEB from 1,165,000).
+    pub const AUXPOW_MWEB: Format = Format { auxpow: true, mweb: true, ..Format::BITCOIN };
     /// Dogecoin-family: AuxPoW, no SegWit.
     pub const AUXPOW: Format = Format { auxpow: true, segwit: false, ..Format::BITCOIN };
     /// Blackcoin/PPCoin-style proof of stake (Kotia).
@@ -46,10 +54,16 @@ impl Format {
         scrypt_id_below_version: 7,
         segwit: false,
         mweb: false,
+        carried_id: false,
     };
+    /// The ARCADE chain as the store keeps it: its transactions are laid out as Dogecoin's.
+    pub const ARCADE: Format = Format { segwit: false, carried_id: true, ..Format::BITCOIN };
 
     /// The block id of a header on this chain.
     pub fn block_id(&self, h: &Header) -> Hash256 {
+        if self.carried_id {
+            return h.merkle_root;
+        }
         if h.version < self.scrypt_id_below_version {
             pow_hash(PowAlgo::Scrypt, &h.encode())
         } else {

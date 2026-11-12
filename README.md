@@ -63,6 +63,8 @@ curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scr
 | `--home DIR` | Data folder (default `~/.local/share/arcade`). |
 | `--http-port N`, `--mesh-port N`, `--stun-port N` | Ports. The defaults are 8420, 8421 and 3478. A port that's already taken (for example, by another arcade on the same PC) moves to the next free one. STUN turns off (`0`) if its port is taken. |
 
+If the web port is reached through a reverse proxy or a tunnel, add `--behind-proxy` to `arcaded`'s own options (its service's `ExecStart` line): then nothing that arrives over the web port counts as this computer, so the API and the wallet's page API answer only the local socket.
+
 To keep the service running while you're logged out, and to start it at boot: `sudo loginctl enable-linger $USER`.
 
 From a clone of this repo, `scripts/install-linux.sh` does the same build and install.
@@ -94,10 +96,10 @@ This removes everything: the programs, the app and its menu entry, the backgroun
 Windows 10 or 11, 64-bit. Paste this into PowerShell:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fioridarrell/arcade-v1/windows/scripts/install.ps1'))"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.ps1'))"
 ```
 
-That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release of this fork that has that file, including a pre-release such as `v0.1.0-windows`, checks its sha256, and installs it for your user. Nothing is compiled, and it does not ask for an administrator password. It installs:
+That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release of this repo that has that file (a pre-release counts), checks its sha256, and installs it for your user. Nothing is compiled, and it does not ask for an administrator password. It installs:
 
 - **arcaded**, the arcade service, started now and at every login (Task Scheduler → **Arcade V1.0**);
 - **arcade**, the command line (`arcade status`, `arcade setup`, ...);
@@ -144,7 +146,7 @@ If the desktop crate fails to compile, the service and the command line are stil
 ### Uninstall
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fioridarrell/arcade-v1/windows/scripts/uninstall.ps1'))"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/uninstall.ps1'))"
 ```
 
 This removes the programs, the Start menu shortcut, the login task, **and your data in `%LOCALAPPDATA%\arcade`**: your wallet and its 12 words, imported wallets, messages and chains. It asks you to type `DELETE` first. If your wallet holds anything, write the 12 words down before (`arcade wallet phrase`). On a new install you restore it from them on the Home tab. Nothing is removed if you type anything else.

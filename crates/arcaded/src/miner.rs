@@ -1,6 +1,8 @@
-//! Testnet mining without Core: build a coinbase-only block on our tip with the right
-//! difficulty (Digishield / min-difficulty, verified against every testnet block), search
-//! nonces with scrypt on CPU threads, and hand found blocks to the chain thread.
+//! Testnet mining without Core: build a block on our tip with the right difficulty (Digishield /
+//! min-difficulty, verified against every testnet block), with the waiting transactions of the
+//! mempool that spend coins we can see (unspent in the chain, or outputs of a transaction already in
+//! the block; parents first, under MAX_TXS_BYTES), their fees added to the coinbase; search nonces
+//! with scrypt on CPU threads, and hand found blocks to the chain thread.
 
 use crate::node::Node;
 use arcade_chain::encode::write_varint;
@@ -41,8 +43,77 @@ fn coinbase_pushes_unchanged() {
 struct Template {
     header: Header,
     coinbase: Vec<u8>,
+    /// The mempool transactions in the block, in order, after the coinbase.
+    txs: Vec<Vec<u8>>,
     height: u32,
     tip: Hash256,
+}
+
+/// How much of the block the mempool's transactions may fill (well under the 1 MB limit).
+const MAX_TXS_BYTES: usize = 900_000;
+
+/// The mempool transactions a block at `height` can carry, parents before children, and their fees.
+/// A transaction is taken only when every coin it spends is unspent in the chain (a coinbase coin
+/// mature) or an output of a transaction taken before it, and its outputs don't exceed its inputs.
+fn pick(node: &Node, height: u32) -> (Vec<arcade_chain::Tx>, u64) {
+    use std::collections::{HashMap, HashSet};
+    let p = node.params;
+    let pool: Vec<arcade_chain::Tx> = node.chain.mempool(p.chain_no).unwrap_or_default().into_iter().filter_map(|(_, raw)| arcade_chain::Tx::parse_with(&raw, &p.format).ok()).collect();
+    let mut made: HashMap<arcade_chain::OutPoint, u64> = HashMap::new();
+    let mut spent: HashSet<arcade_chain::OutPoint> = HashSet::new();
+    let (mut out, mut fees, mut bytes) = (Vec::new(), 0u64, 0usize);
+    let mut left: Vec<arcade_chain::Tx> = pool;
+    // Rounds: each takes what its parents (already taken, or the chain) allow; stop when nothing moves.
+    loop {
+        let before = out.len();
+        let mut rest = Vec::new();
+        for tx in left {
+            if bytes + tx.raw.len() > MAX_TXS_BYTES {
+                continue;
+            }
+            let mut ins = 0u64;
+            let mut ok = !tx.inputs.is_empty();
+            for i in &tx.inputs {
+                if spent.contains(&i.prevout) {
+                    ok = false;
+                    break;
+                }
+                if let Some(v) = made.get(&i.prevout) {
+                    ins += v;
+                    continue;
+                }
+                match node.chain.coin(p, &i.prevout).ok().flatten() {
+                    Some(c) if !c.coinbase || height.saturating_sub(c.height) >= p.coinbase_maturity => ins += c.value,
+                    _ => {
+                        ok = false;
+                        break;
+                    }
+                }
+            }
+            let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+            if !ok {
+                rest.push(tx);
+                continue;
+            }
+            if outs > ins {
+                continue; // spends more than it has: never
+            }
+            for i in &tx.inputs {
+                spent.insert(i.prevout);
+            }
+            for (n, o) in tx.outputs.iter().enumerate() {
+                made.insert(arcade_chain::OutPoint { txid: tx.txid, vout: n as u32 }, o.value);
+            }
+            fees += ins - outs;
+            bytes += tx.raw.len();
+            out.push(tx);
+        }
+        left = rest;
+        if out.len() == before || left.is_empty() {
+            break;
+        }
+    }
+    (out, fees)
 }
 
 fn build(node: &Node, pay_script: &[u8], extranonce: u64) -> Result<Template, String> {
@@ -64,7 +135,8 @@ fn build(node: &Node, pay_script: &[u8], extranonce: u64) -> Result<Template, St
     let height = tip.height + 1;
     let bits = next_bits(p, tip.height, parent.bits, parent.time, grand, time);
 
-    // Coinbase: BIP34 height, extranonce, tag; whole subsidy to our wallet.
+    let (picked, fees) = pick(node, height);
+    // Coinbase: BIP34 height, extranonce, tag; the subsidy and the fees to our wallet.
     let mut ss = Vec::new();
     push(&mut ss, &arcade_ledger::digidollar::encode_script_num(height as i64));
     push(&mut ss, &extranonce.to_le_bytes());
@@ -78,17 +150,18 @@ fn build(node: &Node, pay_script: &[u8], extranonce: u64) -> Result<Template, St
     cb.extend_from_slice(&ss);
     cb.extend_from_slice(&u32::MAX.to_le_bytes());
     write_varint(&mut cb, 1);
-    cb.extend_from_slice(&subsidy(height).to_le_bytes());
+    cb.extend_from_slice(&(subsidy(height) + fees).to_le_bytes());
     write_varint(&mut cb, pay_script.len() as u64);
     cb.extend_from_slice(pay_script);
     cb.extend_from_slice(&0u32.to_le_bytes());
     let txid = arcade_chain::hash::sha256d(&cb);
-    let header = Header { version: BLOCK_VERSION, prev: tip.hash, merkle_root: txid, time, bits, nonce: 0 };
+    let leaves: Vec<Hash256> = std::iter::once(txid).chain(picked.iter().map(|t| t.txid)).collect();
+    let header = Header { version: BLOCK_VERSION, prev: tip.hash, merkle_root: arcade_chain::hash::merkle_root(&leaves), time, bits, nonce: 0 };
     check_header(p, &header, &parent, height).ok(); // PoW not met yet; link/bits sanity below
     if header.prev != p.block_id(&parent) {
         return Err("template does not extend the tip".into());
     }
-    Ok(Template { header, coinbase: cb, height, tip: tip.hash })
+    Ok(Template { header, coinbase: cb, txs: picked.into_iter().map(|t| t.raw).collect(), height, tip: tip.hash })
 }
 
 /// Mining loop; runs until `node.miner.running` is cleared.
@@ -152,13 +225,16 @@ pub fn run(node: Arc<Node>) {
         let mut header = t.header;
         header.nonce = nonce;
         let mut raw = header.encode().to_vec();
-        write_varint(&mut raw, 1);
+        write_varint(&mut raw, 1 + t.txs.len() as u64);
         raw.extend_from_slice(&t.coinbase);
+        for tx in &t.txs {
+            raw.extend_from_slice(tx);
+        }
         match Block::parse_with(&raw, &p.format).map_err(|e| e.to_string()).and_then(|b| b.check().map_err(|e| e.to_string()).map(|_| b)) {
             Ok(b) => {
                 node.miner.found.fetch_add(1, Ordering::Relaxed);
                 node.block_outbox.lock().unwrap().push(raw);
-                let _ = node.app.event("mine", &format!("found block {} at height {} ({} PEP to {})", b.hash(), t.height, subsidy(t.height) / 100_000_000, key.address));
+                let _ = node.app.event("mine", &format!("found block {} at height {} with {} waiting transaction(s) ({} PEP to {})", b.hash(), t.height, t.txs.len(), subsidy(t.height) / 100_000_000, key.address));
             }
             Err(e) => {
                 let _ = node.app.event("mine", &format!("built an invalid block ({e}); stopping"));

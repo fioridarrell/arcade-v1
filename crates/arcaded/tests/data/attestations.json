@@ -1,0 +1,55 @@
+{
+ "source": "arcade/referee.py attest, original arcade, throwaway key",
+ "cases": [
+  {
+   "att": {
+    "v": 1,
+    "referee": "0290aa14e4819e10685fc7fb79a9a301c7c955075e4d65f884992bade093f6e53f",
+    "judge": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "result": {
+     "score": 9,
+     "level": "hard",
+     "ok": true
+    },
+    "address": "nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2",
+    "content": "abababababababababababababababababababababababababababababababab",
+    "sig": "304402201ed52ca6603fddfd6c4e386eefd68d3ab66e4bc876e164b41c56528b36e541fc022016c0630d80c4f370ae3564724c58c5d630f22e7fc37bd0e1e958b03fe1b9121d"
+   },
+   "content": "abababababababababababababababababababababababababababababababab",
+   "address": "nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2",
+   "message": "{\"address\":\"nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2\",\"content\":\"abababababababababababababababababababababababababababababababab\",\"judge\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"referee\":\"0290aa14e4819e10685fc7fb79a9a301c7c955075e4d65f884992bade093f6e53f\",\"result\":{\"level\":\"hard\",\"ok\":true,\"score\":9},\"v\":1}"
+  },
+  {
+   "att": {
+    "v": 1,
+    "referee": "0290aa14e4819e10685fc7fb79a9a301c7c955075e4d65f884992bade093f6e53f",
+    "judge": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "result": [
+     1,
+     2,
+     "é☃"
+    ],
+    "address": "nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2",
+    "content": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+    "sig": "304402205f48234a7c1404ccda3287c569ab1abcc335cacac11e1ae71096e19d835c7c6002203972ad645d1586813efe7450a60c737d4dc3d4cfd145a0615440aed3ed43476e"
+   },
+   "content": "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
+   "address": "nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2",
+   "message": "{\"address\":\"nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2\",\"content\":\"cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd\",\"judge\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"referee\":\"0290aa14e4819e10685fc7fb79a9a301c7c955075e4d65f884992bade093f6e53f\",\"result\":[1,2,\"\\u00e9\\u2603\"],\"v\":1}"
+  },
+  {
+   "att": {
+    "v": 1,
+    "referee": "0290aa14e4819e10685fc7fb79a9a301c7c955075e4d65f884992bade093f6e53f",
+    "judge": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "result": 42,
+    "address": "nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2",
+    "content": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+    "sig": "304402205442eeca8702459e7a0b8d49b13e6a507ca369654655f0de84a0555eaa2ea8a1022007644b679515619f3ac8823a4f576d49c01e14a8bcae1b35696f0c99b8965564"
+   },
+   "content": "0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f",
+   "address": "nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2",
+   "message": "{\"address\":\"nVrY9PSLXmV5LP6NN5h4XjqfDNu8uq24N2\",\"content\":\"0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f\",\"judge\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"referee\":\"0290aa14e4819e10685fc7fb79a9a301c7c955075e4d65f884992bade093f6e53f\",\"result\":42,\"v\":1}"
+  }
+ ]
+}

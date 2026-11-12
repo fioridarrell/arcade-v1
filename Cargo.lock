@@ -121,6 +121,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcade-arc"
+version = "0.1.0"
+dependencies = [
+ "arcade-chain",
+ "arcade-wallet",
+ "curve25519-dalek",
+ "ed25519-dalek",
+ "hex",
+ "num-bigint",
+ "num-traits",
+ "secp256k1",
+ "sha2 0.11.1",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "arcade-chain"
 version = "0.1.0"
 dependencies = [
@@ -156,6 +172,7 @@ name = "arcade-desktop"
 version = "0.1.0"
 dependencies = [
  "arcade-local",
+ "base64 0.23.1",
  "serde_json",
  "tauri",
  "tauri-build",
@@ -173,6 +190,7 @@ dependencies = [
  "bs58",
  "hex",
  "regex",
+ "serde",
  "serde_json",
  "sha2 0.11.1",
  "tempfile",
@@ -249,6 +267,7 @@ name = "arcade-wallet"
 version = "0.1.0"
 dependencies = [
  "arcade-chain",
+ "arcade-chaindb",
  "arcade-ledger",
  "base64 0.23.1",
  "bip39",
@@ -256,6 +275,7 @@ dependencies = [
  "hex",
  "hmac 0.13.0",
  "secp256k1",
+ "serde_json",
  "sha2 0.11.1",
  "thiserror 1.0.69",
  "zeroize",
@@ -267,6 +287,7 @@ version = "0.1.0"
 dependencies = [
  "aes-gcm",
  "arcade-app",
+ "arcade-arc",
  "arcade-chain",
  "arcade-chaindb",
  "arcade-ledger",
@@ -2647,10 +2668,29 @@ dependencies = [
 ]
 
 [[package]]
+name = "num-bigint"
+version = "0.4.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+dependencies = [
+ "num-integer",
+ "num-traits",
+]
+
+[[package]]
 name = "num-conv"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "521739c6d2bac4aa25192232afe6841231376b2b26d4d9fae5ecf8ca5772e441"
+
+[[package]]
+name = "num-integer"
+version = "0.1.47"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7ce2d95d4b3734dc35aa2f45e1aa22cd416814592a4f9d9205e11affd5b8e10b"
+dependencies = [
+ "num-traits",
+]
 
 [[package]]
 name = "num-traits"

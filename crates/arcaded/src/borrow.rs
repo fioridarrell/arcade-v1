@@ -15,9 +15,14 @@
 //!
 //! An installed chain (Chains & Coins) takes over once it is ready (caught up, its address
 //! rows built); until then its borrowed copy keeps running and answers balances and sends.
+//!
+//! The ARCADE chain is borrowed the same way, from arcades that have it installed. It has no
+//! proof of work to check a block by: its blocks are checked against its headers, which the
+//! borrowed copy follows from block 0 by the chain's own rules (`arcborrow`).
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, by_net, check_block_work, check_header, ChainParams, PowCheck, ALL_CHAINS};
+use crate::chains::{find as by_key, find_net as by_net};
+use arcade_chain::params::{check_block_work, check_context, check_header, ChainParams, PowCheck, MEDIAN_TIME_SPAN};
 use arcade_chain::pow::{meets_target, pow_hash, PowAlgo};
 use arcade_chain::{Block, Hash256, Header, OutPoint, Tx};
 use arcade_ledger::address::script_for_address;
@@ -252,6 +257,9 @@ fn fail(addr: &str, err: &str) {
     x.last_err = err.chars().take(200).collect();
 }
 
+/// Lenders' tips told within this many seconds of the newest are compared with one another.
+const TIPS_TOGETHER: u64 = 20;
+
 fn note_tip(key: &str, addr: &str, h: u64) {
     ST.tips.lock().unwrap().entry(key.to_string()).or_default().insert(addr.to_string(), (h, arcade_app::now()));
 }
@@ -438,13 +446,17 @@ fn call_any(node: &Node, p: &ChainParams, calls: Value) -> Result<(String, Vec<V
 
 /// A block as a lender sent it, checked against our own params: hash, merkle root, and proof of
 /// work (AuxPoW included) on top of `parent` (our stored header, or one the lender gave when
-/// there is none: then only the work is checked, not that it is the best chain).
-fn check_block(p: &ChainParams, raw: &[u8], want: &Hash256, parent: &Header, height: u32) -> Result<Block, String> {
+/// there is none: then only the work is checked, not that it is the best chain). `below` is
+/// the chain under it, parent first, as far as we store it: its time (and, where the chain
+/// has the rule, its difficulty) is checked against those. Borrowing follows the lender's
+/// tip and adds up no work, so a header whose work can't be checked weighs nothing here.
+fn check_block(p: &ChainParams, raw: &[u8], want: &Hash256, parent: &Header, height: u32, below: &[Header]) -> Result<Block, String> {
     let b = Block::parse_with(raw, &p.format).map_err(e)?;
     if b.id != *want || p.block_id(&b.header) != *want {
         return Err(format!("block {want}: the lender sent another block"));
     }
     b.check().map_err(|x| format!("block {want}: {x}"))?;
+    check_context(p, &b.header, height, below, arcade_app::now()).map_err(|x| format!("block {want}: {x}"))?;
     match check_header(p, &b.header, parent, height).map_err(|x| format!("block {want}: {x}"))? {
         PowCheck::AuxPow => {
             let a = b.auxpow.as_ref().ok_or("AuxPoW flag without data")?;
@@ -462,6 +474,22 @@ fn check_block(p: &ChainParams, raw: &[u8], want: &Hash256, parent: &Header, hei
     Ok(b)
 }
 
+/// Our stored headers under `height`, parent first: up to MEDIAN_TIME_SPAN, stopping at the
+/// floor or a break in the links.
+fn stored_below(node: &Node, p: &ChainParams, height: u32) -> Vec<Header> {
+    let mut v: Vec<Header> = Vec::with_capacity(MEDIAN_TIME_SPAN);
+    let mut want_hash: Option<Hash256> = None;
+    for h in (height.saturating_sub(MEDIAN_TIME_SPAN as u32)..height).rev() {
+        let Some((hash, hdr)) = stored_header(node, p, h) else { break };
+        if want_hash.is_some_and(|w| w != hash) {
+            break;
+        }
+        want_hash = Some(hdr.prev);
+        v.push(hdr);
+    }
+    v
+}
+
 fn header_from_hex(s: &str) -> Result<Header, String> {
     let b = hex::decode(s).map_err(e)?;
     let a: [u8; 80] = b.get(..80).ok_or("short header")?.try_into().unwrap();
@@ -471,17 +499,21 @@ fn header_from_hex(s: &str) -> Result<Header, String> {
 /// Fetch a block by hash from a lender and check it, its parent header from the lender too
 /// (or ours, when we have that height). Returns (block, height, lender).
 fn fetch_checked(node: &Node, p: &ChainParams, hash: &Hash256) -> Result<(Block, u32, String), String> {
+    if crate::arcborrow::is(p) {
+        return crate::arcborrow::fetch(node, p, hash, &|calls| call_any(node, p, calls));
+    }
     let hx = hash.to_hex();
     let (addr, a) = call_any(node, p, json!([["getblock", [hx, 0]], ["getblockheader", [hx, true]]]))?;
     let raw = hex::decode(r(&a[0])?.as_str().ok_or("bad block")?).map_err(e)?;
     let height = r(&a[1])?["height"].as_u64().ok_or("bad header")? as u32;
     let b0 = Block::parse_with(&raw, &p.format).map_err(e)?;
-    let parent = match height.checked_sub(1).and_then(|h| stored_header(node, p, h)) {
-        Some((ph, hdr)) if ph == b0.header.prev => hdr,
-        _ if height == 0 => b0.header,
+    let (parent, below) = match height.checked_sub(1).and_then(|h| stored_header(node, p, h)) {
+        Some((ph, hdr)) if ph == b0.header.prev => (hdr, stored_below(node, p, height)),
+        _ if height == 0 => (b0.header, vec![]),
         _ => {
             let pa = call(node, &addr, p, json!([["getblockheader", [b0.header.prev.to_hex(), false]]]))?;
-            header_from_hex(r(&pa[0])?.as_str().ok_or("bad header")?)?
+            let hdr = header_from_hex(r(&pa[0])?.as_str().ok_or("bad header")?)?;
+            (hdr, vec![hdr])
         }
     };
     if height == 0 {
@@ -490,7 +522,29 @@ fn fetch_checked(node: &Node, p: &ChainParams, hash: &Hash256) -> Result<(Block,
         }
         return Ok((b0, 0, addr));
     }
-    Ok((check_block(p, &raw, hash, &parent, height)?, height, addr))
+    Ok((check_block(p, &raw, hash, &parent, height, &below)?, height, addr))
+}
+
+/// A block as a lender sent it, read without checking it.
+fn parse_block(p: &ChainParams, raw: &[u8]) -> Result<Block, String> {
+    if crate::arcborrow::is(p) {
+        return crate::arcborrow::parse(raw);
+    }
+    Block::parse_with(raw, &p.format).map_err(e)
+}
+
+/// The id of the block at a height: from a lender (`lender`, or the best one that answers).
+/// On the ARCADE chain no lender is asked: it is what the headers this arcade follows say.
+fn hash_at(node: &Node, p: &ChainParams, lender: Option<&str>, height: u32) -> Result<Hash256, String> {
+    if crate::arcborrow::is(p) {
+        return crate::arcborrow::id_at(node, p, height as u64).ok_or_else(|| format!("no header checked for block {height} yet"));
+    }
+    let calls = json!([["getblockhash", [height]]]);
+    let a = match lender {
+        Some(l) => call(node, l, p, calls)?,
+        None => call_any(node, p, calls)?.1,
+    };
+    Hash256::from_hex(r(&a[0])?.as_str().ok_or("bad hash")?).map_err(e)
 }
 
 // ---------------- storage ----------------
@@ -579,6 +633,9 @@ fn clear(node: &Node, key: &str) {
     }
     ST.pool.lock().unwrap().remove(key);
     ST.tips.lock().unwrap().remove(key);
+    if crate::arcsvc::defines(key) {
+        crate::arcborrow::clear();
+    }
 }
 
 /// Store one checked block on top of our tip: its header, and the wallet's coins it adds and
@@ -727,10 +784,16 @@ pub(crate) fn home_lag(node: &Node) -> (u32, bool) {
 pub fn manage(node: &Node) {
     let c = cfg(node);
     let installed: BTreeSet<String> = node.extra.lock().unwrap().keys().cloned().collect();
-    for p in ALL_CHAINS.iter().copied() {
+    for p in crate::chains::all() {
         let home = p.chain_no == node.params.chain_no;
         let running = ST.runs.lock().unwrap().get(p.key).cloned();
-        let on = if home {
+        // The ARCADE chain installed here: its own copy takes over once it has caught up
+        // and its store holds what the borrowed copy does.
+        let own = crate::arcsvc::lends().is_some_and(|l| l.chain_no == p.chain_no)
+            && node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64 + 3).unwrap_or(0) >= state(node, p.key).and_then(|s| s["tip"].as_u64()).unwrap_or(0);
+        let on = if crate::arcsvc::runs(p) {
+            chain_on(&c, p.key) && !own
+        } else if home {
             // Home: start when 100+ blocks behind, stop once within 10 with addresses built.
             let (lag, addr_ready) = home_lag(node);
             chain_on(&c, p.key) && if running.is_some() { !(lag <= 10 && addr_ready) } else { lag > 100 }
@@ -739,8 +802,9 @@ pub fn manage(node: &Node) {
         };
         match (on, running) {
             (true, None) => {
-                // Only once an arcade lends it (or we borrowed it before).
-                if lenders(node, p).is_empty() && state(node, p.key).is_none() {
+                // Only once an arcade lends it (or we borrowed it before). An installed
+                // ARCADE chain that wasn't borrowed gets its blocks itself.
+                if state(node, p.key).is_none() && (lenders(node, p).is_empty() || crate::arcsvc::runs(p)) {
                     continue;
                 }
                 let run = Arc::new(Run::default());
@@ -753,7 +817,7 @@ pub fn manage(node: &Node) {
             (false, Some(run)) => {
                 run.stop.store(true, Ordering::Relaxed);
                 ST.runs.lock().unwrap().remove(p.key);
-                let why = if installed.contains(p.key) || home { "its own copy has caught up" } else { "switched off" };
+                let why = if own || installed.contains(p.key) || home { "its own copy has caught up" } else { "switched off" };
                 let _ = node.app.event("borrow", &format!("stopped borrowing {} ({why}); its borrowed data is removed", p.name));
                 let n = node.self_arc();
                 let key = p.key;
@@ -870,10 +934,25 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
     note_tip(key, &addr, their as u64);
     let st = state(node, key);
     let tip = st.as_ref().and_then(|s| s["tip"].as_u64()).map(|x| x as u32);
+    // The ARCADE chain: its headers first, checked by its own rules. From here on `their` is
+    // the height of the branch those headers give, whatever the lender says.
+    let arc = crate::arcborrow::is(p);
+    let their = if arc {
+        if tip.is_none() {
+            set("Borrowed · checking the chain's headers".into());
+        }
+        let (top, more) = crate::arcborrow::sync(node, p, their as u64, &|calls| call(node, &addr, p, calls)).inspect_err(|x| fail(&addr, x))?;
+        if more {
+            set(format!("Borrowed · headers checked to block {top}"));
+            return Ok(true);
+        }
+        top as u32
+    } else {
+        their
+    };
     let start_floor = |why: &str| -> Result<bool, String> {
         set(format!("Borrowed · starting at block {their} ({why})"));
-        let (_, a) = call_any(node, p, json!([["getblockhash", [their]]]))?;
-        let hash = Hash256::from_hex(r(&a[0])?.as_str().ok_or("bad hash")?).map_err(e)?;
+        let hash = hash_at(node, p, None, their)?;
         let (b, h, _) = fetch_checked(node, p, &hash)?;
         if h != their {
             return Err("the lender's block heights disagree".into());
@@ -884,6 +963,21 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
         Ok(true)
     };
     let Some(tip) = tip else { return start_floor("first start") };
+    if arc {
+        // The headers moved to another branch: the blocks kept that aren't on it go.
+        let (mut at, mut undone) = (tip, 0);
+        while stored_header(node, p, at).map(|x| x.0) != crate::arcborrow::id_at(node, p, at as u64) {
+            if undone >= MAX_REORG || !disconnect(node, p)? {
+                return start_floor("the chain changed branch below where borrowing started");
+            }
+            undone += 1;
+            at -= 1;
+        }
+        if undone > 0 {
+            let _ = node.app.event("borrow", &format!("{}: change of branch, {undone} block{} taken back", p.name, if undone == 1 { "" } else { "s" }));
+            return Ok(true);
+        }
+    }
     if their <= tip {
         set(format!("Borrowed · at block {tip}"));
         return Ok(false);
@@ -892,24 +986,28 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
         return start_floor(&format!("{} blocks behind", their - tip));
     }
     let n = (their - tip).min(match p.key { "btc" | "ltc" => 3, _ => 20 });
-    let calls: Vec<Value> = (tip + 1..=tip + n).map(|h| json!(["getblockhash", [h]])).collect();
-    let a = call(node, &addr, p, json!(calls))?;
-    let hashes: Vec<Hash256> = a.iter().map(|x| r(x).and_then(|v| Hash256::from_hex(v.as_str().unwrap_or("")).map_err(e))).collect::<Result<_, _>>()?;
+    let hashes: Vec<Hash256> = if arc {
+        (tip + 1..=tip + n).map(|h| hash_at(node, p, None, h)).collect::<Result<_, _>>()?
+    } else {
+        let calls: Vec<Value> = (tip + 1..=tip + n).map(|h| json!(["getblockhash", [h]])).collect();
+        let a = call(node, &addr, p, json!(calls))?;
+        a.iter().map(|x| r(x).and_then(|v| Hash256::from_hex(v.as_str().unwrap_or("")).map_err(e))).collect::<Result<_, _>>()?
+    };
     let calls: Vec<Value> = hashes.iter().map(|h| json!(["getblock", [h.to_hex(), 0]])).collect();
     let blocks = call(node, &addr, p, json!(calls))?;
     let mut h = tip;
     for (hash, x) in hashes.iter().zip(blocks.iter()) {
-        let raw = hex::decode(r(x)?.as_str().ok_or("bad block")?).map_err(e)?;
+        // A lender that lacks a block of the branch the headers give: try the others first.
+        let raw = hex::decode(r(x).inspect_err(|why| if arc { fail(&addr, why) })?.as_str().ok_or("bad block")?).map_err(e)?;
         let (ph, phdr) = stored_header(node, p, h).ok_or("our tip header is missing")?;
-        let b0 = Block::parse_with(&raw, &p.format).map_err(e)?;
+        let b0 = parse_block(p, &raw)?;
         if b0.header.prev != ph {
             // A reorg: take our tip back and look again.
             let mut undone = 0;
             while undone < MAX_REORG {
                 let at = state(node, key).and_then(|s| s["tip"].as_u64()).unwrap_or(0) as u32;
-                let (_, a) = call_any(node, p, json!([["getblockhash", [at]]]))?;
-                let theirs = r(&a[0])?.as_str().unwrap_or("").to_string();
-                if stored_header(node, p, at).map(|x| x.0.to_hex()) == Some(theirs) {
+                let theirs = hash_at(node, p, None, at)?;
+                if stored_header(node, p, at).map(|x| x.0) == Some(theirs) {
                     break;
                 }
                 if !disconnect(node, p)? {
@@ -923,7 +1021,11 @@ fn step(node: &Node, p: &'static ChainParams, watch: &HashSet<Vec<u8>>, run: &Ru
             if undone > 0 { let _ = node.app.event("borrow", &format!("{}: reorg, {undone} block{} taken back", p.name, if undone == 1 { "" } else { "s" })); }
             return Ok(true);
         }
-        let b = check_block(p, &raw, hash, &phdr, h + 1)?;
+        let b = if arc {
+            crate::arcborrow::check(node, p, &raw, hash, h + 1).inspect_err(|why| fail(&addr, why))?
+        } else {
+            check_block(p, &raw, hash, &phdr, h + 1, &stored_below(node, p, h + 1))?
+        };
         connect(node, p, h + 1, &b, watch, false)?;
         h += 1;
     }
@@ -997,8 +1099,7 @@ fn coinscan(node: &Node, p: &'static ChainParams, w: &[Watched]) -> Result<Scan,
             if blocks.len() >= 50 {
                 blocks.clear();
             }
-            let a = call(node, &lender, p, json!([["getblockhash", [c.height]]]))?;
-            let bh = Hash256::from_hex(r(&a[0])?.as_str().unwrap_or("")).map_err(e)?;
+            let bh = hash_at(node, p, Some(&lender), c.height)?;
             let (b, h, _) = fetch_checked(node, p, &bh)?;
             if h != c.height {
                 continue;
@@ -1338,16 +1439,23 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     let offers = node.offers_for(p.key);
     let told = ST.tips.lock().unwrap().get(p.key).cloned().unwrap_or_default();
     let mut seen = BTreeSet::new();
+    let mut fresh: Vec<(u64, u64)> = Vec::new();
     for (id, addr, kind, h) in offers {
         if kind != "cr" || !seen.insert(addr.clone()) {
             continue;
         }
         let t = told.get(&addr).map(|x| x.0).unwrap_or(h);
+        if let Some((tip, at)) = told.get(&addr) {
+            fresh.push((*tip, *at));
+        }
         let fails = recent_fails(&addr);
         let (rtt, last) = ST.health.lock().unwrap().get(&addr).map(|x| (Some(x.rtt_ms), Some(x.last_err.clone()).filter(|s| !s.is_empty()))).unwrap_or((None, None));
         lenders_v.push(json!({"node": &id[..id.len().min(16)], "addr": addr, "tip": t, "rtt_ms": rtt, "fails": fails, "last_error": last}));
     }
-    let tips: Vec<u64> = lenders_v.iter().filter_map(|l| l["tip"].as_u64()).collect();
+    // Only tips told at about the same time can disagree: one told a while ago is behind
+    // because the chain went on, not because its lender is on another chain.
+    let newest = fresh.iter().map(|x| x.1).max().unwrap_or(0);
+    let tips: Vec<u64> = fresh.iter().filter(|x| x.1 + TIPS_TOGETHER >= newest).map(|x| x.0).collect();
     let mismatch = match (tips.iter().min(), tips.iter().max()) {
         (Some(a), Some(b)) if b - a > 3 => Some(format!("lenders disagree on the tip: {a} to {b}")),
         _ => None,
@@ -1357,9 +1465,10 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     let coins_n = coin_rows(node, p.key).iter().filter(|(_, c)| c["sp"].is_null()).count();
     let top = tips.iter().max().copied().unwrap_or(tip).max(tip);
     let scan = run.scan.lock().unwrap().clone();
+    let arc = crate::arcborrow::is(p);
     let stages = vec![
-        json!({"name": "Source", "detail": format!("borrowed from {} lender{} over the arcade mesh (their Core node)", lenders_v.len(), if lenders_v.len() == 1 { "" } else { "s" }), "pct": 100.0, "info": true}),
-        json!({"name": "Headers", "detail": format!("from block {} (the floor), each block checked as it arrives, not stored", st["floor"]), "pct": if top == 0 { 0.0 } else { (tip as f64 * 100.0 / top as f64).min(100.0) }, "at": tip, "of": top}),
+        json!({"name": "Source", "detail": format!("borrowed from {} lender{} over the arcade mesh ({})", lenders_v.len(), if lenders_v.len() == 1 { "" } else { "s" }, if arc { "arcades that have it installed" } else { "their Core node" }), "pct": 100.0, "info": true}),
+        json!({"name": "Headers", "detail": if arc { format!("every header checked from block 0 by the chain's rules; blocks from block {} on, each checked against them, not stored", st["floor"]) } else { format!("from block {} (the floor), each block checked as it arrives, not stored", st["floor"]) }, "pct": if top == 0 { 0.0 } else { (tip as f64 * 100.0 / top as f64).min(100.0) }, "at": tip, "of": top}),
         json!({"name": "Your coins", "detail": if scan.is_empty() { "older coins: coin scan waiting".to_string() } else { scan.clone() }, "pct": if st["scan"].is_object() { 100.0 } else { 0.0 }, "info": true}),
     ];
     Some(json!({"key": p.key, "name": p.name, "installed": false, "borrowed": true, "home": false, "mode": "borrowed", "indexes": [],
@@ -1372,13 +1481,12 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
 pub fn status_all(node: &Node) -> Value {
     let c = cfg(node);
     let installed: BTreeSet<String> = node.extra.lock().unwrap().keys().cloned().collect();
-    let chains: Vec<Value> = ALL_CHAINS
-        .iter()
+    let chains: Vec<Value> = crate::chains::all()
         .filter(|p| p.chain_no != node.params.chain_no)
         .map(|p| {
             let mut v = status(node, p.key).unwrap_or_else(|| json!({"key": p.key, "name": p.name, "borrowed": false}));
             v["on"] = json!(chain_on(&c, p.key));
-            v["installed"] = json!(installed.contains(p.key));
+            v["installed"] = json!(installed.contains(p.key) || crate::arcsvc::runs(p));
             v["lendable"] = json!(node.offers_for(p.key).iter().any(|o| o.2 == "cr"));
             v
         })
@@ -1428,10 +1536,7 @@ fn x_block(node: &Node, p: &'static ChainParams, id: &str) -> R {
         let h: u32 = id.trim().replace(',', "").parse().map_err(|_| format!("{id} is not a height or block hash"))?;
         match stored_header(node, p, h) {
             Some((x, _)) => x,
-            None => {
-                let (_, a) = call_any(node, p, json!([["getblockhash", [h]]]))?;
-                Hash256::from_hex(r(&a[0])?.as_str().ok_or("bad hash")?).map_err(e)?
-            }
+            None => hash_at(node, p, None, h)?,
         }
     };
     let (b, height, addr) = fetch_checked(node, p, &hash)?;
@@ -1445,7 +1550,7 @@ fn x_block(node: &Node, p: &'static ChainParams, id: &str) -> R {
               "nonce": b.header.nonce, "version": b.header.version, "merkle_root": b.header.merkle_root.to_hex(), "best": best,
               "confirmations": if best { tip.max(height).saturating_sub(height) + 1 } else { 0 }, "tx_count": b.txs.len(), "size": b.encode().len(),
               "txs": txs, "inscriptions": null, "unit": crate::explorer::unit(p), "borrowed_from": addr,
-              "checked": if ours.is_some() { "hash, merkle root and work checked; matches our headers" } else { "hash, merkle root and work checked (older than our headers: in the best chain on the lender's word)" }}))
+              "checked": if crate::arcborrow::is(p) { "checked against the headers this arcade followed from block 0" } else if ours.is_some() { "hash, merkle root and work checked; matches our headers" } else { "hash, merkle root and work checked (older than our headers: in the best chain on the lender's word)" }}))
 }
 
 /// A transaction by txid from a lender: its txid recomputed, its block checked when confirmed.

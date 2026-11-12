@@ -1,8 +1,10 @@
 //! Installing a chain from V1.0 copies (docs/V1SHARE.md §5, phase 3): headers from the
 //! network (checked by proof of work), then the blocks copy and the coins copy, each fetched
 //! from every arcade holding it and taken in WHILE it comes (§5.0): rows in order, blocks
-//! checked against our headers, no scripts run, pieces deleted once used. The coins are
-//! marked trusted (made by N arcades) until the background re-check.
+//! checked against our headers, no scripts run, pieces deleted once used. Copies count only
+//! when 2 or more established arcades made them (vxshare::established). Each coin is checked
+//! against the transaction at its position in those blocks as it is taken in; that the coins
+//! are unspent is the makers' word ("trusted") until the re-check, started right after.
 
 use crate::node::Node;
 use crate::vxshare;
@@ -35,11 +37,17 @@ fn set(key: &str, phase: &str, detail: String) {
     }
 }
 
+/// Is a chain being installed from copies right now?
+pub fn running(key: &str) -> bool {
+    jobs().get(key).is_some_and(|x| x.phase != "done" && x.phase != "failed")
+}
+
 pub fn status() -> Value {
     json!(jobs().iter().map(|(k, j)| json!({"key": k, "phase": j.phase, "detail": j.detail, "started": j.started, "rows": j.rows, "rows_per_s": j.rows_rate})).collect::<Vec<_>>())
 }
 
-/// share.install: take a chain in from V1.0 copies (blocks and coins) made by 2 or more arcades.
+/// share.install: take a chain in from V1.0 copies (blocks and coins) made by 2 or more
+/// established arcades.
 pub fn start(node: Arc<Node>, key: &str) -> Result<Value, String> {
     start_with(node, key, 1800)
 }
@@ -47,6 +55,8 @@ pub fn start(node: Arc<Node>, key: &str) -> Result<Value, String> {
 /// First start of an arcade far behind on its home chain: install it from copies when the
 /// mesh offers them within a few minutes (the usual sync goes on meanwhile and takes over if
 /// not), borrowing the chain meanwhile (crate::borrow) so balances and claims work at once.
+/// Only when enough established arcades are known (an arcade this far behind knows few from
+/// its own chain: the operator names them, ARCADE_COPY_TRUSTED); otherwise it syncs as usual.
 pub fn auto_home(node: Arc<Node>) {
     std::thread::Builder::new()
         .name("install-home".into())
@@ -57,6 +67,7 @@ pub fn auto_home(node: Arc<Node>) {
             // as the home chain is far behind (ThinkPad 2026-11-10 synced from zero after one
             // early check).
             let mut last_try: Option<Instant> = None;
+            let mut told = false;
             loop {
                 std::thread::sleep(Duration::from_secs(60));
                 let (lag, _) = crate::borrow::home_lag(&node);
@@ -69,6 +80,13 @@ pub fn auto_home(node: Arc<Node>) {
                     // Caught up the usual way (and tips known): nothing more to do.
                     if !running && lag < 1_000 && node.mesh_tips.lock().unwrap().len() > 0 {
                         return;
+                    }
+                    continue;
+                }
+                if !vxshare::enough_established(&node) {
+                    if !told {
+                        told = true;
+                        let _ = node.app.event("chain", &format!("{} is {lag} blocks behind; no copies are asked for: too few established arcades known to vouch for them (ARCADE_COPY_TRUSTED names some), so it syncs the usual way", node.params.name));
                     }
                     continue;
                 }
@@ -104,6 +122,8 @@ fn start_with(node: Arc<Node>, key: &str, wait_secs: u64) -> Result<Value, Strin
                 Ok(note) => {
                     set(p.key, "done", note.clone());
                     let _ = node.app.event("chain", &format!("{} installed from V1.0 copies: {note}", p.name));
+                    // That the coins are unspent is the makers' word until re-derived here.
+                    crate::cbimport::start_verify(node.clone(), p.key.to_string());
                 }
                 Err(e) => {
                     set(p.key, "failed", e.clone());
@@ -132,7 +152,7 @@ fn wait_for_copies(node: &Arc<Node>, p: &'static ChainParams, cancel: &Arc<Atomi
             return Err("cancelled".into());
         }
         let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
-        if let (Some((bid, bcp, _)), Some((cid, ccp, _))) = (vxshare::best(p.net, "blocks"), vxshare::best(p.net, "coins")) {
+        if let (Some((bid, bcp, _)), Some((cid, ccp, _))) = (vxshare::best(node, p.net, "blocks"), vxshare::best(node, p.net, "coins")) {
             if bcp == ccp && bcp > tip {
                 return Ok((bid, cid, bcp as u32));
             }
@@ -154,7 +174,7 @@ fn wait_for_copies(node: &Arc<Node>, p: &'static ChainParams, cancel: &Arc<Atomi
             set(p.key, "asking", format!("asked {n} V1.0 arcade{} for copies at block {h} (network tip {top}); they are made when the arcades reach it", if n == 1 { "" } else { "s" }));
         }
         if t0.elapsed() > Duration::from_secs(wait_secs) {
-            return Err(format!("no copies made by 2 or more arcades came within {} minutes; it syncs the usual way", wait_secs / 60));
+            return Err(format!("no copies made by 2 or more established arcades came within {} minutes; it syncs the usual way", wait_secs / 60));
         }
         // Caught up meanwhile the usual way: nothing to take in.
         if node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64 + 1000 >= net_tip(node, p) as u64).unwrap_or(false) {
@@ -411,22 +431,29 @@ fn run(node: &Arc<Node>, p: &'static ChainParams, bid: &str, cid: &str, cp: u32,
     if m["cp"].as_u64() != Some(cp as u64) {
         return Err("the coins copy is at another height".into());
     }
-    let mut bad: Option<String> = None;
+    // The copy's count and total are checked when its last coin is read, before anything is
+    // written (every coin is checked against its block by import_coins_at).
+    let (mut n, mut total) = (0u64, 0u128);
     let mut next = || -> Result<Option<(u32, u32, u32, u64, bool, Vec<u8>)>, String> {
-        let Some(r) = cs.record()? else { return Ok(None) };
+        let Some(r) = cs.record()? else {
+            if m["coins"].as_u64() != Some(n) || m["total"].as_u64().map(|t| t as u128) != Some(total) {
+                return Err(format!("the coins copy holds {n} coins, its manifest says {}", m["coins"]));
+            }
+            return Ok(None);
+        };
         if r.len() < 21 {
-            bad = Some("short coin record".into());
             return Err("short coin record".into());
         }
         let h = u32::from_be_bytes(r[0..4].try_into().unwrap());
         let pos = u32::from_be_bytes(r[4..8].try_into().unwrap());
         let vout = u32::from_be_bytes(r[8..12].try_into().unwrap());
         let value = u64::from_le_bytes(r[12..20].try_into().unwrap());
+        n += 1;
+        total += value as u128;
         Ok(Some((h, pos, vout, value, r[20] != 0, r[21..].to_vec())))
     };
     let trusted = json!({"from": "V1.0 copies", "blocks": bid, "coins": cid, "height": cp, "at": arcade_app::now()}).to_string();
     let rep = node.chain.import_coins_at(p, &path, cp, &mut next, &trusted, &tmp, cancel, &mut |s| set(p.key, "coins", s)).map_err(|e| e.to_string())?;
-    let _ = bad;
     if m["coins"].as_u64() != Some(rep.kept) || m["total"].as_u64().map(|t| t as u128) != Some(rep.kept_amount) {
         return Err(format!("coin set taken in ({} coins) doesn't match the copy's manifest ({})", rep.kept, m["coins"]));
     }

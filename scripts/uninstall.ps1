@@ -1,7 +1,7 @@
 # Arcade V1.0 uninstaller for Windows. Removes the programs, the login task, the Start
 # menu shortcut, and your data (wallet, its 12 words, messages, chains).
 #
-#   powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/fioridarrell/arcade-v1/windows/scripts/uninstall.ps1'))"
+#   powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/uninstall.ps1'))"
 #
 # It asks you to type DELETE first. Without a way to ask, it removes nothing unless
 # ARCADE_UNINSTALL_YES=1 is set. ARCADE_HOME, when set, is the data folder; otherwise the

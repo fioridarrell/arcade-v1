@@ -543,9 +543,17 @@ pub fn run(node: Arc<Node>) {
     std::thread::sleep(Duration::from_secs(5));
     restore(&node);
     loop {
-        let keys: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+        // Added chains, and the home chain (installed from V1.0 copies) for its re-check.
+        let mut keys: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+        if !keys.iter().any(|k| k == node.params.key) {
+            keys.push(node.params.key.to_string());
+        }
         for key in keys {
             let Some(p) = arcade_chain::params::by_key(&key) else { continue };
+            if crate::v1import::running(&key) {
+                // Its install from V1.0 copies takes the coins in, and starts the re-check itself.
+                continue;
+            }
             // An import left unfinished: the coins are half taken in; take it in again.
             if let Ok(Some(_)) = node.chain.import_pending(p.chain_no) {
                 if !st().jobs.contains_key(&key) {

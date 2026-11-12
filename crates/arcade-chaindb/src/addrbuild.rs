@@ -85,6 +85,8 @@ struct Resume {
     log_rows: u64,
     cut_done: bool,
     merged: Vec<u8>,
+    /// The kind being merged and the last key written for it (steps 2-5 go on after it).
+    mergeat: Option<(u8, Vec<u8>)>,
     files: Vec<(u8, PathBuf)>,
 }
 
@@ -96,6 +98,9 @@ impl Resume {
             self.counts[0], self.counts[1], self.counts[2], self.counts[3], self.log_rows, self.cut_done as u8,
             String::from_utf8_lossy(&self.merged)
         );
+        if let Some((k, key)) = &self.mergeat {
+            o.push_str(&format!("mergeat {} {}\n", *k as char, hex::encode(key)));
+        }
         for (k, p) in &self.files {
             o.push_str(&format!("file {} {}\n", *k as char, p.display()));
         }
@@ -120,6 +125,10 @@ impl Resume {
                 "logrows" => r.log_rows = rest.parse().ok()?,
                 "cut" => r.cut_done = rest == "1",
                 "merged" => r.merged = rest.as_bytes().to_vec(),
+                "mergeat" => {
+                    let (kc, key) = rest.split_once(' ')?;
+                    r.mergeat = Some((kc.as_bytes().first().copied()?, hex::decode(key).ok()?));
+                }
                 "file" => {
                     let (kc, path) = rest.split_once(' ')?;
                     r.files.push((kc.as_bytes().first().copied()?, PathBuf::from(path)));
@@ -141,6 +150,9 @@ const RUN_BYTES: usize = if cfg!(test) { 3000 } else { 512 << 20 };
 const LOG_PAGE: usize = if cfg!(test) { 50 } else { 50_000 };
 /// Rows per write while building (short writes, so the syncer gets turns).
 const WRITE_ROWS: usize = if cfg!(test) { 37 } else { 20_000 };
+/// Writes between saves of the merge position (so a restart in steps 2-5 goes on near where
+/// it was instead of merging the kind's runs from the start again).
+const SAVE_EVERY: u32 = if cfg!(test) { 1 } else { 25 };
 
 /// A history row's value: received, spent.
 pub fn hist_val(recv: u64, spent: u64) -> [u8; 16] {
@@ -308,12 +320,27 @@ impl ChainDb {
                 }
                 let files: Vec<&PathBuf> = runs.iter().filter(|(k, _)| k == kind).map(|(_, p)| p).collect();
                 self.set_step(c, i + 1, 0, res.counts[i], "rows", 1);
-                if !self.merge_into(c, i + 1, res.counts[i], *kind, table, &files, stop, &mut |s| note(format!("building addresses: step {} of 6, {s}", i + 2)))? {
+                // A restart in the middle of this kind goes on after the last key it saved.
+                let after = res.mergeat.as_ref().filter(|(k, _)| k == kind).map(|(_, key)| key.clone());
+                if let Some(a) = &after {
+                    note(format!("building addresses: step {} of 6, going on after the last saved row ({} bytes of key)", i + 2, a.len()));
+                }
+                let recs_total = res.counts[i];
+                let mut saved = |key: &[u8]| -> Result<()> {
+                    if backfill.is_some() {
+                        return Ok(());
+                    }
+                    res.mergeat = Some((*kind, key.to_vec()));
+                    let v = res.encode();
+                    self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &v))
+                };
+                if !self.merge_into(c, i + 1, recs_total, *kind, table, &files, after.as_deref(), &mut saved, stop, &mut |s| note(format!("building addresses: step {} of 6, {s}", i + 2)))? {
                     return Ok(false);
                 }
                 self.set_step(c, i + 1, res.counts[i], res.counts[i], "rows", 2);
                 if backfill.is_none() {
                     res.merged.push(*kind);
+                    res.mergeat = None;
                     self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()))?;
                 }
             }
@@ -579,9 +606,23 @@ impl ChainDb {
         Ok(true)
     }
 
-    /// Steps 2-4: merge one kind's runs and write them in key order.
+    /// Steps 2-5: merge one kind's runs and write them in key order. Rows whose key is at or
+    /// before `after` were written by an earlier start (a key is written only once all its
+    /// rows are combined) and are skipped; `saved` records the last key written now and then.
     #[allow(clippy::too_many_arguments)]
-    fn merge_into(&self, c: u16, step: usize, recs_total: u64, kind: u8, table: &str, files: &[&PathBuf], stop: &AtomicBool, note: &mut dyn FnMut(String)) -> Result<bool> {
+    fn merge_into(
+        &self,
+        c: u16,
+        step: usize,
+        recs_total: u64,
+        kind: u8,
+        table: &str,
+        files: &[&PathBuf],
+        after: Option<&[u8]>,
+        saved: &mut dyn FnMut(&[u8]) -> Result<()>,
+        stop: &AtomicBool,
+        note: &mut dyn FnMut(String),
+    ) -> Result<bool> {
         let mut recs_read = 0u64;
         let mut readers: Vec<BufReader<std::fs::File>> =
             files.iter().map(|p| std::fs::File::open(p).map(|f| BufReader::with_capacity(1 << 20, f)).map_err(io)).collect::<Result<_>>()?;
@@ -609,10 +650,25 @@ impl ChainDb {
         let mut batch: Vec<Vec<u8>> = Vec::with_capacity(WRITE_ROWS);
         let mut cur: Option<Vec<u8>> = None;
         let mut written = 0u64;
+        let mut writes = 0u32;
         while let Some(std::cmp::Reverse((key, i, rec))) = heap.pop() {
             recs_read += 1;
             if let Some(rec2) = next(&mut readers[i], &mut read_bytes)? {
                 heap.push(std::cmp::Reverse((key_of(&rec2).to_vec(), i, rec2)));
+            }
+            // Written already (tx index rows aren't combined, so the last key may have more).
+            if let Some(a) = after {
+                if key.as_slice() < a || (key.as_slice() == a && kind != TXROW) {
+                    if recs_read % (WRITE_ROWS as u64 * 10) == 0 {
+                        let pct = if total > 0 { read_bytes * 100 / total } else { 100 };
+                        self.set_step(c, step, recs_read.min(recs_total.max(recs_read)), recs_total.max(recs_read), "rows", 1);
+                        note(format!("{} {pct}% (skipping rows written before the restart)", match kind { HIST => "address history", SPEND => "spends", TXROW => "transaction index", _ => "address coins" }));
+                        if stop.load(Ordering::Relaxed) {
+                            return Ok(false);
+                        }
+                    }
+                    continue;
+                }
             }
             cur = Some(match cur.take() {
                 Some(prev) if key_of(&prev) == key.as_slice() && kind != TXROW => combine(kind, &prev, &rec),
@@ -627,6 +683,10 @@ impl ChainDb {
                     return Ok(false);
                 }
                 written += self.write_batch(c, kind, table, &batch)?;
+                writes += 1;
+                if writes % SAVE_EVERY == 0 {
+                    saved(key_of(batch.last().unwrap()))?;
+                }
                 batch.clear();
                 let pct = if total > 0 { read_bytes * 100 / total } else { 100 };
                 self.set_step(c, step, recs_read.min(recs_total.max(recs_read)), recs_total.max(recs_read), "rows", 1);

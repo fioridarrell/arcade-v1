@@ -32,6 +32,11 @@ const MAX_PART: usize = 8 << 20;
 const MAX_RAW: usize = 16 << 20;
 const ASK_EVERY: Duration = Duration::from_secs(600);
 const HI_EVERY: Duration = Duration::from_secs(600);
+/// How long a checked snapshot that is waiting for more arcades to back it holds back the
+/// chain's own ord walk. After that the walk goes on (the snapshot is still taken in if enough
+/// arcades back it later): with only the snapshot's holder in reach, no chunk can ever be
+/// backed, and the index must not wait for that forever.
+const WAIT_HOLD: u64 = 600;
 const INDEXER: &str = "ord.v1";
 
 struct Req {
@@ -74,6 +79,8 @@ struct Job {
     /// The moves question in flight: (id, walker, sent, chunks); answers waiting to be compared.
     ask: Option<(u64, String, Instant, Vec<u32>)>,
     answers: Vec<(String, Vec<u32>, Value)>,
+    /// When the check first found every reachable walker asked and some chunks still unbacked.
+    waiting_since: Option<u64>,
 }
 
 #[derive(Default)]
@@ -532,10 +539,12 @@ fn new_job(node: &Node, p: &ChainParams, id: String, h: u64, auto: bool, from: O
         asked_done: BTreeSet::new(),
         ask: None,
         answers: Vec::new(),
+        waiting_since: None,
     }
 }
 
 pub fn run(node: Arc<Node>) {
+    clear_stale_dirs(&node.home.join("import"));
     loop {
         std::thread::sleep(Duration::from_secs(2));
         let nets = ord_chains(&node);
@@ -730,7 +739,9 @@ fn step(node: &Arc<Node>, p: &'static ChainParams) {
                 let n2 = node.clone();
                 std::thread::Builder::new().name("dx convert".into()).spawn(move || convert_job(n2, p, dir, m, check)).unwrap();
             } else {
-                j.detail = format!("waiting for more arcades: {confirmed} of {total} chunks backed by {need} or more other established arcades ({one} by at least one)");
+                let since = *j.waiting_since.get_or_insert(now());
+                let walk = if now() >= since + WAIT_HOLD { "; the ord index walks on by itself meanwhile" } else { "" };
+                j.detail = format!("waiting for more arcades: {confirmed} of {total} chunks backed by {need} or more other established arcades ({one} by at least one){walk}");
                 if j.started + 3600 < now() {
                     j.asked_done.clear(); // ask again now and then: words and walkers come and go
                 }
@@ -839,9 +850,33 @@ fn convert_job(node: Arc<Node>, p: &'static ChainParams, dir: PathBuf, m: Value,
 /// from its start) or checked and taken in.
 pub fn holds(key: &str) -> bool {
     let Some(p) = by_key(key) else { return false };
-    st().jobs.get(p.net).is_some_and(|j| {
-        matches!(j.phase.as_str(), "assembling" | "checking" | "converting") || (matches!(j.phase.as_str(), "manifest" | "copy") && now() < j.started + 1800)
-    })
+    st().jobs.get(p.net).is_some_and(|j| phase_holds(&j.phase, j.started, j.waiting_since, now()))
+}
+
+/// Whether a job in `phase` holds back the chain's own ord walk at `now`: while it is fetched
+/// (at most 30 minutes from its start), put together, taken in, or checked; but a check left
+/// waiting for arcades that may never come (WAIT_HOLD) no longer does.
+fn phase_holds(phase: &str, started: u64, waiting_since: Option<u64>, now: u64) -> bool {
+    match phase {
+        "assembling" | "converting" => true,
+        "checking" => waiting_since.is_none_or(|t| now < t + WAIT_HOLD),
+        "manifest" | "copy" => now < started + 1800,
+        _ => false,
+    }
+}
+
+/// Snapshot folders left in `import` by an earlier run: the jobs live in memory only, so
+/// nothing goes on with them, and each holds a copy of several GB. (Ledger copies, `-ledger-`,
+/// are crate::lxfetch's.)
+fn clear_stale_dirs(import: &std::path::Path) {
+    let Ok(rd) = std::fs::read_dir(import) else { return };
+    for e in rd.flatten() {
+        let name = e.file_name().to_string_lossy().to_string();
+        let ours = name.split_once("-ord-").is_some_and(|(net, id)| by_net(net).is_some() && !id.is_empty() && id.bytes().all(|b| b.is_ascii_hexdigit()));
+        if ours && e.path().is_dir() {
+            let _ = std::fs::remove_dir_all(e.path());
+        }
+    }
 }
 
 // ---------------- operator ----------------
@@ -941,6 +976,40 @@ mod tests {
         let mut words = BTreeMap::new();
         words.insert(0, w(&[("m", "aa")]));
         assert!(check_chunks(&chunks, &words, &makers).unwrap().is_empty());
+    }
+
+    #[test]
+    fn a_check_waiting_for_arcades_stops_holding_the_walk() {
+        let t = 1_000_000;
+        // Fetching: held for 30 minutes from the start.
+        assert!(phase_holds("copy", t, None, t + 1799));
+        assert!(!phase_holds("copy", t, None, t + 1800));
+        assert!(phase_holds("assembling", t, None, t + 99_999));
+        assert!(phase_holds("converting", t, None, t + 99_999));
+        // Checking: held while the walkers are asked...
+        assert!(phase_holds("checking", t, None, t + 99_999));
+        // ...and, once they all were and chunks are still unbacked, only for WAIT_HOLD.
+        assert!(phase_holds("checking", t, Some(t + 50), t + 50 + WAIT_HOLD - 1));
+        assert!(!phase_holds("checking", t, Some(t + 50), t + 50 + WAIT_HOLD));
+        assert!(!phase_holds("refused", t, None, t));
+        assert!(!phase_holds("failed", t, None, t));
+        assert!(!phase_holds("done", t, None, t));
+    }
+
+    #[test]
+    fn stale_snapshot_folders_are_cleared() {
+        let d = tempfile::tempdir().unwrap();
+        let net = arcade_chain::params::by_key("pep").map(|p| p.net).unwrap_or("main");
+        let stale = d.path().join(format!("{net}-ord-cdae0b93"));
+        let ledger = d.path().join(format!("{net}-ledger-cdae0b93"));
+        let other = d.path().join("notes-ord-xyz");
+        for p in [&stale, &ledger, &other] {
+            std::fs::create_dir_all(p).unwrap();
+            std::fs::write(p.join("p000000"), b"x").unwrap();
+        }
+        clear_stale_dirs(d.path());
+        assert!(!stale.exists());
+        assert!(ledger.exists() && other.exists());
     }
 
     #[test]

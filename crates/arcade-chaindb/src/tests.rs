@@ -595,7 +595,7 @@ fn address_build_resumes_and_reports_steps() {
     let want = address_tables(&live.db);
     let c = live.p.chain_no;
 
-    for stop_in in ["step 1 of 6", "step 3 of 6"] {
+    for stop_in in ["step 1 of 6", "step 2 of 6", "step 3 of 6"] {
         let f = fixture();
         f.db.connect_blocks_with(f.p, &blocks, true, true).unwrap();
         let tmp = f._dir.path().join("tmp");
@@ -617,12 +617,16 @@ fn address_build_resumes_and_reports_steps() {
         // The next start goes on; every step's progress ends at its total.
         let stop = std::sync::atomic::AtomicBool::new(false);
         let mut resumed = false;
+        let mut mid_merge = false;
         let mut last: Option<[crate::addrbuild::StepProgress; 6]> = None;
         assert!(f.db.build_addresses(f.p, &tmp, &stop, &mut |s| {
             resumed |= s.contains("going on where the last build stopped");
+            mid_merge |= s.contains("going on after the last saved row");
             last = f.db.build_progress(c).or(last.clone());
         }).unwrap());
         assert!(resumed, "{stop_in}: resumed");
+        // Stopped inside a merge step: that step goes on after the last key it wrote.
+        assert_eq!(mid_merge, stop_in != "step 1 of 6", "{stop_in}: merge resumed mid-kind");
         let steps = last.expect("progress reported");
         assert!(steps[..5].iter().all(|s| s.state == 2 && s.done == s.total), "{stop_in}: steps 1-5 done: {steps:?}");
         assert!(f.db.build_progress(c).is_none(), "progress cleared at the end");

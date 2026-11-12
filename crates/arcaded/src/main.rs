@@ -70,6 +70,7 @@ mod ringsvc;
 mod rpc;
 mod sizes;
 mod udpsvc;
+mod turnsvc;
 mod v1copy;
 mod vxshare;
 mod v1import;

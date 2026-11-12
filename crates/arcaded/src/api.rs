@@ -256,6 +256,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             }
             Ok(j)
         }
+        "realtime.ice" => Ok(crate::turnsvc::ice(node, &s("tag").unwrap_or_default(), req["lan"] == true)),
         "realtime.cert" => crate::realtime::cert(node, &s("address").ok_or("address required")?),
         "tx.coins" => crate::sitesvc::coins(node, req),
         "tx.activity" => crate::sitesvc::activity(node, req),

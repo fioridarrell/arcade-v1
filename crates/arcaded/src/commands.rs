@@ -221,6 +221,7 @@ cmds! {
     "apps.trust" Admin "address, on?" "Trust a publisher (never flagged as a lookalike).";
     "apps.storage" Local "page, op, key?, value?" "An app page's saves (load, set, remove, clear, history), as arcade.storage.";
     "realtime.join" Local "page, room, game?, member?, cred?, fast?" "Join a room over the mesh as this arcade's player (game defaults to the page): a token, me and the members; fast: true also takes the fast lane (realtime.fast). A website joins for its user with member (their address, or a guest id) and cred {a, x, s} signed over realtime.cert's words.";
+    "realtime.ice" Local "tag?, lan?" "ICE servers for one player (tag: their address or account, kept apart only for the relay's per-login limit): logins on this arcade's media relay where other arcades proved its STUN port open (lan: true adds its LAN address, for a player on its own network), else on relays borrowed from linked arcades; and this arcade's proved STUN. What a website hands its pages for WebRTC.";
     "realtime.cert" Public "address" "The words an address signs (Core signmessage) to play through this arcade, and their expiry: a website's user signs them in the browser and the site passes {a: address, x: expires, s: signature} to realtime.join.";
     "realtime.send" Local "token, data?, b64?" "Send to everyone in the room: text or base64 bytes, at most 512 bytes, about 5 a second.";
     "realtime.leave" Local "token" "Leave the room.";

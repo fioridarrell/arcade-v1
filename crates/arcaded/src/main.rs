@@ -58,6 +58,7 @@ mod sitesvc;
 mod grpsvc;
 mod feedsvc;
 mod node;
+mod ordmarket;
 mod ordsafe;
 mod ordsend;
 mod peerbook;

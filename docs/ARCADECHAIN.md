@@ -568,3 +568,16 @@ Built for the live testnet. Martin's decisions: the test coin is in main for eve
 ### 14.16 The testnet in V1.0
 
 `crates/arcaded/arctest.json` is the ARCADE testnet every arcade knows: block 0 (time 2026-11-11 22:11 UTC; the lists and beacons are placeholders until the genesis list of §10 exists), the genesis writers (the GX10 and the JB20B, 1 GiB each), 2.5-minute blocks and the rule's 1 GiB segments. `--arc-local <settings>` replaces it with a local test chain for closed test networks. Still stand-ins: the proof of time (§14.8), and audits and serving checks (not built).
+
+### 14.17 Earn ARCADE: one switch per coin (Martin 2026-11-11, to build)
+
+What Martin asked for, word for word in substance: "Each coin should just have a toggle ... earn arcade. When that toggle is clicked on it should start sealing the complete database starting at block zero including all indexes, block by block until it reaches the tip, and then it should continue block by block as they are confirmed. It needs to be as easy as it can be for the user." Earlier the same day: "Sealing is not an option for arcade coin, it is the only option"; "I don't want duplicate copies of anything ... we should just have sealed databases that we read from."
+
+- **The switch:** each coin's manage card has one switch, *Earn ARCADE*. Nothing else to choose. The card shows one line: sealing progress (block n of tip, percent), then earning (weight, paid so far).
+- **On:** the arcade seals that coin's whole database from block 0, the blocks and every index it keeps, block by block in the background, up to the tip, then each new block as it settles. Registration (§14.15) and the catalog run by themselves.
+- **One copy:** a sealed piece replaces its plain copy; reads unseal only the leaves they need (about 1.4 µs per 127-byte leaf). The newest, not yet settled data stays plain until it is sealed. Off stops sealing and earning; the sealed data stays the database.
+- **Pay** is still counted per confirmed segment (so arcades agree on what a copy holds): a segment earns once it is sealed here, confirmed and registered. Each index is its own family of segments, in a fixed journal form, so arcades keeping the same index confirm it together; lookup tables keep pointers into the sealed data, not the data.
+- **The ARCADE chain** itself is a listed chain, sealed like any coin, and keeps its blocks once (not in a block log and a mirror).
+- **Testnet:** restarts with 64 MiB segments so small chains (Pepecoin testnet) take part.
+
+Build order: the sealed-only store for blocks; the switch and its card line; index journals (ord first); the ARCADE chain's single copy; the testnet restart and release.

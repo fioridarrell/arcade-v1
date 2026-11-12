@@ -51,26 +51,30 @@ struct T20 {
     pk: arcade_wallet::secp256k1::PublicKey,
     tick: String,
     amount: String,
+    dec: u32,
 }
 
 fn t20(node: &Node, chain: &str, tick: &str, amount: &str, to: &str) -> Result<T20, String> {
     let p = crate::chains::find(chain).ok_or_else(|| format!("unknown chain {chain}"))?;
     let proto = arcade_ledger::tokens::protocol(p).ok_or_else(|| format!("no PRC-20 / DRC-20 on {}", p.name))?.0;
     if crate::borrow::is_borrowed(p.key) || !crate::chains::kept(node, p) {
-        return Err(format!("{} is not installed here: a token send reads its balances on this arcade's own copy", p.name));
+        return Err(format!("{} is not installed here: a token send spends this arcade's own coins of it", p.name));
     }
-    if node.chain.indexed_to(p.chain_no, crate::chains::indexer_name("tokens")).ok().flatten().is_none() {
-        return Err(format!("add the tokens index to {} in Chains & Coins first", p.name));
-    }
-    let info = arcade_ledger::tokens::tick(&node.chain, p.chain_no, tick).ok_or_else(|| format!("no token {tick} on {}", p.name))?;
+    // The tick and the balance: from this arcade's tokens index, else from an arcade on the mesh that keeps it
+    // (explorer.token / explorer.address answer either way).
+    let info = crate::explorer::handle(node, "explorer.token", &json!({"chain": p.key, "tick": tick}))
+        .ok().filter(|v| v["tick"].is_string()).ok_or_else(|| format!("no token {tick} on {} (or no arcade keeping its tokens index answered)", p.name))?;
     let dec = info["dec"].as_u64().unwrap_or(18) as u32;
     let amount = amount.trim().to_string();
     let n = arcade_ledger::tokens::num(&amount).ok_or("an amount is a number, for example 100 or 2.5")?;
     let base = n.units(dec).filter(|u| *u > 0).ok_or_else(|| format!("{tick} has {dec} decimals: that amount doesn't fit"))?;
     let (sk, pk) = wallet_key(node, p)?;
     let addr = arcade_ledger::address::base58check(p.p2pkh_version, &arcade_ledger::address::hash160(&pk.serialize()));
-    let (overall, transferable) = arcade_ledger::tokens::balances(&node.chain, p.chain_no, &addr).into_iter()
-        .find(|(t, _, _)| t.eq_ignore_ascii_case(tick)).map(|(_, o, t)| (o.parse::<u128>().unwrap_or(0), t.parse::<u128>().unwrap_or(0))).unwrap_or((0, 0));
+    let held = crate::explorer::handle(node, "explorer.address", &json!({"chain": p.key, "address": addr})).map_err(|e| format!("this wallet's tokens can't be read right now: {e}"))?;
+    let (overall, transferable) = held["tokens"].as_array().into_iter().flatten()
+        .find(|t| t["tick"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(tick)))
+        .map(|t| (t["overall"].as_str().and_then(|x| x.parse::<u128>().ok()).unwrap_or(0), t["transferable"].as_str().and_then(|x| x.parse::<u128>().ok()).unwrap_or(0)))
+        .unwrap_or((0, 0));
     // Notes already waiting in jobs here count as taken too (their reveal may not be indexed yet).
     let waiting: u128 = all(node).iter().filter(|j| j["chain"] == p.key && j["tick"].as_str().is_some_and(|t| t.eq_ignore_ascii_case(tick)) && j["step"] == "noted")
         .filter_map(|j| j["base"].as_str().and_then(|b| b.parse::<u128>().ok())).sum();
@@ -79,7 +83,7 @@ fn t20(node: &Node, chain: &str, tick: &str, amount: &str, to: &str) -> Result<T
         return Err(format!("this wallet has {} {tick} free to send (its address {addr})", plain(free, dec)));
     }
     arcade_ledger::address::script_for_address(p, to.trim()).ok_or_else(|| format!("that is not a {} address", p.name))?;
-    Ok(T20 { p, proto, sk, pk, tick: info["tick"].as_str().unwrap_or(tick).to_string(), amount })
+    Ok(T20 { p, proto, sk, pk, tick: info["tick"].as_str().unwrap_or(tick).to_string(), amount, dec })
 }
 
 /// Base units as the token's own decimal number.
@@ -120,8 +124,7 @@ pub fn t20_send(node: &Node, chain: &str, tick: &str, amount: &str, to: &str, go
     }
     send(node, p, &i.commit)?;
     let reveal = send_raw(node, p, &i.reveal)?;
-    let dec = arcade_ledger::tokens::tick(&node.chain, p.chain_no, &t.tick).and_then(|x| x["dec"].as_u64()).unwrap_or(18) as u32;
-    let base = arcade_ledger::tokens::num(&t.amount).and_then(|n| n.units(dec)).unwrap_or(0);
+    let base = arcade_ledger::tokens::num(&t.amount).and_then(|n| n.units(t.dec)).unwrap_or(0);
     let id = arcade_mesh::random::hex(8);
     let job = json!({"id": id, "chain": p.key, "tick": t.tick, "amount": t.amount, "base": base.to_string(), "to": to.trim(),
                      "note_tx": reveal, "commit_tx": i.commit.txid.to_hex(), "step": "noted", "at": arcade_app::now(), "last": ""});
@@ -148,11 +151,30 @@ fn step(node: &Node, j: &mut Value) -> Result<(), String> {
             if d < 1 {
                 return Ok(());
             }
-            let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
-            let at = tip + 1 - d;
-            let read = node.chain.indexed_to(p.chain_no, crate::chains::indexer_name("tokens")).ok().flatten().unwrap_or(0);
-            if read < at {
-                return Ok(());
+            // Sent only once the tokens index has read the note: this arcade's own, when it keeps one; else the
+            // mesh's, given a block more (and the note shown as transferable there).
+            let kept = if p.chain_no == node.params.chain_no { crate::chains::home_indexes(node) } else { node.extra.lock().unwrap().get(p.key).map(|r| r.indexes.clone()).unwrap_or_default() }
+                .iter().any(|i| i == "tokens");
+            if kept {
+                let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+                let read = node.chain.indexed_to(p.chain_no, crate::chains::indexer_name("tokens")).ok().flatten().unwrap_or(0);
+                if read < tip + 1 - d {
+                    return Ok(());
+                }
+            } else {
+                if d < 2 {
+                    return Ok(());
+                }
+                let (_, pk) = wallet_key(node, p)?;
+                let addr = arcade_ledger::address::base58check(p.p2pkh_version, &arcade_ledger::address::hash160(&pk.serialize()));
+                let held = crate::explorer::handle(node, "explorer.address", &json!({"chain": p.key, "address": addr})).map_err(|e| e.to_string())?;
+                let base: u128 = j["base"].as_str().and_then(|b| b.parse().ok()).unwrap_or(0);
+                let noted = held["tokens"].as_array().into_iter().flatten()
+                    .find(|t| t["tick"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(j["tick"].as_str().unwrap_or(""))))
+                    .and_then(|t| t["transferable"].as_str().and_then(|x| x.parse::<u128>().ok())).unwrap_or(0);
+                if noted < base {
+                    return Ok(());
+                }
             }
             let (sk, pk) = wallet_key(node, p)?;
             let own = p2pkh_of(&pk);

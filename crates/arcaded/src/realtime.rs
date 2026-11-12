@@ -182,11 +182,15 @@ fn subs_are_capped_per_link_and_routes_in_all() {
     let mut st = St::default();
     let one = vec![format!("{:016x}", 1)];
     let subs: Vec<Value> = (0..400).map(|i| sub(i, &one)).collect();
+    // The bucket refills while this loop runs. A slow debug build (Windows CI) is allowed
+    // the tokens that actually accrued; a limiter that takes every sub still fails.
+    let started = Instant::now();
     for h in &subs {
         on_sub(&t.node, &mut st, "L1", h);
     }
     let took = st.heard.len();
-    assert!(took <= SUB_LINK_BURST as usize + 30, "took {took} subs from one link at once");
+    let cap = SUB_LINK_BURST + SUB_LINK_RATE * started.elapsed().as_secs_f64() + 5.0;
+    assert!((took as f64) <= cap && took < subs.len(), "took {took} subs from one link at once (cap {cap:.0})");
     // Many links, every sub with MAX_ROOMS rooms: routes stop at the cap.
     let mut st = St::default();
     let rooms: Vec<String> = (0..MAX_ROOMS).map(|i| format!("{i:016x}")).collect();

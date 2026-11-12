@@ -1131,7 +1131,7 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
             .map(|(pid, units)| {
                 let p = arcade_ledger::engine::property(&x.node.chain, c, pid).ok().flatten().unwrap_or(Value::Null);
                 let div = p["divisible"] == true || p["type"] == 2;
-                json!({"propertyid": pid, "name": p["name"], "units": units, "balance": arcade_ledger::amount::token_plain(div, units)})
+                json!({"propertyid": pid, "name": p["name"], "units": units, "divisible": div, "balance": arcade_ledger::amount::token_plain(div, units)})
             })
             .collect();
         v["ledger_tokens"] = json!(toks);

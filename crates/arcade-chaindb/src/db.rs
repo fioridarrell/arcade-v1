@@ -500,7 +500,14 @@ pub struct ChainDb {
     cache_bytes: std::sync::atomic::AtomicUsize,
     /// Address builds running now: per chain, each step's progress (addrbuild).
     pub(crate) addr_progress: std::sync::Mutex<std::collections::HashMap<u16, [crate::addrbuild::StepProgress; 6]>>,
+    /// Where a pruned block's bytes are read back when this arcade holds them sealed (the ARCADE
+    /// chain's sealed copies, arcaded's arcseal): (chain, block hash) -> raw block. One copy on
+    /// disk: a sealed block's plain body is pruned and read through this.
+    sealed: std::sync::RwLock<Option<SealedReader>>,
 }
+
+/// Reads a sealed block back: (chain number, block hash) -> its raw bytes.
+pub type SealedReader = Arc<dyn Fn(u16, &Hash256) -> Option<Vec<u8>> + Send + Sync>;
 
 fn ix_key(c: u16, name: &str) -> Vec<u8> {
     k_state(c, &format!("ix:{name}"))
@@ -589,6 +596,7 @@ impl ChainDb {
             caches: Default::default(),
             cache_bytes: std::sync::atomic::AtomicUsize::new(cache_budget()),
             addr_progress: Default::default(),
+            sealed: Default::default(),
         };
         db.open_own_files()?;
         for c in 0..=255u16 {
@@ -612,6 +620,7 @@ impl ChainDb {
             caches: Default::default(),
             cache_bytes: std::sync::atomic::AtomicUsize::new(0),
             addr_progress: Default::default(),
+            sealed: Default::default(),
         };
         db.open_own_files()?;
         db.load_runs()?;
@@ -1043,8 +1052,40 @@ impl ChainDb {
         self.store(c).read(|r| Ok(r.get(HEIGHT, &k_height(c, height))?.map(|v| Hash256(v[..32].try_into().unwrap()))))
     }
 
-    /// Raw block bytes, rebuilt exactly from the stored parts.
+    /// Set the reader of sealed blocks (arcaded does, at start).
+    pub fn set_sealed_reader(&self, f: SealedReader) {
+        *self.sealed.write().unwrap() = Some(f);
+    }
+
+    /// A pruned block's bytes from this arcade's sealed copy, checked against its hash.
+    fn sealed_raw(&self, c: u16, hash: &Hash256) -> Option<Vec<u8>> {
+        let f = self.sealed.read().unwrap().clone()?;
+        let raw = f(c, hash)?;
+        let h80: [u8; 80] = raw.get(..80)?.try_into().ok()?;
+        (Header::parse(&h80).hash() == *hash).then_some(raw)
+    }
+
+    /// A pruned block's transaction `p`, from the sealed copy (block number `b`).
+    fn sealed_tx(&self, params: &ChainParams, b: u32, p: u32) -> Option<Tx> {
+        let c = params.chain_no;
+        let m = self.store(c).read(|r| r.get(BLOCK_META, &k_block(c, b))).ok()??;
+        let h80: [u8; 80] = m.get(..80)?.try_into().ok()?;
+        let raw = self.sealed_raw(c, &Header::parse(&h80).hash())?;
+        let block = arcade_chain::Block::parse_with(&raw, &params.format).ok()?;
+        block.txs.into_iter().nth(p as usize)
+    }
+
+    /// Raw block bytes, rebuilt exactly from the stored parts (a sealed block's from its
+    /// sealed copy).
     pub fn block_raw(&self, c: u16, hash: &Hash256) -> Result<Option<Vec<u8>>> {
+        let plain = self.block_raw_plain(c, hash)?;
+        if plain.is_some() {
+            return Ok(plain);
+        }
+        Ok(self.header(c, hash)?.filter(|h| h.b != 0).and_then(|_| self.sealed_raw(c, hash)))
+    }
+
+    fn block_raw_plain(&self, c: u16, hash: &Hash256) -> Result<Option<Vec<u8>>> {
         let Some(h) = self.header(c, hash)? else { return Ok(None) };
         if h.b == 0 {
             return Ok(None);
@@ -1121,20 +1162,28 @@ impl ChainDb {
             for (b, p) in cands {
                 let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? else { continue };
                 if row_txid(&raw, params)? == *txid {
-                    return Ok(if is_pruned(&raw) { None } else { Some((raw, b)) });
+                    return Ok(if is_pruned(&raw) { Err((b, p)) } else { Ok((raw, b)) }.into());
                 }
             }
             Ok(None)
+        })
+        .map(|found: Option<std::result::Result<(Vec<u8>, u32), (u32, u32)>>| match found {
+            Some(Ok(x)) => Some(x),
+            // Pruned: the sealed copy, if this arcade holds one.
+            Some(Err((b, p))) => self.sealed_tx(params, b, p).filter(|t| t.txid == *txid).map(|t| (t.raw, b)),
+            None => None,
         })
     }
 
     /// A stored transaction by block number and position.
     pub fn tx_at(&self, params: &ChainParams, b: u32, p: u32) -> Result<Option<Tx>> {
         let c = params.chain_no;
-        self.store(c).read(|r| match r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
+        let row = self.store(c).read(|r| r.get(BLOCK_TX, &k_block_tx(c, b, p)))?;
+        match row {
             Some(raw) if !is_pruned(&raw) => Ok(Some(Tx::parse_with(&raw, &params.format).map_err(other)?)),
-            _ => Ok(None),
-        })
+            Some(_) => Ok(self.sealed_tx(params, b, p)),
+            None => Ok(None),
+        }
     }
 
     /// The height of stored block number `b`, when it is on the main chain.

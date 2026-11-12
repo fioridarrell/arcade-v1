@@ -264,16 +264,7 @@ fn free_bytes(path: &std::path::Path) -> Option<u64> {
     (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
 }
 
-/// Bytes on the disk in all, for the 10% floor.
-fn disk_bytes(path: &std::path::Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_blocks as u64 * s.f_frsize as u64)
-}
 
-/// Free space a sealing must leave: 50 GB, or 10% of the disk if that is more.
-const FREE_FLOOR: u64 = 50_000_000_000;
 
 /// What automatic sealing is waiting on, when it isn't sealing (shown in the cards).
 static SEAL_NOTE: Mutex<String> = Mutex::new(String::new());
@@ -282,42 +273,84 @@ pub fn seal_note() -> String {
     SEAL_NOTE.lock().unwrap().clone()
 }
 
-/// Sealing is the only way to hold the ARCADE chain's storage (Martin 2026-11-11): every
-/// confirmed segment of a chain this arcade keeps is sealed, one at a time, in the background,
-/// and then registered (`register`). A segment that would leave less than [`FREE_FLOOR`] (or
-/// 10% of the disk) free waits until there is room: a sealed copy sits beside the chain's own
-/// blocks until the database keeps only the sealed copy.
+// ---------------- Earn ARCADE (docs/ARCADECHAIN.md §14.17) ----------------
+
+fn earn_key(chain: &str) -> Vec<u8> {
+    format!("arc_earn:{chain}").into_bytes()
+}
+
+/// Whether the operator switched Earn ARCADE on for this coin.
+pub fn earn_on(node: &Node, chain: &str) -> bool {
+    node.app.store.read(|r| r.get(arcade_app::META, &earn_key(chain))).ok().flatten().is_some_and(|v| v == b"1")
+}
+
+pub fn set_earn(node: &Node, chain: &str, on: bool) -> Result<(), String> {
+    node.app.store.write(|w| w.put(arcade_app::META, &earn_key(chain), if on { b"1" } else { b"0" })).map_err(|e| e.to_string())
+}
+
+/// Free space a seal needs beyond the segment itself (its working copy and the sealed file
+/// exist side by side for a moment, then the plain blocks go).
+const FREE_FLOOR: u64 = 2_000_000_000;
+
+/// Earn ARCADE: for each kept coin switched on, seal its next segment (from block 0 up), one
+/// at a time in the background; when it is sealed and checked, its plain blocks are pruned so
+/// the sealed copy is the database's only copy (reads unseal it, arcseal::reader).
 pub fn auto_seal(node: &Node, net: &Net, catalog: &Catalog) {
     if crate::arcseal::sealing().is_some() {
         return;
     }
-    let have: Vec<Hash> = crate::arcseal::replicas(node, net).iter().map(|r| r.segment).collect();
-    let next = kept(node, net).into_iter().find_map(|p| {
-        catalog.spans(p.key, segment::FAMILY_BLOCKS).find_map(|(_, _, l)| l.filter(|l| !have.contains(&l.id)).map(|l| (p, l.clone())))
-    });
-    let Some((p, l)) = next else {
+    let have: Vec<(String, u64)> = crate::arcseal::replicas(node, net).iter().map(|r| (r.chain.clone(), r.first)).collect();
+    let next = kept(node, net)
+        .into_iter()
+        .filter(|p| !crate::arcsvc::runs(p) && earn_on(node, p.key))
+        .find_map(|p| spans(p.chain_no, catalog.segment_bytes()).into_iter().find(|s| !have.contains(&(p.key.to_string(), s.first))).map(|s| (p, s)));
+    let Some((p, span)) = next else {
         *SEAL_NOTE.lock().unwrap() = String::new();
         return;
     };
     let dir = node.home.join("arc");
-    let need = l.entry.bytes / 127 * 128 + l.entry.bytes / 127 * 64 + l.entry.bytes;
-    let floor = FREE_FLOOR.max(disk_bytes(&dir).unwrap_or(0) / 10);
-    if free_bytes(&dir).is_some_and(|f| f < need.saturating_add(floor)) {
-        *SEAL_NOTE.lock().unwrap() = format!("waiting for disk space: sealing {} blocks {}..={} needs {:.1} GB and keeps {:.0} GB free", p.name, l.entry.first, l.entry.last, need as f64 / 1e9, floor as f64 / 1e9);
+    let need = span.bytes() / 127 * 128 + span.bytes() * 2;
+    if free_bytes(&dir).is_some_and(|f| f < need.saturating_add(FREE_FLOOR)) {
+        *SEAL_NOTE.lock().unwrap() = format!("waiting for disk space to seal {} blocks {}..={}", p.name, span.first, span.last);
         return;
     }
     *SEAL_NOTE.lock().unwrap() = String::new();
-    let (n, net, e, id) = (node.self_arc(), *net, l.entry.clone(), l.id);
+    let (n, net) = (node.self_arc(), *net);
     let _ = std::thread::Builder::new().name("arc sealing".into()).spawn(move || {
         let t0 = std::time::Instant::now();
-        match crate::arcseal::seal(&n, &net, p, id, e.first, e.last, e.bytes, e.root) {
-            Ok(r) => eprintln!("arc: sealed {} {}..={} ({} leaves) in {:.0} s", r.chain, r.first, r.last, r.leaves, t0.elapsed().as_secs_f64()),
+        let Some((bytes, root)) = root_of(&n, p, span.first, span.last) else {
+            *SEAL_NOTE.lock().unwrap() = format!("{} blocks {}..={} aren't all here", p.name, span.first, span.last);
+            return;
+        };
+        let id = crate::arcseal::segment_id(&net, p.key, span.first, span.last, bytes, root);
+        match crate::arcseal::seal(&n, &net, p, id, span.first, span.last, bytes, root) {
+            Ok(r) => {
+                let freed = prune_sealed(&n, p, r.first, r.last);
+                eprintln!("arc: sealed {} {}..={} ({} leaves) in {:.0} s; its plain blocks pruned ({:.1} MB)", r.chain, r.first, r.last, r.leaves, t0.elapsed().as_secs_f64(), freed as f64 / 1e6);
+            }
             Err(why) => {
-                eprintln!("arc: sealing {} {}..={}: {why}", e.chain, e.first, e.last);
-                *SEAL_NOTE.lock().unwrap() = format!("sealing {} blocks {}..={} failed: {why}", e.chain, e.first, e.last);
+                eprintln!("arc: sealing {} {}..={}: {why}", p.key, span.first, span.last);
+                *SEAL_NOTE.lock().unwrap() = format!("sealing {} blocks {}..={} failed: {why}", p.name, span.first, span.last);
             }
         }
     });
+}
+
+/// After a segment is sealed: its blocks' plain bodies go (the sealed copy answers for them).
+fn prune_sealed(node: &Node, p: &'static ChainParams, first: u64, last: u64) -> u64 {
+    let c = p.chain_no;
+    let mut freed = 0;
+    let bs: Vec<u32> = (first..=last).filter_map(|h| Some(node.chain.header(c, &node.chain.hash_at(c, h as u32).ok()??).ok()??.b)).filter(|b| *b != 0).collect();
+    for chunk in bs.chunks(1000) {
+        freed += node.chain.prune_blocks(p, chunk).unwrap_or(0);
+    }
+    freed
+}
+
+/// Where Earn ARCADE stands for a coin: sealed up to which height of how many.
+pub fn earn_progress(node: &Node, net: &Net, p: &ChainParams) -> (u64, u64) {
+    let sealed = crate::arcseal::replicas(node, net).iter().filter(|r| r.chain == p.key).map(|r| r.last + 1).max().unwrap_or(0);
+    (sealed, tip_of(node, p) as u64 + 1)
 }
 
 /// Registration (§4): every sealed replica of this arcade that isn't registered gets a commit

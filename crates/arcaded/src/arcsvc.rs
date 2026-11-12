@@ -1332,6 +1332,38 @@ pub fn sealing(node: &Node, req: &Value) -> Result<Value, String> {
               "weight": reg.weight(&me), "total_weight": total, "note": crate::arcseg::seal_note(), "height": st.chain.tip().height}))
 }
 
+/// `arc.earn {chain, on?}`: the coin's Earn ARCADE switch (docs/ARCADECHAIN.md §14.17) and where
+/// it stands. `on: true` installs the ARCADE chain here first when it isn't (the switch is the
+/// only step an operator takes); the coin must be kept in full.
+pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
+    let key = req["chain"].as_str().ok_or("give a chain")?;
+    let p = node.chain_params(key).ok_or_else(|| format!("{key} isn't installed here"))?;
+    if let Some(on) = req["on"].as_bool() {
+        if on {
+            if node.mode_of(key).as_deref() != Some("full") {
+                return Err(format!("Earn ARCADE needs {} kept in full (its whole database is sealed)", p.name));
+            }
+            if svc().is_none() {
+                install(&node.self_arc())?;
+            }
+        }
+        crate::arcseg::set_earn(node, key, on)?;
+        let _ = node.app.event("chains", &format!("Earn ARCADE {} for {}", if on { "on" } else { "off" }, p.name));
+    }
+    let on = crate::arcseg::earn_on(node, key);
+    let Some(svc) = svc() else { return Ok(json!({"chain": key, "on": on, "running": false})) };
+    let (sealed, of) = crate::arcseg::earn_progress(node, &svc.net, p);
+    let me = node.identity.verifying_key().to_bytes();
+    let (weight, total, pot, height) = {
+        let st = svc.st.lock().unwrap();
+        let reg = st.chain.storage();
+        (reg.weight(&me), reg.all_replicas().iter().map(|r| r.3).sum::<u64>() + genesis_total(), reg.pot(), st.chain.tip().height)
+    };
+    let sealing = crate::arcseal::sealing().map(|(_, d, o)| json!({"done": d, "of": o}));
+    Ok(json!({"chain": key, "on": on, "running": true, "sealed_to": sealed, "of": of, "sealing": sealing, "weight": weight, "total_weight": total,
+              "pot": pot, "height": height, "note": crate::arcseg::seal_note()}))
+}
+
 /// The genesis holders' weight together.
 pub fn genesis_total() -> u64 {
     DEF.get().map(|d| d.settings.holders.iter().map(|h| h.1).sum()).unwrap_or(0)

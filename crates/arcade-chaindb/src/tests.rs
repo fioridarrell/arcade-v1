@@ -340,6 +340,33 @@ fn prune_and_restore_a_block_body() {
     assert_eq!(f.db.block_raw(c, &b1.hash()).unwrap().unwrap(), b1.encode());
 }
 
+/// A pruned block held sealed (one copy): its bytes, its transactions by id and by place come
+/// back through the sealed reader, checked against the block's hash.
+#[test]
+fn a_pruned_block_reads_back_from_its_sealed_copy() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    let cb1 = tx(&[], &[(5000, p2pkh(1)), (700, p2pkh(2))], 1);
+    let b1 = block(f.g.hash(), vec![cb1.clone()], 2);
+    let b2 = block(b1.hash(), vec![tx(&[], &[(5000, p2pkh(3))], 2)], 3);
+    f.db.connect_blocks(f.p, &[b1.clone(), b2.clone()]).unwrap();
+    let b = f.db.header(c, &b1.hash()).unwrap().unwrap().b;
+    f.db.prune_block(f.p, b).unwrap();
+    assert!(f.db.block_raw(c, &b1.hash()).unwrap().is_none(), "no sealed reader yet: gone");
+    // The sealed copy answers for b1 only; a reader that hands back the wrong block is refused.
+    let raw1 = b1.encode();
+    let wrong = b2.encode();
+    let h1 = b1.hash();
+    f.db.set_sealed_reader(std::sync::Arc::new(move |_c, h| if *h == h1 { Some(raw1.clone()) } else { None }));
+    assert_eq!(f.db.block_raw(c, &b1.hash()).unwrap().unwrap(), b1.encode());
+    assert_eq!(f.db.tx_raw(f.p, &cb1.txid).unwrap().unwrap(), (cb1.raw.clone(), b));
+    assert_eq!(f.db.tx_at(f.p, b, 0).unwrap().unwrap().txid, cb1.txid);
+    assert_eq!(f.db.block_raw(c, &b2.hash()).unwrap().unwrap(), b2.encode(), "an unpruned block reads as before");
+    f.db.set_sealed_reader(std::sync::Arc::new(move |_c, _h| Some(wrong.clone())));
+    assert!(f.db.block_raw(c, &b1.hash()).unwrap().is_none(), "bytes of another block are not taken");
+    assert!(f.db.tx_raw(f.p, &cb1.txid).unwrap().is_none());
+}
+
 /// A chain with spends across blocks, scripts paid twice in one tx, and paying-and-spending
 /// the same script in one tx.
 fn busy_chain(g: &Block, n: u32) -> Vec<Block> {

@@ -294,6 +294,8 @@ fn main() {
         mesh_sizes: Mutex::new(Default::default()),
     });
     let _ = node.me.set(Arc::downgrade(&node));
+    // Pruned blocks of coins held sealed for Earn ARCADE read back from their sealed copies.
+    node.chain.set_sealed_reader(arcseal::reader(Arc::downgrade(&node)));
     chains::start_home(&node).expect("home indexes");
     // A local ARCADE test chain (stand-in rules; closed test networks only), which this
     // arcade can then install in Chains & Coins: crate::arcsvc.

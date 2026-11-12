@@ -62,8 +62,24 @@ fn read_replica(dir: &std::path::Path) -> Option<Replica> {
     })
 }
 
-/// Every finished replica this arcade holds on `net`.
+/// Every finished replica this arcade holds on `net` (kept in memory; read again after a seal).
 pub fn replicas(node: &Node, net: &Net) -> Vec<Replica> {
+    if let Some(v) = CACHE.lock().unwrap().clone() {
+        return v;
+    }
+    let v = replicas_on_disk(node, net);
+    *CACHE.lock().unwrap() = Some(v.clone());
+    v
+}
+
+static CACHE: Mutex<Option<Vec<Replica>>> = Mutex::new(None);
+
+/// The replica list changed (a seal finished, a chain was removed).
+pub fn forget_cache() {
+    *CACHE.lock().unwrap() = None;
+}
+
+fn replicas_on_disk(node: &Node, net: &Net) -> Vec<Replica> {
     let base = node.home.join("arc").join(net.key).join("sealed");
     let Ok(rd) = std::fs::read_dir(&base) else { return Vec::new() };
     let mut out: Vec<Replica> = rd.filter_map(|e| read_replica(&e.ok()?.path())).collect();
@@ -91,6 +107,7 @@ pub fn seal(node: &Node, net: &Net, p: &ChainParams, segment: Hash, first: u64, 
     }
     let r = seal_into(node, p, &dir, segment, first, last, bytes, root);
     *SEALING.lock().unwrap() = None;
+    forget_cache();
     if r.is_err() {
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -212,6 +229,56 @@ fn hashes(path: &std::path::Path) -> Result<Vec<Hash>, String> {
     Ok(b.chunks_exact(32).map(|c| c.try_into().unwrap()).collect())
 }
 
+/// The segment id a catalog entry for these heights would carry (the mask of every leaf).
+pub fn segment_id(net: &Net, chain: &str, first: u64, last: u64, bytes: u64, root: Hash) -> Hash {
+    arcade_arc::block::CatalogEntry { chain: chain.to_string(), family: arcade_arc::segment::FAMILY_BLOCKS, first, last, bytes, manifest: [0; 32], root, poster: [0; 32], sig: [0; 64] }
+        .segment(net)
+}
+
+impl Replica {
+    /// Bytes `at .. at + len` of the segment, unsealing only the leaves that hold them.
+    pub fn read(&self, owner: &[u8; 32], at: u64, len: u64) -> Result<Vec<u8>, String> {
+        if len == 0 {
+            return Ok(Vec::new());
+        }
+        let (first, count) = arcade_arc::segment::leaves_of(at, len);
+        let f = std::fs::File::open(self.dir.join("sealed.bin")).map_err(|e| e.to_string())?;
+        let mut sealed = vec![0u8; count as usize * SEALED_LEAF];
+        f.read_exact_at(&mut sealed, first * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+        let mut out = Vec::with_capacity(count as usize * DATA_LEAF);
+        for (k, s) in sealed.chunks_exact(SEALED_LEAF).enumerate() {
+            let s: &[u8; SEALED_LEAF] = s.try_into().unwrap();
+            out.extend_from_slice(&sloth::unseal_leaf(owner, &self.segment, first + k as u64, s).map_err(|e| format!("{e:?}"))?);
+        }
+        let skip = (at - first * DATA_LEAF as u64) as usize;
+        Ok(out[skip..skip + len as usize].to_vec())
+    }
+
+    /// Block `height` of the segment, as its chain sends it.
+    pub fn block(&self, owner: &[u8; 32], height: u64) -> Result<Vec<u8>, String> {
+        if height < self.first || height > self.last {
+            return Err("not in this segment".into());
+        }
+        let row = |h: u64| -> Result<u64, String> { Ok(u64::from_le_bytes(self.read(owner, arcade_arc::segment::row_at(self.first, h), 8)?.try_into().unwrap())) };
+        let start = row(height)?;
+        let end = if height == self.last { self.bytes } else { row(height + 1)? };
+        self.read(owner, start, end.checked_sub(start).ok_or("a bad table row")?)
+    }
+}
+
+/// The chain store's reader of sealed blocks (set at start): a pruned block of a coin this
+/// arcade holds sealed comes back from its replica.
+pub fn reader(node: std::sync::Weak<Node>) -> arcade_chaindb::db::SealedReader {
+    std::sync::Arc::new(move |c, hash| {
+        let node = node.upgrade()?;
+        let net = crate::arcsvc::defined_net()?.0;
+        let p = arcade_chain::params::ALL_CHAINS.iter().find(|p| p.chain_no == c)?;
+        let h = node.chain.header(c, hash).ok()??.height as u64;
+        let me = node.identity.verifying_key().to_bytes();
+        replicas(&node, &net).into_iter().find(|r| r.chain == p.key && r.first <= h && h <= r.last)?.block(&me, h).ok()
+    })
+}
+
 impl Replica {
     /// Leaf `i` of the data, read from the sealed copy (one squaring).
     #[cfg_attr(not(test), allow(dead_code))]
@@ -248,6 +315,39 @@ impl Replica {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A block reads back from a sealed segment through its table row, unsealing only its leaves.
+    #[test]
+    fn blocks_read_back_from_a_sealed_segment() {
+        let dir = std::env::temp_dir().join(format!("arcseal-read-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (owner, segment) = ([3u8; 32], [4u8; 32]);
+        // Heights 100..=104: blocks of different sizes, one crossing many leaves.
+        let blocks: Vec<Vec<u8>> = [50usize, 300, 1, 127, 900].iter().enumerate().map(|(i, n)| (0..*n).map(|k| (i * 31 + k) as u8).collect()).collect();
+        let mut seg = arcade_arc::segment::table(&blocks.iter().map(|b| b.len() as u64).collect::<Vec<_>>());
+        for b in &blocks {
+            seg.extend_from_slice(b);
+        }
+        let leaves = (seg.len() as u64).div_ceil(DATA_LEAF as u64);
+        let sealed: Vec<u8> = (0..leaves)
+            .flat_map(|i| {
+                let mut l = [0u8; DATA_LEAF];
+                let at = i as usize * DATA_LEAF;
+                let n = (seg.len() - at).min(DATA_LEAF);
+                l[..n].copy_from_slice(&seg[at..at + n]);
+                sloth::seal_leaf(&owner, &segment, i, &l)
+            })
+            .collect();
+        std::fs::write(dir.join("sealed.bin"), sealed).unwrap();
+        let r = Replica { chain: "peptest".into(), first: 100, last: 104, bytes: seg.len() as u64, leaves, segment, root: [0; 32], replica_root: [0; 32], dir: dir.clone() };
+        for (k, b) in blocks.iter().enumerate() {
+            assert_eq!(&r.block(&owner, 100 + k as u64).unwrap(), b, "block {}", 100 + k);
+        }
+        assert!(r.block(&owner, 99).is_err() && r.block(&owner, 105).is_err());
+        assert_ne!(r.block(&[9u8; 32], 101).ok().as_ref(), Some(&blocks[1]), "another key reads nonsense or fails");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// An opened leaf proves itself against both roots, and what unseals is the data.
     #[test]

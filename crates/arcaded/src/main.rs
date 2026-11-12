@@ -57,6 +57,7 @@ mod staker;
 mod sitesvc;
 mod grpsvc;
 mod feedsvc;
+mod follows;
 mod node;
 mod ordmarket;
 mod ordsafe;

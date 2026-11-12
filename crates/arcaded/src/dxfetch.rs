@@ -851,7 +851,31 @@ fn convert_job(node: Arc<Node>, p: &'static ChainParams, dir: PathBuf, m: Value,
 /// from its start) or checked and taken in.
 pub fn holds(key: &str) -> bool {
     let Some(p) = by_key(key) else { return false };
-    st().jobs.get(p.net).is_some_and(|j| phase_holds(&j.phase, j.started, j.waiting_since, now()))
+    st().jobs.get(p.net).is_some_and(|j| {
+        walk_held(&j.phase, j.started, j.waiting_since, now(), crate::watchdog::released(key, INDEXER, &format!("{}@{}", j.id, j.started)))
+    })
+}
+
+/// [`phase_holds`], unless the watchdog let the walk go on (`released`) while the copy is only
+/// fetched or checked; never while it is assembled or taken in.
+fn walk_held(phase: &str, started: u64, waiting_since: Option<u64>, now: u64, released: bool) -> bool {
+    phase_holds(phase, started, waiting_since, now) && !(released && soft_phase(phase))
+}
+
+/// Phases in which the copy is only fetched or checked: the ord tables aren't touched yet, so
+/// the chain's own walk may go on meanwhile (as it already does after WAIT_HOLD or 30 min).
+fn soft_phase(phase: &str) -> bool {
+    matches!(phase, "manifest" | "copy" | "checking")
+}
+
+/// For the watchdog (crate::watchdog): the copy that holds the ord walk and can let it go
+/// (fetched or checked only), as (token, what it is doing).
+pub fn releasable(key: &str) -> Option<(String, String)> {
+    let p = by_key(key)?;
+    let s = st();
+    let j = s.jobs.get(p.net)?;
+    (soft_phase(&j.phase) && phase_holds(&j.phase, j.started, j.waiting_since, now()))
+        .then(|| (format!("{}@{}", j.id, j.started), format!("ord snapshot {} {}: {}", short(&j.id), j.phase, j.detail)))
 }
 
 /// Whether a job in `phase` holds back the chain's own ord walk at `now`: while it is fetched
@@ -1040,6 +1064,15 @@ mod tests {
         assert!(!phase_holds("refused", t, None, t));
         assert!(!phase_holds("failed", t, None, t));
         assert!(!phase_holds("done", t, None, t));
+        // Let go by the watchdog: fetched or checked only, the walk goes on; never while the
+        // copy is assembled or taken in (the ord tables are written then).
+        for ph in ["manifest", "copy", "checking"] {
+            assert!(walk_held(ph, t, None, t + 10, false), "{ph} holds");
+            assert!(!walk_held(ph, t, None, t + 10, true), "{ph} let go");
+        }
+        for ph in ["assembling", "converting"] {
+            assert!(walk_held(ph, t, None, t + 10, true), "{ph} always holds");
+        }
     }
 
     #[test]

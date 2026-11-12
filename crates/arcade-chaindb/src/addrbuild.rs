@@ -87,6 +87,9 @@ struct Resume {
     merged: Vec<u8>,
     /// The kind being merged and the last key written for it (steps 2-5 go on after it).
     mergeat: Option<(u8, Vec<u8>)>,
+    /// A build from the stored blocks: (from, upto) heights whose run files are in `files`
+    /// (step 1 done), so a restart after step 1 goes on instead of reading every block again.
+    bf: Option<(u32, u32)>,
     files: Vec<(u8, PathBuf)>,
 }
 
@@ -100,6 +103,9 @@ impl Resume {
         );
         if let Some((k, key)) = &self.mergeat {
             o.push_str(&format!("mergeat {} {}\n", *k as char, hex::encode(key)));
+        }
+        if let Some((from, upto)) = self.bf {
+            o.push_str(&format!("bf {from} {upto}\n"));
         }
         for (k, p) in &self.files {
             o.push_str(&format!("file {} {}\n", *k as char, p.display()));
@@ -128,6 +134,10 @@ impl Resume {
                 "mergeat" => {
                     let (kc, key) = rest.split_once(' ')?;
                     r.mergeat = Some((kc.as_bytes().first().copied()?, hex::decode(key).ok()?));
+                }
+                "bf" => {
+                    let (a, b) = rest.split_once(' ')?;
+                    r.bf = Some((a.parse().ok()?, b.parse().ok()?));
                 }
                 "file" => {
                     let (kc, path) = rest.split_once(' ')?;
@@ -236,7 +246,36 @@ impl ChainDb {
             return Ok(moved);
         }
         let t: Vec<String> = TABLES.iter().map(|s| s.to_string()).collect();
-        self.clear_rows_batch(c, &t, max)
+        let n = self.clear_rows_batch(c, &t, max)?;
+        if n == 0 {
+            // The log is empty: no tx index rows wait any more. Left set, the flag would hold
+            // every protocol index walk on this chain for good (ChainDb::backfill waits on it).
+            self.repair_txs_pending(c)?;
+        }
+        Ok(n)
+    }
+
+    /// Whether some txs can't be found by id yet: their tx index rows are still in the log
+    /// (protocol index walks wait for the address build to write them).
+    pub fn txs_pending(&self, c: u16) -> Result<bool> {
+        Ok(self.store(c).read(|r| r.get(STATE, &k_state(c, TXS_PENDING)))?.is_some())
+    }
+
+    /// Clear a stale TXS_PENDING flag: set, but no address rows wait to be built (so no build
+    /// will clear it) and the chain's log is empty (so no tx index row is missing). True if
+    /// cleared. Touches nothing else.
+    pub fn repair_txs_pending(&self, c: u16) -> Result<bool> {
+        if !self.txs_pending(c)? || self.addresses_pending(c)? {
+            return Ok(false);
+        }
+        let pre = k_chain(c);
+        self.wstore(c)?.write(|w| {
+            if !w.scan_prefix_limit(ADDR_LOG, &pre, 1)?.is_empty() {
+                return Ok(false);
+            }
+            w.del(STATE, &k_state(c, TXS_PENDING))?;
+            Ok(true)
+        })
     }
 
     /// Turn the Addresses index on. Blocks connected from now on write their rows; those
@@ -269,10 +308,12 @@ impl ChainDb {
         let backfill = self.store(c).read(|r| r.get(STATE, &k_state(c, BACKFILL)))?.map(|v| be_u32(&v, 0));
         let from = self.store(c).read(|r| r.get(STATE, &k_state(c, BACKFILL_FROM)))?.map(|v| be_u32(&v, 0)).unwrap_or(1).max(1);
         std::fs::create_dir_all(tmp).map_err(io)?;
-        // A build cut short by a restart goes on where it was (log builds; backfills start over).
+        // A build cut short by a restart goes on where it was. A build from the stored blocks
+        // goes on once its step 1 (reading the blocks) was done for the same heights; cut short
+        // in step 1 it starts over.
         let saved = self.store(c).read(|r| r.get(STATE, &k_state(c, RUNS_STATE)))?.and_then(|v| Resume::decode(&v));
         let mut res: Resume = match saved {
-            Some(r) if backfill.is_none() && r.whole() => {
+            Some(r) if r.whole() && (backfill.is_none() || (r.bf.is_some() && r.bf == backfill.map(|b| (from, b)))) => {
                 note(format!("building addresses: going on where the last build stopped ({} rows sorted, {} run files)", r.rows, r.files.len()));
                 r
             }
@@ -288,7 +329,7 @@ impl ChainDb {
         let upto = res.upto;
         self.addr_progress.lock().unwrap().insert(c, Default::default());
         let mut runs: Vec<(u8, PathBuf)> = Vec::new();
-        if let Some(bf) = backfill {
+        if let Some(bf) = backfill.filter(|b| res.bf != Some((from, *b))) {
             if !self.backfill_runs(params, from, bf, tmp, stop, note, &mut runs)? {
                 for (_, p) in &runs {
                     let _ = std::fs::remove_file(p);
@@ -302,6 +343,12 @@ impl ChainDb {
                     res.counts[i] += std::fs::metadata(p).map(|m| m.len() / 64).unwrap_or(0);
                 }
             }
+            // Recorded: a restart from here on keeps these files and goes on after step 1.
+            res.bf = Some((from, bf));
+            res.files.append(&mut runs);
+            self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()))?;
+        } else if backfill.is_some() {
+            self.set_step(c, 0, 1, 1, "blocks", 2);
         }
         if !res.cut_done {
             if !self.cut_runs(c, &mut res, tmp, stop, note)? {
@@ -327,9 +374,6 @@ impl ChainDb {
                 }
                 let recs_total = res.counts[i];
                 let mut saved = |key: &[u8]| -> Result<()> {
-                    if backfill.is_some() {
-                        return Ok(());
-                    }
                     res.mergeat = Some((*kind, key.to_vec()));
                     let v = res.encode();
                     self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &v))
@@ -338,11 +382,9 @@ impl ChainDb {
                     return Ok(false);
                 }
                 self.set_step(c, i + 1, res.counts[i], res.counts[i], "rows", 2);
-                if backfill.is_none() {
-                    res.merged.push(*kind);
-                    res.mergeat = None;
-                    self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()))?;
-                }
+                res.merged.push(*kind);
+                res.mergeat = None;
+                self.wstore(c)?.write(|w| w.put(STATE, &k_state(c, RUNS_STATE), &res.encode()))?;
             }
             note("building addresses: step 6 of 6, clearing the log".into());
             if backfill.is_some() {
@@ -354,8 +396,8 @@ impl ChainDb {
             self.clear_log(c, upto, res.log_rows, stop)
         })();
         let finished = matches!(done, Ok(true));
-        // Kept for the next start unless finished (or a backfill, which starts over anyway).
-        if finished || backfill.is_some() {
+        // Kept for the next start unless finished.
+        if finished {
             for (_, p) in &runs {
                 let _ = std::fs::remove_file(p);
             }

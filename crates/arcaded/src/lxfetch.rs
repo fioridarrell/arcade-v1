@@ -692,7 +692,27 @@ fn take_in(node: &Node, p: &ChainParams, file: &std::path::Path, m: &Value) -> R
 /// minutes from its start, so a copy that never completes doesn't stop the index) or taken in.
 pub fn holds(key: &str) -> bool {
     let Some(p) = by_key(key) else { return false };
-    st().jobs.get(p.net).is_some_and(|j| j.phase == "converting" || (matches!(j.phase.as_str(), "manifest" | "copy" | "votes") && now() < j.started + 1800))
+    st().jobs.get(p.net).is_some_and(|j| {
+        j.phase == "converting"
+            || (soft_phase(&j.phase) && now() < j.started + 1800
+                // The watchdog let the walk go on while this copy is only fetched.
+                && !crate::watchdog::released(key, "ledger.v1", &format!("{}@{}", j.id, j.started)))
+    })
+}
+
+/// Phases in which the copy is only fetched or voted on: the ledger isn't touched yet.
+fn soft_phase(phase: &str) -> bool {
+    matches!(phase, "manifest" | "copy" | "votes")
+}
+
+/// For the watchdog (crate::watchdog): the copy that holds the ledger walk and can let it go,
+/// as (token, what it is doing).
+pub fn releasable(key: &str) -> Option<(String, String)> {
+    let p = by_key(key)?;
+    let s = st();
+    let j = s.jobs.get(p.net)?;
+    (soft_phase(&j.phase) && now() < j.started + 1800)
+        .then(|| (format!("{}@{}", j.id, j.started), format!("ledger copy {} {}: {}", short(&j.id), j.phase, j.detail)))
 }
 
 /// Whether a chain's own walk of an index should wait for a copy (ledger: lx, ord: dx).

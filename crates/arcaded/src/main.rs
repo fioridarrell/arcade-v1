@@ -73,6 +73,7 @@ mod udpsvc;
 mod turnsvc;
 mod v1copy;
 mod vxshare;
+mod watchdog;
 mod v1import;
 mod shares;
 mod secretbox;

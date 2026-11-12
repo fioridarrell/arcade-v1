@@ -764,3 +764,74 @@ fn read_only_open_child() {
     let ro = ChainDb::open_readonly(&path).unwrap();
     println!("child read tip {}", ro.tip(PEPECOIN_TEST.chain_no).unwrap().unwrap().height);
 }
+
+/// A build from the stored blocks (Addresses added to a stored chain) stopped after its step 1
+/// goes on at the next start: the blocks' run files and the record are kept, the blocks aren't
+/// read again, and the tables come out as live.
+#[test]
+fn backfill_build_resumes_after_reading_the_blocks() {
+    let live = fixture();
+    let blocks = busy_chain(&live.g, 40);
+    live.db.connect_blocks(live.p, &blocks).unwrap();
+    let want = address_tables(&live.db);
+    let c = live.p.chain_no;
+    for stop_in in ["step 2 of 6", "step 3 of 6"] {
+        let f = fixture();
+        f.db.set_addresses_off(c).unwrap();
+        f.db.connect_blocks(f.p, &blocks).unwrap();
+        f.db.set_addresses_on(c).unwrap();
+        let tmp = f._dir.path().join("tmp");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let mut seen = 0;
+        let r = f.db.build_addresses(f.p, &tmp, &stop, &mut |s| {
+            if s.contains(stop_in) {
+                seen += 1;
+                if seen == 2 {
+                    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+        });
+        assert!(!r.unwrap(), "{stop_in}: stopped part way");
+        let files = f.db.addr_resume_files();
+        assert!(!files.is_empty() && files.iter().all(|p| p.exists()), "{stop_in}: the blocks' run files kept");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let (mut resumed, mut reread) = (false, false);
+        assert!(f.db.build_addresses(f.p, &tmp, &stop, &mut |s| {
+            resumed |= s.contains("going on where the last build stopped");
+            reread |= s.contains("reading the stored blocks");
+        }).unwrap());
+        assert!(resumed && !reread, "{stop_in}: went on without reading the blocks again");
+        assert!(!f.db.addresses_pending(c).unwrap(), "{stop_in}: built");
+        assert!(f.db.store(c).read(|r| r.get(STATE, &k_state(c, crate::addrbuild::RUNS_STATE))).unwrap().is_none(), "record gone");
+        assert!(files.iter().all(|p| !p.exists()), "run files deleted");
+        let mut got = address_tables(&f.db);
+        got[3] = want[3].clone();
+        assert_eq!(got, want, "{stop_in}: resumed backfill build = live");
+    }
+}
+
+/// TXS_PENDING (tx index rows still in the log) holds every protocol index walk. Removing the
+/// Addresses index mid-way moves those rows to the tx index; the flag goes with the last of
+/// them, and a stale flag is cleared by repair_txs_pending, never a real one.
+#[test]
+fn txs_pending_cleared_when_addresses_removed() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    let blocks = busy_chain(&f.g, 40);
+    f.db.set_coin_cache_mb(1024);
+    for part in blocks.chunks(7) {
+        f.db.connect_blocks_with(f.p, part, true, true).unwrap();
+    }
+    f.db.flush_coins(c).unwrap();
+    assert!(f.db.txs_pending(c).unwrap(), "rows put off");
+    assert!(!f.db.repair_txs_pending(c).unwrap(), "a real flag (a build pending) is left alone");
+    assert!(f.db.txs_pending(c).unwrap());
+    // Removed before it was built.
+    f.db.set_addresses_off(c).unwrap();
+    while f.db.clear_address_rows_batch(c, 50).unwrap() > 0 {}
+    assert!(!f.db.txs_pending(c).unwrap(), "cleared with the log");
+    // A stale flag (left by an older version): cleared by the repair.
+    f.db.wstore(c).unwrap().write(|w| w.put(STATE, &k_state(c, crate::addrbuild::TXS_PENDING), b"1")).unwrap();
+    assert!(f.db.repair_txs_pending(c).unwrap(), "stale flag cleared");
+    assert!(!f.db.txs_pending(c).unwrap());
+}

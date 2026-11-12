@@ -549,6 +549,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
                     (st.chain.storage().clone(), st.chain.storage().weight(&me), st.chain.tip().height)
                 };
                 crate::arcseg::round(&n, &s2.net, reg.catalog(), weight);
+                crate::arcseg::auto_seal(&n, &s2.net, reg.catalog());
                 crate::arcseg::register(&n, &s2.net, s2.params, &reg, tip);
                 std::thread::sleep(Duration::from_secs(if crate::arcseg::busy() { 2 } else { 60 }));
             })
@@ -1040,6 +1041,23 @@ pub fn raw_block(id: &Hash256) -> Option<Vec<u8>> {
     svc()?.st.lock().unwrap().chain.block(id).map(Block::encode)
 }
 
+/// Block `h` of the branch this arcade is on, as the chain writes it: what a segment of the
+/// ARCADE chain holds (block 0 has no bytes). None past the tip.
+pub fn raw_block_at(h: u64) -> Option<Vec<u8>> {
+    let svc = svc()?;
+    let st = svc.st.lock().unwrap();
+    if h == 0 {
+        return Some(Vec::new());
+    }
+    let id = st.chain.id_at(h)?;
+    st.chain.block(&id).map(Block::encode)
+}
+
+/// The ARCADE chain's height here.
+pub fn height() -> Option<u64> {
+    Some(svc()?.st.lock().unwrap().chain.tip().height)
+}
+
 /// The header of a block this arcade holds, as the chain writes it.
 pub fn raw_header(id: &Hash256) -> Option<Vec<u8>> {
     let svc = svc()?;
@@ -1265,6 +1283,58 @@ pub fn replicas(node: &Node) -> Result<Value, String> {
     drop(st);
     let sealing = crate::arcseal::sealing().map(|(id, done, of)| json!({"segment": id, "done": done, "of": of}));
     Ok(json!({"replicas": list, "sealing": sealing, "weight": weight}))
+}
+
+/// `arc.sealing {chain}`: the segments of a chain as this arcade holds them for the ARCADE
+/// chain: waiting (offered, not confirmed), queued (confirmed, to be sealed here), sealing
+/// (done of leaves), registering, earning (its weight); this arcade's weight and the chain's
+/// total; why sealing waits, if it does. {on: false} when the ARCADE chain isn't running.
+pub fn sealing(node: &Node, req: &Value) -> Result<Value, String> {
+    let Some(svc) = svc() else { return Ok(json!({"on": false})) };
+    let key = req["chain"].as_str().ok_or("give a chain")?;
+    let me = node.identity.verifying_key().to_bytes();
+    let replicas = crate::arcseal::replicas(node, &svc.net);
+    let busy = crate::arcseal::sealing();
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let cat = reg.catalog();
+    let listed = svc.net.listed.contains(&key);
+    let kept = crate::arcseg::kept(node, &svc.net).iter().any(|p| p.key == key);
+    let mut rows = Vec::new();
+    for (first, last, l) in cat.spans(key, arcade_arc::segment::FAMILY_BLOCKS) {
+        let Some(l) = l else { continue };
+        let id = arcade_arc::block::replica_id(&svc.net, &l.id, &me);
+        let mut v = json!({"first": first, "last": last, "bytes": l.entry.bytes, "segment": hex::encode(l.id)});
+        let holders = reg.all_replicas().iter().filter(|r| r.1 == l.id).count();
+        v["holders"] = json!(holders);
+        if reg.registered(&id) {
+            v["state"] = json!("earning");
+            v["weight"] = json!(l.entry.bytes / holders.max(1) as u64);
+        } else if replicas.iter().any(|r| r.segment == l.id) {
+            v["state"] = json!("registering");
+            v["commit_height"] = json!(reg.commit(&id).map(|c| c.3));
+        } else if let Some((sid, done, of)) = busy.as_ref().filter(|b| b.0 == hex::encode(l.id)) {
+            let _ = sid;
+            v["state"] = json!("sealing");
+            v["done"] = json!(done);
+            v["of"] = json!(of);
+        } else {
+            v["state"] = json!("queued");
+        }
+        rows.push(v);
+    }
+    for (_, c) in cat.all_waiting().filter(|(_, c)| c.entry.chain == key) {
+        rows.push(json!({"first": c.entry.first, "last": c.entry.last, "bytes": c.entry.bytes, "state": "waiting", "behind": c.behind.len()}));
+    }
+    rows.sort_by_key(|v| v["first"].as_u64());
+    let total: u64 = reg.all_replicas().iter().map(|r| r.3).sum::<u64>() + crate::arcsvc::genesis_total();
+    Ok(json!({"on": true, "chain": key, "listed": listed, "kept": kept, "segment_bytes": cat.segment_bytes(), "segments": rows,
+              "weight": reg.weight(&me), "total_weight": total, "note": crate::arcseg::seal_note(), "height": st.chain.tip().height}))
+}
+
+/// The genesis holders' weight together.
+pub fn genesis_total() -> u64 {
+    DEF.get().map(|d| d.settings.holders.iter().map(|h| h.1).sum()).unwrap_or(0)
 }
 
 /// `arc.open {segment, leaves:[i..]}`: leaves of one of this arcade's replicas, opened.

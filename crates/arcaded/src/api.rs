@@ -516,6 +516,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.seal" => crate::arcsvc::seal(&node.self_arc(), req),
         "arc.replicas" => crate::arcsvc::replicas(node),
         "arc.open" => crate::arcsvc::open(node, req),
+        "arc.sealing" => crate::arcsvc::sealing(node, req),
         "chains.add" => {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::chains::add(&node.self_arc(), &s("key").ok_or("key required")?, &s("mode").unwrap_or_else(|| "full".into()), with)

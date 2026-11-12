@@ -204,8 +204,7 @@ fn seal_into(node: &Node, p: &ChainParams, dir: &std::path::Path, segment: Hash,
 }
 
 fn block(node: &Node, p: &ChainParams, h: u64) -> Result<Vec<u8>, String> {
-    let id = node.chain.hash_at(p.chain_no, h as u32).ok().flatten().ok_or_else(|| format!("{} block {h} isn't here", p.name))?;
-    node.chain.block_raw(p.chain_no, &id).ok().flatten().ok_or_else(|| format!("{} block {h} isn't here", p.name))
+    crate::arcseg::block_bytes(node, p, h as u32).ok_or_else(|| format!("{} block {h} isn't here", p.name))
 }
 
 fn hashes(path: &std::path::Path) -> Result<Vec<Hash>, String> {

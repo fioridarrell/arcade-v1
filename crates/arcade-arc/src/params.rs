@@ -91,7 +91,7 @@ pub const MAINNET: Net = Net {
     tag: b"ARCADE/arc",
     // 2027-01-01 00:00:00 UTC.
     genesis_time: Some(1_798_761_600),
-    listed: &["pep", "peptest", "doge", "dgb", "flop", "wjk", "kot", "ltc", "btc"],
+    listed: &["arc", "pep", "peptest", "doge", "dgb", "flop", "wjk", "kot", "ltc", "btc"],
 };
 
 pub const TESTNET: Net = Net {
@@ -103,7 +103,7 @@ pub const TESTNET: Net = Net {
     tag: b"ARCADE/arctest",
     genesis_time: None,
     // The main network's, and the other test chains: small, so cheap to try things on.
-    listed: &["pep", "peptest", "doge", "dgb", "dgbtest", "flop", "wjk", "kot", "ltc", "ltctest", "btc"],
+    listed: &["arctest", "pep", "peptest", "doge", "dgb", "dgbtest", "flop", "wjk", "kot", "ltc", "ltctest", "btc"],
 };
 
 /// The first height of the epoch `height` is in.

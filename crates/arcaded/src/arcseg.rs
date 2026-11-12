@@ -127,15 +127,28 @@ pub fn busy() -> bool {
     BUSY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-fn block_bytes(node: &Node, p: &ChainParams, h: u32) -> Option<Vec<u8>> {
+/// Block `h` of a kept chain as its segments hold it: a coin's as its network sends it; the
+/// ARCADE chain's as the chain writes it (its stored copy has another shape).
+pub fn block_bytes(node: &Node, p: &ChainParams, h: u32) -> Option<Vec<u8>> {
+    if crate::arcsvc::runs(p) {
+        return crate::arcsvc::raw_block_at(h as u64);
+    }
     let id = node.chain.hash_at(p.chain_no, h).ok()??;
     node.chain.block_raw(p.chain_no, &id).ok()?
+}
+
+/// A chain's height here.
+fn tip_of(node: &Node, p: &ChainParams) -> u32 {
+    if crate::arcsvc::runs(p) {
+        return crate::arcsvc::height().unwrap_or(0) as u32;
+    }
+    node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0)
 }
 
 /// Measure the ranges of `p` not measured yet, up to `SETTLED` below its tip (a few at a time:
 /// every block is read once). Whether some are left.
 fn measure(node: &Node, p: &ChainParams, most: usize) -> bool {
-    let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+    let tip = tip_of(node, p);
     let settled = tip.saturating_sub(SETTLED) as u64;
     for _ in 0..most {
         let i = CUTS.lock().unwrap().entry(p.chain_no).or_default().ranges.len() as u64;
@@ -183,8 +196,11 @@ pub fn root_of(node: &Node, p: &ChainParams, first: u64, last: u64) -> Option<(u
 pub fn kept(node: &Node, net: &Net) -> Vec<&'static ChainParams> {
     net.listed
         .iter()
-        .filter_map(|k| node.chain_params(k))
-        .filter(|p| node.mode_of(p.key).as_deref() == Some("full") && crate::chains::kept(node, p))
+        .filter_map(|k| match crate::arcsvc::defined().filter(|d| d.key == *k) {
+            // The ARCADE chain itself, while it runs here.
+            Some(d) => crate::arcsvc::runs(d).then_some(d),
+            None => node.chain_params(k).filter(|p| node.mode_of(p.key).as_deref() == Some("full") && crate::chains::kept(node, p)),
+        })
         .collect()
 }
 
@@ -238,6 +254,70 @@ pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64) {
         add(Item::CatalogEntry(e));
     }
     BUSY.store(more, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Bytes free on the disk holding `path`.
+fn free_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+/// Bytes on the disk in all, for the 10% floor.
+fn disk_bytes(path: &std::path::Path) -> Option<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    (unsafe { libc::statvfs(c.as_ptr(), &mut s) } == 0).then(|| s.f_blocks as u64 * s.f_frsize as u64)
+}
+
+/// Free space a sealing must leave: 50 GB, or 10% of the disk if that is more.
+const FREE_FLOOR: u64 = 50_000_000_000;
+
+/// What automatic sealing is waiting on, when it isn't sealing (shown in the cards).
+static SEAL_NOTE: Mutex<String> = Mutex::new(String::new());
+
+pub fn seal_note() -> String {
+    SEAL_NOTE.lock().unwrap().clone()
+}
+
+/// Sealing is the only way to hold the ARCADE chain's storage (Martin 2026-11-11): every
+/// confirmed segment of a chain this arcade keeps is sealed, one at a time, in the background,
+/// and then registered (`register`). A segment that would leave less than [`FREE_FLOOR`] (or
+/// 10% of the disk) free waits until there is room: a sealed copy sits beside the chain's own
+/// blocks until the database keeps only the sealed copy.
+pub fn auto_seal(node: &Node, net: &Net, catalog: &Catalog) {
+    if crate::arcseal::sealing().is_some() {
+        return;
+    }
+    let have: Vec<Hash> = crate::arcseal::replicas(node, net).iter().map(|r| r.segment).collect();
+    let next = kept(node, net).into_iter().find_map(|p| {
+        catalog.spans(p.key, segment::FAMILY_BLOCKS).find_map(|(_, _, l)| l.filter(|l| !have.contains(&l.id)).map(|l| (p, l.clone())))
+    });
+    let Some((p, l)) = next else {
+        *SEAL_NOTE.lock().unwrap() = String::new();
+        return;
+    };
+    let dir = node.home.join("arc");
+    let need = l.entry.bytes / 127 * 128 + l.entry.bytes / 127 * 64 + l.entry.bytes;
+    let floor = FREE_FLOOR.max(disk_bytes(&dir).unwrap_or(0) / 10);
+    if free_bytes(&dir).is_some_and(|f| f < need.saturating_add(floor)) {
+        *SEAL_NOTE.lock().unwrap() = format!("waiting for disk space: sealing {} blocks {}..={} needs {:.1} GB and keeps {:.0} GB free", p.name, l.entry.first, l.entry.last, need as f64 / 1e9, floor as f64 / 1e9);
+        return;
+    }
+    *SEAL_NOTE.lock().unwrap() = String::new();
+    let (n, net, e, id) = (node.self_arc(), *net, l.entry.clone(), l.id);
+    let _ = std::thread::Builder::new().name("arc sealing".into()).spawn(move || {
+        let t0 = std::time::Instant::now();
+        match crate::arcseal::seal(&n, &net, p, id, e.first, e.last, e.bytes, e.root) {
+            Ok(r) => eprintln!("arc: sealed {} {}..={} ({} leaves) in {:.0} s", r.chain, r.first, r.last, r.leaves, t0.elapsed().as_secs_f64()),
+            Err(why) => {
+                eprintln!("arc: sealing {} {}..={}: {why}", e.chain, e.first, e.last);
+                *SEAL_NOTE.lock().unwrap() = format!("sealing {} blocks {}..={} failed: {why}", e.chain, e.first, e.last);
+            }
+        }
+    });
 }
 
 /// Registration (§4): every sealed replica of this arcade that isn't registered gets a commit

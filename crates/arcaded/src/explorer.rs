@@ -577,11 +577,28 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         }
         "explorer.tokens" => {
             x.need("tokens")?;
-            // Offset paging (ticks in alphabetical order), with the total for the pager.
+            // Offset paging (ticks in alphabetical order), with the total for the pager. `q`: ticks starting with it;
+            // `open`: only ticks still being minted (minted under supply; the Token Minter's suggestions, 2026-11-12).
             let off = req["offset"].as_u64().unwrap_or(0) as usize;
             let want = n(50, 200) as usize;
-            let pre = KeyBuf::new().u16(x.c()).done();
-            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, off + want)).map_err(e)?;
+            let q = s("q").map(|t| t.trim().to_lowercase()).unwrap_or_default();
+            if q.len() > 32 {
+                return Err("a tick is at most 32 characters".into());
+            }
+            let open = req["open"] == true;
+            let pre = KeyBuf::new().u16(x.c()).bytes(q.as_bytes()).done();
+            // With `open` the closed ones are skipped, so read further (bounded) to fill the page.
+            let scan = if open { (off + want).saturating_mul(20).min(20_000) } else { off + want };
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::TICK, &pre, scan)).map_err(e)?;
+            let rows: Vec<_> = if open {
+                rows.into_iter().filter(|(_, v)| {
+                    let v: Value = serde_json::from_slice(v).unwrap_or(Value::Null);
+                    let big = |k: &str| v[k].as_str().and_then(|x| x.parse::<u128>().ok()).unwrap_or(0);
+                    big("minted") < big("supply")
+                }).collect()
+            } else {
+                rows
+            };
             Ok(json!({"protocol": tokens::protocol(x.p).map(|t| t.0).unwrap_or("tokens"), "total": tokens::tick_count(&x.node.chain, x.c()),
                 "offset": off, "items": rows.into_iter().skip(off).filter_map(|(k, v)| {
                 let mut v: Value = serde_json::from_slice(&v).ok()?;

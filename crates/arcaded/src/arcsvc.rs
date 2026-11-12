@@ -182,8 +182,6 @@ pub struct Svc {
     pub params: &'static ChainParams,
     genesis_hex: String,
     steps_per_second: u64,
-    /// Where this arcade's own blocks pay their fees.
-    pay: Option<Vec<u8>>,
     st: Mutex<State>,
     peers: Mutex<HashMap<String, Peer>>,
     /// Set (under `st`) when the chain is removed: nothing is taken in or written after.
@@ -349,21 +347,16 @@ fn seed_proof(chain: &LocalChain) -> Option<TimeProof> {
 
 /// This arcade's block on the tip, as its ticket allows: the coinbase pays what is owed,
 /// then the fees of the waiting transactions the block takes to `pay`.
-fn write_block(chain: &LocalChain, pool: &Pool, pay: Option<&[u8]>, secret: &[u8; 32], ticket: &Ticket, seed: Option<TimeProof>, now: u64) -> Block {
+fn write_block(chain: &LocalChain, pool: &Pool, secret: &[u8; 32], ticket: &Ticket, seed: Option<TimeProof>, now: u64) -> Block {
     // The storage items waiting (crate::arcseg) that this block can carry, in group order.
     let mut items = chain.storage().fitting(&crate::arcseg::waiting(), ticket.height);
     items.sort_by_key(|i| i.tag() >> 4);
     let items = chain.storage().fitting(&items, ticket.height);
     let time = now.max(chain.tip().time + 1);
-    let mut outputs = chain.payouts();
-    // Room for the transactions: the block's, less the coinbase with a fee output.
-    let fee_out = pay.map(|script| (u64::MAX, script.to_vec()));
-    let coinbase_bytes = coins::coinbase(ticket.height, &ticket.prev, b"", &[outputs.as_slice(), fee_out.as_slice()].concat()).raw.len();
-    let (mut txs, fees) = pool.pick(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes));
-    // Fees under the dust amount can't be paid out, and with nowhere to pay they are burned.
-    if let Some(script) = pay.filter(|_| fees >= params::DUST) {
-        outputs.push((fees, script.to_vec()));
-    }
+    // The coinbase pays what is owed; fees join the pot (docs/ARCADECHAIN.md §14.18).
+    let outputs = chain.payouts();
+    let coinbase_bytes = coins::coinbase(ticket.height, &ticket.prev, b"", &outputs).raw.len();
+    let (mut txs, _fees) = pool.pick(params::MAX_TX_BYTES.saturating_sub(coinbase_bytes));
     txs.insert(0, coins::coinbase(ticket.height, &ticket.prev, b"", &outputs));
     ticket.seal(chain.net(), secret, time, txs, items, StandIn.prove(&ticket.challenge, ticket.steps), seed)
 }
@@ -394,7 +387,7 @@ fn run_writer(node: Arc<Node>, svc: Arc<Svc>) {
             if st.since.elapsed().as_secs_f64() < t.steps as f64 / svc.steps_per_second as f64 {
                 continue;
             }
-            written = Some(write_block(&st.chain, &st.pool, svc.pay.as_deref(), &secret, t, seed.clone(), arcade_app::now()));
+            written = Some(write_block(&st.chain, &st.pool, &secret, t, seed.clone(), arcade_app::now()));
             ticket = None;
         }
         let Some(b) = written.clone() else { continue };
@@ -527,7 +520,6 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         params: p,
         genesis_hex: genesis.to_hex(),
         steps_per_second: s.steps_per_second,
-        pay,
         st: Mutex::new(State { chain, log, since: Instant::now(), pool: Pool::default(), refused: HashSet::new() }),
         peers: Default::default(),
         stop: AtomicBool::new(false),
@@ -1487,14 +1479,14 @@ mod tests {
     }
 
     /// `who`'s block on the tip, 150 seconds after it, with what waits in `pool`.
-    fn block_with(c: &LocalChain, who: u8, pool: &Pool, pay: Option<&[u8]>) -> Block {
+    fn block_with(c: &LocalChain, who: u8, pool: &Pool) -> Block {
         let seed = seed_proof(c);
         let t = c.ticket(&secret(who), seed.as_ref()).unwrap();
-        write_block(c, pool, pay, &secret(who), &t, seed, c.tip().time + params::BLOCK_SECONDS)
+        write_block(c, pool, &secret(who), &t, seed, c.tip().time + params::BLOCK_SECONDS)
     }
 
     fn block_by(c: &LocalChain, who: u8) -> Block {
-        block_with(c, who, &Pool::default(), Some(&pay_script(who)))
+        block_with(c, who, &Pool::default())
     }
 
     /// `who` spends its coin `from` (worth `value`): `amount` to `to`, the rest less `fee` back.
@@ -1589,7 +1581,7 @@ mod tests {
     }
 
     #[test]
-    fn a_block_takes_what_waits_and_its_writer_the_fees() {
+    fn a_block_takes_what_waits_and_its_fees_join_the_pot() {
         let mut c = chain();
         // The first pot is paid in block 100 and can be spent 100 blocks on.
         grow(&mut c, 2, 199);
@@ -1607,27 +1599,21 @@ mod tests {
         // A block earlier the reward is too young, and the rules say so too.
         assert!(Pool::default().add(first.clone(), c.coins(), next - 1).is_err());
 
-        // Writer 2's block carries both, and its coinbase ends with their fees.
+        // Writer 2's block carries both, the parent first; its coinbase pays only what is owed.
         let fees = params::COIN / 100 + params::COIN / 50;
-        let b = block_with(&c, 2, &pool, Some(&pay_script(2)));
+        let b = block_with(&c, 2, &pool);
         assert_eq!(b.txs.iter().map(|t| t.txid).collect::<Vec<_>>()[1..], [first.txid, second.txid]);
-        let last = b.txs[0].outputs.last().unwrap();
-        assert_eq!((last.value, &last.script_pubkey), (fees, &pay_script(2)));
-        // A writer with nowhere to be paid leaves the fees: the block holds all the same.
-        let burnt = block_with(&c, 1, &pool, None);
-        assert_eq!(burnt.txs.len(), 3);
-        assert_eq!(burnt.txs[0].outputs.len(), c.payouts().len());
-        assert_eq!(b.txs[0].outputs.len(), c.payouts().len() + 1);
-        let mut other = chain();
-        for h in 1..=c.tip().height {
-            other.accept(c.block(&c.id_at(h).unwrap()).unwrap().clone(), LATE).unwrap();
-        }
-        assert!(matches!(other.accept(burnt, LATE), Ok(Accepted::Tip { .. })));
-
+        assert_eq!(b.txs[0].outputs.len(), c.payouts().len());
+        // Any writer writes the same block body.
+        assert_eq!(block_with(&c, 1, &pool).txs, b.txs);
+        let pot = c.storage().pot();
+        let paid: u64 = b.txs[0].outputs.iter().map(|o| o.value).sum();
         assert!(matches!(c.accept(b, LATE), Ok(Accepted::Tip { .. })));
         let theirs: u64 = c.coins().values().filter(|coin| coin.script == pay_script(2) && !coin.coinbase).map(|coin| coin.value).sum();
         assert_eq!(theirs, 8 * params::COIN);
-        assert!(c.coins().values().any(|coin| coin.coinbase && coin.height == 200 && coin.value == fees));
+        // The fees are nobody's coin: they wait in the pot for the next settlement.
+        assert!(!c.coins().values().any(|coin| coin.coinbase && coin.height == 200 && coin.value == fees));
+        assert_eq!(c.storage().pot(), pot - paid + params::BLOCK_REWARD + fees);
         pool.retip(c.coins(), c.tip().height + 1, Vec::new());
         assert!(pool.is_empty());
     }

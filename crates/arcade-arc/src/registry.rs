@@ -67,10 +67,13 @@ pub struct Registry {
     blocks: Vec<(Hash256, Hash)>,
     commits: BTreeMap<Hash, Commit>,
     replicas: BTreeMap<Hash, Replica>,
+    /// Shares too small to pay, owed to their address and paid with its next payout.
+    credit: BTreeMap<Payout, u64>,
 }
 
 pub struct Undo {
     pot: u64,
+    credit: Option<BTreeMap<Payout, u64>>,
     catalog: catalog::Undo,
     ops: Vec<Op>,
 }
@@ -112,7 +115,7 @@ impl Registry {
                 return None;
             }
         }
-        Some(Registry { net: *net, genesis, catalog: Catalog::new(*net, segment_bytes), pot: 0, blocks: Vec::new(), commits: BTreeMap::new(), replicas: BTreeMap::new() })
+        Some(Registry { net: *net, genesis, catalog: Catalog::new(*net, segment_bytes), pot: 0, blocks: Vec::new(), commits: BTreeMap::new(), replicas: BTreeMap::new(), credit: BTreeMap::new() })
     }
 
     pub fn catalog(&self) -> &Catalog {
@@ -142,6 +145,61 @@ impl Registry {
 
     fn total(&self) -> u128 {
         self.shares().values().sum()
+    }
+
+    /// An epoch's settlement at `height` (docs/ARCADECHAIN.md §14.18): the pot is shared by
+    /// weight in whole units (floors), the units left over go one each to the largest
+    /// remainders (ties: the lower address); each address's credit is added; what comes to
+    /// less than [`params::MIN_PAYOUT`] is carried as its credit instead of paid. Returns the
+    /// payouts in address order, the pot spent, and the credits after.
+    fn settle(&self, height: u64) -> (Vec<(Payout, u64)>, u64, BTreeMap<Payout, u64>) {
+        if height % params::EPOCH_BLOCKS != 0 {
+            return (Vec::new(), 0, self.credit.clone());
+        }
+        self.settle_on(height, self.pot)
+    }
+
+    fn settle_on(&self, _height: u64, pot: u64) -> (Vec<(Payout, u64)>, u64, BTreeMap<Payout, u64>) {
+        let shares = self.shares();
+        let total: u128 = shares.values().sum();
+        let mut credit = self.credit.clone();
+        if total == 0 || pot == 0 {
+            return (Vec::new(), 0, credit);
+        }
+        let mut amounts: Vec<(Payout, u64, u128)> = shares
+            .iter()
+            .map(|(pay, w)| {
+                let x = pot as u128 * *w;
+                (*pay, (x / total) as u64, x % total)
+            })
+            .collect();
+        let floors: u64 = amounts.iter().map(|a| a.1).sum();
+        let mut left = pot - floors;
+        let mut order: Vec<usize> = (0..amounts.len()).collect();
+        order.sort_by(|&i, &j| amounts[j].2.cmp(&amounts[i].2).then(amounts[i].0.cmp(&amounts[j].0)));
+        for i in order {
+            if left == 0 {
+                break;
+            }
+            amounts[i].1 += 1;
+            left -= 1;
+        }
+        let mut paid = Vec::new();
+        for (pay, amount, _) in amounts {
+            let owed = amount + credit.get(&pay).copied().unwrap_or(0);
+            if owed >= params::MIN_PAYOUT {
+                paid.push((pay, owed));
+                credit.remove(&pay);
+            } else if owed > 0 {
+                credit.insert(pay, owed);
+            }
+        }
+        (paid, pot, credit)
+    }
+
+    /// What an address is owed but not yet paid (a share under the payout minimum).
+    pub fn credit_of(&self, pay: &Payout) -> u64 {
+        self.credit.get(pay).copied().unwrap_or(0)
     }
 
     /// The (block id, seed) of block `h` on this branch (1 and up).
@@ -278,38 +336,30 @@ impl Storage for Registry {
     }
 
     fn payouts(&self, height: u64) -> Vec<(u64, Vec<u8>)> {
-        if height % params::EPOCH_BLOCKS != 0 {
-            return Vec::new();
-        }
-        let shares = self.shares();
-        let total: u128 = shares.values().sum();
-        if total == 0 {
-            return Vec::new();
-        }
-        shares
-            .iter()
-            .filter_map(|(pay, w)| {
-                let amount = (self.pot as u128 * *w / total) as u64;
-                if amount < params::MIN_PAYOUT {
-                    return None;
-                }
-                Some((amount, script::pay_to(&self.net, pay)?))
-            })
-            .collect()
+        self.settle(height).0.into_iter().filter_map(|(pay, amount)| Some((amount, script::pay_to(&self.net, &pay)?))).collect()
     }
 
     fn apply(&mut self, block: &Block, at: &Applied) -> Result<Self::Undo, BlockError> {
-        let paid: u64 = self.payouts(at.height).iter().map(|(amount, _)| amount).sum();
         let before = self.pot;
+        // The epoch's settlement, worked out before the block's items: as the coinbase was checked.
+        let settled = (at.height % params::EPOCH_BLOCKS == 0).then(|| self.settle_on(at.height, before));
         // The block's own seed is known to its items only from the next block on.
         let (catalog, ops) = self.items(&block.items, at.height)?;
-        self.pot = self.pot - paid + params::BLOCK_REWARD;
+        let credit_before = settled.map(|(_, shared, credit)| {
+            self.pot = before - shared;
+            std::mem::replace(&mut self.credit, credit)
+        });
+        // Fees join the pot with the block reward (§14.18).
+        self.pot += params::BLOCK_REWARD + at.fees;
         self.blocks.push((at.id, at.seed));
-        Ok(Undo { pot: before, catalog, ops })
+        Ok(Undo { pot: before, credit: credit_before, catalog, ops })
     }
 
     fn undo(&mut self, u: Self::Undo) {
         self.blocks.pop();
+        if let Some(c) = u.credit {
+            self.credit = c;
+        }
         for op in u.ops.into_iter().rev() {
             match op {
                 Op::Committed(id, prev) => {
@@ -467,5 +517,62 @@ mod tests {
         grow(&mut r, 80);
         let late = proof(&r, c4.replica(&NET), &s4, &e, &data, 51);
         assert!(r.items(&[Item::RegProof(late)], 41 + params::CHALLENGE_DELAY + params::ANSWER_WINDOW + 1).is_err());
+    }
+
+    /// Three genesis holders with these weights (keys and addresses 1, 2, 3).
+    fn three(w: [u64; 3]) -> Registry {
+        let hs: Vec<(Key, u64, Payout)> = (0..3).map(|i| (key(i as u8 + 1).1, w[i], pay(i as u8 + 1))).collect();
+        Registry::new(&NET, &hs, 1).unwrap()
+    }
+
+    #[test]
+    fn a_settlement_pays_whole_units_and_the_leftovers_to_the_largest_remainders() {
+        let m = params::MIN_PAYOUT;
+        // Equal weights, 2 units over: the tie goes to the lower addresses.
+        let r = three([1, 1, 1]);
+        let (paid, shared, credit) = r.settle_on(100, 3 * m + 2);
+        assert_eq!(paid, vec![(pay(1), m + 1), (pay(2), m + 1), (pay(3), m)]);
+        assert_eq!((shared, credit.len()), (3 * m + 2, 0));
+        // Weights 1, 1, 2 and a pot that leaves remainders 1, 1, 2 (of 4): the one unit left
+        // goes to the heaviest, though its address is the highest.
+        let r = three([1, 1, 2]);
+        let pot = 100 * m + 5;
+        let (paid, shared, _) = r.settle_on(100, pot);
+        assert_eq!(paid, vec![(pay(1), 25 * m + 1), (pay(2), 25 * m + 1), (pay(3), 50 * m + 3)]);
+        assert_eq!(paid.iter().map(|p| p.1).sum::<u64>(), shared);
+        // Every unit of the pot is paid or carried, never lost.
+        for pot in [0, 1, 2, 7, m - 1, m, 3 * m - 1, 12_345_678_901] {
+            for w in [[1, 1, 1], [1, 2, 3], [5, 7, 1 << 40]] {
+                let (paid, shared, credit) = three(w).settle_on(100, pot);
+                assert_eq!(shared, pot);
+                assert_eq!(paid.iter().map(|p| p.1).sum::<u64>() + credit.values().sum::<u64>(), pot, "{pot} {w:?}");
+            }
+        }
+        // Off the epoch's end, nothing is settled.
+        let mut r = three([1, 1, 1]);
+        r.pot = 9 * m;
+        assert_eq!(r.settle(99).0, vec![]);
+        assert_eq!(r.settle(100).0.len(), 3);
+    }
+
+    #[test]
+    fn a_share_too_small_to_pay_is_carried_to_the_next_settlement() {
+        let m = params::MIN_PAYOUT;
+        // Holder 3 is a thousandth of the weight: its share of a 10 × min pot is under the minimum.
+        let mut r = three([500, 499, 1]);
+        let (paid, _, credit) = r.settle_on(100, 10 * m);
+        assert_eq!(paid.iter().map(|p| p.0).collect::<Vec<_>>(), vec![pay(1), pay(2)]);
+        assert_eq!(credit, BTreeMap::from([(pay(3), 10 * m / 1000)]));
+        // It builds up epoch by epoch and is paid with the epoch that brings it over.
+        r.credit = credit;
+        for _ in 0..98 {
+            let (paid, _, credit) = r.settle_on(200, 10 * m);
+            assert!(paid.iter().all(|p| p.0 != pay(3)));
+            r.credit = credit;
+        }
+        assert_eq!(r.credit_of(&pay(3)), 99 * 10 * m / 1000);
+        let (paid, _, credit) = r.settle_on(300, 10 * m);
+        assert_eq!(paid.last(), Some(&(pay(3), m)));
+        assert!(credit.is_empty());
     }
 }

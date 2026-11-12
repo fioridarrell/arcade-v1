@@ -16,7 +16,7 @@ ARCADE is a new blockchain, built into Arcade V1.0. Its coins are earned by **ke
 | Premine | **none**: every coin is earned by storage |
 | Who writes blocks | **drawn by chance, weighted by verified storage** |
 | Who gets the 50 | **everyone with verified storage, split by their share** |
-| Fees | **to the arcade that writes the block** |
+| Fees | **into the pot**, shared by weight with the block reward (§14.18; the first draft gave them to the block's writer) |
 | What earns | **every listed chain and index, by bytes; every verified copy earns, and each piece's share is split among the arcades holding it** (changed 2026-11-10 from "only the first 10 copies earn": that rule locked latecomers out and capped the network's size) |
 | Anti-cheat | **sealed copies**: each arcade's copy is encoded with its own key and challenged on that copy |
 | Sharing | **a serving check**: arcades must hand the data to other arcades on request, or they earn nothing (§5.4) |
@@ -258,7 +258,7 @@ Storage decides **who**, a proof of time decides **when**. The structure follows
   - Registering the same segment under several keys takes a separately sealed copy for each, so it buys a larger part only with real disk.
 - **Accrued, then released in slices.** An epoch's share is first **accrued** to the replica. Each audit covers the slice accrued since the replica's previous pick: passed, the slice is released (about 2 days after it was earned, on average); not passed, it is forfeited to the next pot (§5.3). The serving rule can hold a slice back (§5.4).
 - **Paid** in the coinbase of the first block of each epoch: one output per payout address for everything released since the last payout, in address order. Amounts under 0.01 ARCADE wait in an owed balance.
-- **The writer** gets the block's **fees**. It gets no extra part of the 50.
+- **The writer** gets no extra part of the 50, and since §14.18 no fees either: they join the pot.
 - **Coinbase maturity:** 100 blocks.
 
 ## 8. Coins, addresses and fees
@@ -435,7 +435,7 @@ Every arcade gets the same answer whichever block reached it first. An arcade do
 - A transaction is Dogecoin's legacy format, version 1, at most 100,000 bytes, written the one way its fields can be written.
 - Every spendable output holds at least **0.001 ARCADE** (a chain rule, not a relay habit). An output starting with `OP_RETURN` burns what it holds.
 - A coinbase's one input carries the height (8 bytes), the id of the block before (32) and up to 60 free bytes, so no two coinbases share an id on any chain or fork. Its outputs are spendable 100 blocks on.
-- **A coinbase starts with exactly the payouts owed**, in order; after them the writer may pay itself at most the block's fees. Fees it doesn't claim are burned.
+- **A coinbase starts with exactly the payouts owed**, in order; the writer pays itself nothing (a zero `OP_RETURN` may follow). The block's fees join the pot (§14.18).
 - A lock time is a block height. At most 8,000 signature checks per block.
 - **Script** is a strict part of Bitcoin's, enough for what V1.0 signs: pay to a key hash, pay to a script hash, the exchange's pre-signed trades, the prize pool, bare multisig, a hash lock and a height lock. An opcode outside the list makes a script invalid even in a branch that isn't run; pushes are written the shortest way; signatures are strict DER with low S; hash types are ALL, ALL|ANYONECANPAY and SINGLE|ANYONECANPAY; a signature covers the whole locking (or redeem) script. New opcodes come by upgrade.
 - **Epoch payouts** (stand-in today, §7 when audits are built): the first coinbase of an epoch pays the pot, one output per payout address in address order; a share under 0.01 ARCADE stays in the pot.
@@ -476,7 +476,7 @@ What an arcade keeps waiting, passes on and puts in its blocks is **its own choi
 - **Rows.** A waiting transaction may spend another's coins, up to 25 in a row.
 - **Room.** 5 MB. A full pool takes a newcomer only if it pays more per byte than the cheapest waiting ones, which leave with everything that spends them; a transaction never pushes out one it needs.
 - **Checked once.** Scripts and signatures are run when a transaction arrives. After each new block the arcade only looks its coins up again: what the block held or made impossible leaves, the rest stays in the order it came. When the chain changes branch, the transactions of the blocks taken back are checked again in full and wait again.
-- **Into a block.** The writer takes the best paying per byte, a transaction never before one it spends from, up to 1 MB and 8,000 signature checks. After the payouts owed, its coinbase pays the fees to the writer's payout address; fees under 0.001 ARCADE, and those of a writer with no address, are burned.
+- **Into a block.** The writer takes the best paying per byte, a transaction never before one it spends from, up to 1 MB and 8,000 signature checks. Its coinbase holds only the payouts owed; the fees join the pot (§14.18). The block's transactions go in the order its seed sets, not the order the writer picked them.
 - **Not kept.** The pool isn't saved: after a restart a wallet offers its transaction again.
 - **Over the mesh** (more frames of kind `ac`):
 
@@ -593,5 +593,7 @@ Martin read Darrell's "Arcade Coin Blueprint" (registered CPU mining, committee-
    - A share too small to pay (under the dust amount) is carried forward to that address's next payout, not lost.
    - **Fees join the pot** and are shared by weight like the block reward (this replaces "fees to the block writer"): writers are drawn at random, so fees kept by the writer would reach runners unevenly.
 4. **Transaction order is not the writer's choice.** A block's transactions are ordered by `H(block seed ‖ txid)`, every transaction after the ones it spends from the same block, so no writer can front-run or reorder for advantage. (Blueprint risk 5.)
+
+*Built (3 and 4):* `coins::canonical_order` (parents first, then the lowest `H("txorder", seed, txid)` of those ready); `Ticket::seal` puts a block's transactions in that order and `join` refuses any other (`TxError::Order`). A coinbase that claims any fees is refused; `Applied.fees` joins the pot. `Registry::settle_on` does the floors, the largest remainders (ties: lower address) and the credit (`credit_of`); the credit is undone with its block. The settlement is worked out before the block's own items, as its coinbase was checked.
 
 Not taken, possibly later: a "my work" panel and a network page (city and country only); a maintenance button; a cap per key on recent blocks; a legal review before mainnet. Not taken: pay for relay bytes or request receipts (easy to fake by trading traffic with oneself); 2/3 finality signatures.

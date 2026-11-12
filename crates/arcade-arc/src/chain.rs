@@ -210,6 +210,8 @@ pub struct Applied {
     pub height: u64,
     pub id: Hash256,
     pub seed: Hash,
+    /// The block's transaction fees: they join the pot (docs/ARCADECHAIN.md §14.18).
+    pub fees: u64,
 }
 
 /// The storage side of the state, as the chain's rules need it: who has how much draw
@@ -265,6 +267,17 @@ pub struct Ticket {
 impl Ticket {
     /// The finished block, signed with the key that drew the ticket.
     pub fn seal(&self, net: &Net, secret: &[u8; 32], time: u64, txs: Vec<Tx>, items: Vec<Item>, pot: TimeProof, draw_seed: Option<TimeProof>) -> Block {
+        // The transactions after the coinbase in the order the block's seed sets (§14.18).
+        let txs = match vrf::output_of_proof(&self.vrf_proof) {
+            Some(out) if txs.len() > 2 => {
+                let seed = draw::block_seed(net, &out, &pot.output);
+                let mut txs = txs;
+                let rest = txs.split_off(1);
+                txs.extend(coins::canonical_order(net, &seed, rest));
+                txs
+            }
+            _ => txs,
+        };
         let mut header = Header {
             version: HEADER_VERSION,
             height: self.height,
@@ -609,9 +622,16 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         if block.header.weight != self.storage.weight(&block.header.writer) {
             return Err(ChainError::Weight);
         }
+        // The order of the transactions is the seed's, not the writer's (§14.18).
+        if block.txs.len() > 2 {
+            let want: Vec<Hash256> = coins::canonical_order(&self.net, &entry.seed, block.txs[1..].to_vec()).iter().map(|t| t.txid).collect();
+            if block.txs[1..].iter().map(|t| t.txid).ne(want.iter().copied()) {
+                return Err(ChainError::Tx(coins::TxError::Order));
+            }
+        }
         let payouts = self.storage.payouts(entry.height);
         let changes = coins::check_block(&block.txs, entry.height, &entry.prev, &self.coins, &payouts)?;
-        let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed })?;
+        let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees })?;
         for (at, _) in &changes.spent {
             self.coins.remove(at);
         }
@@ -805,7 +825,7 @@ impl Storage for FixedHolders {
         let catalog = self.catalog.apply(&block.items, at.height, &Fixed(&self.weights, self.total))?;
         let before = self.pot;
         let paid: u64 = self.payouts(at.height).iter().map(|(amount, _)| amount).sum();
-        self.pot = self.pot - paid + params::BLOCK_REWARD;
+        self.pot = self.pot - paid + params::BLOCK_REWARD + at.fees;
         Ok((before, catalog))
     }
 
@@ -1257,25 +1277,27 @@ pub(crate) mod tests {
         assert_eq!(c.tip().height, 150);
         grow_to(&mut c, 199);
 
-        // Block 200 takes it; its writer takes the fee, after the epoch's payouts.
+        // Block 200 takes it; the fee joins the pot (a writer that pays itself the fee is refused).
         let who = ranked(&c)[0];
         let writer_pay = p2pkh(&coin_key(who).1);
         let before = (c.coins().clone(), c.storage().clone());
-        let greedy = block_by(&c, who, next_time(&c), &[(fee + 1, writer_pay.clone())], vec![spend.clone()]);
+        let greedy = block_by(&c, who, next_time(&c), &[(fee, writer_pay.clone())], vec![spend.clone()]);
         assert_eq!(c.accept(greedy, LATE), Err(ChainError::Tx(TxError::CoinbaseAmount)));
-        let block = block_by(&c, who, next_time(&c), &[(fee, writer_pay.clone())], vec![spend.clone()]);
+        let pot_before = c.storage().pot();
+        let block = block_by(&c, who, next_time(&c), &[], vec![spend.clone()]);
         assert!(matches!(c.accept(block.clone(), LATE), Ok(Accepted::Tip { .. })));
         assert_eq!(c.coins().get(&from), None);
         assert_eq!(c.coins()[&OutPoint { txid: spend.txid, vout: 0 }].value, amount - fee);
-        let fee_coin = &c.coins()[&OutPoint { txid: block.txs[0].txid, vout: 3 }];
-        assert_eq!((fee_coin.value, fee_coin.coinbase, fee_coin.height), (fee, true, 200));
+        assert!(c.coins().keys().all(|p| p.txid != block.txs[0].txid || c.coins()[p].value != fee));
+        let paid_out: u64 = block.txs[0].outputs.iter().map(|o| o.value).sum();
+        assert_eq!(c.storage().pot(), pot_before - paid_out + BLOCK_REWARD + fee);
         assert_eq!(total_coins(&c) + c.storage().pot(), 200 * BLOCK_REWARD);
         // The same payment can't go into a later block.
         let who = ranked(&c)[0];
         let again = block_by(&c, who, next_time(&c), &[], vec![spend.clone()]);
         assert_eq!(c.accept(again, LATE), Err(ChainError::Tx(TxError::MissingCoin)));
 
-        // A heavier branch without the payment: the coin is back, the fee coin is gone.
+        // A heavier branch without the payment: the coin is back, the fee leaves the pot.
         let mut other = chain();
         feed(&mut other, &blocks);
         grow_to(&mut other, 199);
@@ -1289,6 +1311,40 @@ pub(crate) mod tests {
         assert_eq!(c.coins().get(&from).map(|coin| coin.value), Some(amount));
         assert_eq!(c.coins(), other.coins());
         assert_eq!(c.storage(), other.storage());
+    }
+
+    #[test]
+    fn a_block_keeps_its_transactions_in_the_order_its_seed_sets() {
+        let mut c = chain();
+        let blocks = grow_to(&mut c, 199);
+        // Each holder spends its pay from block 100: three unrelated payments.
+        let spends: Vec<Tx> = HOLDERS
+            .iter()
+            .map(|&who| {
+                let (sk, pk) = coin_key(who);
+                let lock = p2pkh(&pk);
+                let paid = &blocks[99].txs[0];
+                let vout = paid.outputs.iter().position(|o| o.script_pubkey == lock).unwrap();
+                let from = OutPoint { txid: paid.txid, vout: vout as u32 };
+                let t = tx(vec![(from, vec![], u32::MAX)], vec![(paid.outputs[vout].value - COIN / 100, p2pkh(&coin_key(7).1))], 0);
+                let mut s = Vec::new();
+                push(&mut s, &sign(&t, 0, &lock, &sk, SIGHASH_ALL));
+                push(&mut s, &pk);
+                with_sig(&t, 0, s)
+            })
+            .collect();
+        let who = ranked(&c)[0];
+        // However the writer hands them in, the sealed block holds them in one order.
+        let block = block_by(&c, who, next_time(&c), &[], spends.clone());
+        let reversed = block_by(&c, who, next_time(&c), &[], spends.iter().rev().cloned().collect());
+        assert_eq!(block, reversed);
+        // Any other order is refused (the header signed over it, so only the order is wrong).
+        let mut wrong = block.clone();
+        wrong.txs.swap(1, 2);
+        wrong.header.tx_root = block::tx_root(&wrong.txs);
+        let wrong = resigned(wrong, who);
+        assert_eq!(c.accept(wrong, LATE), Err(ChainError::Tx(TxError::Order)));
+        assert!(matches!(c.accept(block, LATE), Ok(Accepted::Tip { .. })));
     }
 
     #[test]

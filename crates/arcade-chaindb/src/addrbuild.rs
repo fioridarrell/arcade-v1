@@ -404,6 +404,8 @@ impl ChainDb {
             Ok(())
         };
         let next_h = std::sync::atomic::AtomicU32::new(from_h);
+        let span = upto.saturating_sub(from_h) as u64 + 1;
+        self.set_step(c, 0, 0, span, "blocks", 1);
         let failed: Mutex<Option<arcade_store::StoreError>> = Mutex::new(None);
         const SPAN: u32 = 500;
         let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
@@ -487,6 +489,8 @@ impl ChainDb {
                 std::thread::sleep(std::time::Duration::from_millis(200));
                 if last_note.elapsed() > std::time::Duration::from_secs(2) {
                     let done = acc.lock().unwrap().done;
+                    // Step 1's bar (chain status shows the bars, not this note, while a build runs).
+                    self.set_step(c, 0, done.min(span), span, "blocks", 1);
                     let now: Vec<String> = at.iter().map(|a| a.load(Ordering::Relaxed)).filter(|h| *h > 0).map(|h| h.to_string()).collect();
                     note(format!("building addresses: step 1 of 4, reading the stored blocks (block {} of {upto}; threads at {})", done.min(upto as u64), now.join(", ")));
                     last_note = std::time::Instant::now();
@@ -547,6 +551,7 @@ impl ChainDb {
         let Acc { mut bufs, mut files, .. } = a;
         flush_runs(c, "blocks", tmp, &mut bufs, &mut files)?;
         *runs = files;
+        self.set_step(c, 0, span, span, "blocks", 2);
         Ok(true)
     }
 

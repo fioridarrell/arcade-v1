@@ -277,7 +277,12 @@ fn indexer_in_commit_undo_and_backfill_agree() {
     let bdb = ChainDb::open(dir.path().join("c.mdbx")).unwrap();
     bdb.connect_blocks(a.p, &[a.g.clone(), b1, b2]).unwrap();
     bdb.add_indexer(a.p.chain_no, std::sync::Arc::new(CountTx)).unwrap();
-    while bdb.backfill(a.p, "count", 1).unwrap() > 0 {}
+    // With no time left, each write takes one block (and commits it) however many are asked for.
+    let mut calls = 0;
+    while bdb.backfill_for(a.p, "count", 500, std::time::Duration::ZERO).unwrap() > 0 {
+        calls += 1;
+    }
+    assert_eq!(calls, 2, "one block per write: b1, then b2");
     assert_eq!(bdb.scan_all("addon.v1.count").unwrap(), a.db.scan_all("addon.v1.count").unwrap());
     // Backfilled rows inside the undo window are undone by a reorg too.
     bdb.disconnect_tip(a.p.chain_no).unwrap();
@@ -413,7 +418,17 @@ fn addresses_built_later_match_live() {
     f.db.connect_blocks(f.p, &blocks).unwrap();
     assert!(f.db.store(c).read(|r| r.scan_prefix(BY_SCRIPT, b"")).unwrap().is_empty());
     f.db.set_addresses_on(c).unwrap();
-    build(&f);
+    // Step 1 (reading the stored blocks) shows on its bar while it runs, in blocks.
+    let mut seen: Option<crate::addrbuild::StepProgress> = None;
+    let tmp = f._dir.path().join("tmp");
+    let stop = std::sync::atomic::AtomicBool::new(false);
+    assert!(f.db.build_addresses(f.p, &tmp, &stop, &mut |s| {
+        if s.contains("step 1 of 4") && seen.is_none() {
+            seen = f.db.build_progress(c).map(|p| p[0].clone());
+        }
+    }).unwrap());
+    let s1 = seen.expect("step 1 reported while reading the blocks");
+    assert!(s1.state == 1 && s1.unit == "blocks" && s1.total >= blocks.len() as u64, "{s1:?}");
     assert_eq!(address_tables(&f.db), want, "built from stored blocks");
 
     // Logged for a while, then live (spending logged coins), then built.

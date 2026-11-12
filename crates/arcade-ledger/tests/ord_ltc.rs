@@ -170,3 +170,83 @@ fn litecoin_ord_numbers_curses_fees_and_pointers() {
     // Content reads back from the envelope.
     assert_eq!(arcade_ledger::ord::content(&db, p, &d).unwrap(), ("text/plain".to_string(), b"d".to_vec()));
 }
+
+/// A SegWit spend to the given (value, script) outputs.
+fn spend_to(ins: &[(Hash256, u32, Option<Vec<u8>>)], outs: &[(u64, Vec<u8>)]) -> Tx {
+    let mut o = 2i32.to_le_bytes().to_vec();
+    o.extend_from_slice(&[0, 1]);
+    write_varint(&mut o, ins.len() as u64);
+    for (prev, vout, _) in ins {
+        o.extend_from_slice(&prev.0);
+        o.extend_from_slice(&vout.to_le_bytes());
+        o.push(0);
+        o.extend_from_slice(&u32::MAX.to_le_bytes());
+    }
+    write_varint(&mut o, outs.len() as u64);
+    for (v, s) in outs {
+        o.extend_from_slice(&v.to_le_bytes());
+        write_varint(&mut o, s.len() as u64);
+        o.extend_from_slice(s);
+    }
+    for (_, _, script) in ins {
+        match script {
+            Some(s) => {
+                write_varint(&mut o, 2);
+                write_varint(&mut o, s.len() as u64);
+                o.extend_from_slice(s);
+                write_varint(&mut o, 33);
+                o.extend_from_slice(&[0xc0; 33]);
+            }
+            None => {
+                write_varint(&mut o, 1);
+                write_varint(&mut o, 64);
+                o.extend_from_slice(&[1; 64]);
+            }
+        }
+    }
+    o.extend_from_slice(&0u32.to_le_bytes());
+    Tx::parse(&o).unwrap()
+}
+
+/// LTC-20 (Litecoin's BRC-20, as ord20-indexer reads it): #0 counts for nothing; a deploy, a mint to A, a transfer of
+/// 30 from A to B; a transfer of 10 sent as fee goes back to A.
+#[test]
+fn ltc20_deploy_mint_transfer_and_a_transfer_lost_to_the_fee() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = ChainDb::open(dir.path().join("chain.mdbx")).unwrap();
+    let g = block(Hash256::ZERO, vec![coinbase(&[50], 0)], 1);
+    let mut p: ChainParams = LITECOIN_MAIN.clone();
+    p.net = "ltcreg";
+    p.genesis = Box::leak(g.hash().to_hex().into_boxed_str());
+    p.genesis_header = "";
+    let p: &'static ChainParams = Box::leak(Box::new(p));
+    db.add_indexer(p.chain_no, Arc::new(arcade_ledger::ord::OrdIndexer::new(&["tokens"]))).unwrap();
+    db.connect_blocks(p, &[g.clone()]).unwrap();
+    let (sa, sb, sc) = (p2pkh(0xa0), p2pkh(0xb0), p2pkh(0xc0));
+    let (a, b) = (arcade_ledger::ord::holder(p, &sa), arcade_ledger::ord::holder(p, &sb));
+    let j = |s: &str| env("text/plain;charset=utf-8", s.as_bytes(), None);
+
+    let cb1 = coinbase(&[1000; 6], 1);
+    let b1 = block(g.hash(), vec![cb1.clone()], 2);
+    let t0 = spend_to(&[(cb1.txid, 0, Some(j(r#"{"p":"ltc-20","op":"deploy","tick":"zero","max":"9","lim":"9"}"#)))], &[(900, sa.clone())]);
+    let td = spend_to(&[(cb1.txid, 1, Some(j(r#"{"p":"ltc-20","op":"deploy","tick":"lite","max":"1000","lim":"100"}"#)))], &[(900, sa.clone())]);
+    let b2 = block(b1.hash(), vec![coinbase(&[5000], 2), t0, td], 3);
+    let tm = spend_to(&[(cb1.txid, 2, Some(j(r#"{"p":"ltc-20","op":"mint","tick":"lite","amt":"100"}"#)))], &[(900, sa.clone())]);
+    let b3 = block(b2.hash(), vec![coinbase(&[5000], 3), tm], 4);
+    let tx1 = spend_to(&[(cb1.txid, 3, Some(j(r#"{"p":"ltc-20","op":"transfer","tick":"lite","amt":"30"}"#)))], &[(900, sa.clone())]);
+    let b4 = block(b3.hash(), vec![coinbase(&[5000], 4), tx1.clone()], 5);
+    let send = spend_to(&[(tx1.txid, 0, None)], &[(800, sb.clone())]);
+    let tx2 = spend_to(&[(cb1.txid, 4, Some(j(r#"{"p":"ltc-20","op":"transfer","tick":"lite","amt":"10"}"#)))], &[(900, sa.clone())]);
+    let b5 = block(b4.hash(), vec![coinbase(&[5000], 5), send, tx2.clone()], 6);
+    // The note's coin is input 1, at 1000 of 500 out: the fee.
+    let fee = spend_to(&[(cb1.txid, 5, None), (tx2.txid, 0, None)], &[(500, sc)]);
+    let b6 = block(b5.hash(), vec![coinbase(&[5_000_000_000, 10_000], 6), fee], 7);
+    db.connect_blocks(p, &[b1, b2, b3, b4, b5, b6]).unwrap();
+
+    let e18 = |n: u128| (n * 10u128.pow(18)).to_string();
+    let bal = |who: &str| arcade_ledger::tokens::balances(&db, p.chain_no, who).into_iter().find(|t| t.0 == "lite").map(|t| (t.1, t.2));
+    assert!(arcade_ledger::tokens::tick(&db, p.chain_no, "zero").is_none(), "inscription #0 counts for nothing");
+    assert!(arcade_ledger::tokens::tick(&db, p.chain_no, "lite").is_some(), "deployed");
+    assert_eq!(bal(&b), Some((e18(30), "0".into())), "B got the 30");
+    assert_eq!(bal(&a), Some((e18(70), "0".into())), "A kept 70; the 10 sent as fee came back, transferable again 0");
+}

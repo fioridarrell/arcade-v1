@@ -506,6 +506,9 @@ struct Flot {
     new: Option<NewIns>,
     /// Where an old one came from (for the riders).
     from: Option<Hash256>,
+    /// It went to the fee (and lands in the coinbase): for the riders it went nowhere, as ord20-indexer has it (an
+    /// LTC-20 transfer sent as fee goes back to its sender).
+    fee: bool,
 }
 
 struct NewIns {
@@ -572,7 +575,7 @@ impl OrdIndexer {
                 }
                 for (off, iid) in carried {
                     let offset = total_in + off;
-                    floating.push(Flot { offset, iid, new: None, from: Some(input.prevout.txid) });
+                    floating.push(Flot { offset, iid, new: None, from: Some(input.prevout.txid), fee: false });
                     inscribed.entry(offset).or_insert((iid, 0)).1 += 1;
                 }
                 let offset = total_in;
@@ -610,6 +613,7 @@ impl OrdIndexer {
                         offset: to,
                         iid,
                         from: None,
+                        fee: false,
                         new: Some(NewIns {
                             reinscription: inscribed.contains_key(&to),
                             unbound: in_value == 0 || env.unrecognized_even_field,
@@ -649,7 +653,7 @@ impl OrdIndexer {
             }
             // To the fee: into the coinbase's value space, after what came before.
             for f in rest {
-                to_coinbase.push(Flot { offset: reward + f.offset - out_start, ..f });
+                to_coinbase.push(Flot { offset: reward + f.offset - out_start, fee: true, ..f });
             }
             reward += total_in.saturating_sub(out_start);
         }
@@ -721,9 +725,9 @@ impl OrdIndexer {
                         }
                     }
                     if let (false, Some(ft)) = (self.hooks.is_empty(), f.from) {
-                        let who = holder(p, script);
+                        let who = (!f.fee).then(|| holder(p, script));
                         for h in &self.hooks {
-                            h.moved(l, c, &Moved { params: p, iid: &iid, from_txid: &ft, txid, to: Some(who.clone()) })?;
+                            h.moved(l, c, &Moved { params: p, iid: &iid, from_txid: &ft, txid, to: who.clone() })?;
                         }
                     }
                 }
@@ -813,9 +817,12 @@ impl OrdIndexer {
                 }
             }
         }
-        for h in &self.hooks {
-            h.born(l, c, &Born { params: p, iid: &iid, number: number.max(0) as u64, height: ctx.height, ctype: &ct, body: &body,
-                                 pieces: 1, txid: &n.txid, landed: landed.clone(), reinscription: n.reinscription })?;
+        // The riders (tokens, names) count blessed inscriptions after #0 only, as ord20-indexer does (`number > 0`).
+        if number > 0 {
+            for h in &self.hooks {
+                h.born(l, c, &Born { params: p, iid: &iid, number: number as u64, height: ctx.height, ctype: &ct, body: &body,
+                                     pieces: 1, txid: &n.txid, landed: landed.clone(), reinscription: n.reinscription })?;
+            }
         }
         Ok(())
     }

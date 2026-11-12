@@ -5,7 +5,8 @@
 //! below our stored tip (or when the operator asks), this fetches the copy's manifest and its
 //! 1 MiB pieces (sha256 each), asks the other arcades for their `d` at the copy's checkpoint
 //! (`ix q`), and takes the copy in only if 2 or more arcades that didn't serve it agree and they
-//! are a strict majority of those asked (Martin's rule, §5). The SQLite file is converted once
+//! are a strict majority of those asked (Martin's rule, §5), counting only established arcades
+//! (crate::vxshare::established: announced on chain a day deep, or named by the operator). The SQLite file is converted once
 //! by arcade-oldimport and deleted; `d`, `s` and `n` recomputed from the converted rows must equal
 //! the manifest, or the rows are cleared again and the copy is never taken again.
 //! V1.0 makes no lx copies of its own (that would mean writing SQLite).
@@ -322,12 +323,7 @@ fn our_hash(node: &Node, c: u16, h: u32) -> Option<String> {
 }
 
 fn free_bytes(p: &std::path::Path) -> u64 {
-    let Ok(c) = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()) else { return 0 };
-    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
-        return 0;
-    }
-    s.f_bavail as u64 * s.f_frsize as u64
+    crate::diskfree::free_bytes(p)
 }
 
 /// Check a manifest (compat/INDEXSHARE.md §4 "Fetching") against the copy's id and this arcade.
@@ -485,6 +481,7 @@ pub fn run(node: Arc<Node>) {
 
 fn step(node: &Arc<Node>, p: &'static ChainParams) {
     let (have, tip_h) = (ours(node, p), tip(node, p));
+    let est = crate::vxshare::established(node);
     let mut s = st();
     if !s.jobs.contains_key(p.net) {
         if let Some((id, h, _)) = best_offer(&s, p.net, tip_h, None) {
@@ -569,19 +566,18 @@ fn step(node: &Arc<Node>, p: &'static ChainParams) {
     if asked_out && j.votes_since.is_some_and(|t| t.elapsed() < VOTE_WAIT) {
         return;
     }
-    let others: Vec<(&String, &String)> = j.votes.iter().filter(|(peer, _)| !j.served_by.contains(*peer)).collect();
-    let agreed = others.iter().filter(|(_, x)| **x == d).count();
-    let voters = others.len();
-    j.detail = format!("{agreed} of {voters} other arcades agree at block {cp}");
-    if voters > 0 && agreed * 2 <= voters && voters >= 2 {
-        let id = j.id.clone();
-        let _ = node.app.event("chains", &format!("{}: ledger copy {} refused: only {agreed} of {voters} arcades agree with it", p.key, short(&id)));
-        j.phase = "refused".into();
-        s.refused.insert(id);
-        return;
-    }
-    if agreed < 2 || agreed * 2 <= voters {
-        return; // wait for more arcades to answer
+    let (agreed, voters, verdict) = tally(&j.votes, &j.served_by, &est, &d);
+    j.detail = format!("{agreed} of {voters} other established arcades agree at block {cp}");
+    match verdict {
+        Some(true) => {}
+        Some(false) => {
+            let id = j.id.clone();
+            let _ = node.app.event("chains", &format!("{}: ledger copy {} refused: only {agreed} of {voters} established arcades agree with it", p.key, short(&id)));
+            j.phase = "refused".into();
+            s.refused.insert(id);
+            return;
+        }
+        None => return, // wait for more arcades to answer
     }
     j.phase = "converting".into();
     let (dir, manifest, served, votes) = (j.dir.clone(), m, j.served_by.clone(), j.votes.clone());
@@ -609,6 +605,25 @@ fn step(node: &Arc<Node>, p: &'static ChainParams) {
             }
         })
         .unwrap();
+}
+
+/// The votes on a copy whose `d` is `d`: (agreeing, voting, verdict). Only arcades that didn't
+/// serve the copy and whose word counts (`est`, crate::vxshare::established) are counted: a
+/// node id is free to make, so votes of new ones would decide nothing. Taken (Some(true)) when
+/// 2 or more agree and they are a strict majority; refused when 2 or more voted and no more
+/// than half agree; else None (wait for more).
+fn tally(votes: &BTreeMap<String, String>, served: &BTreeSet<String>, est: &BTreeSet<String>, d: &str) -> (usize, usize, Option<bool>) {
+    let others: Vec<&String> = votes.iter().filter(|(peer, _)| !served.contains(*peer) && est.contains(*peer)).map(|(_, x)| x).collect();
+    let agreed = others.iter().filter(|x| x.as_str() == d).count();
+    let voters = others.len();
+    let verdict = if voters >= 2 && agreed * 2 <= voters {
+        Some(false)
+    } else if agreed >= 2 && agreed * 2 > voters {
+        Some(true)
+    } else {
+        None
+    };
+    (agreed, voters, verdict)
 }
 
 /// Put the pieces together, stop the ledger index, convert, check, start it again.
@@ -789,5 +804,25 @@ mod tests {
         z.write_all(&vec![0u8; MAX_RAW + 1]).unwrap();
         assert!(inflate(&z.finish().unwrap(), true).is_err());
         assert_eq!(inflate(b"raw", false).unwrap(), b"raw");
+    }
+
+    #[test]
+    fn only_established_arcades_vote() {
+        let id = |n: u8| hex::encode([n; 32]);
+        let est: BTreeSet<String> = [id(1), id(2), id(3)].into();
+        let votes = |vs: &[(u8, &str)]| vs.iter().map(|(n, d)| (id(*n), d.to_string())).collect::<BTreeMap<String, String>>();
+        let none = BTreeSet::new();
+        // Fresh keys agreeing, however many: nothing decided.
+        assert_eq!(tally(&votes(&[(10, "d"), (11, "d"), (12, "d")]), &none, &est, "d"), (0, 0, None));
+        // Fresh keys disagreeing don't refuse it either.
+        assert_eq!(tally(&votes(&[(1, "d"), (10, "x"), (11, "x")]), &none, &est, "d"), (1, 1, None));
+        // Two established arcades agreeing: taken.
+        assert_eq!(tally(&votes(&[(1, "d"), (2, "d"), (10, "x")]), &none, &est, "d"), (2, 2, Some(true)));
+        // Not a strict majority of the established voters: refused.
+        assert_eq!(tally(&votes(&[(1, "d"), (2, "x")]), &none, &est, "d"), (1, 2, Some(false)));
+        assert_eq!(tally(&votes(&[(1, "d"), (2, "d"), (3, "x")]), &none, &est, "d").2, Some(true));
+        // An arcade that served the copy doesn't vote for it.
+        let served: BTreeSet<String> = [id(2)].into();
+        assert_eq!(tally(&votes(&[(1, "d"), (2, "d")]), &served, &est, "d"), (1, 1, None));
     }
 }

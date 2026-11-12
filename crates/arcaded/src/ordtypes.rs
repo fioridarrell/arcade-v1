@@ -303,6 +303,19 @@ pub fn run(node: std::sync::Arc<Node>) {
                 build(&node, p);
             }
         }
+        // The site records of the chains whose names are read here (namesites.rs), the same way.
+        let mut named: Vec<&'static ChainParams> = Vec::new();
+        if crate::chains::home_indexes(&node).iter().any(|i| i == "names") {
+            named.push(node.params);
+        }
+        for r in node.extra.lock().unwrap().values() {
+            if r.indexes.iter().any(|i| i == "names") {
+                named.push(r.params);
+            }
+        }
+        for p in named {
+            crate::namesites::ensure(&node, p);
+        }
         std::thread::sleep(std::time::Duration::from_secs(120));
     }
 }

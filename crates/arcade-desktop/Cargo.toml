@@ -5,6 +5,8 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+arcade-local = { version = "0.1.0", path = "../arcade-local" }
+base64 = "0.23.1"
 serde_json = "1.0.154"
 tauri = "2"
 

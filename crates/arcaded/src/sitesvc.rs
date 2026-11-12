@@ -16,6 +16,7 @@
 use crate::node::Node;
 use arcade_chain::params::{by_key, ChainParams};
 use arcade_chain::{OutPoint, Tx};
+use arcade_wallet::tx::Utxo;
 use serde_json::{json, Value};
 use std::collections::{HashMap, HashSet};
 
@@ -97,10 +98,17 @@ pub fn coins(node: &Node, req: &Value) -> R {
     let mut out = serde_json::Map::new();
     for (a, script) in &want {
         let mut confirmed = Vec::new();
+        let mut immature = Vec::new();
         let mut total = 0u64;
         for (op, value, height) in node.chain.coins_for_script(p, script).map_err(|e| e.to_string())? {
             if spent_in_pool.contains(&op) {
                 continue; // a waiting transaction spends it already
+            }
+            // A mining reward too young to spend: listed apart, not counted (the coin's network
+            // refuses a spend of it).
+            if node.chain.coin(p, &op).ok().flatten().is_some_and(|c| crate::mempoolshare::immature(p, c.coinbase, c.height, tip)) {
+                immature.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "spendable_after": height + p.coinbase_maturity}));
+                continue;
             }
             total += value;
             confirmed.push(json!({"txid": op.txid.to_hex(), "vout": op.vout, "value": value, "height": height, "confirmations": tip.saturating_sub(height) + 1}));
@@ -115,7 +123,23 @@ pub fn coins(node: &Node, req: &Value) -> R {
                 }
             }
         }
-        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total}));
+        // Coins carrying an inscription (or small ones nobody can read) are held back, so a
+        // browser wallet building a payment from this list doesn't spend them (crate::ordsafe).
+        let op_of = |c: &Value| OutPoint { txid: arcade_chain::Hash256::from_hex(c["txid"].as_str().unwrap_or("")).unwrap_or_default(), vout: c["vout"].as_u64().unwrap_or(0) as u32 };
+        let listed: Vec<Utxo> = confirmed.iter().chain(&unconfirmed).map(|c| Utxo { outpoint: op_of(c), value: c["value"].as_u64().unwrap_or(0), script: script.clone() }).collect();
+        let free: HashSet<OutPoint> = crate::ordsafe::keep_free(node, p, listed).into_iter().map(|u| u.outpoint).collect();
+        let mut held_back = Vec::new();
+        for list in [&mut confirmed, &mut unconfirmed] {
+            list.retain(|c| {
+                let keep = free.contains(&op_of(c));
+                if !keep {
+                    total -= c["value"].as_u64().unwrap_or(0);
+                    held_back.push(c.clone());
+                }
+                keep
+            });
+        }
+        out.insert(a.clone(), json!({"script": hex::encode(script), "confirmed": confirmed, "unconfirmed": unconfirmed, "total": total, "held_back": held_back, "immature": immature}));
     }
     Ok(json!({"chain": p.key, "height": tip, "addresses": out}))
 }
@@ -182,6 +206,21 @@ pub fn fee(node: &Node, req: &Value) -> R {
 }
 
 pub fn broadcast(node: &Node, req: &Value) -> R {
+    send_raw(node, req, true)
+}
+
+/// A transaction this arcade built and signed itself (DigiDollar sends): pooled and sent as
+/// `broadcast` does, without checking its signatures again.
+pub fn broadcast_own(node: &Node, req: &Value) -> R {
+    send_raw(node, req, false)
+}
+
+/// `checked`: every input's signature is verified first, as for a transaction from the mesh
+/// (`mempoolshare::sort`). One with a bad signature is refused: pooled, it would be reported
+/// sent though no node relays it, and the coins it spends would stay held behind it. One with
+/// an input of a kind this arcade can't check (an inscription reveal, say) goes on to the
+/// coin's own peers, whose nodes check every script, without being pooled here.
+fn send_raw(node: &Node, req: &Value, checked: bool) -> R {
     let p = chain(node, req)?;
     let hex_tx = req["hex"].as_str().ok_or("hex required (the signed transaction)")?;
     let raw = hex::decode(hex_tx.trim()).map_err(|_| "hex is not hex".to_string())?;
@@ -214,9 +253,23 @@ pub fn broadcast(node: &Node, req: &Value) -> R {
         };
         ins += value;
     }
-    let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
+    let Some(outs) = tx.outputs.iter().try_fold(0u64, |t, o| t.checked_add(o.value)) else {
+        return Err("the outputs add up to more than any amount can be".into());
+    };
     if outs > ins {
         return Err(format!("the outputs ({outs}) are more than the coins spent ({ins})"));
+    }
+    if checked {
+        match crate::mempoolshare::sort(node, p, &tx) {
+            Ok(None) => {}
+            Ok(Some((n, why))) => {
+                crate::mempoolshare::pass_on(node, p, raw);
+                let _ = node.app.event("wallet", &format!("passed on {} for a website user (input {n} not checked here: {why})", tx.txid.to_hex()));
+                return Ok(json!({"txid": tx.txid.to_hex(), "fee": ins - outs, "size": tx.raw.len(), "pooled": false}));
+            }
+            Err(e) if e.contains("twice") => return Err("refused: a waiting transaction already spends one of these coins".into()),
+            Err(e) => return Err(format!("refused: {e}")),
+        }
     }
     if !crate::mempoolshare::add(node, p, &tx) {
         return Err("refused: a waiting transaction already spends one of these coins".into());
@@ -305,11 +358,17 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn setup() -> T {
+        setup_with(|_| {})
+    }
+
+    /// The same chain, with its parameters changed first (SegWit on, say).
+    pub(crate) fn setup_with(edit: impl FnOnce(&mut ChainParams)) -> T {
         let dir = tempfile::tempdir().unwrap();
         let g = block(Hash256::ZERO, vec![tx(&[], &[(50, p2pkh(0))], 0)], 1);
         let mut pp = arcade_chain::params::PEPECOIN_TEST.clone();
         pp.genesis = Box::leak(g.hash().to_hex().into_boxed_str());
         pp.genesis_header = "";
+        edit(&mut pp);
         let p: &'static ChainParams = Box::leak(Box::new(pp));
         let app = arcade_app::AppDb::open(dir.path()).unwrap();
         let chain = arcade_chaindb::ChainDb::open(dir.path().join("chain.mdbx")).unwrap();
@@ -329,7 +388,7 @@ pub(crate) mod tests {
             params: p,
             identity,
             tx_outbox: Mutex::new(Vec::new()),
-            mesh_outbox: Mutex::new(Vec::new()),
+            mesh_outbox: Mutex::new(Default::default()),
             links: Mutex::new(Default::default()),
             mesh_tips: Mutex::new(Default::default()),
             sync_state: Mutex::new("test".into()),
@@ -360,6 +419,49 @@ pub(crate) mod tests {
         arcade_ledger::address::address_of(&p2pkh(tag), t.p).unwrap()
     }
 
+    /// One test arcade shared by tests that need a node but not a fresh one: each setup()
+    /// maps a chain database, and many at once run out of address space (Mdbx OutOfMemory).
+    pub(crate) struct Shared {
+        pub(crate) node: std::sync::Arc<Node>,
+        pub(crate) p: &'static ChainParams,
+        /// Addresses of tags 1 and 2 (see T).
+        pub(crate) a: [String; 2],
+    }
+
+    pub(crate) fn shared() -> &'static Shared {
+        static S: std::sync::OnceLock<Shared> = std::sync::OnceLock::new();
+        S.get_or_init(|| {
+            let t = setup();
+            let a = [addr(&t, 1), addr(&t, 2)];
+            let T { _dir, node, p, .. } = t;
+            std::mem::forget(_dir); // kept for the whole test run
+            let node = std::sync::Arc::new(node);
+            let _ = node.me.set(std::sync::Arc::downgrade(&node));
+            Shared { node, p, a }
+        })
+    }
+
+    /// A mining reward too young to spend is not offered as a coin, and a transaction that spends
+    /// it is refused (the coin's network refuses it: bad-txns-premature-spend-of-coinbase).
+    #[test]
+    fn an_immature_mining_reward_is_not_spendable() {
+        let t = setup();
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap();
+        let reward = tx(&[], &[(7000, p2pkh(8))], 8);
+        t.node.chain.connect_blocks(t.p, &[block(tip.hash, vec![reward.clone()], 9)]).unwrap();
+        let a = addr(&t, 8);
+        let v = coins(&t.node, &json!({"addresses": [a]})).unwrap();
+        let ca = &v["addresses"][&a];
+        assert_eq!(ca["confirmed"].as_array().unwrap().len(), 0);
+        assert_eq!(ca["total"], 0);
+        assert_eq!(ca["immature"][0]["value"], 7000);
+        assert_eq!(ca["immature"][0]["spendable_after"], tip.height + 1 + t.p.coinbase_maturity);
+        let spend = tx(&[(reward.txid, 0)], &[(6000, p2pkh(4))], 0);
+        let why = broadcast(&t.node, &json!({"hex": hex::encode(&spend.raw)})).unwrap_err();
+        assert!(why.contains("isn't mature"), "{why}");
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty());
+    }
+
     #[test]
     fn coins_of_several_addresses() {
         let t = setup();
@@ -384,7 +486,10 @@ pub(crate) mod tests {
 
     #[test]
     fn broadcast_checks_then_pools() {
-        let t = setup();
+        use arcade_wallet::tx::{sign_keyhash, TxOutSpec, Utxo};
+        let (t, coins) = crate::mempoolshare::tests::funded();
+        let key = crate::mempoolshare::tests::key();
+        let mine = coins[1].script.clone();
         let change = OutPoint { txid: t.spend.txid, vout: 1 };
         // Spends a coin nobody has: refused.
         let ghost = tx(&[(Hash256([7; 32]), 0)], &[(10, p2pkh(4))], 0);
@@ -395,8 +500,18 @@ pub(crate) mod tests {
         // Spends A's spent coinbase again: refused.
         let again = tx(&[(t.cb1.txid, 0)], &[(10, p2pkh(4))], 0);
         assert!(broadcast(&t.node, &json!({"hex": hex::encode(&again.raw)})).is_err());
+        // Not signed by the coin's owner: refused, not pooled, not sent.
+        let unsigned = tx(&[(change.txid, 1)], &[(1000, p2pkh(4))], 0);
+        assert!(broadcast(&t.node, &json!({"hex": hex::encode(&unsigned.raw)})).unwrap_err().contains("refused"));
+        let good = sign_keyhash(t.p, 1, &coins[1..], &[TxOutSpec { value: 1300, script: mine.clone() }], &key, 0).unwrap();
+        let mut bad = good.raw.clone();
+        let at = bad.len() - 4 - 4 - 34 - 33 - 10; // inside the scriptSig's signature
+        bad[at] ^= 1;
+        let why = broadcast(&t.node, &json!({"hex": hex::encode(&bad)})).unwrap_err();
+        assert!(why.contains("refused: input 0"), "a bad signature: {why}");
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty());
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty());
         // A good one: pooled, queued for the coin's network, fee reported.
-        let good = tx(&[(change.txid, 1)], &[(1000, p2pkh(4)), (800, p2pkh(1))], 0);
         let v = broadcast(&t.node, &json!({"hex": hex::encode(&good.raw)})).unwrap();
         assert_eq!(v["txid"], good.txid.to_hex());
         assert_eq!(v["fee"], 100);
@@ -405,15 +520,28 @@ pub(crate) mod tests {
         // The same again: already known, not sent twice.
         assert_eq!(broadcast(&t.node, &json!({"hex": hex::encode(&good.raw)})).unwrap()["already"], true);
         assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 1);
-        // A rival spend of the same coin: refused.
-        let rival = tx(&[(change.txid, 1)], &[(1500, p2pkh(5))], 1);
+        // A rival spend of the same coin, signed: refused.
+        let rival = sign_keyhash(t.p, 1, &coins[1..], &[TxOutSpec { value: 1200, script: p2pkh(5) }], &key, 0).unwrap();
         assert!(broadcast(&t.node, &json!({"hex": hex::encode(&rival.raw)})).unwrap_err().contains("waiting transaction"));
         // A child of the waiting transaction may spend its output.
-        let child = tx(&[(good.txid, 0)], &[(900, p2pkh(6))], 0);
+        let out = Utxo { outpoint: OutPoint { txid: good.txid, vout: 0 }, value: 1300, script: mine.clone() };
+        let child = sign_keyhash(t.p, 1, &[out], &[TxOutSpec { value: 1200, script: p2pkh(6) }], &key, 0).unwrap();
         assert_eq!(broadcast(&t.node, &json!({"hex": hex::encode(&child.raw)})).unwrap()["fee"], 100);
         // Junk.
         assert!(broadcast(&t.node, &json!({"hex": "zz"})).is_err());
         assert!(broadcast(&t.node, &json!({"hex": "0100"})).is_err());
+    }
+
+    /// tx.coins and tx.activity with waiting transactions (pooled as the arcade's own sends
+    /// are, unchecked: the test chain's coins have no real keys).
+    #[test]
+    fn coins_and_activity_count_waiting_transactions() {
+        let t = setup();
+        let change = OutPoint { txid: t.spend.txid, vout: 1 };
+        let good = tx(&[(change.txid, 1)], &[(1000, p2pkh(4)), (800, p2pkh(1))], 0);
+        assert_eq!(broadcast_own(&t.node, &json!({"hex": hex::encode(&good.raw)})).unwrap()["fee"], 100);
+        let child = tx(&[(good.txid, 0)], &[(900, p2pkh(6))], 0);
+        assert_eq!(broadcast_own(&t.node, &json!({"hex": hex::encode(&child.raw)})).unwrap()["fee"], 100);
 
         // tx.coins now: A's confirmed change is spent by a waiting tx and leaves the list; the
         // waiting change to A shows as unconfirmed.
@@ -442,6 +570,15 @@ pub(crate) mod tests {
         assert_eq!(v["addresses"][&addr(&t, 6)]["waiting"][0]["received"], 900);
         let all = activity(&t.node, &json!({"addresses": [a.clone()]})).unwrap();
         assert_eq!(all["addresses"][&a]["confirmed"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn outputs_that_add_past_u64_are_refused() {
+        let t = setup();
+        // u64::MAX + 2 wraps to 1, less than the 1900 spent: refused, not pooled.
+        let wraps = tx(&[(t.spend.txid, 1)], &[(u64::MAX, p2pkh(4)), (2, p2pkh(5))], 0);
+        assert!(broadcast(&t.node, &json!({"hex": hex::encode(&wraps.raw)})).unwrap_err().contains("more than any amount"));
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty());
     }
 
     #[test]

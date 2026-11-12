@@ -78,7 +78,23 @@ pub struct Schema {
 /// Room for add-on index tables (ord, tokens, other chains' protocols) created later
 /// with [`Store::add_table`]; they must be named under a prefix in `ADDON_PREFIXES`.
 pub const ADDON_TABLE_SLOTS: u64 = 256;
-pub const ADDON_PREFIXES: &[&str] = &["ord.", "tok.", "names.", "sites.", "maps.", "ledger.", "msg.", "addon."];
+pub const ADDON_PREFIXES: &[&str] = &["ord.", "tok.", "names.", "sites.", "maps.", "ledger.", "msg.", "coll.", "addon."];
+
+/// Upper bound passed to libmdbx. On Linux this is only a ceiling. On Windows this
+/// build of libmdbx reserves the whole bound with one `NtMapViewOfSection`, so a
+/// multi-terabyte ceiling (fine on Linux) exhausts the process once a few databases
+/// are open. 512 GiB is still room for a large chain; the file grows up to that.
+fn geometry_max(requested: isize) -> isize {
+    #[cfg(windows)]
+    {
+        const CAP: isize = 512 << 30;
+        if requested > CAP { CAP } else { requested }
+    }
+    #[cfg(not(windows))]
+    {
+        requested
+    }
+}
 
 pub struct Store {
     db: Database<NoWriteMap>,
@@ -108,7 +124,7 @@ impl Store {
             mode: Mode::ReadWrite(ReadWriteOptions {
                 sync_mode: if durable { SyncMode::Durable } else { SyncMode::SafeNoSync },
                 min_size: None,
-                max_size: Some(schema.max_size),
+                max_size: Some(geometry_max(schema.max_size)),
                 growth_step: Some(64 << 20),
                 ..Default::default()
             }),

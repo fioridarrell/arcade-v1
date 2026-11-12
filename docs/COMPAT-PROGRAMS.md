@@ -12,11 +12,18 @@ of a Core node, from this computer only.
 | `/r/tag/<tag>`, `/r/token/<id>`, `/r/inscription/<id>`, `/r/inscriptions/<addr>`, `/r/inscriptions?creator=`, `/r/tx/<txid>`, `/content/<id>` | page API (same fields as the original) |
 | `/r/balances/<addr>?pending=1` | `units` from the blocks, plus `arriving` / `leaving` per token from the mempool (simple sends and grants) |
 | `/r/pending/<addr>` | waiting token transfers in and out |
+| `/r/ledgertx/<txid>` | the arcade ledger's record of one transaction (the original's `arcade_tx` row): `block`, `position`, `class`, `type`, `version`, `sender`, `reference`, `payload_hex`, `valid`; 404 with `state` `pending` (mempool, or a block the ledger hasn't reached), `none` (no arcade record) or `unknown`. No `invalid_reason`: V1.0 keeps only valid or not |
 | `/inscriptions/<id>/full` | redirects to the sandboxed `/app/<home chain>/<id>` |
 | `/realtime/hello`, `join` (certificate signed by the address), `send`, `leave`, `stream` (server-sent events, chunked) | the room door, on V1.0's mesh rooms |
 | Core JSON-RPC: `getblockcount`, `getrawtransaction` (verbose, Core's shape), `decoderawtransaction`, `gettxout`, `validateaddress`, `importaddress`, `listunspent`, `listtransactions`, `sendrawtransaction` (checked like a node, then shared over the mesh and sent to coin peers) | `POST /` (home chain) or `POST /chain/<key>`, Basic auth with `<home>/.cookie` |
 
 ## Pointing a program at V1.0
+
+- The page API (`/r/...`) answers an app page with its page pass, or a program on this computer that sends the
+  RPC cookie (`<home>/.cookie`) as Basic auth, as `/rpc` and the Core RPC take it: reads only, on the home chain;
+  `/r/send` and the market's writes still need an app page's pass.
+  A program reading for an app on another chain adds `X-Arcade-Chain: <key>` (a chain this arcade keeps or
+  borrows): those reads answer on that chain, as an app page's pass makes them.
 
 - The arcade's address: `http://127.0.0.1:<http port>` (not a public name through a proxy:
   these routes answer only this computer).
@@ -34,3 +41,5 @@ of a Core node, from this computer only.
 - The original's certificate room client: joined, messages arrived in ~10 ms, a wrong key was
   refused.
 - `sendrawtransaction`: a transaction already mined -> -27, an unknown coin -> -26.
+- `/r/ledgertx/<txid>` (2026-11-11): 45 transactions (30 valid, 15 invalid, sends to and from one
+  service address, the oldest and newest) equal to the original's `arcade_tx` rows field for field.

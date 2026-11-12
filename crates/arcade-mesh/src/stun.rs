@@ -139,9 +139,88 @@ pub fn parse_response(p: &[u8]) -> Option<([u8; 12], SocketAddr)> {
     plain.map(|a| (tx, normalize(a)))
 }
 
+/// How often Binding requests are answered. An answer is larger than the request and goes to
+/// whatever source address the request names, so answers are counted per asking IP and in all.
+/// A node asks a server at most a few times a minute (3 tries, NAT checks, proofs), so the
+/// per-IP allowance is far above what an arcade needs.
+pub struct AnswerLimit {
+    per_ip: std::collections::HashMap<IpAddr, (f64, std::time::Instant)>,
+    all: (f64, std::time::Instant),
+}
+
+/// Answers per asking IP: 2 a second, 8 at once.
+pub const ANSWER_IP_RATE: f64 = 2.0;
+pub const ANSWER_IP_BURST: f64 = 8.0;
+/// Answers in all: 200 a second, 400 at once.
+pub const ANSWER_ALL_RATE: f64 = 200.0;
+pub const ANSWER_ALL_BURST: f64 = 400.0;
+/// Asking IPs remembered at once (older ones are forgotten first).
+const ANSWER_IPS: usize = 4096;
+
+impl Default for AnswerLimit {
+    fn default() -> Self {
+        let now = std::time::Instant::now();
+        AnswerLimit { per_ip: Default::default(), all: (ANSWER_ALL_BURST, now) }
+    }
+}
+
+fn refill(b: &mut (f64, std::time::Instant), rate: f64, burst: f64, now: std::time::Instant) {
+    b.0 = (b.0 + now.saturating_duration_since(b.1).as_secs_f64() * rate).min(burst);
+    b.1 = now;
+}
+
+impl AnswerLimit {
+    /// May a request from `ip` be answered now?
+    pub fn allow(&mut self, ip: IpAddr, now: std::time::Instant) -> bool {
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(ip),
+            v4 => v4,
+        };
+        refill(&mut self.all, ANSWER_ALL_RATE, ANSWER_ALL_BURST, now);
+        if self.all.0 < 1.0 {
+            return false;
+        }
+        if !self.per_ip.contains_key(&ip) && self.per_ip.len() >= ANSWER_IPS {
+            // Forget askers whose allowance is back to full; if none, refuse new ones for now.
+            let full = (ANSWER_IP_BURST / ANSWER_IP_RATE) as u64 + 1;
+            self.per_ip.retain(|_, (_, t)| now.saturating_duration_since(*t).as_secs() < full);
+            if self.per_ip.len() >= ANSWER_IPS {
+                return false;
+            }
+        }
+        let b = self.per_ip.entry(ip).or_insert((ANSWER_IP_BURST, now));
+        refill(b, ANSWER_IP_RATE, ANSWER_IP_BURST, now);
+        if b.0 < 1.0 {
+            return false;
+        }
+        b.0 -= 1.0;
+        self.all.0 -= 1.0;
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answers_are_counted_per_ip_and_in_all() {
+        let t = std::time::Instant::now();
+        let mut l = AnswerLimit::default();
+        let a: IpAddr = "203.0.113.9".parse().unwrap();
+        let n = (0..50).filter(|_| l.allow(a, t)).count();
+        assert_eq!(n, ANSWER_IP_BURST as usize);
+        // The same asker as IPv4-mapped IPv6 shares the allowance.
+        assert!(!l.allow("::ffff:203.0.113.9".parse().unwrap(), t));
+        // Another asker has its own; after a second the first has two more.
+        assert!(l.allow("203.0.113.10".parse().unwrap(), t));
+        let t1 = t + std::time::Duration::from_secs(1);
+        assert_eq!((0..10).filter(|_| l.allow(a, t1)).count(), ANSWER_IP_RATE as usize);
+        // In all: many askers at once get at most the overall burst.
+        let mut l = AnswerLimit::default();
+        let n = (0..2000u32).filter(|i| l.allow(IpAddr::V4(std::net::Ipv4Addr::from(0x0a00_0000 + i)), t)).count();
+        assert_eq!(n, ANSWER_ALL_BURST as usize);
+    }
 
     #[test]
     fn binding_round_trip() {

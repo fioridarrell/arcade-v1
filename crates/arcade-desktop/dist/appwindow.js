@@ -15,6 +15,12 @@
     return;
   }
   const here = frame.split("/").pop();
+  // The chain the app is inscribed on (its frame's address). Its reads answer on that chain; this
+  // arcade's wallet writes on its home chain only, so the doors that write say so for another.
+  const appChain = frame.split("/")[4];
+  let homeChain = null;
+  const homeReady = api("chains.list").then((l) => { const h = (l.chains || l || []).find((c) => c.home); homeChain = h ? h.key : null; }).catch(() => {});
+  const WRITES = { inscribe: () => true, swap: (m) => m.op !== "items", seed: () => true, claim: () => true, owner: (m) => m.op === "send" };
   let appState = { state: "open", timeout: null, closesAt: null, inShell: false };
 
   const perms = async () => (id ? await api("apps.perms", { id }) : {});
@@ -54,6 +60,23 @@
     if (yes) await api("apps.perms", { id, set: { wallet: true } });
     return yes;
   }
+
+  // Files an app saves (groups.save): the first goes through, more ask once per window.
+  const SAVE_MAX = 64 * 1024 * 1024;
+  let saves = 0, savesOk = false;
+  function base64(buf) {
+    const b = new Uint8Array(buf);
+    let out = "";
+    for (let i = 0; i < b.length; i += 0x8000) out += String.fromCharCode.apply(null, b.subarray(i, i + 0x8000));
+    return btoa(out);
+  }
+  function toast(text) {
+    const t = document.createElement("div"); t.className = "toast"; t.textContent = text;
+    document.body.append(t);
+    setTimeout(() => t.remove(), 5000);
+  }
+  // The ring this window was opened from, if any (arcade.realtime.ringed).
+  const ringId = /^[0-9a-f]{16}$/.test(q.get("ring") || "") ? q.get("ring") : "";
 
   const doors = {
     async node(m) {
@@ -102,8 +125,10 @@
     async contacts(m) {
       if (m.op === "list") {
         const p = await perms();
-        if (!p.contacts) return { people: [], why: "off" };
-        return { people: (await api("contacts.list")).filter((c) => c.tag || c.address).map((c) => ({ address: c.address, tag: c.tag })) };
+        // Answered under both names: `contacts` is the original viewer's, `people` this shim's.
+        if (!p.contacts) return { contacts: [], people: [], why: "off" };
+        const list = (await api("contacts.list")).filter((c) => c.address).map((c) => ({ address: c.address, tag: c.tag || "" }));
+        return { contacts: list, people: list };
       }
       const a = String(m.address || "").trim();
       if (!/^@?[A-Za-z0-9_]{1,24}$/.test(a) && !/^[A-Za-z0-9]{25,90}$/.test(a)) throw new Error("not an address: give an address or an @tag");
@@ -162,7 +187,24 @@
           const r = await api("group.create", { name, members });
           return { group: (await api("group.app_list")).groups.find((g) => g.id === r.id) || { id: r.id, name } };
         }
-        case "save": throw new Error("saving files from an app is coming to Arcade V1.0");
+        case "save": {
+          // An app's frame cannot save a file, so this window does, for bytes the app hands over: a file named by
+          // the app, put in the Downloads folder beside any file already there. Nothing opens it.
+          const bytes = m.data instanceof ArrayBuffer ? m.data : null;
+          const file = String(m.name || "file").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 120);
+          if (!bytes) throw new Error("nothing to save");
+          if (bytes.byteLength > SAVE_MAX) throw new Error("too big: a saved file is at most 64 MB");
+          if (saves > 0 && !savesOk) {
+            const yes = await oneCard(() => card(`Let ${appName} save more files?`, [
+              `${appName} has saved a file to your Downloads folder and wants to save another (“${file}”). Allow lets it save files until this window closes.`], "Allow"));
+            if (!yes) throw new Error("declined");
+            savesOk = true;
+          }
+          saves++;
+          const kept = await invoke("save_file", { name: file, data: base64(bytes) });
+          toast(`Saved “${kept}” to Downloads`);
+          return { saved: file };
+        }
         default: throw new Error("groups ops are list, read, send, leave, seal, open, people, add, create and save");
       }
     },
@@ -177,37 +219,315 @@
     async realtime(m) {
       const name = String(m.room == null ? "" : m.room);
       if (m.op === "join") {
-        if (rooms[name]) { const old = rooms[name]; delete rooms[name]; api("realtime.leave", { token: old.token }).catch(() => {}); }
+        if (rooms[name]) { const old = rooms[name]; delete rooms[name]; fastStop(old); api("realtime.leave", { token: old.token }).catch(() => {}); }
         let r;
-        try { r = await api("realtime.join", { page: here, game: String(m.game || ""), room: name }); }
+        try { r = await api("realtime.join", { page: here, game: String(m.game || ""), room: name, fast: !!m.fast }); }
         catch (err) { return { online: false, why: String(err && err.message || err), me: null, members: [] }; }
-        const seat = { token: r.token, game: String(m.game || "") };
+        const seat = { name, token: r.token, game: String(m.game || ""), me: r.me, members: {}, wantFast: !!m.fast,
+                       link: fastLinkList(m.link), fastMax: fastMaxOf(m.max), fast: null, media: null };
+        for (const p of r.members || []) seat.members[p.id] = p;
         rooms[name] = seat;
+        if (seat.wantFast) fastStart(name, seat);
         listen(name, seat);
-        return { online: true, me: r.me, members: r.members, fast: false, media: false, screen: false };
+        return { online: true, me: r.me, members: r.members, fast: !!seat.fast, media: !!seat.fast,
+                 screen: !!(navigator.mediaDevices && navigator.mediaDevices.getDisplayMedia) };
       }
+      // Ringing: this window adds WHICH app is ringing (its own page, never what the page says); the arcade adds
+      // who (the player's cert). Whether it reaches anybody is for the other person's arcade to decide.
+      if (m.op === "ringed") return ringId ? await api("ring.get", { id: ringId, page: here }).catch(() => ({ ring: null })) : { ring: null };
+      if (m.op === "ring") {
+        const r = await api("ring.send", { page: here, to: String(m.to || ""), line: String(m.line || ""), link: String(m.link || "") });
+        return { rung: !!r.rung, why: r.why || "" };
+      }
+      const seat = rooms[name];
+      if (m.op === "leave") {
+        delete rooms[name];
+        if (seat) { fastStop(seat); await api("realtime.leave", { token: seat.token }).catch(() => {}); }
+        return {};
+      }
+      if (!seat) throw new Error("join the room first");
+      if (m.op === "fastroutes") return { routes: fastRoutes(seat) };
+      if (m.op === "fastlink") { fastLink(name, seat, m.link, m.max); return { fast: !!seat.fast }; }
       if (m.op === "send") {
-        const seat = rooms[name];
-        if (!seat) throw new Error("join the room first");
         await api("realtime.send", { token: seat.token, data: typeof m.data === "string" ? m.data : JSON.stringify(m.data) });
         return {};
       }
-      if (m.op === "leave") {
-        const seat = rooms[name]; delete rooms[name];
-        if (seat) await api("realtime.leave", { token: seat.token }).catch(() => {});
-        return {};
-      }
-      if (m.op === "ringed") return { ring: null };
-      if (m.op === "ring") return { rung: false, why: "ringing is coming to Arcade V1.0" };
-      if (m.op === "media") throw new Error("media needs a room joined with {fast: true}");
+      if (m.op === "media") return await media.door(seat, m);
       throw new Error("realtime ops are join, send, media and leave");
     },
   };
 
   // Rooms: one seat per room name; each listens for its events and hands them to the page.
   const rooms = {};
+  // Camera, microphone and screen on fast rooms (media.js).
+  const media = window.ArcadeMedia({ api, push: (ev) => push(ev), perms });
+  // Trades between two players of one room (trade.js).
+  const trade = window.ArcadeTrade({ api, rooms, toPage: (b) => el.contentWindow?.postMessage(b, "*"), card, oneCard, walletGate });
+  doors.swap = (m) => trade.door(m);
+  // Prize pools on the chain: a seed for a run (from the pool's referee) and a claim of one lot. The arcade
+  // opens the lot with the page's phrase and, for a refereed pool, has its referee check the run.
+  doors.seed = async (m) => {
+    if (!(await walletGate("play for a prize"))) throw new Error("cancelled");
+    return await api("prize.seed", { page: here, pool: m.pool == null ? "" : String(m.pool), game: m.game === true, session: m.session === true,
+                                     judge: m.judge ? String(m.judge) : "", referee: m.referee ? String(m.referee) : "" });
+  };
+  doors.claim = async (m) => {
+    if (!(await walletGate("claim a prize"))) throw new Error("cancelled");
+    const ask = { page: here, pool: m.pool ? String(m.pool) : "", secret: String(m.secret || ""),
+                  replay: m.replay && typeof m.replay === "object" ? { seed: String(m.replay.seed || ""), inputs: m.replay.inputs } : null };
+    const pre = await api("prize.claim", ask);
+    if (!pre.pool_pays) {
+      // The claimer pays: the price to the pool's creator and the network fee, said first.
+      if (m.silent === true) throw new Error("this claim costs coins, so the player says yes first");
+      const seller = pre.seller_tag ? "@" + pre.seller_tag : "its owner";
+      const price = (Number(pre.price) / 1e8).toString();
+      const yes = await oneCard(() => card(`Claim ${pre.piece}?`, [
+        `${seller} set this aside for whoever got here. It costs ${price} ${price === "1" ? "coin" : "coins"} to ${seller} and a network fee of ${pre.fee_text}. `
+        + "What you claim and the coins move in one transaction, or neither does." + (pre.refereed ? " The pool's referee checks your run before it pays." : "")],
+        "Claim it"));
+      if (!yes) throw new Error("Cancelled.");
+    }
+    const done = await api("prize.claim", { ...ask, lot: pre.lot, send: true });
+    return { txid: done.txid, piece: done.piece };
+  };
   const push = (event) => el.contentWindow?.postMessage({ arcade: "realtime", event }, "*");
   const pause = (ms) => new Promise((r) => setTimeout(r, ms));
+
+  // The fast lane (a room joined with {fast: true}), on the original arcade's room wire: hidden room
+  // messages that begin with RTC and never reach the page.
+  //  - {f: 1, d, r?, b?, t?}: fast data carried by the room. r: sent reliable; b: d is base64 of
+  //    bytes; t: only for these player ids.
+  //  - {to, k, i, n, d}: piece i of n of signal k for one player. The signal is JSON {t}: 'o' and 'a'
+  //    (the two halves of a direct link), 'h' (please offer) and 'n' (I don't link with you).
+  // This window makes no WebRTC links (it has none). A pair whose arcades are both V1.0 goes over the
+  // arcades' own fast lane instead (realtime.fast / realtime.lanes): state 'direct'. Every other pair
+  // is carried by the room: at most three hidden messages a second, signals first, then the reliable
+  // sends in order, and of the rest only the latest. An original arcade that offers a WebRTC link gets
+  // no answer and carries the pair over the room after its own wait.
+  const RTC = "\u001farcade-rtc:", TRADE = "\u001farcade-trade:";
+  const FAST_MAX = 16384, FAST_PEERS = 19, FAST_PEERS_MAX = 60, FAST_TO_MAX = 64, RTC_PIECE = 300, FAST_LANE_WAIT = 5000, LANES_EVERY = 1000;
+  const fastLinkList = (link) => (Array.isArray(link) ? link.slice(0, FAST_PEERS_MAX).map(String) : null);
+  const fastMaxOf = (max) => Math.max(1, Math.min(FAST_PEERS_MAX, (max | 0) || FAST_PEERS));
+  const fastLinks = (s, id) => !s.link || s.link.includes(String(id));
+  function fastB64(buf) { const u = new Uint8Array(buf); let t = ""; for (let i = 0; i < u.length; i++) t += String.fromCharCode(u[i]); return btoa(t); }
+  function fastUnB64(text) { const t = atob(text), u = new Uint8Array(t.length); for (let i = 0; i < t.length; i++) u[i] = t.charCodeAt(i); return u.buffer; }
+  function fastStart(name, s) {
+    const fast = (s.fast = { peers: {}, out: [], parts: {}, latest: null, reliable: [], k: 0, pump: null,
+                             lane: { out: [], busy: false }, routes: {} });
+    for (const id in s.members) fastMeet(name, s, s.members[id]);
+    // Which players the arcades' fast lane reaches: those pairs go 'direct', the rest stay on the room.
+    const look = async () => {
+      if (s.fast !== fast || rooms[name] !== s) return;
+      let r;
+      try { r = await api("realtime.lanes", { token: s.token }); } catch (err) { r = null; }
+      if (s.fast !== fast || !r) return;
+      const up = new Set(r.up || []);
+      fast.routes = r.routes || {};
+      for (const id in fast.peers) {
+        const peer = fast.peers[id];
+        if (up.has(id) && peer.state !== "direct") { clearTimeout(peer.timer); fastSay(name, s, peer.p, "direct"); }
+        else if (!up.has(id) && peer.state === "direct") { fastSay(name, s, peer.p, "room"); fastPump(name, s); }
+      }
+    };
+    fast.lanes = setInterval(look, LANES_EVERY);
+    look();
+  }
+  function fastStop(s) {
+    if (!s) return;
+    media.close(s);
+    if (!s.fast) return;
+    for (const id in s.fast.peers) clearTimeout(s.fast.peers[id].timer);
+    clearInterval(s.fast.pump);
+    clearInterval(s.fast.lanes);
+    s.fast = null;
+  }
+  function fastSay(name, s, p, state) {
+    const peer = s.fast && s.fast.peers[p.id];
+    if (peer) { if (peer.state === state) return; peer.state = state; }
+    push({ type: "peer", room: name, member: p, state });
+  }
+  function fastMeet(name, s, p) {
+    if (!s.fast || !s.me || p.id === s.me.id || s.fast.peers[p.id]) return;
+    if (!fastLinks(s, p.id)) return;                 // the page does not want this link
+    if (Object.keys(s.fast.peers).length >= s.fastMax) return;
+    const fast = s.fast, peer = (fast.peers[p.id] = { p, state: "" });
+    fastSay(name, s, p, "connecting");
+    // No lane by then: the room carries the pair (and it goes 'direct' if a lane comes up later).
+    peer.timer = setTimeout(() => {
+      if (s.fast !== fast || fast.peers[p.id] !== peer || peer.state === "direct") return;
+      fastSay(name, s, peer.p, "room");
+      fastPump(name, s);
+    }, FAST_LANE_WAIT);
+  }
+  function fastDrop(s, id) {
+    const peer = s.fast && s.fast.peers[id];
+    if (!peer) return;
+    media.gone(s, id);
+    clearTimeout(peer.timer);
+    delete s.fast.peers[id];
+  }
+  function fastLink(name, s, link, max) {
+    s.link = fastLinkList(link); s.fastMax = fastMaxOf(max);
+    if (!s.fast) return;
+    for (const id in s.fast.peers) if (!fastLinks(s, id)) {
+      const p = s.fast.peers[id].p; fastDrop(s, id); fastSay(name, s, p, "gone");
+      fastSignal(name, s, p.id, { t: "n" });
+    }
+    for (const id in s.members) {
+      // A player newly linked with is asked to link back: they may have let this one go.
+      const had = !!s.fast.peers[id];
+      fastMeet(name, s, s.members[id]);
+      if (!had && s.fast.peers[id]) fastSignal(name, s, id, { t: "h" });
+    }
+  }
+  const fastViaRoom = (s) => Object.values(s.fast.peers).some((peer) => peer.state === "room");
+  function fastRoutes(s) {
+    const out = {};
+    if (s.fast) for (const id in s.fast.peers) {
+      const st = s.fast.peers[id].state;
+      out[id] = st === "room" ? "none" : st === "direct" ? (s.fast.routes[id] || "direct") : "connecting";
+    }
+    return out;
+  }
+  function fastSignal(name, s, to, body) {
+    const text = JSON.stringify(body), k = (++s.fast.k).toString(36), n = Math.ceil(text.length / RTC_PIECE);
+    for (let i = 0; i < n; i++) s.fast.out.push({ to, k, i, n, d: text.slice(i * RTC_PIECE, (i + 1) * RTC_PIECE) });
+    fastPump(name, s);
+  }
+  function fastPump(name, s) {
+    if (!s.fast || s.fast.pump) return;
+    const fast = s.fast;
+    fast.pump = setInterval(() => {
+      if (s.fast !== fast || rooms[name] !== s) { clearInterval(fast.pump); return; }
+      let msg = fast.out.shift();
+      if (!msg && fastViaRoom(s)) {
+        let it = null;
+        if (fast.reliable.length) { it = fast.reliable.shift(); msg = { f: 1, r: 1, d: it.d }; }
+        else if (fast.latest != null) { it = fast.latest; msg = { f: 1, d: it.d }; fast.latest = null; }
+        if (it && it.b) msg.b = 1;
+        if (it && it.t) msg.t = it.t;
+      }
+      if (!msg) {
+        if (!fastViaRoom(s)) { clearInterval(fast.pump); fast.pump = null; }
+        return;
+      }
+      api("realtime.send", { token: s.token, data: RTC + JSON.stringify(msg) }).catch(() => {});
+    }, 340);
+  }
+  const fastHeard = (name, p, data) => push({ type: "fast", room: name, member: p, data });
+  // A hidden fast-lane message heard in the room.
+  function rtcHeard(name, s, p, text) {
+    let msg; try { msg = JSON.parse(text); } catch (err) { return; }
+    if (!msg || typeof msg !== "object" || !s.fast || !p || !s.me || p.id === s.me.id) return;
+    if (msg.f) {
+      if (msg.t && (!Array.isArray(msg.t) || !msg.t.includes(s.me.id))) return;   // sent to others only
+      if (typeof msg.d === "string") { try { fastHeard(name, p, msg.b ? fastUnB64(msg.d) : msg.d); } catch (err) {} }
+      return;
+    }
+    if (msg.to !== s.me.id || typeof msg.d !== "string") return;
+    const key = p.id + "/" + msg.k, got = s.fast.parts[key] || (s.fast.parts[key] = []);
+    got[msg.i | 0] = msg.d;
+    const n = msg.n | 0;
+    if (n < 1 || n > 8) { delete s.fast.parts[key]; return; }
+    for (let i = 0; i < n; i++) if (got[i] == null) return;
+    delete s.fast.parts[key];
+    let o; try { o = JSON.parse(got.join("")); } catch (err) { return; }
+    if (!o) return;
+    if (o.t === "n") {                              // they do not link with us: let them go
+      if (s.fast.peers[p.id]) { fastDrop(s, p.id); fastSay(name, s, p, "gone"); }
+    } else if (o.t === "o" || o.t === "h") {
+      // They want a direct link. One the page does not link with is told so; the rest get no
+      // answer, and the pair stays on the room.
+      if (!s.fast.peers[p.id]) fastMeet(name, s, p);
+      if (!s.fast.peers[p.id] && !fastLinks(s, p.id)) fastSignal(name, s, p.id, { t: "n" });
+    }
+  }
+  // The page's fast.send: through the room to the players it is for.
+  function fastSend(s, m) {
+    if (!s.fast) return;
+    const bin = m.data instanceof ArrayBuffer;
+    const data = bin ? m.data : String(m.data == null ? "" : m.data);
+    if ((bin ? data.byteLength : data.length) > FAST_MAX) return;
+    const to = Array.isArray(m.to) ? m.to.slice(0, FAST_TO_MAX).map(String) : null;
+    let viaRoom = false;
+    const lane = [];
+    for (const id in s.fast.peers) {
+      if (to && !to.includes(id)) continue;
+      const st = s.fast.peers[id].state;
+      if (st === "direct") lane.push(id); else if (st === "room") viaRoom = true;
+    }
+    if (lane.length) laneSend(s, { to: lane.slice(0, FAST_TO_MAX), reliable: !!m.reliable, ...(bin ? { b64: fastB64(data) } : { data }) });
+    if (!viaRoom) return;
+    const d = bin ? fastB64(data) : data, it = { d };
+    if (bin) it.b = 1;
+    if (to) it.t = to;
+    if (d.length <= 400 && JSON.stringify(it).length <= 470) {
+      if (m.reliable) { if (s.fast.reliable.length < 50) s.fast.reliable.push(it); }
+      else s.fast.latest = it;
+    }
+  }
+
+  // Sends over the arcades' lane, one at a time so reliable ones keep their order; an unreliable send
+  // still waiting is replaced by the newest for the same players. Reliable sends are never dropped:
+  // when the arcade says "too fast" the send waits a moment and goes again (a data channel buffers too).
+  const LANE_RELIABLE_MAX = 10000;
+  function laneSend(s, msg) {
+    const lane = s.fast.lane, key = msg.reliable ? null : msg.to.join(",");
+    if (key !== null) {
+      const i = lane.out.findIndex((x) => !x.reliable && x.to.join(",") === key);
+      if (i >= 0) { lane.out[i] = msg; return; }
+    } else if (lane.out.length >= LANE_RELIABLE_MAX) return;     // as a full data channel: no more for now
+    lane.out.push(msg);
+    laneNext(s, s.fast);
+  }
+  function laneNext(s, fast) {
+    const lane = fast.lane;
+    if (lane.busy || s.fast !== fast) return;
+    const msg = lane.out.shift();
+    if (!msg) return;
+    lane.busy = true;
+    api("realtime.fast", { token: s.token, ...msg }).then(() => 0, (err) => {
+      if (msg.reliable && /too fast/.test(String(err && err.message || err))) { lane.out.unshift(msg); return 50; }
+      return 0;
+    }).then((wait) => {
+      const go = () => { lane.busy = false; laneNext(s, fast); };
+      if (wait) setTimeout(go, wait); else go();
+    });
+  }
+
+  // One room event: the seat's own list of who is here, the fast lane's part, then the page's.
+  function hear(name, s, ev) {
+    if (!ev || ev.type === "reconnecting") return;
+    ev.room = name;
+    const p = ev.member;
+    if (p && ev.type === "join") {
+      s.members[p.id] = p;
+      if (s.fast && s.fast.peers[p.id]) s.fast.peers[p.id].p = p;
+      fastMeet(name, s, p);
+    }
+    if (p && ev.type === "leave") {
+      // The seat they left behind on an arcade they dropped from, after coming back through
+      // another: they are still here.
+      const now = s.members[p.id];
+      if (now && now.node && p.node && now.node !== p.node) return;
+      delete s.members[p.id];
+      if (s.fast && s.fast.peers[p.id]) { fastDrop(s, p.id); fastSay(name, s, p, "gone"); }
+    }
+    if (ev.type === "mchunk") { media.heard(s, ev); return; }   // pieces of a call: the window's own
+    if (ev.type === "fast") {
+      // From the arcades' lane: only from a player this page links with, and bytes as an ArrayBuffer.
+      if (!p || !s.fast || !s.fast.peers[p.id]) return;
+      let data = ev.data;
+      if (typeof ev.b64 === "string") { try { data = fastUnB64(ev.b64); } catch (err) { return; } }
+      fastHeard(name, p, data);
+      return;
+    }
+    if (ev.type === "message" && typeof ev.data === "string") {
+      if (ev.data.startsWith(RTC)) { rtcHeard(name, s, p, ev.data.slice(RTC.length)); return; }
+      if (ev.data.startsWith(TRADE)) { trade.heard(name, p, ev.data.slice(TRADE.length)); return; }   // the windows' own talk: never the page's
+    }
+    push(ev);
+  }
   async function listen(name, seat) {
     let fails = 0;
     while (rooms[name] === seat) {
@@ -220,31 +540,46 @@
         if (fails > 1) r = { events: [], gone: true }; else continue;
       }
       if (rooms[name] !== seat) return;
-      for (const ev of r.events || []) if (ev.type !== "reconnecting") push(ev);
+      for (const ev of r.events || []) hear(name, seat, ev);
       if (r.gone) {
-        // The seat was let go (the service restarted): take it again.
+        // The seat was let go (the service restarted): take it again, and tell the page who left
+        // and who is here now.
         try {
-          const j = await api("realtime.join", { page: here, game: seat.game, room: name });
-          seat.token = j.token; fails = 0;
+          const j = await api("realtime.join", { page: here, game: seat.game, room: name, fast: seat.wantFast });
+          if (rooms[name] !== seat) { api("realtime.leave", { token: j.token }).catch(() => {}); return; }
+          const before = seat.members, was = seat.me;
+          fastStop(seat);
+          seat.token = j.token; seat.me = j.me; seat.members = {}; fails = 0;
+          for (const p of j.members || []) seat.members[p.id] = p;
+          if (seat.wantFast) fastStart(name, seat);
           push({ type: "rejoined", room: name, member: j.me, media: null });
-          for (const p of j.members || []) if (!j.me || p.id !== j.me.id) push({ type: "join", room: name, member: p });
+          if (j.me && (!was || j.me.id !== was.id)) push({ type: "me", room: name, member: j.me });
+          for (const id in before) if (!seat.members[id]) push({ type: "leave", room: name, member: before[id] });
+          for (const id in seat.members) if (!before[id]) push({ type: "join", room: name, member: seat.members[id] });
         } catch (err) { await pause(2000); }
       }
     }
   }
   window.addEventListener("pagehide", () => {
-    for (const k of Object.keys(rooms)) { api("realtime.leave", { token: rooms[k].token }).catch(() => {}); delete rooms[k]; }
+    for (const k of Object.keys(rooms)) { fastStop(rooms[k]); api("realtime.leave", { token: rooms[k].token }).catch(() => {}); delete rooms[k]; }
   });
 
   window.addEventListener("message", async (e) => {
     if (e.source !== el.contentWindow) return;
     const m = e.data;
     if (!m || typeof m !== "object" || typeof m.seq !== "number" || !m.arcade) return;
-    if (m.arcade === "realtime" && m.op === "fast") return; // never answered
-    if (m.arcade === "inscribe") el.contentWindow.postMessage({ arcade: "inscribe", seq: m.seq, heard: true }, "*");
+    if (m.arcade === "realtime" && m.op === "fast") {   // many a second: never answered
+      const s = rooms[String(m.room == null ? "" : m.room)];
+      if (s) fastSend(s, m);
+      return;
+    }
+    if (m.arcade === "inscribe" || m.arcade === "claim") el.contentWindow.postMessage({ arcade: m.arcade, seq: m.seq, heard: true }, "*");
     const door = doors[m.arcade];
     let body;
+    if (WRITES[m.arcade] && WRITES[m.arcade](m)) await homeReady;
     if (!door) body = { ok: false, error: `${m.arcade} is coming to Arcade V1.0` };
+    else if (WRITES[m.arcade] && WRITES[m.arcade](m) && homeChain && appChain !== homeChain)
+      body = { ok: false, error: `this app is on ${appChain}: this arcade's wallet writes on ${homeChain} only` };
     else {
       try { body = { ok: true, ...(await door(m)) }; }
       catch (err) { body = { ok: false, error: String(err && err.message || err) }; }
@@ -284,6 +619,7 @@
     finally { showing = null; }
   }, 1500);
 
-  el.src = frame;
+  // The page with its pass for the page API (a new address, so a copy cached before passes isn't used).
+  el.src = frame + "?pass=1";
   window.arcadeApp = { id, frame, el };
 })();

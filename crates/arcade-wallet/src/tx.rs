@@ -22,6 +22,13 @@ pub enum BuildError {
     InsufficientFunds { have: u64, need: u64 },
     #[error("payload too large for one OP_RETURN ({0} bytes)")]
     PayloadTooLarge(usize),
+    #[error("the amounts add up to more than any amount can be")]
+    TooMuch,
+}
+
+/// `a + b`, refused when it doesn't fit (a wrapped sum would pay what nobody asked).
+fn add(a: u64, b: u64) -> Result<u64, BuildError> {
+    a.checked_add(b).ok_or(BuildError::TooMuch)
 }
 
 #[derive(Debug, Clone)]
@@ -53,7 +60,7 @@ pub fn op_return(data: &[u8]) -> Vec<u8> {
 }
 
 /// Serialize with the given per-input scriptSigs (legacy, no witness).
-fn serialize(p: &ChainParams, version: i32, time: u32, ins: &[(OutPoint, Vec<u8>)], outs: &[TxOutSpec]) -> Vec<u8> {
+pub(crate) fn serialize(p: &ChainParams, version: i32, time: u32, ins: &[(OutPoint, Vec<u8>)], outs: &[TxOutSpec]) -> Vec<u8> {
     let mut o = Vec::new();
     o.extend_from_slice(&version.to_le_bytes());
     if p.format.tx_time {
@@ -150,7 +157,7 @@ fn outputs_bytes(outs: &[TxOutSpec]) -> Vec<u8> {
 
 /// BIP143 signature hash of input `i` (a P2WPKH coin) with SIGHASH_ALL, as this module builds
 /// txs: every nSequence 0xffffffff, locktime 0.
-fn bip143_digest(version: i32, utxos: &[Utxo], outs: &[TxOutSpec], i: usize) -> [u8; 32] {
+pub(crate) fn bip143_digest(version: i32, utxos: &[Utxo], outs: &[TxOutSpec], i: usize) -> [u8; 32] {
     bip143_digest_with(version, utxos, &vec![u32::MAX; utxos.len()], 0, outs, i)
 }
 
@@ -182,6 +189,24 @@ fn bip143_digest_with(version: i32, utxos: &[Utxo], sequences: &[u32], lock_time
 
 /// Sign every input with `key`: P2PKH coins with the legacy signature hash, P2WPKH coins with
 /// BIP143 (a witness of signature and key). The tx is written with a witness when any input
+
+/// The Dogecoin family (Dogecoin Core 1.14 and the chains built on it) charges its relay fee per STARTED
+/// kilobyte: a 14,783-byte transaction pays 15 x the rate, and a peer drops one that pays a byte-exact
+/// 14.783 x (the node's own RPC doesn't check, so it looks fine there; 2026-11-11, an app inscription's
+/// later pieces were never relayed).
+pub fn per_started_kb(p: &ChainParams) -> bool {
+    matches!(p.key, "doge" | "pep" | "peptest" | "lky" | "wjk" | "flop" | "shic")
+}
+
+/// The fee a transaction of `size` bytes pays at `fee_per_kb` on chain `p`.
+pub fn fee_for_size(p: &ChainParams, size: u64, fee_per_kb: u64) -> u64 {
+    if per_started_kb(p) {
+        (size / 1000 + 1) * fee_per_kb
+    } else {
+        (size * fee_per_kb).div_ceil(1000)
+    }
+}
+
 /// has one (chains that allow SegWit only). Inputs that are neither are refused.
 pub fn sign_keyhash(p: &ChainParams, version: i32, utxos: &[Utxo], outs: &[TxOutSpec], key: &SecretKey, time: u32) -> Result<Tx, String> {
     let pk: PublicKey = PublicKey::from_secret_key(SECP256K1, key);
@@ -318,26 +343,27 @@ pub fn build_send_keyhash(
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let fee_for = |c: &[Utxo]| {
         let w = c.iter().filter(|u| p2wpkh_hash(&u.script).is_some()).count();
-        (estimate_vsize(c.len() - w, w, &[to_script.len(), change_script.len()]) as u64 * fee_per_kb).div_ceil(1000)
+        fee_for_size(p, estimate_vsize(c.len() - w, w, &[to_script.len(), change_script.len()]) as u64, fee_per_kb)
     };
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= amount + fee_for(&chosen) {
+        have = add(have, u.value).map_err(|e| e.to_string())?;
+        if add(amount, fee_for(&chosen)).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(&chosen);
-    if chosen.is_empty() || have < amount + fee {
-        return Err(BuildError::InsufficientFunds { have, need: amount + fee }.to_string());
+    let need = add(amount, fee).map_err(|e| e.to_string())?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need }.to_string());
     }
     if amount < dust {
         return Err(format!("{amount} is below the network's dust limit ({dust})"));
     }
     let mut outs = vec![TxOutSpec { value: amount, script: to_script.to_vec() }];
-    let change = have - amount - fee;
+    let change = have - need;
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script.to_vec() });
     }
@@ -379,17 +405,18 @@ pub fn build_claim(
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
-    let fee_for = |n_in: usize| (estimate_size(n_in, &[ret.len(), 25]) as u64 * fee_per_kb).div_ceil(1000);
+    let fee_for = |n_in: usize| fee_for_size(p, estimate_size(n_in, &[ret.len(), 25]) as u64, fee_per_kb);
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= fee_for(chosen.len()) + dust {
+        have = add(have, u.value)?;
+        if add(fee_for(chosen.len()), dust).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(chosen.len().max(1));
-    if chosen.is_empty() || have < fee + dust {
-        return Err(BuildError::InsufficientFunds { have, need: fee + dust });
+    let need = add(fee, dust)?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need });
     }
     let outs = vec![
         TxOutSpec { value: 0, script: ret },
@@ -470,25 +497,26 @@ pub fn build_arcade(
         }
     }
     outs.extend(extra);
-    let spend: u64 = outs.iter().map(|o| o.value).sum();
+    let spend = outs.iter().try_fold(0u64, |t, o| add(t, o.value))?;
     let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
     let lens: Vec<usize> = outs.iter().map(|o| o.script.len()).chain(std::iter::once(25)).collect();
-    let fee_for = |n_in: usize| (estimate_size(n_in, &lens) as u64 * fee_per_kb).div_ceil(1000);
+    let fee_for = |n_in: usize| fee_for_size(p, estimate_size(n_in, &lens) as u64, fee_per_kb);
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= spend + fee_for(chosen.len()) + dust {
+        have = add(have, u.value)?;
+        if add(spend, fee_for(chosen.len())).and_then(|n| add(n, dust)).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(chosen.len().max(1));
-    if chosen.is_empty() || have < spend + fee {
-        return Err(BuildError::InsufficientFunds { have, need: spend + fee });
+    let need = add(spend, fee)?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need });
     }
-    let change = have - spend - fee;
+    let change = have - need;
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script });
     }
@@ -551,26 +579,41 @@ pub fn build_send(
         arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
     let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
-    let fee_for = |n_in: usize| (estimate_size(n_in, &[to_script.len(), 25]) as u64 * fee_per_kb).div_ceil(1000);
+    let fee_for = |n_in: usize| fee_for_size(p, estimate_size(n_in, &[to_script.len(), 25]) as u64, fee_per_kb);
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
     for u in sorted {
         chosen.push(u.clone());
-        have += u.value;
-        if have >= amount + fee_for(chosen.len()) {
+        have = add(have, u.value)?;
+        if add(amount, fee_for(chosen.len())).is_ok_and(|need| have >= need) {
             break;
         }
     }
     let fee = fee_for(chosen.len().max(1));
-    if chosen.is_empty() || have < amount + fee {
-        return Err(BuildError::InsufficientFunds { have, need: amount + fee });
+    let need = add(amount, fee)?;
+    if chosen.is_empty() || have < need {
+        return Err(BuildError::InsufficientFunds { have, need });
     }
     let mut outs = vec![TxOutSpec { value: amount, script: to_script.to_vec() }];
-    let change = have - amount - fee;
+    let change = have - need;
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script });
     }
     Ok(sign_p2pkh(p, &chosen, &outs, key, time))
+}
+
+#[cfg(test)]
+mod fee_tests {
+    use super::*;
+    use arcade_chain::params::{DIGIBYTE_TEST, PEPECOIN_TEST};
+
+    #[test]
+    fn the_dogecoin_family_pays_per_started_kilobyte() {
+        // The app inscription's pieces (2026-11-11): 14,783 bytes needs 0.15 PEP, not 0.14783.
+        assert_eq!(fee_for_size(&PEPECOIN_TEST, 14_783, 1_000_000), 15_000_000);
+        assert_eq!(fee_for_size(&PEPECOIN_TEST, 223, 1_000_000), 1_000_000);
+        assert_eq!(fee_for_size(&DIGIBYTE_TEST, 14_783, 1_000_000), 14_783_000);
+    }
 }
 
 #[cfg(test)]
@@ -701,8 +744,9 @@ mod tests {
         assert_eq!(atx.sender, me);
         assert_eq!(atx.reference.as_deref(), Some(me.as_str()));
         assert_eq!(tags::parse(&atx.payload), Some(Ok(tags::TagOp::Claim("martin".into()))));
+        // Under 1 kB on Pepecoin: one started kilobyte at 0.01 a kB (fee_for_size).
         let fee = 100_000_000 - tx.outputs[1].value;
-        assert!(fee > 0 && fee < 1_000_000, "fee {fee}");
+        assert_eq!(fee, 1_000_000, "fee {fee}");
     }
 
     #[test]
@@ -729,6 +773,25 @@ mod tests {
         assert_eq!(tx.outputs[0].script_pubkey, to);
         assert_eq!(tx.outputs[1].script_pubkey, me);
         assert!(build_send(p, &to, 600_000_000, &k, &coins, 1_000_000, 1_000_000, 0).is_err());
+    }
+
+    #[test]
+    fn amounts_that_overflow_are_refused() {
+        let p = &PEPECOIN_TEST;
+        let k = key();
+        let pk = PublicKey::from_secret_key(SECP256K1, &k);
+        let me = crate::keys::p2pkh_script_for(&pk);
+        let to = arcade_ledger::address::p2pkh_script(&[3; 20]);
+        let coins = vec![Utxo { outpoint: OutPoint { txid: Hash256([5; 32]), vout: 0 }, value: 500_000_000, script: me.clone() }];
+        // An amount that wraps to a few coins once the fee is added: refused, never a small payment.
+        assert_eq!(build_send(p, &to, u64::MAX - 10, &k, &coins, 1_000_000, 1_000_000, 0).unwrap_err(), BuildError::TooMuch);
+        let wpkh = arcade_ledger::address::p2wpkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
+        let dgb = &arcade_chain::params::DIGIBYTE_MAIN;
+        let wcoins = vec![Utxo { outpoint: OutPoint { txid: Hash256([6; 32]), vout: 0 }, value: 500_000_000, script: wpkh.clone() }];
+        assert!(build_send_keyhash(dgb, &to, u64::MAX - 10, &k, &wcoins, &wpkh, 1_000_000, 5_460, 0).unwrap_err().contains("more than any amount"));
+        // Coins whose values add past u64: refused.
+        let two = vec![coins[0].clone(), Utxo { outpoint: OutPoint { txid: Hash256([7; 32]), vout: 0 }, value: u64::MAX, script: me }];
+        assert_eq!(build_send(p, &to, u64::MAX - 1, &k, &two, 1_000_000, 1_000_000, 0).unwrap_err(), BuildError::TooMuch);
     }
 
     #[test]

@@ -15,6 +15,7 @@
     });
   }
   window.addEventListener('message', function (e) {
+    if (e.source !== window.parent) return;          // only the arcade window that framed this page
     var m = e.data;
     if (!m || m.arcade !== 'access' || !waiting[m.seq]) return;
     var w = waiting[m.seq]; delete waiting[m.seq]; clearTimeout(w.t);

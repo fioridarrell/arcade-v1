@@ -5,6 +5,7 @@
   if (window.arcade.state) return;
   var seq = 0, waiting = {};
   window.addEventListener('message', function (e) {
+    if (e.source !== window.parent) return;          // only the arcade window that framed this page
     var m = e.data;
     if (!m || m.arcade !== 'state' || !waiting[m.seq]) return;
     var w = waiting[m.seq]; delete waiting[m.seq]; clearTimeout(w.t);

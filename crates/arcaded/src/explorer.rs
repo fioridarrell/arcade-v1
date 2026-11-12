@@ -8,8 +8,9 @@
 //!   explorer.inscriptions {before?, n?}    newest first, with previews
 //!   explorer.inscription  {id}             details + content (as a data URL, capped)
 //!   explorer.tokens   {after?, n?}         token ticks
-//!   explorer.token    {tick}               a tick and its top holders
+//!   explorer.token    {tick, offset?, n?}  a tick and a page of its holders (biggest first)
 //!   explorer.names / explorer.maps {after?, n?}, explorer.name {name}, explorer.map {claim}
+//!   explorer.site {name} / explorer.sites {all?}   a name's site, the names with one (namesites.rs)
 //!   explorer.mempool                       unconfirmed transactions
 //!   explorer.search   {q}                  what a search box string points at
 
@@ -40,6 +41,12 @@ pub fn unit(p: &ChainParams) -> &'static str {
         "ltctest" => "LTCtest",
         "btc" => "BTC",
         "wjk" => "WJK",
+        "arc" => "ARCADE",
+        "arctest" => "ARCADEtest",
+        "shic" => "SHIC",
+        "bel" => "BEL",
+        "lky" => "LKY",
+        "jkc" => "JKC",
         _ => "",
     }
 }
@@ -69,13 +76,33 @@ impl Ctx<'_> {
     }
 }
 
+/// A token's holder rows (`tok.v1.holder`, key = prefix + address, value {"o", "t"}): how many
+/// hold some, and the page from `off` of up to `size`, biggest balance first, then by address so
+/// pages never overlap. Each: (balance, address, transferable).
+fn holder_page(rows: &[(Vec<u8>, Vec<u8>)], pre: usize, off: usize, size: usize) -> (usize, Vec<(u128, String, String)>) {
+    let mut hs: Vec<(u128, String, String)> = rows
+        .iter()
+        .filter_map(|(k, b)| {
+            let b: Value = serde_json::from_slice(b).ok()?;
+            let o: u128 = b["o"].as_str()?.parse().ok()?;
+            (o > 0).then(|| (o, String::from_utf8_lossy(&k[pre..]).into_owned(), b["t"].as_str().unwrap_or("0").to_string()))
+        })
+        .collect();
+    let count = hs.len();
+    hs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    (count, hs.into_iter().skip(off).take(size).collect())
+}
+
 fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
     let p = match req["chain"].as_str() {
-        Some(k) => by_key(k).ok_or_else(|| format!("unknown chain {k}"))?,
+        Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
         None => node.params,
     };
     let indexes = if p.chain_no == node.params.chain_no {
         crate::chains::home_indexes(node)
+    } else if crate::arcsvc::runs(p) {
+        // The ARCADE chain: its blocks, transactions and addresses, nothing else.
+        if node.chain.addresses_on(p.chain_no).unwrap_or(false) { vec!["addresses".to_string()] } else { vec![] }
     } else if !node.extra.lock().unwrap().contains_key(p.key) && crate::borrow::is_borrowed(p.key) {
         // Borrowed: no indexes here; blocks and transactions come from lenders (crate::borrow).
         vec![]
@@ -91,8 +118,17 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.inscription", "explorer.tokens", "explorer.token", "explorer.names", "explorer.name", "explorer.maps",
     "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens", "explorer.ledger_token",
     "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag", "explorer.search",
-    "explorer.inscription_types",
+    "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
+    "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
 ];
+
+/// Page routes another arcade may answer for an app on a chain it keeps: every public read
+/// under /r/ but the asking arcade's own (its wallet, its send requests).
+fn page_route_ok(path: &str) -> bool {
+    let rest = path.strip_prefix("/r/").unwrap_or("");
+    let first = rest.split(['/', '?']).next().unwrap_or("");
+    !rest.is_empty() && !matches!(first, "wallet" | "send") && !rest.contains("..")
+}
 
 /// Mesh answers kept a short while: the Explorer asks the same things again and again
 /// (switching coins and back, the overview's 30 s refresh). A failure is kept too, so a
@@ -167,6 +203,15 @@ fn mesh_from(id: &str) -> Value {
 }
 
 /// The index an error says is missing here ("the ord index is not on ...").
+/// The index a question needs, whatever the error says: a borrowed chain answers "borrowed",
+/// which names no index, and these must go to an arcade keeping the chain's arcade ledger.
+fn needed_index(cmd: &str) -> Option<&'static str> {
+    if cmd == "explorer.ord_outpoints" {
+        return Some("ord");
+    }
+    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards")).then_some("ledger")
+}
+
 fn missing_index(e: &str) -> Option<String> {
     let rest = e.strip_prefix("the ")?;
     let (ix, tail) = rest.split_once(' ')?;
@@ -235,16 +280,30 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 v["mesh_indexes"] = json!(more);
             }
             if cmd == "explorer.address" && v.is_object() {
-                // NFTs and tokens of the address from an arcade that keeps them.
-                for (ix, keys) in [("ord", &["inscriptions", "inscription_count"][..]), ("tokens", &["tokens"][..])] {
+                // What this arcade doesn't keep for the address, from an arcade that keeps it:
+                // its balance and history, NFTs, tokens, and arcade ledger holdings.
+                let parts: [(&str, &[&str]); 4] = [
+                    ("addresses", &["balance", "tx_count", "history"]),
+                    ("ord", &["inscriptions", "inscription_count"]),
+                    ("tokens", &["tokens"]),
+                    ("ledger", &["ledger_tokens", "ledger_inscriptions", "ledger_inscription_count"]),
+                ];
+                for (ix, keys) in parts {
                     if v.get(keys[0]).is_none() {
                         let mut q = req.clone();
                         q["chain"] = json!(p.key);
                         if let Ok((r, id)) = mesh_ask(node, p, ix, cmd, &q) {
+                            if r.get(keys[0]).is_none() {
+                                continue; // that arcade doesn't answer this part (an older version)
+                            }
                             for k in keys {
                                 if !r[*k].is_null() {
                                     v[*k] = r[*k].clone();
                                 }
+                            }
+                            if ix == "addresses" {
+                                // The note said balances weren't kept here; now they came.
+                                v["note"] = r["note"].clone();
                             }
                             v["mesh_parts"][ix] = mesh_from(&id);
                         }
@@ -257,7 +316,11 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             // A missing index, or a chain not kept here at all.
             // (Any other failure, e.g. a chain only borrowed here or not kept at all: any
             // arcade keeping the chain may know.)
-            let ix = missing_index(&e).unwrap_or_default();
+            // (A site is read from the names index, whatever else is missing here.)
+            let ix = missing_index(&e)
+                .or_else(|| needed_index(cmd).map(String::from))
+                .or_else(|| matches!(cmd, "explorer.site" | "explorer.sites").then(|| "names".to_string()))
+                .unwrap_or_default();
             if crate::shares::index_holders(node, p.net, &ix).is_empty() {
                 return Err(e);
             }
@@ -282,7 +345,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     // Not kept here, or kept but still catching up (borrowed meanwhile, the home chain
     // included): the borrowed chain answers what it can; indexes still come from here or
     // the mesh.
-    let kept = x.p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(x.p.key);
+    let kept = crate::chains::kept(node, x.p);
     if !kept || crate::borrow::is_borrowed(x.p.key) {
         if cmd == "explorer.mempool" {
             return Ok(shared_pool(node, x.p, crate::borrow::explorer(node, cmd, req, x.p).and_then(|r| r.ok()), 2500));
@@ -327,6 +390,39 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     let s = |k: &str| req[k].as_str().map(String::from);
     let n = |d: u64, max: u64| req["n"].as_u64().unwrap_or(d).clamp(1, max);
     match cmd {
+        "explorer.ord_outpoints" => crate::ordsafe::answer(node, x.p, req),
+        "explorer.collections" => {
+            x.need("collections")?;
+            let mut v = crate::collsvc::list(node, x.p, req)?;
+            // Each row's cover (an inscription here): a preview, as the inscriptions list's.
+            for r in v["items"].as_array_mut().into_iter().flatten() {
+                let Some(id) = r["cover"].as_str().map(String::from) else { continue };
+                if let Some(rec) = ord::inscription(&x.node.chain, x.p, &id) {
+                    r["cover_content"] = image_link(&x, &rec, &id, 96 << 10).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
+                    r["cover_ct"] = rec["ct"].clone();
+                }
+            }
+            Ok(v)
+        }
+        "explorer.collection" => {
+            x.need("collections")?;
+            let mut v = crate::collsvc::get(node, x.p, req)?;
+            // Each item held here: its record (n, h, ct) and a preview, as the inscriptions list.
+            for it in v["items"].as_array_mut().into_iter().flatten() {
+                let id = it["id"].as_str().unwrap_or("").to_string();
+                if let Some(rec) = ord::inscription(&x.node.chain, x.p, &id) {
+                    it["n"] = rec["n"].clone();
+                    it["h"] = rec["h"].clone();
+                    it["ct"] = rec["ct"].clone();
+                    it["content"] = image_link(&x, &rec, &id, 96 << 10).or_else(|| no_preview(&rec)).unwrap_or_else(|| content(&x, &id, 96 << 10));
+                }
+            }
+            Ok(v)
+        }
+        "explorer.collection_of" => {
+            x.need("collections")?;
+            crate::collsvc::of(node, x.p, req)
+        }
         "explorer.summary" => summary(&x),
         "explorer.blocks" => {
             let tip = tip(&x);
@@ -335,7 +431,11 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         }
         "explorer.block" => block(&x, &s("id").ok_or("give a height or block hash")?),
         "explorer.tx" => tx(&x, &s("txid").ok_or("give a txid")?),
-        "explorer.address" => addr(&x, &s("address").ok_or("give an address")?),
+        "explorer.address" => addr(&x, &s("address").ok_or("give an address")?, req),
+        "explorer.held" => {
+            x.need("ord")?;
+            held(&x, &s("address").ok_or("give an address")?, req)
+        }
         "explorer.inscriptions" => {
             x.need("ord")?;
             let total = ord::count(&x.node.chain, x.c());
@@ -414,28 +514,33 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let local = tokens::tick(&x.node.chain, x.c(), &t);
             let held = crate::shares::groups_of(&x.node.share_of(x.p.key)["tok"]);
             if local.is_none() && held.as_ref().is_some_and(|g| !g.contains(&tokens::tick_group(&t))) {
-                let (mut v, from) = crate::shares::ask_holders(x.node, x.p, "tok", tokens::tick_group(&t) as u64, "tick", &t)?;
+                let page = json!({"offset": req["offset"], "n": req["n"]});
+                let (mut v, from) = crate::shares::ask_holders_with(x.node, x.p, "tok", tokens::tick_group(&t) as u64, "tick", &t, page)?;
                 v["from_arcade"] = json!(from);
                 return Ok(v);
             }
             let mut v = local.ok_or_else(|| format!("no token {t}"))?;
+            // Every holder, biggest first, a page at a time (`offset`, `n`: 25 by default).
             let pre = KeyBuf::new().u16(x.c()).var(t.as_bytes()).done();
-            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(tokens::HOLDER, &pre, 5000)).map_err(e)?;
-            let more = rows.len() >= 5000;
-            let mut hs: Vec<(u128, String, String)> = rows
-                .iter()
-                .filter_map(|(k, b)| {
-                    let b: Value = serde_json::from_slice(b).ok()?;
-                    let o: u128 = b["o"].as_str()?.parse().ok()?;
-                    (o > 0).then(|| (o, String::from_utf8_lossy(&k[pre.len()..]).into_owned(), b["t"].as_str().unwrap_or("0").to_string()))
-                })
-                .collect();
-            let count = hs.len();
-            hs.sort_by(|a, b| b.0.cmp(&a.0));
+            let rows = x.node.chain.store(x.c()).read(|r| r.scan_prefix(tokens::HOLDER, &pre)).map_err(e)?;
+            let off = req["offset"].as_u64().unwrap_or(0) as usize;
+            let size = n(25, 100) as usize;
+            let (count, hs) = holder_page(&rows, pre.len(), off, size);
             v["tick"] = json!(t);
-            v["holders"] = json!(if more { format!("{count}+") } else { count.to_string() });
-            v["top"] = json!(hs.iter().take(25).map(|(o, a, tr)| json!({"address": a, "tag": tag_of(&x, a), "overall": o.to_string(), "transferable": tr})).collect::<Vec<_>>());
+            v["holders"] = json!(count.to_string());
+            v["total"] = json!(count);
+            v["offset"] = json!(off);
+            v["n"] = json!(size);
+            v["top"] = json!(hs.iter().map(|(o, a, tr)| json!({"address": a, "tag": tag_of(&x, a), "overall": o.to_string(), "transferable": tr})).collect::<Vec<_>>());
             Ok(v)
+        }
+        "explorer.site" => {
+            x.need("names")?;
+            crate::namesites::site_here(x.node, x.p, &s("name").ok_or("give a name")?)
+        }
+        "explorer.sites" => {
+            x.need("names")?;
+            crate::namesites::directory_here(x.node, x.p, req["all"] == true)
         }
         "explorer.names" => {
             x.need("names")?;
@@ -493,6 +598,36 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let total = ledger_count(&x);
             let before = req["before"].as_u64().unwrap_or(total).min(total);
             Ok(json!({"total": total, "items": ledger_latest(&x, before, n(24, 100))}))
+        }
+        // The rows of this chain that may be app cards, for an arcade's App Store that borrows it.
+        "explorer.app_cards" => {
+            x.need("ledger")?;
+            Ok(json!({"rows": crate::appsvc::card_rows(x.node, x.p)}))
+        }
+        // An arcade inscription's whole bytes (an app page, or what it fetches), for an arcade
+        // that does not keep this chain's ledger.
+        "explorer.ledger_bytes" => {
+            x.need("ledger")?;
+            let id = s("id").ok_or("give an inscription txid or number")?;
+            let c = arcade_ledger::content::content(&x.node.chain, x.p, id.trim_start_matches('#'))?;
+            if c.bytes.len() > 16 << 20 {
+                return Err("that inscription is larger than 16 MB".into());
+            }
+            let row = arcade_ledger::content::inscription(&x.node.chain, x.c(), id.trim_start_matches('#')).unwrap_or(Value::Null);
+            Ok(json!({"txid": row["txid"], "number": row["number"], "content_type": c.content_type, "sha256": c.sha256,
+                      "b64": base64::engine::general_purpose::STANDARD.encode(&c.bytes)}))
+        }
+        // A page route (GET /r/...) answered on this chain, for an app on it opened at an arcade
+        // that does not keep its ledger.
+        "explorer.page" => {
+            x.need("ledger")?;
+            let path = s("path").unwrap_or_default();
+            if !page_route_ok(&path) {
+                return Err("that is no public page read".into());
+            }
+            let q: serde_json::Map<String, Value> = req["query"].as_object().cloned().unwrap_or_default();
+            let (status, body) = crate::pagechain::with(x.p, || crate::walletsvc::route(x.node, &path, &q));
+            Ok(json!({"status": status, "body": body}))
         }
         "explorer.ledger_inscription" => {
             x.need("ledger")?;
@@ -753,10 +888,19 @@ fn latest(x: &Ctx, before: u64, n: u64) -> Vec<Value> {
         .collect()
 }
 
+/// The transactions waiting for a block, each with when it was first seen (the ARCADE
+/// chain's wait in its own pool, which keeps no times).
+fn waiting(x: &Ctx) -> Result<Vec<(u64, Vec<u8>)>, String> {
+    if crate::arcsvc::runs(x.p) {
+        return Ok(crate::arcsvc::waiting(2_500).into_iter().map(|raw| (0, raw)).collect());
+    }
+    x.node.chain.mempool(x.c()).map_err(e)
+}
+
 fn summary(x: &Ctx) -> R {
     let c = x.c();
     let t = tip(x);
-    let pool = x.node.chain.mempool(c).map_err(e)?;
+    let pool = waiting(x)?;
     let mut v = json!({
         "chain": x.p.key, "name": x.p.name, "unit": unit(x.p), "indexes": x.indexes, "tip": t,
         "tip_time": x.node.chain.hash_at(c, t).ok().flatten().and_then(|h| x.node.chain.header(c, &h).ok().flatten()).map(|r| r.header.time),
@@ -841,10 +985,19 @@ fn block(x: &Ctx, id: &str) -> R {
                "out": tx.outputs.iter().map(|o| o.value).sum::<u64>(), "size": tx.raw.len(),
                "inscription": x.has("ord") && !tx.is_coinbase() && ord::genesis_ctype(&tx.inputs[0].script_sig, d).is_some()})
     }).collect();
-    Ok(json!({"height": rec.height, "hash": hash.to_hex(), "prev": rec.header.prev.to_hex(), "next": x.node.chain.hash_at(c, rec.height + 1).ok().flatten().filter(|_| best).map(|h| h.to_hex()),
+    let mut v = json!({"height": rec.height, "hash": hash.to_hex(), "prev": rec.header.prev.to_hex(), "next": x.node.chain.hash_at(c, rec.height + 1).ok().flatten().filter(|_| best).map(|h| h.to_hex()),
               "time": rec.header.time, "bits": format!("{:08x}", rec.header.bits), "nonce": rec.header.nonce, "version": rec.header.version,
               "merkle_root": rec.header.merkle_root.to_hex(), "best": best, "confirmations": if best { t.saturating_sub(rec.height) + 1 } else { 0 },
-              "tx_count": blk.txs.len(), "size": blk.encode().len(), "txs": txs, "inscriptions": geneses(x, rec.height), "unit": unit(x.p)}))
+              "tx_count": blk.txs.len(), "size": blk.encode().len(), "txs": txs, "inscriptions": geneses(x, rec.height), "unit": unit(x.p)});
+    if crate::arcsvc::runs(x.p) {
+        // The store's header only stands in for the ARCADE one (arcade-arc store.rs): what
+        // the block itself says comes from the chain.
+        if let Ok(a) = crate::arcsvc::block(&json!({"id": hash.to_hex()})) {
+            v["arcade"] = json!({"writer": a["writer"], "difficulty": a["difficulty"], "score": a["score"], "steps": a["steps"]});
+            v["size"] = a["bytes"].clone();
+        }
+    }
+    Ok(v)
 }
 
 fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Value {
@@ -862,12 +1015,11 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
 }
 
 fn tx(x: &Ctx, id: &str) -> R {
-    let c = x.c();
     let txid = Hash256::from_hex(id.trim()).map_err(|_| format!("{id} is not a txid"))?;
     let (t, height) = match tx_any(x, &txid) {
         Some(found) => found,
         None => {
-            let pool = x.node.chain.mempool(c).map_err(e)?;
+            let pool = waiting(x)?;
             let t = pool.iter().filter_map(|(_, raw)| Tx::parse_with(raw, &x.p.format).ok()).find(|t| t.txid == txid).ok_or_else(|| format!("no transaction {id} on {}", x.p.name))?;
             (t, None)
         }
@@ -892,12 +1044,50 @@ fn tx(x: &Ctx, id: &str) -> R {
               "inputs": inputs, "outputs": outputs, "genesis": born, "unit": unit(x.p)}))
 }
 
-fn addr(x: &Ctx, a: &str) -> R {
+/// `explorer.held {address, offset?, limit?, order?}`: the ord inscriptions an address holds, a
+/// page at a time by inscription number (order old, the default, or new), without content: what
+/// a wallet lists. limit 100 by default, at most 500.
+fn held(x: &Ctx, a: &str, req: &Value) -> R {
+    let c = x.c();
+    let a = a.trim();
+    let script = address::script_for_address(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
+    let mut all: Vec<(u64, String)> = ord::held_by(&x.node.chain, x.p, &script)
+        .map_err(e)?
+        .into_iter()
+        .map(|id| (ord::parse_iid(&id).and_then(|b| ord::number_of(&x.node.chain, c, &b)).unwrap_or(u64::MAX), id))
+        .collect();
+    match req["order"].as_str().unwrap_or("old") {
+        "old" => all.sort(),
+        "new" => all.sort_by(|p, q| q.cmp(p)),
+        o => return Err(format!("order is old or new, not {o}")),
+    }
+    let off = req["offset"].as_u64().unwrap_or(0) as usize;
+    let limit = req["limit"].as_u64().unwrap_or(100).clamp(1, 500) as usize;
+    let items: Vec<Value> = all
+        .iter()
+        .skip(off)
+        .take(limit)
+        .map(|(n, id)| match ord::inscription(&x.node.chain, x.p, id) {
+            Some(i) => json!({"id": id, "n": i["n"], "h": i["h"], "ct": i["ct"], "size": i["size"], "at": i["at"], "p": i["proto"]}),
+            // Shared storage: the record is held by other arcades; the number is known here.
+            None => json!({"id": id, "n": (*n != u64::MAX).then_some(*n), "h": null, "ct": null, "size": null, "at": null, "p": null}),
+        })
+        .collect();
+    Ok(json!({"address": a, "chain": x.p.key, "total": all.len(), "offset": off, "limit": limit, "items": items}))
+}
+
+/// `explorer.address {address, history?, inscriptions?, content?}`: false for `history` or
+/// `inscriptions` leaves that part out (a wallet asking only for token balances); `content:
+/// false` lists the first 60 inscriptions without their previews.
+fn addr(x: &Ctx, a: &str, req: &Value) -> R {
     let c = x.c();
     let a = a.trim();
     let script = address::script_for_address(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
     let mut v = json!({"address": a, "tag": tag_of(x, a), "unit": unit(x.p)});
-    if x.has("addresses") {
+    let want = |k: &str| req[k] != false;
+    if !want("history") {
+        // Asked without its history (a wallet reading token balances).
+    } else if x.has("addresses") {
         let hist = x.node.chain.history_for_script(c, &script).map_err(e)?;
         let rows: Vec<Value> = hist.iter().rev().take(50).map(|(h, t12, recv, sent)| {
             let txid = x.node.chain.txids_by_t12(x.p, t12).ok().and_then(|v| v.first().copied());
@@ -912,11 +1102,14 @@ fn addr(x: &Ctx, a: &str) -> R {
     } else {
         v["note"] = json!(format!("Balance and history need the Addresses index for {}; add it in Chains & Coins.", x.p.name));
     }
-    if x.has("ord") {
+    if x.has("ord") && want("inscriptions") {
         let held = ord::held_by(&x.node.chain, x.p, &script).map_err(e)?;
+        let previews = want("content");
         v["inscriptions"] = json!(held.iter().take(60).filter_map(|id| {
             let mut i = ord::inscription(&x.node.chain, x.p, id)?;
-            i["content"] = content(x, id, 64 << 10);
+            if previews {
+                i["content"] = content(x, id, 64 << 10);
+            }
             i.as_object_mut()?.remove("txs");
             Some(i)
         }).collect::<Vec<_>>());
@@ -928,17 +1121,42 @@ fn addr(x: &Ctx, a: &str) -> R {
             json!({"tick": t, "overall": o, "transferable": tr, "dec": dec})
         }).collect::<Vec<_>>());
     }
+    // The arcade ledger: the address's arcade tokens and arcade inscriptions.
+    if x.has("ledger") {
+        let toks: Vec<Value> = arcade_ledger::engine::holdings(&x.node.chain, c, a)
+            .into_iter()
+            .map(|(pid, units)| {
+                let p = arcade_ledger::engine::property(&x.node.chain, c, pid).ok().flatten().unwrap_or(Value::Null);
+                let div = p["divisible"] == true || p["type"] == 2;
+                json!({"propertyid": pid, "name": p["name"], "units": units, "balance": arcade_ledger::amount::token_plain(div, units)})
+            })
+            .collect();
+        v["ledger_tokens"] = json!(toks);
+        let owned: Vec<Value> = x.node.chain.store(c)
+            .read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &arcade_store::KeyBuf::new().u16(c).done()))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|(_, raw)| serde_json::from_slice::<Value>(&raw).ok())
+            .filter(|i| i["owner"].as_str() == Some(a))
+            .collect();
+        v["ledger_inscription_count"] = json!(owned.len());
+        let mut newest = owned;
+        newest.sort_by(|p, q| q["number"].as_u64().cmp(&p["number"].as_u64()));
+        v["ledger_inscriptions"] = json!(newest.iter().take(60).map(|i| json!({"txid": i["txid"], "number": i["number"], "content_type": i["content_type"]})).collect::<Vec<_>>());
+    }
     Ok(v)
 }
 
 fn mempool(x: &Ctx) -> R {
-    let pool = x.node.chain.mempool(x.c()).map_err(e)?;
+    let pool = waiting(x)?;
+    // The ARCADE chain's pools never swap a waiting transaction for another.
+    let arc = crate::arcsvc::runs(x.p);
     let d = ord::dialect(x.p);
     let txs: Vec<Value> = pool.iter().filter_map(|(seen, raw)| Tx::parse_with(raw, &x.p.format).ok().map(|t| (seen, t))).map(|(seen, t)| {
         let kind = if x.has("ord") && ord::genesis_ctype(&t.inputs[0].script_sig, d).is_some() { "inscription" }
             else if t.outputs.iter().any(|o| o.script_pubkey.first() == Some(&0x6a)) { "data" } else { "payment" };
         json!({"txid": t.txid.to_hex(), "seen": seen, "size": t.raw.len(), "out": t.outputs.iter().map(|o| o.value).sum::<u64>(),
-               "rbf": t.inputs.iter().any(|i| i.sequence < 0xffff_fffe), "kind": kind})
+               "rbf": !arc && t.inputs.iter().any(|i| i.sequence < 0xffff_fffe), "kind": kind})
     }).collect();
     let home = x.p.chain_no == x.node.params.chain_no;
     Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": if home { json!(crate::claims::pending_tags(x.node)) } else { json!([]) }, "unit": unit(x.p)}))
@@ -1122,5 +1340,100 @@ mod type_tests {
         assert!(type_matches("application/json", "json") && type_matches("application/ld+json", "json"));
         assert!(type_matches("model/gltf-binary", "model") && type_matches("application/pdf", "other") && type_matches("", "other"));
         assert!(type_matches("image/PNG", "image/png") && !type_matches("image/png", "image/webp"));
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn only_public_page_reads_are_answered_for_another_arcade() {
+    assert!(page_route_ok("/r/inscription/7063"));
+    assert!(page_route_ok("/r/verified/abc"));
+    assert!(page_route_ok("/r/balances/nAddr"));
+    assert!(!page_route_ok("/r/wallet"), "the asking arcade's own wallet");
+    assert!(!page_route_ok("/r/send/abc"), "its own send requests");
+    assert!(!page_route_ok("/r/"));
+    assert!(!page_route_ok("/content/abc"));
+    assert!(!page_route_ok("/r/../x"));
+}
+
+#[cfg(test)]
+#[test]
+fn ledger_questions_go_to_arcades_keeping_the_ledger() {
+    for c in ["explorer.ledger_bytes", "explorer.page", "explorer.app_cards", "explorer.ledger_inscription"] {
+        assert_eq!(needed_index(c), Some("ledger"), "{c}");
+    }
+    assert_eq!(needed_index("explorer.tx"), None);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// explorer.held: every inscription an address holds, by number, a page at a time, no content.
+    #[test]
+    fn an_address_lists_all_it_holds_a_page_at_a_time() {
+        use crate::sitesvc::tests::{addr as address_of, setup};
+        use arcade_store::KeyBuf;
+        let t = setup();
+        let c = t.p.chain_no;
+        t.node.app.store.write(|w| w.put(arcade_app::META, b"home_indexes", br#"["addresses","messages","ord"]"#)).unwrap();
+        t.node.chain.add_indexer(c, std::sync::Arc::new(ord::OrdIndexer::new(&[]))).unwrap();
+        // Five inscriptions on address 1's coin (block 2's change), numbered out of order.
+        let numbers = [40u64, 7, 300, 12, 99];
+        for (i, n) in numbers.iter().enumerate() {
+            let iid = [i as u8 + 1; 36];
+            let id = ord::iid_str(&iid);
+            t.node.chain.store(c).write(|w| {
+                w.put(ord::LOC, &KeyBuf::new().u16(c).bytes(&t.spend.txid.0).u32(1).u64(0).bytes(&iid).done(), &[])?;
+                w.put(ord::IDS, &KeyBuf::new().u16(c).bytes(&iid).done(), &n.to_be_bytes())?;
+                w.put(ord::INSC, &KeyBuf::new().u16(c).bytes(&iid).done(), json!({"n": n, "h": 2, "p": 0, "ct": "image/png", "size": 10, "pieces": 1, "txs": [], "proto": if *n == 12 { json!("drc-20") } else { Value::Null }}).to_string().as_bytes())
+            }).unwrap();
+            let _ = id;
+        }
+        let a = address_of(&t, 1);
+        let page = |q: Value| handle_here(&t.node, "explorer.held", &q, false).unwrap();
+        let v = page(json!({"address": a, "limit": 2}));
+        assert_eq!(v["total"], 5);
+        assert_eq!(v["items"].as_array().unwrap().iter().map(|i| i["n"].as_u64().unwrap()).collect::<Vec<_>>(), vec![7, 12]);
+        assert_eq!(v["items"][1]["p"], "drc-20");
+        assert!(v["items"][0].get("content").is_none(), "no content");
+        let rest: Vec<u64> = page(json!({"address": a, "offset": 2, "limit": 10}))["items"].as_array().unwrap().iter().map(|i| i["n"].as_u64().unwrap()).collect();
+        assert_eq!(rest, vec![40, 99, 300]);
+        let newest: Vec<u64> = page(json!({"address": a, "order": "new", "limit": 2}))["items"].as_array().unwrap().iter().map(|i| i["n"].as_u64().unwrap()).collect();
+        assert_eq!(newest, vec![300, 99]);
+        assert!(handle_here(&t.node, "explorer.held", &json!({"address": a, "order": "sideways"}), false).is_err());
+        // explorer.address without history or previews, and without inscriptions.
+        let lean = handle_here(&t.node, "explorer.address", &json!({"address": a, "history": false, "content": false}), false).unwrap();
+        assert!(lean.get("history").is_none() && lean["inscription_count"] == 5);
+        assert!(lean["inscriptions"][0].get("content").is_none());
+        let bare = handle_here(&t.node, "explorer.address", &json!({"address": a, "history": false, "inscriptions": false}), false).unwrap();
+        assert!(bare.get("inscriptions").is_none() && bare.get("inscription_count").is_none());
+    }
+
+    /// Every holder can be read, a page at a time, biggest first; none twice, none left out
+    /// (the Explorer showed only the 25 biggest).
+    #[test]
+    fn every_token_holder_pages() {
+        let pre = b"PRE".to_vec();
+        let row = |addr: &str, o: u128| {
+            let mut k = pre.clone();
+            k.extend_from_slice(addr.as_bytes());
+            (k, json!({"o": o.to_string(), "t": "0"}).to_string().into_bytes())
+        };
+        // 60 holders, three with the same balance, and one that holds nothing any more.
+        let mut rows: Vec<(Vec<u8>, Vec<u8>)> = (0..60).map(|i| row(&format!("addr{i:02}"), if i < 3 { 500 } else { 1000 + i as u128 })).collect();
+        rows.push(row("gone", 0));
+        let (count, first) = holder_page(&rows, pre.len(), 0, 25);
+        assert_eq!(count, 60, "every holder is counted, not only the first page");
+        assert_eq!(first.len(), 25);
+        assert_eq!((first[0].0, first[0].1.as_str()), (1059, "addr59"));
+        let mut seen = Vec::new();
+        for off in (0..count).step_by(25) {
+            seen.extend(holder_page(&rows, pre.len(), off, 25).1.into_iter().map(|h| h.1));
+        }
+        assert_eq!(seen.len(), 60);
+        assert_eq!(seen.iter().collect::<std::collections::HashSet<_>>().len(), 60, "no holder on two pages");
+        assert_eq!(&seen[57..], &["addr00", "addr01", "addr02"], "the same balance by address, smallest last");
+        assert!(holder_page(&rows, pre.len(), 60, 25).1.is_empty());
     }
 }

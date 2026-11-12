@@ -9,12 +9,15 @@
 //! 3. The coin set (`import_coins`): each coin's txid is found in TXS ((b, p): the stored
 //!    position), coins are sorted by position and merged against the coins we have: only the
 //!    differences are written (a chain synced to 5.0M of 6.45M keeps most of its rows).
-//!    Then heights t+1..=H join the main chain and the tip moves to H in one commit.
+//!    Then heights t+1..=H join the main chain and the tip moves to H in one commit. Before
+//!    anything is written each coin is checked against the transaction stored at its position
+//!    (`Anchor`): a coin set naming an output our blocks don't have is refused whole.
 //!    Address rows are built afterwards from the stored blocks (addrbuild, from t+1), the
 //!    protocol indexes walk the blocks as after any catch-up.
 //! 4. The coin set is marked trusted (STATE "coins_trusted": who made it, at what height)
-//!    until `Replay` has derived the coin set from the blocks the normal way and it matched.
-//!    On a mismatch, `apply_coin_diff` puts our own derivation in place.
+//!    until `Replay` (or `DiskReplay`, for a set too big for memory) has derived the coin set
+//!    from the blocks the normal way and it matched. On a mismatch, `apply_coin_diff` puts our
+//!    own derivation in place.
 //!
 //! STATE "cb_import" is set while step 3 runs: the coins are half old, half new then. The
 //! arcade keeps the chain held while it is set and runs the import again (it is idempotent).
@@ -344,7 +347,8 @@ impl ChainDb {
     /// Take in a coin set at `path`'s last block (height `to`), replacing the chain's coins.
     /// `path` = hashes of heights tip+1..=to on our header chain, every block stored already
     /// (store_blocks_only) and in the tx index (write_txs_for). `next` yields the coins in
-    /// any order. `trusted` is the note kept until the coins are re-derived (who made them).
+    /// any order. Each coin is checked against its own block first (Anchor). `trusted` is the
+    /// note kept until the coins are re-derived (who made them).
     #[allow(clippy::too_many_arguments)]
     pub fn import_coins(
         &self,
@@ -367,10 +371,17 @@ impl ChainDb {
         if self.header(c, &path[0])?.map(|r| r.header.prev) != Some(tip.hash) {
             return Err(err("the copy's blocks don't extend our tip"));
         }
-        // 1. Each coin at its stored position (nothing is written yet: a coin whose tx is
-        // not stored refuses the whole set here).
+        // Height of each block number on our main chain (u32::MAX: not on it).
+        let bs = self.main_bs(c, &tip, path)?;
+        let mut heights = vec![u32::MAX; bs.iter().max().map(|b| *b as usize + 1).unwrap_or(0)];
+        for (h, b) in bs.iter().enumerate() {
+            heights[*b as usize] = h as u32;
+        }
+        // 1. Each coin at its stored position, checked against its block (nothing is written
+        // yet: a coin whose tx is not stored, or not as the copy says, refuses the whole set).
         let mut sorter = Sorter::new(tmp, &format!("coins-{c}"))?;
         let mut rep = CoinImport::default();
+        let mut anchor = Anchor::default();
         let mut done = false;
         while !done {
             if stop.load(Ordering::Relaxed) {
@@ -395,9 +406,13 @@ impl ChainDb {
                     }
                     let (b, p) = crate::db::locate(r, params, &k.txid)?
                         .ok_or_else(|| err(format!("coin {}:{}: its transaction is not among the stored blocks", k.txid, k.vout)))?;
+                    if heights.get(b as usize) != Some(&k.height) {
+                        return Err(err(format!("coin {}:{}: not in our main chain's block at height {}; the coin set is refused", k.txid, k.vout, k.height)));
+                    }
+                    let v = anchor.coin(r, params, b, p, k.vout, k.height, k.value, &k.script)?;
                     rep.kept += 1;
                     rep.kept_amount += k.value as u128;
-                    sorter.push(&k_pos(c, b, p, k.vout), &encode_coin(k.value, k.height, k.coinbase, &k.script))?;
+                    sorter.push(&k_pos(c, b, p, k.vout), &v)?;
                 }
                 Ok(())
             })?;
@@ -409,7 +424,8 @@ impl ChainDb {
 
     /// Take in a coin set given by position (a V1.0 copy, docs/V1SHARE.md §2): each coin as
     /// (height, tx position, vout, value, coinbase, script). Heights at or below our tip use
-    /// our own blocks; above it, `path`'s (stored already, as for import_coins).
+    /// our own blocks; above it, `path`'s (stored already, as for import_coins). Each coin is
+    /// checked against its block (Anchor); whether it is a coinbase output comes from the block.
     #[allow(clippy::too_many_arguments)]
     pub fn import_coins_at(
         &self,
@@ -431,8 +447,50 @@ impl ChainDb {
         if !path.is_empty() && self.header(c, &path[0])?.map(|r| r.header.prev) != Some(tip.hash) {
             return Err(err("the copy's blocks don't extend our tip"));
         }
-        // Block number of every height 0..=to.
-        let mut bs: Vec<u32> = Vec::with_capacity(to as usize + 1);
+        let bs = self.main_bs(c, &tip, path)?;
+        // Each coin checked against its block as it comes (Anchor), a page at a time.
+        let mut sorter = Sorter::new(tmp, &format!("coins-{c}"))?;
+        let mut rep = CoinImport::default();
+        let mut anchor = Anchor::default();
+        let mut done = false;
+        while !done {
+            if stop.load(Ordering::Relaxed) {
+                return Err(err("stopped"));
+            }
+            let mut page = Vec::with_capacity(20_000);
+            while page.len() < 20_000 {
+                match next().map_err(err)? {
+                    Some(k) => page.push(k),
+                    None => {
+                        done = true;
+                        break;
+                    }
+                }
+            }
+            self.store(c).read(|r| {
+                for (h, p, vout, value, _coinbase, script) in &page {
+                    rep.read += 1;
+                    rep.read_amount += *value as u128;
+                    let b = *bs.get(*h as usize).ok_or_else(|| err(format!("a coin at height {h}, above the copy's {to}")))?;
+                    let v = anchor.coin(r, params, b, *p, *vout, *h, *value, script)?;
+                    rep.kept += 1;
+                    rep.kept_amount += *value as u128;
+                    sorter.push(&k_pos(c, b, *p, *vout), &v)?;
+                }
+                Ok(())
+            })?;
+            if rep.read % 1_000_000 < 20_000 {
+                note(format!("coin set: {} coins read", rep.read));
+            }
+        }
+        let sorted = sorter.finish()?;
+        self.finish_coin_import(params, path, to, tip, sorted, rep, trusted, tmp, stop, note)
+    }
+
+    /// Block numbers of heights 0..=tip on our main chain, then of `path`'s blocks (heights
+    /// tip+1.., stored already).
+    fn main_bs(&self, c: u16, tip: &Tip, path: &[Hash256]) -> Result<Vec<u32>> {
+        let mut bs: Vec<u32> = Vec::with_capacity(tip.height as usize + 1 + path.len());
         self.store(c).read(|r| {
             r.for_each_prefix(HEIGHT, &k_chain(c), |k, v| {
                 if be_u32(k, 2) as usize == bs.len() && bs.len() as u32 <= tip.height {
@@ -448,26 +506,7 @@ impl ChainDb {
             let b = self.header(c, h)?.map(|r| r.b).filter(|b| *b != 0).ok_or_else(|| err(format!("block {h} is not stored")))?;
             bs.push(b);
         }
-        let mut sorter = Sorter::new(tmp, &format!("coins-{c}"))?;
-        let mut rep = CoinImport::default();
-        while let Some((h, p, vout, value, coinbase, script)) = next().map_err(err)? {
-            if rep.read % 100_000 == 0 {
-                if stop.load(Ordering::Relaxed) {
-                    return Err(err("stopped"));
-                }
-                if rep.read % 1_000_000 == 0 {
-                    note(format!("coin set: {} coins read", rep.read));
-                }
-            }
-            rep.read += 1;
-            rep.read_amount += value as u128;
-            let b = *bs.get(h as usize).ok_or_else(|| err(format!("a coin at height {h}, above the copy's {to}")))?;
-            rep.kept += 1;
-            rep.kept_amount += value as u128;
-            sorter.push(&k_pos(c, b, p, vout), &encode_coin(value, h, coinbase, &script))?;
-        }
-        let sorted = sorter.finish()?;
-        self.finish_coin_import(params, path, to, tip, sorted, rep, trusted, tmp, stop, note)
+        Ok(bs)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -713,6 +752,50 @@ impl ChainDb {
     }
 }
 
+// ---------------- each coin against its own block ----------------
+
+/// Checks the coins of a copy one by one against our own blocks: the transaction stored at a
+/// coin's position (a block on our own header chain, checked by proof of work, its merkle root
+/// matching) must have that output, of that value, paying that script. The coin's height is
+/// the block's and whether it is a coinbase output comes from the transaction, not the copy.
+/// Where the block's body is held by other arcades (pruned here), the coin must be the one this
+/// arcade derived itself. One coin that fails refuses the whole set, before anything is written.
+/// Whether each coin is still unspent stays the copy's word until the re-check (Replay).
+#[derive(Default)]
+struct Anchor {
+    last: Option<(u32, u32, Tx)>,
+}
+
+impl Anchor {
+    /// The coin as an OUTPUTS value, or why it is refused.
+    #[allow(clippy::too_many_arguments)]
+    fn coin<R: Rd>(&mut self, r: &R, params: &ChainParams, b: u32, p: u32, vout: u32, height: u32, value: u64, script: &[u8]) -> Result<Vec<u8>> {
+        let c = params.chain_no;
+        let bad = |why: &str| err(format!("the coin at height {height}, transaction {p}, output {vout}: {why}; the coin set is refused"));
+        if is_unspendable(value, script) {
+            return Err(bad("an output that can never be spent is no coin"));
+        }
+        if self.last.as_ref().is_none_or(|(lb, lp, _)| (*lb, *lp) != (b, p)) {
+            self.last = None;
+            let raw = r.get(BLOCK_TX, &k_block_tx(c, b, p))?.ok_or_else(|| bad("no such transaction in our blocks"))?;
+            if is_pruned(&raw) {
+                let ours = coin_at(r, params, b, p, vout)?.ok_or_else(|| bad("its block is pruned here and the coin is not ours"))?;
+                if ours.value != value || ours.script != script || ours.height != height {
+                    return Err(bad("its block is pruned here and the coin differs from ours"));
+                }
+                return Ok(encode_coin(value, height, ours.coinbase, script));
+            }
+            self.last = Some((b, p, Tx::parse_with(&raw, &params.format).map_err(err)?));
+        }
+        let tx = &self.last.as_ref().unwrap().2;
+        let out = tx.outputs.get(vout as usize).ok_or_else(|| bad("its transaction has no such output"))?;
+        if out.value != value || out.script_pubkey != script {
+            return Err(bad("not the output its block has"));
+        }
+        Ok(encode_coin(value, height, tx.is_coinbase() || tx.is_coinstake(), script))
+    }
+}
+
 // ---------------- the re-check: derive the coin set from the blocks ----------------
 
 /// The coin set derived again from the stored main chain, block by block, the way connect
@@ -816,5 +899,120 @@ impl Replay {
         }).collect();
         v.sort_unstable();
         v
+    }
+}
+
+// ---------------- the re-check on disk ----------------
+
+/// The same derivation as Replay, in sorted runs on disk instead of memory: every output the
+/// main chain made and every output its inputs spent, merged at the end. Memory stays small
+/// (two Sorters) whatever the size of the coin set, so a chain too big for Replay's budget is
+/// still re-checked coin by coin. Temporary disk: about 60 bytes per output and per input.
+pub struct DiskReplay {
+    made: Sorter,
+    spent: Sorter,
+    pub height: u32,
+    missing: u64,
+}
+
+impl DiskReplay {
+    pub fn new(tmp: &Path, c: u16) -> Result<DiskReplay> {
+        Ok(DiskReplay { made: Sorter::new(tmp, &format!("made-{c}"))?, spent: Sorter::new(tmp, &format!("spent-{c}"))?, height: 0, missing: 0 })
+    }
+
+    /// Read blocks height+1..=to (main chain).
+    pub fn advance(&mut self, db: &ChainDb, params: &ChainParams, to: u32, stop: &AtomicBool, note: Note) -> Result<()> {
+        let c = params.chain_no;
+        while self.height < to {
+            if stop.load(Ordering::Relaxed) {
+                return Err(err("stopped"));
+            }
+            let end = to.min(self.height + 1000);
+            db.store(c).read(|r| {
+                for h in self.height + 1..=end {
+                    let hv = r.get(HEIGHT, &k_height(c, h))?.ok_or_else(|| err(format!("height {h} is not on the main chain")))?;
+                    let b = be_u32(&hv, 32);
+                    for (k, raw) in r.scan_prefix(BLOCK_TX, &k_block(c, b))? {
+                        if is_pruned(&raw) {
+                            return Err(err("a block's transactions are held by other arcades (Shared storage)"));
+                        }
+                        let p = be_u32(&k, k.len() - 4);
+                        let tx = Tx::parse_with(&raw, &params.format).map_err(err)?;
+                        if !tx.is_coinbase() {
+                            for i in &tx.inputs {
+                                match crate::db::locate(r, params, &i.prevout.txid)? {
+                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &h.to_be_bytes())?,
+                                    None => self.missing += 1,
+                                }
+                            }
+                        }
+                        let coinbase = tx.is_coinbase() || tx.is_coinstake();
+                        for (vout, o) in tx.outputs.iter().enumerate() {
+                            if is_unspendable(o.value, &o.script_pubkey) {
+                                continue;
+                            }
+                            let mut v = h.to_be_bytes().to_vec();
+                            v.extend_from_slice(&encode_coin(o.value, h, coinbase, &o.script_pubkey));
+                            self.made.push(&k_pos(c, b, p, vout as u32), &v)?;
+                        }
+                    }
+                }
+                Ok(())
+            })?;
+            self.height = end;
+            note(format!("re-checking the coin set on disk: block {end} of {to}"));
+        }
+        Ok(())
+    }
+
+    /// The derived set, read in key order from `DiskRows::next_kv`.
+    pub fn finish(self) -> Result<DiskRows> {
+        let mut spent = self.spent.finish()?;
+        let next_spend = spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        Ok(DiskRows { made: self.made.finish()?, spent, next_spend, missing: self.missing })
+    }
+}
+
+/// The coin set a DiskReplay derived: outputs made and not spent by a later input, as OUTPUTS
+/// rows in key order.
+pub struct DiskRows {
+    made: Sorted,
+    spent: Sorted,
+    next_spend: Option<(Vec<u8>, u32)>,
+    /// Inputs that spent a coin not made before them (a broken chain: never expected); complete
+    /// once `next_kv` returned None.
+    pub missing: u64,
+}
+
+impl DiskRows {
+    fn pull(&mut self) -> Result<()> {
+        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        Ok(())
+    }
+
+    pub fn next_kv(&mut self) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        loop {
+            let Some((k, v)) = self.made.next_kv()? else {
+                while self.next_spend.is_some() {
+                    self.missing += 1;
+                    self.pull()?;
+                }
+                return Ok(None);
+            };
+            let made_at = be_u32(&v, 0);
+            let mut spent = false;
+            while let Some((sk, at)) = &self.next_spend {
+                match sk.as_slice().cmp(k.as_slice()) {
+                    std::cmp::Ordering::Greater => break,
+                    // Spent once, at or after it was made; any other spend of it finds nothing (as Replay).
+                    std::cmp::Ordering::Equal if !spent && *at >= made_at => spent = true,
+                    _ => self.missing += 1,
+                }
+                self.pull()?;
+            }
+            if !spent {
+                return Ok(Some((k, v[4..].to_vec())));
+            }
+        }
     }
 }

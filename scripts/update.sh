@@ -25,5 +25,8 @@ fi
 
 newest="$(curl -fsSL "https://api.github.com/repos/$OWNER_REPO/releases/latest" 2>/dev/null | sed -n 's/.*"tag_name": *"\([^"]*\)".*/\1/p' | head -1 || true)"
 say "Updating Arcade V1.0${newest:+ to $newest}. Your wallet and data in $HOME_DIR stay as they are."
-curl -fsSL "https://raw.githubusercontent.com/$OWNER_REPO/$BRANCH/scripts/install.sh" | ARCADE_NO_OPEN=1 bash -s -- "$@"
+# The installer comes from the release being installed, not from whatever is on the branch today.
+# ARCADE_BRANCH set by hand still takes the installer (and a source build) from that branch.
+if [ -n "${ARCADE_BRANCH:-}" ] || [ -z "$newest" ]; then ref="$BRANCH"; else ref="$newest"; fi
+curl -fsSL "https://raw.githubusercontent.com/$OWNER_REPO/$ref/scripts/install.sh" | ARCADE_NO_OPEN=1 bash -s -- "$@"
 say "Updated. If the app was open, close it and open Arcade V1.0 again to load the new version."

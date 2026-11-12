@@ -14,6 +14,7 @@
   .btns { display: flex; gap: 8px; justify-content: flex-end; margin-top: 14px; }
   .btns button { font: inherit; padding: 8px 16px; border-radius: 8px; border: 1px solid #ccc; background: #fff; cursor: pointer; }
   .btns .yes { background: #2e8b44; color: #fff; border-color: #2e8b44; font-weight: 600; }
+  .toast { position: fixed; left: 50%; bottom: 18px; transform: translateX(-50%); z-index: 9; background: rgba(20,24,21,.92); color: #fff; padding: 8px 14px; border-radius: 10px; font: 13px/1.4 system-ui, sans-serif; max-width: calc(100% - 40px); overflow-wrap: anywhere; box-shadow: 0 4px 18px rgba(0,0,0,.35); }
   #err { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; color: #eee; font: 15px system-ui, sans-serif; padding: 24px; text-align: center; }
 </style>
 </head>
@@ -23,6 +24,8 @@
 <iframe id="app" sandbox="allow-scripts allow-pointer-lock" allow="fullscreen; autoplay" referrerpolicy="unsafe-url"></iframe>
 <div id="err"></div>
 <script src="common.js"></script>
+<script src="media.js"></script>
+<script src="trade.js"></script>
 <script src="appwindow.js"></script>
 </body>
 </html>

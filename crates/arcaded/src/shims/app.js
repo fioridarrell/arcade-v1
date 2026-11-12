@@ -6,6 +6,7 @@
   var now = { state: 'open', timeout: null, closesAt: null, inShell: false }, fns = [], seq = 0, waiting = {};
   function strip(m) { var o = {}; for (var k in m) if (k !== 'arcade' && k !== 'seq' && k !== 'event' && k !== 'ok') o[k] = m[k]; return o; }
   window.addEventListener('message', function (e) {
+    if (e.source !== window.parent) return;          // only the arcade window that framed this page
     var m = e.data;
     if (!m || m.arcade !== 'app') return;
     if (m.event) {

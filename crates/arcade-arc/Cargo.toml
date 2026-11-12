@@ -1,0 +1,20 @@
+[package]
+name = "arcade-arc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "The ARCADE chain: sealing, audits and consensus rules (docs/ARCADECHAIN.md)"
+
+[dependencies]
+arcade-chain = { path = "../arcade-chain" }
+curve25519-dalek = "4"
+ed25519-dalek = "2"
+num-bigint = "0.4"
+num-traits = "0.2"
+secp256k1 = { version = "0.29", features = ["global-context"] }
+sha2 = "0.11.1"
+thiserror = "1"
+
+[dev-dependencies]
+arcade-wallet = { path = "../arcade-wallet" }
+hex = "0.4.3"

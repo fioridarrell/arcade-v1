@@ -8,7 +8,7 @@
 use crate::format::Format;
 use crate::hash::Hash256;
 use crate::header::Header;
-use crate::pow::{meets_target, target_from_bits, try_pow_hash, PowAlgo, PowRule, U256};
+use crate::pow::{meets_target, target_from_bits, try_pow_hash, work_from_bits, PowAlgo, PowRule, U256};
 
 #[derive(Clone, Debug)]
 pub struct ChainParams {
@@ -30,11 +30,20 @@ pub struct ChainParams {
     pub format: Format,
     pub pow: PowRule,
     /// Apply the arcade's MAX_EASIER rule. Off for DigiByte and Kotia, as in the existing
-    /// arcade (its DGB index halted on 2026-10-28 when the rule misfired on multi-algo).
+    /// arcade (its DGB index halted on 2026-10-28 when the rule misfired on multi-algo: each
+    /// algorithm keeps its own difficulty, so a block's parent may be far harder), and for
+    /// Wojakcoin (its averaging window eases more than 4x per block). Where it is off, bits
+    /// are not bounded by the parent: headers whose work isn't checked count only
+    /// [`ChainParams::min_work`].
     pub max_easier: bool,
     pub pow_limit_bits: u32,
     /// A block at or below powLimit difficulty is always accepted (testnet rule).
     pub min_difficulty_blocks: bool,
+    /// From this height a header's bits must be exactly the Digishield next work
+    /// ([`crate::pepecoin::next_bits`], testnet min-difficulty rule included). None = only the
+    /// MAX_EASIER step is checked. Set only where the rule was compared with every real header
+    /// (arcade-chaindb examples/checkbits, or arcade-chain examples/rpcheaders against a node).
+    pub digishield_from: Option<u32>,
     /// AuxPoW chain id to check in merge-mined headers; None = not checked.
     pub auxpow_chain_id: Option<u32>,
     pub auxpow_strict_chain_id: bool,
@@ -71,7 +80,46 @@ impl ChainParams {
     pub fn block_id(&self, h: &Header) -> Hash256 {
         self.format.block_id(h)
     }
+
+    /// The work of a powLimit block: what a header counts when its work isn't checked.
+    pub fn min_work(&self) -> U256 {
+        work_from_bits(self.pow_limit_bits)
+    }
+
+    /// The work a header adds to its chain. Only a checked proof of work (the header's own, or
+    /// an AuxPoW parent's, which the caller checks) counts what its bits claim. A header whose
+    /// work isn't checked (DigiByte algorithms not implemented here, proof-of-stake blocks)
+    /// counts as a powLimit block, never more than it claims: otherwise one made-up header with
+    /// tiny bits would outweigh the whole chain.
+    ///
+    /// So on a chain of such blocks (Kotia after its last PoW height) every block weighs the
+    /// same and the longest chain wins; see sync's UNVERIFIED_REORG_DEPTH for the limit on how
+    /// deep such a chain may take the tip back.
+    pub fn header_work(&self, bits: u32, check: PowCheck) -> U256 {
+        let claimed = work_from_bits(bits);
+        match check {
+            PowCheck::Verified | PowCheck::AuxPow => claimed,
+            PowCheck::NotCheckable | PowCheck::NeedsBlock => claimed.min(self.min_work()),
+        }
+    }
+
+    /// The checkpoint hash at `height`, if there is one.
+    pub fn checkpoint_at(&self, height: u32) -> Option<Hash256> {
+        self.checkpoints.iter().find(|(h, _)| *h == height).map(|(_, x)| Hash256::from_hex(x).expect("valid checkpoint hex"))
+    }
+
+    /// The highest checkpoint height at or below `height`: no fork may start under it.
+    pub fn last_checkpoint(&self, height: u32) -> Option<u32> {
+        self.checkpoints.iter().map(|(h, _)| *h).filter(|h| *h <= height).max()
+    }
 }
+
+/// How far ahead of our clock a header's time may be (MAX_FUTURE_BLOCK_TIME, two hours, as
+/// in every chain here; Kotia's own limit for staked blocks is tighter, never looser).
+pub const MAX_FUTURE_BLOCK_TIME: u32 = 2 * 60 * 60;
+
+/// A header's time must be after the median of this many blocks before it.
+pub const MEDIAN_TIME_SPAN: usize = 11;
 
 /// The arcade's header-link rule (rawchain.py MAX_EASIER): a block's target may be at most
 /// 4x its parent's; getting harder is never limited; on min-difficulty chains a block at or
@@ -90,6 +138,14 @@ pub enum HeaderError {
     TooEasy,
     #[error("unknown mining algorithm in header version")]
     UnknownAlgo,
+    #[error("not the checkpoint's block")]
+    Checkpoint,
+    #[error("time is not after the median of the last {MEDIAN_TIME_SPAN} blocks")]
+    TimeTooOld,
+    #[error("time is more than two hours ahead of our clock")]
+    TimeTooNew,
+    #[error("bits are not the chain's next difficulty")]
+    BadDifficulty,
 }
 
 pub fn too_easy(params: &ChainParams, bits: u32, parent_bits: u32) -> bool {
@@ -122,14 +178,15 @@ pub enum PowCheck {
     /// Merge-mined: the caller must check the AuxPoW's parent header.
     AuxPow,
     /// Not checkable yet (some DigiByte algorithms, Kotia proof of stake):
-    /// accepted on the heaviest-chain rule with link and merkle proofs only.
+    /// accepted with link and merkle proofs only, counting the minimum work
+    /// ([`ChainParams::header_work`]).
     NotCheckable,
     /// Header misses its PoW target but the chain allows proof-of-stake blocks here:
     /// decided by [`check_block_work`] once the block is in hand.
     NeedsBlock,
 }
 
-/// Check a header at `height` against its parent: link, difficulty step and work.
+/// Check a header at `height` against its parent: link, checkpoint, difficulty step and work.
 pub fn check_header(
     params: &ChainParams,
     h: &Header,
@@ -138,6 +195,11 @@ pub fn check_header(
 ) -> Result<PowCheck, HeaderError> {
     if h.prev != params.block_id(parent) {
         return Err(HeaderError::BadLink);
+    }
+    if let Some(cp) = params.checkpoint_at(height) {
+        if params.block_id(h) != cp {
+            return Err(HeaderError::Checkpoint);
+        }
     }
     let t = target_from_bits(h.bits).ok_or(HeaderError::BadBits)?;
     if t == U256::ZERO {
@@ -178,6 +240,34 @@ pub fn check_block_work(params: &ChainParams, b: &crate::block::Block, height: u
     }
 }
 
+/// The rules that look past the parent, or at the clock: the header's time must be after the
+/// median of the last [`MEDIAN_TIME_SPAN`] blocks' times and at most [`MAX_FUTURE_BLOCK_TIME`]
+/// ahead of `now` (unix seconds), and from `digishield_from` its bits must be exactly the next
+/// difficulty. `below` is the chain under the header, parent first; a rule whose blocks aren't
+/// all there is skipped (the median needs min(11, height) of them, the difficulty two).
+pub fn check_context(params: &ChainParams, h: &Header, height: u32, below: &[Header], now: u64) -> Result<(), HeaderError> {
+    let need = MEDIAN_TIME_SPAN.min(height as usize);
+    if need > 0 && below.len() >= need {
+        let mut times: Vec<u32> = below[..need].iter().map(|x| x.time).collect();
+        times.sort_unstable();
+        if h.time <= times[need / 2] {
+            return Err(HeaderError::TimeTooOld);
+        }
+    }
+    if h.time as u64 > now + MAX_FUTURE_BLOCK_TIME as u64 {
+        return Err(HeaderError::TimeTooNew);
+    }
+    if let (Some(from), [parent, grandparent, ..]) = (params.digishield_from, below) {
+        if height >= from {
+            let want = crate::pepecoin::next_bits(params, height.saturating_sub(1), parent.bits, parent.time, Some(grandparent.time), h.time);
+            if h.bits != want {
+                return Err(HeaderError::BadDifficulty);
+            }
+        }
+    }
+    Ok(())
+}
+
 pub static PEPECOIN_TEST: ChainParams = ChainParams {
     key: "peptest",
     net: "test",
@@ -192,6 +282,8 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: true,
+    // examples/checkbits: the rule gives the bits of every testnet block from 2 to 1,561,558.
+    digishield_from: Some(2),
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: None,
@@ -213,6 +305,7 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
     checkpoints: &[
         (0, "f9f4ea4ae7f6ea4c55040ede2019ba0a53e262f46ec9bce3dcda2cb11f96fc52"),
         (42001, "1b111a1eb8cb3e35d0aa6b89a06245574a78ce65996e5f2932f0df17027a5cd1"),
+        (1_500_000, "283de0ba36bdb5ff9902a8a11119097f8546104f63efc9dade795e95cb4c242b"),
     ],
     coinbase_maturity: 240,
     index_start: 1_496_133,
@@ -232,6 +325,9 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    // Same rule as the testnet. examples/rpcheaders against a Pepecoin Core node: the rule
+    // gives the bits of every mainnet header from 1 to 1,288,000.
+    digishield_from: Some(2),
     auxpow_chain_id: Some(0x3f),
     auxpow_strict_chain_id: false,
     bech32_hrp: None,
@@ -256,7 +352,10 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
         "64.227.69.247:33874",
         "3.73.126.174:33874",
     ],
-    checkpoints: &[],
+    checkpoints: &[
+        (1_208_000, "77348329cbd64c5c62f663a644177d4740e9a2e8d38de923319d6e2beb39d54f"),
+        (1_280_000, "5de45799be38cb26f73876f645f7c4db1f062b897b55186885e0a2a83d15b7df"),
+    ],
     coinbase_maturity: 240,
     index_start: 1_208_000,
 };
@@ -275,6 +374,7 @@ pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("dgb"),
@@ -291,7 +391,10 @@ pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
         "seed.tuyul.cc",
     ],
     fixed_peers: &[],
-    checkpoints: &[],
+    checkpoints: &[
+        (24_450_000, "6354bf0c6d0b308c00b20b9e70e3555041439f94288fe05b7277b30cd4c59b2a"),
+        (24_530_000, "00000000000000069e962e840f14abf41a4fbaaeebd01d9b7815c01635b33409"),
+    ],
     coinbase_maturity: 100,
     index_start: 24_450_000,
 };
@@ -311,6 +414,7 @@ pub static DIGIBYTE_TEST: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: true,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("dgbt"),
@@ -345,6 +449,7 @@ pub static KOTIA_MAIN: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: None,
@@ -379,6 +484,7 @@ pub static FLOPCOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: Some(0xa3),
     auxpow_strict_chain_id: true,
     bech32_hrp: None,
@@ -409,6 +515,7 @@ pub static LITECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("ltc"),
@@ -419,7 +526,9 @@ pub static LITECOIN_MAIN: ChainParams = ChainParams {
     protocol_version: 70017,
     dns_seeds: &["seed-a.litecoin.loshan.co.uk", "dnsseed.thrasher.io", "dnsseed.ltcpool.org", "dnsseed.koin-project.com"],
     fixed_peers: &[],
-    checkpoints: &[],
+    checkpoints: &[
+        (3_000_000, "ed232cbb31d5b922042e309b15a53168e437ff66467322435080f51d6fdd45fd"),
+    ],
     coinbase_maturity: 100,
     index_start: 3_197_300,
 };
@@ -438,6 +547,7 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: true,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("tltc"),
@@ -448,7 +558,9 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
     protocol_version: 70017,
     dns_seeds: &["seed-b.litecoin.loshan.co.uk", "dnsseed-testnet.thrasher.io"],
     fixed_peers: &[],
-    checkpoints: &[],
+    checkpoints: &[
+        (3_200_000, "86169ba8283d09ffde76c21880fe7e22ea294411016f22ca2593295712176fad"),
+    ],
     coinbase_maturity: 100,
     index_start: 4_926_300,
 };
@@ -468,6 +580,10 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1e0fffff,
     min_difficulty_blocks: false,
+    // Digishield (the same next_bits) from block 145,001 (Dogecoin Core: parent height
+    // 145,000); before that a different retarget. Not yet compared with the real headers:
+    // Some(145_001) once examples/rpcheaders has walked from there clean.
+    digishield_from: None,
     auxpow_chain_id: Some(0x62),
     auxpow_strict_chain_id: true,
     bech32_hrp: None,
@@ -483,7 +599,9 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
         "74.139.78.63:22556", "217.115.120.70:22556", "144.76.234.216:22556", "80.211.154.104:22556",
         "13.228.138.193:22556", "135.181.56.49:22556", "47.241.177.51:22556",
     ],
-    checkpoints: &[],
+    checkpoints: &[
+        (6_400_000, "d9248a55b06dfa46841ae7fdff2d918c5c1d1434eaa60ba9cca27455903dd393"),
+    ],
     coinbase_maturity: 240,
     index_start: 6_415_000,
 };
@@ -503,6 +621,7 @@ pub static BITCOIN_MAIN: ChainParams = ChainParams {
     max_easier: true,
     pow_limit_bits: 0x1d00ffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("bc"),
@@ -539,6 +658,7 @@ pub static WOJAKCOIN_MAIN: ChainParams = ChainParams {
     max_easier: false,
     pow_limit_bits: 0x1d00ffff,
     min_difficulty_blocks: false,
+    digishield_from: None,
     auxpow_chain_id: None,
     auxpow_strict_chain_id: false,
     bech32_hrp: Some("wj"),
@@ -561,6 +681,191 @@ pub static WOJAKCOIN_MAIN: ChainParams = ChainParams {
     index_start: 228_000,
 };
 
+/// Shibacoin (SHIC): a Scrypt chain built from Dogecoin Core like Pepecoin, merge-mined with AuxPoW from block
+/// 24,000 (chain id 74, strict). From Shibacoin Core 1.2.1 (github.com/shibacoinppc/shibacoin master,
+/// chainparams.cpp, chainparamsseeds.h, version.h), 2026-11-11; the genesis header below hashes to its genesis.
+pub static SHIBACOIN_MAIN: ChainParams = ChainParams {
+    key: "shic",
+    net: "shic",
+    chain_no: 12,
+    name: "Shibacoin",
+    magic: [0xb0, 0xc0, 0xe0, 0xf0],
+    p2p_port: 33864,
+    genesis: "ff271edcc83f7d71e7a4e4b0a43b386a188e1470a28671cdbdc47e900118ac7f",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000450f8ab5cade1c53c2ef36d655076fd0a114378cc54678073b966dff820459e40c845f67f0ff0f1ef9890100",
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    digishield_from: None,
+    auxpow_chain_id: Some(0x4a),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: None,
+    p2pkh_version: 63,
+    p2sh_version: 22,
+    wif_version: 158,
+    bip44_coin_type: 3,
+    protocol_version: 70016,
+    dns_seeds: &["seeds.shibacoinshic.org", "seednodes.shibacoinshic.org"],
+    fixed_peers: &[
+        // Answering 2026-11-11 (the ThinkPad's check; the earlier list's 45.x/64.x/108.x/149.x
+        // hosts were gone): what seeds.shibacoinshic.org and seednodes.shibacoinshic.org gave.
+        "109.123.245.37:33864",
+        "161.97.106.45:33864",
+        "173.249.4.210:33864",
+        "157.173.201.78:33864",
+    ],
+    checkpoints: &[
+        (0, "ff271edcc83f7d71e7a4e4b0a43b386a188e1470a28671cdbdc47e900118ac7f"),
+        (100, "4c5ad0c33d31bdbdb6f353231bfd95916ff380c648e6c3ff0a07513a34f7965b"),
+        (1000, "1678b9c5af79d2d42264ba6ca6a0c94cd748ee0172b616b912aac0b62b7565ed"),
+        (20000, "2035d66dd969aa8ba3342e45dc949f032ddd5cca934a4d5f9c209958bcf455c6"),
+        (24000, "c771781bb5c79f53d17fcf4f541289e154cae38e4e4f4419ef1fa4c4c8be1d0e"),
+        (25800, "91e9d5d9c4ac1f236c1baf5f62fc8a96cfc0e844ae4739516ea53e0d6bb78f46"),
+    ],
+    coinbase_maturity: 240,
+    index_start: 0,
+};
+
+/// Bellscoin (BEL), Bells 3: Scrypt, AuxPoW (chain id 16, strict) and SegWit both from block 144,000, bech32 "bel".
+/// From Bells Core (github.com/Nintondo/bellscoinV3 master, src/kernel/chainparams.cpp, chainparamsseeds.h,
+/// node/protocol_version.h, consensus/consensus.h), 2026-11-11; the genesis header below hashes to its genesis.
+/// It kept Dogecoin's magic (c0c0c0c0); its port and genesis tell the two apart.
+pub static BELLSCOIN_MAIN: ChainParams = ChainParams {
+    key: "bel",
+    net: "bel",
+    chain_no: 13,
+    name: "Bellscoin",
+    magic: [0xc0, 0xc0, 0xc0, 0xc0],
+    p2p_port: 19919,
+    genesis: "e5be24df57c43a82d15c2f06bda961296948f8f8eb48501bed1efb929afe0698",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000696ad20e2dd4365c7459b4a4a5af743d5e92c6da3229e6532cd605f6533f2a5b1aae7652f0ff0f1ec1ad0000",
+    format: Format::AUXPOW_SEGWIT,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    digishield_from: None,
+    auxpow_chain_id: Some(16),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: Some("bel"),
+    p2pkh_version: 25,
+    p2sh_version: 30,
+    wif_version: 153,
+    bip44_coin_type: 3,
+    protocol_version: 70016,
+    dns_seeds: &["bdnsseeder.quark.blue"],
+    fixed_peers: &[
+        "65.21.180.169:19919",
+        "5.161.184.103:19919",
+        "23.162.56.39:19919",
+        "135.181.31.54:19919",
+        "162.55.243.23:19919",
+        "3.66.245.44:19919",
+    ],
+    checkpoints: &[
+        (0, "e5be24df57c43a82d15c2f06bda961296948f8f8eb48501bed1efb929afe0698"),
+        (1000, "35668ee4f0fc1334849813c8a8e583814e9b22bfe5dc5a2bd2ded2b3aeec6643"),
+        (10000, "2c05ea6918e28ca2d216c6518940c8782c09bebfe705d792155465662e275351"),
+        (20000, "e705ee3c0097e6466155f8eea44a813f4f3e0774f1336ab20da1e7076dcc36d9"),
+        (30000, "22b2474f45c8d29f31e9caeb6bcccc68f583e2d40afb782e10ad19b63ff47f84"),
+        (40000, "50c259c50c5c2ab235f2ceb45da49f7c046f0411667c00d81cb8165f2b843ea1"),
+    ],
+    coinbase_maturity: 30,
+    // The original arcade's Bellscoin floor (config.py BEL_MAINNET_FLOOR).
+    index_start: 1_289_000,
+};
+
+/// Luckycoin (LKY), Luckycoin Core 5.0.1 on Dogecoin 1.14's code: Scrypt, Digishield from 69,360, AuxPoW chain id 0x2013
+/// (strict) from block 176,000, no SegWit. From github.com/LuckycoinFoundation/Luckycoin master (chainparams.cpp,
+/// version.h), 2026-11-11; the genesis header below hashes to its genesis. It kept Litecoin's magic (fbc0b6db);
+/// its port and genesis tell them apart. 5.0.1 refuses 4.0.x nodes: protocol 70015.
+pub static LUCKYCOIN_MAIN: ChainParams = ChainParams {
+    key: "lky",
+    net: "lky",
+    chain_no: 14,
+    name: "Luckycoin",
+    magic: [0xfb, 0xc0, 0xb6, 0xdb],
+    p2p_port: 9917,
+    genesis: "9b7bce58999062b63bfb18586813c42491fa32f4591d8d3043cb4fa9e551541b",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000f9abf8b1949a6a5c2362247fe78164d0041613381d3eab3e1e6e5638d0ef806f10559c51f0ff0f1e3841ac00",
+    format: Format::AUXPOW,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    digishield_from: None,
+    auxpow_chain_id: Some(0x2013),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: None,
+    p2pkh_version: 47,
+    p2sh_version: 5,
+    wif_version: 175,
+    bip44_coin_type: 3,
+    protocol_version: 70015,
+    dns_seeds: &["mainnet.luckycoinfoundation.org"],
+    fixed_peers: &["149.102.135.48:9917", "5.161.255.153:9917", "207.180.249.242:9917", "91.99.78.148:9917"],
+    checkpoints: &[
+        (0, "9b7bce58999062b63bfb18586813c42491fa32f4591d8d3043cb4fa9e551541b"),
+        (6452, "e502fdfb3a35ee853ccd4a68433b1f9bbe3295c7d453fbcc484d06a766971475"),
+        (69240, "07d2b42e1898d59594b10f26fdc76d4f970a10b4b330237012f48eb489c8d744"),
+        (172330, "8458c3eeda44dc11352edad04e0eb69ae898c69c0dded3b3903b37f5bf352555"),
+        (320000, "3da52a29c4a7528d7624a4a74d659c08fbc7808cd4c217d152ba5981fc318b68"),
+        (640000, "99e1d5c9283b9b70c2ff3dec80aa1b9517822c789b4dcbf2b984c395e99d487d"),
+        (720000, "12b47acc054fd204faa8924a2243f1b4a1c208c717ac0c9333f581860269d8aa"),
+    ],
+    coinbase_maturity: 70,
+    // The original arcade's Luckycoin floor (config.py LKY_MAINNET_FLOOR).
+    index_start: 1_153_000,
+};
+
+/// Junkcoin (JKC), Junkcoin Core 4.0.3.1 on Litecoin 0.21's code: Scrypt, AuxPoW chain id 0x2020 (strict) from block
+/// 173,000, SegWit from 1,145,000, Taproot from 1,155,000, MWEB from 1,165,000. From
+/// github.com/Junkcoin-Foundation/junkcoin-core master (chainparams.cpp, version.h), 2026-11-11; the genesis header
+/// below hashes to its genesis. It kept Litecoin's magic (fbc0b6db), as Luckycoin did; its port and genesis tell them
+/// apart. Protocol 70015 (not Litecoin's 70017).
+pub static JUNKCOIN_MAIN: ChainParams = ChainParams {
+    key: "jkc",
+    net: "jkc",
+    chain_no: 15,
+    name: "Junkcoin",
+    magic: [0xfb, 0xc0, 0xb6, 0xdb],
+    p2p_port: 9771,
+    genesis: "a2effa738145e377e08a61d76179c21703e13e48910b30a2a87f0dfe794b64c6",
+    genesis_header: "010000000000000000000000000000000000000000000000000000000000000000000000c8dba1acb85826f819cbb65d83122cb96cf76be95025e11f91074327b024e13d10c78051f0ff0f1ea167af06",
+    format: Format::AUXPOW_MWEB,
+    pow: PowRule::Single(PowAlgo::Scrypt),
+    max_easier: true,
+    pow_limit_bits: 0x1e0fffff,
+    min_difficulty_blocks: false,
+    digishield_from: None,
+    auxpow_chain_id: Some(0x2020),
+    auxpow_strict_chain_id: true,
+    bech32_hrp: Some("jc"),
+    p2pkh_version: 16,
+    p2sh_version: 5,
+    wif_version: 144,
+    bip44_coin_type: 3,
+    protocol_version: 70015,
+    dns_seeds: &["mainnet.junk-coin.com", "junk-seed.s3na.xyz", "jkc-seed.junkiewally.xyz"],
+    fixed_peers: &["204.12.227.26:9771", "3.212.41.153:9771", "3.66.245.44:9771", "8.218.231.1:9771"],
+    checkpoints: &[
+        (0, "a2effa738145e377e08a61d76179c21703e13e48910b30a2a87f0dfe794b64c6"),
+        (6452, "506562c2172d9f10e86d2b467ed3bb7b9eba40148d18d1e660c1ff692604f3fc"),
+        (69240, "c34f5d113fe92f3206ef8855caf51cd6252286e3381b253bbc1237211198c22b"),
+        (168312, "deea2bcecb1146ae9cd74d67b29b4d0161e9bb63beb9022ca10f3625dda6c0e6"),
+        (172000, "6208026838cd18d3f401f3c5c2305105a3aafeb63164827d3e341f356cb3529a"),
+        // Synced live 2026-11-11 through SegWit, Taproot and MWEB; equal to explorer.junk-coin.com.
+        (1145000, "db41f2d85032d8318f5c6b19ee6917570b1dd4213110cce51aeb2fb4ceaf6154"),
+        (1165000, "82ecdb2d2704b95a9d7b647a38897b366af74abc7f677374e3d82feb2caeedee"),
+        (1200000, "e93c0573552bd263d6ed8419272cc6a3aa9383a90b593a026c5ff4f9355ae0b1"),
+    ],
+    coinbase_maturity: 70,
+    // No original-arcade floor: indexes start near the tip when it was added (2026-11-11, tip 1,215,059).
+    index_start: 1_215_000,
+};
+
 pub static ALL_CHAINS: &[&ChainParams] =
     &[
         &PEPECOIN_TEST,
@@ -574,7 +879,17 @@ pub static ALL_CHAINS: &[&ChainParams] =
         &LITECOIN_TEST,
         &BITCOIN_MAIN,
         &WOJAKCOIN_MAIN,
+        &SHIBACOIN_MAIN,
+        &BELLSCOIN_MAIN,
+        &LUCKYCOIN_MAIN,
+        &JUNKCOIN_MAIN,
     ];
+
+/// The ARCADE chain's two networks (crates/arcade-arc): chain number and key. They are not in
+/// [`ALL_CHAINS`]: nothing about them is followed over a coin's P2P network, and the service
+/// that runs one makes its parameters when it starts (its block 0 comes from its settings).
+/// The coins count up from 1; these numbers are far from theirs, so a new coin never meets one.
+pub const ARCADE_CHAINS: &[(u16, &str)] = &[(1000, "arc"), (1001, "arctest")];
 
 /// A chain by its mesh name (what the existing arcades call it).
 impl ChainParams {
@@ -584,6 +899,9 @@ impl ChainParams {
     pub fn user_agent(&self) -> &'static str {
         match self.key {
             "flop" => "/Floptoshi:2.0.0/",
+            // Junkcoin Core 4 (net_processing.cpp) drops a peer whose user agent holds neither "JKC:3.1.1" nor
+            // "JunkcoinCore:4." (it shares Litecoin's magic and keeps Litecoin nodes out); a BIP14 comment says it.
+            "jkc" => "/arcade:1.0.0(JunkcoinCore:4.0.3 compatible)/",
             _ => "/arcade:1.0.0/",
         }
     }
@@ -634,6 +952,13 @@ mod tests {
     }
 
     #[test]
+    fn the_arcade_chain_shares_no_number_or_key_with_a_coin() {
+        for (c, key) in ARCADE_CHAINS {
+            assert!(ALL_CHAINS.iter().all(|p| p.chain_no != *c && p.key != *key && p.net != *key));
+        }
+    }
+
+    #[test]
     fn genesis_headers_hash_to_genesis() {
         for p in ALL_CHAINS {
             if let Some(g) = p.genesis_header() {
@@ -648,7 +973,14 @@ mod tests {
             for b in &ALL_CHAINS[i + 1..] {
                 assert_ne!(a.chain_no, b.chain_no);
                 assert_ne!(a.key, b.key);
-                assert_ne!(a.magic, b.magic);
+                assert_ne!(a.genesis, b.genesis, "{} and {}", a.name, b.name);
+                // Shared magics are only the forks that kept their parent's (Bellscoin Dogecoin's; Luckycoin and Junkcoin Litecoin's): a
+                // connection already knows its chain, and a peer of the other never leads back to this chain's genesis.
+                if a.magic == b.magic {
+                    let mut pair = [a.key, b.key];
+                    pair.sort();
+                    assert!(matches!(pair, ["bel", "doge"] | ["lky", "ltc"] | ["jkc", "ltc"] | ["jkc", "lky"]), "{} and {} share a magic", a.name, b.name);
+                }
             }
         }
     }
@@ -697,6 +1029,101 @@ mod tests {
         assert!(too_easy(p, 0x1d0fffff, parent), "256x easier is not");
         assert!(!too_easy(p, 0x1b0fffff, parent), "harder is always fine");
         assert!(!too_easy(&PEPECOIN_TEST, 0x1e0fffff, 0x1b0fffff), "testnet powLimit is fine");
+    }
+
+    /// A header whose work isn't checked counts a powLimit block's work, whatever its bits
+    /// claim; a checked one counts its bits (the real DigiByte sha256d fixture).
+    #[test]
+    fn unchecked_work_counts_the_minimum() {
+        use crate::pow::work_from_bits;
+        let p = &DIGIBYTE_MAIN;
+        let tiny = 0x0300_0001; // target 1: claims nearly 2^256 work
+        assert_eq!(p.header_work(tiny, PowCheck::NotCheckable), p.min_work());
+        assert_eq!(p.header_work(tiny, PowCheck::NeedsBlock), p.min_work());
+        assert_eq!(p.header_work(tiny, PowCheck::Verified), work_from_bits(tiny));
+        // Never more than the header claims.
+        assert_eq!(p.header_work(0x207fffff, PowCheck::NotCheckable), work_from_bits(0x207fffff));
+        let raw: [u8; 80] = hex::decode("02a2f925994a1c8add99de9e8c12e798e70a2fab949b5d7a171f45b8cfd859c686ef944bec972620b6fcd7d2ab8c9fce88664ba4f5dc0c0c157249c95e5dca0f3e04c3788cd1de6ac73704199684e683").unwrap().try_into().unwrap();
+        let h = Header::parse(&raw);
+        assert!(meets_target(&pow_hash(PowAlgo::Sha256d, &raw), h.bits));
+        assert_eq!(p.header_work(h.bits, PowCheck::Verified), work_from_bits(h.bits));
+        assert!(p.header_work(h.bits, PowCheck::Verified) > p.min_work());
+        // A groestl header (not checked here) with the tiny bits passes as NotCheckable.
+        let g = p.genesis_header().unwrap();
+        let forged = Header { version: 0x0400 | 2, prev: p.block_id(&g), merkle_root: Hash256::ZERO, time: g.time + 15, bits: tiny, nonce: 0 };
+        assert_eq!(check_header(p, &forged, &g, 1), Ok(PowCheck::NotCheckable));
+    }
+
+    fn child(p: &ChainParams, parent: &Header, time: u32, bits: u32) -> Header {
+        Header { version: 1, prev: p.block_id(parent), merkle_root: Hash256::ZERO, time, bits, nonce: 0 }
+    }
+
+    #[test]
+    fn checkpoints_are_enforced() {
+        let p = &PEPECOIN_TEST;
+        let g = p.genesis_header().unwrap();
+        let h = child(p, &g, g.time + 60, g.bits);
+        assert_eq!(check_header(p, &h, &g, 42_001), Err(HeaderError::Checkpoint));
+        assert_ne!(check_header(p, &h, &g, 42_002), Err(HeaderError::Checkpoint));
+        // The checkpoint's own block passes it.
+        let mut q = PEPECOIN_TEST.clone();
+        let id: &'static str = Box::leak(p.block_id(&h).to_hex().into_boxed_str());
+        q.checkpoints = Box::leak(vec![(42_001, id)].into_boxed_slice());
+        assert_ne!(check_header(&q, &h, &g, 42_001), Err(HeaderError::Checkpoint));
+        assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(499), None);
+        assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(500), Some(500));
+        assert_eq!(WOJAKCOIN_MAIN.last_checkpoint(10_000), Some(600));
+        assert_eq!(PEPECOIN_MAIN.last_checkpoint(10_000), None);
+    }
+
+    #[test]
+    fn header_time_rules() {
+        let p = &LITECOIN_MAIN;
+        let now = 2_000_000_000u64;
+        // Parent first: times 1100, 1090, ..., 1000 (median 1050).
+        let below: Vec<Header> = (0..11u32).rev().map(|i| child(p, &p.genesis_header().unwrap(), 1000 + 10 * i, 0x1e0fffff)).collect();
+        let at = |t: u32| child(p, &below[0], t, 0x1e0fffff);
+        assert_eq!(check_context(p, &at(1050), 100, &below, now), Err(HeaderError::TimeTooOld));
+        assert_eq!(check_context(p, &at(1051), 100, &below, now), Ok(()));
+        // Under 11 blocks: the median of what there is (height 3: three blocks, median 1090).
+        assert_eq!(check_context(p, &at(1090), 3, &below[..3], now), Err(HeaderError::TimeTooOld));
+        // Ancestors missing: the median rule is skipped, never guessed.
+        assert_eq!(check_context(p, &at(1000), 100, &below[..5], now), Ok(()));
+        // Two hours ahead of our clock at most.
+        let t = (now + MAX_FUTURE_BLOCK_TIME as u64) as u32;
+        assert_eq!(check_context(p, &at(t), 100, &below, now), Ok(()));
+        assert_eq!(check_context(p, &at(t + 1), 100, &below, now), Err(HeaderError::TimeTooNew));
+        // The real Pepecoin testnet genesis is in the past.
+        let g = PEPECOIN_TEST.genesis_header().unwrap();
+        assert_eq!(check_context(&PEPECOIN_TEST, &g, 0, &[], now), Ok(()));
+    }
+
+    #[test]
+    fn pepecoin_bits_must_be_the_next_difficulty() {
+        let p = &PEPECOIN_TEST;
+        let now = 2_000_000_000u64;
+        let g = p.genesis_header().unwrap();
+        let grand = child(p, &g, 1_000_000, 0x1d00ffff);
+        let parent = child(p, &grand, 1_000_060, 0x1d00ffff);
+        let below = [parent, grand];
+        let h = 1_561_001;
+        // On time: Digishield keeps the target; anything else is refused.
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_120, 0x1d00ffff), h, &below, now), Ok(()));
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_120, 0x1d00fffe), h, &below, now), Err(HeaderError::BadDifficulty));
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Err(HeaderError::BadDifficulty));
+        // Testnet min difficulty only after a gap of more than two spacings (120 s).
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_180, 0x1e0fffff), h, &below, now), Err(HeaderError::BadDifficulty));
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_181, 0x1e0fffff), h, &below, now), Ok(()));
+        // After the gap it must be exactly powLimit.
+        assert_eq!(check_context(p, &child(p, &parent, 1_000_181, 0x1d00ffff), h, &below, now), Err(HeaderError::BadDifficulty));
+        // The old step rule alone let the gapless powLimit block through.
+        assert!(!too_easy(p, 0x1e0fffff, 0x1d00ffff));
+        // Chains without the rule (it is off until checked against their headers) skip it.
+        assert_eq!(check_context(&DOGECOIN_MAIN, &child(&DOGECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Ok(()));
+        // Pepecoin's mainnet has it on, as its testnet.
+        assert_eq!(check_context(&PEPECOIN_MAIN, &child(&PEPECOIN_MAIN, &parent, 1_000_120, 0x1c00ffff), h, &below, now), Err(HeaderError::BadDifficulty));
+        // Before digishield_from, or without a grandparent, nothing to compare.
+        assert_eq!(check_context(p, &child(p, &g, g.time + 1, 0x1c00ffff), 1, &[g], now), Ok(()));
     }
 
     #[test]

@@ -225,6 +225,7 @@ fn mempool_add_conflict_and_settle() {
     assert!(!f.db.mempool_add(f.p, &spend, 101).unwrap(), "already pooled");
     assert!(!f.db.mempool_add(f.p, &rival, 102).unwrap(), "double spend of a pooled coin");
     assert_eq!(f.db.mempool(c).unwrap().len(), 1);
+    assert_eq!(f.db.mempool_size(c).unwrap(), (1, spend.raw.len() as u64));
     assert_eq!(f.db.mempool_spender(c, &OutPoint { txid: cb1.txid, vout: 0 }).unwrap(), Some(spend.txid));
     // The rival confirms instead: our pooled spend is dropped.
     let b2 = block(b1.hash(), vec![tx(&[], &[(1, p2pkh(9))], 2), rival], 3);

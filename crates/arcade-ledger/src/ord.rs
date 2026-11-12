@@ -17,7 +17,7 @@
 //! iid = genesis txid (internal byte order) | n u32 (always 0 here); shown as "<txid>i0".
 
 use arcade_chain::params::ChainParams;
-use arcade_chain::{Hash256, Tx};
+use arcade_chain::{Hash256, OutPoint, Tx};
 use arcade_chaindb::undo::Logged;
 use arcade_chaindb::{BlockCtx, ChainDb, Indexer};
 use arcade_store::{KeyBuf, Result, TableDef};
@@ -834,6 +834,34 @@ pub fn count(db: &ChainDb, c: u16) -> u64 {
         .flatten()
         .map(|v| be_u64(&v, 0))
         .unwrap_or(0)
+}
+
+/// The inscriptions on one coin (ids), from the index's locations.
+pub fn on_coin(db: &ChainDb, p: &ChainParams, op: &arcade_chain::OutPoint) -> Vec<String> {
+    let c = p.chain_no;
+    db.store(c)
+        .read(|r| r.scan_prefix(LOC, &loc_prefix(c, &op.txid, op.vout)))
+        .unwrap_or_default()
+        .into_iter()
+        .map(|(key, _)| iid_str(&key[key.len() - 36..]))
+        .collect()
+}
+
+/// Where an inscription is now: (its coin, its offset in the coin).
+pub fn location(db: &ChainDb, p: &ChainParams, id: &str) -> Option<(arcade_chain::OutPoint, u64)> {
+    let c = p.chain_no;
+    let iid = resolve(db, c, id)?;
+    let at = db.store(c).read(|r| r.get(AT, &k(c, &iid))).ok()??;
+    let mut t = [0u8; 32];
+    t.copy_from_slice(&at[..32]);
+    Some((arcade_chain::OutPoint { txid: Hash256(t), vout: be_u32(&at, 32) }, be_u64(&at, 36)))
+}
+
+/// Whether an output carries an inscription, or a piece of an unfinished one (the next piece
+/// spends an output of that transaction), as far as the ord index has read.
+pub fn carries(db: &ChainDb, p: &ChainParams, op: &OutPoint) -> Result<bool> {
+    let c = p.chain_no;
+    db.store(c).read(|r| Ok(!r.scan_prefix_limit(LOC, &loc_prefix(c, &op.txid, op.vout), 1)?.is_empty() || r.get(PENDING, &k(c, &op.txid.0))?.is_some()))
 }
 
 /// Inscriptions held at an address's outputs: for each unspent output of the script, its loc rows.

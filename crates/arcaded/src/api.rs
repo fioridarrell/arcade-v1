@@ -2,16 +2,24 @@
 //! Used by the `arcade` CLI and the desktop app.
 
 use crate::node::Node;
+use arcade_local::{UnixListener, UnixStream};
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 use std::sync::Arc;
 
 pub fn serve(node: Arc<Node>, path: std::path::PathBuf) {
+    if let Err(e) = arcade_local::check_socket_path(&path) {
+        panic!("bind API socket: {e}");
+    }
     let _ = std::fs::remove_file(&path);
-    let l = UnixListener::bind(&path).expect("bind API socket");
-    use std::os::unix::fs::PermissionsExt;
-    let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660) /* service user + arcade group */);
+    let l = UnixListener::bind(&path).unwrap_or_else(|e| panic!("bind API socket {}: {e}", path.display()));
+    // Group-readable on Linux (the service user and the arcade group). On Windows the
+    // socket lives in the user's own local app data, which other users cannot read.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+    }
     for s in l.incoming().flatten() {
         let node = node.clone();
         std::thread::spawn(move || handle(node, s));
@@ -86,7 +94,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "wallet.keys" => {
             // Any chain: the same 12 words derive each chain's own addresses (its BIP44 coin type).
             let cp = match s("chain") {
-                Some(k) => arcade_chain::params::by_key(&k).ok_or_else(|| format!("unknown chain {k}"))?,
+                Some(k) => crate::chains::find(&k).ok_or_else(|| format!("unknown chain {k}"))?,
                 None => p,
             };
             let mut keys = node.app.tag_keys(cp.chain_no).map_err(|e| e.to_string())?;
@@ -94,7 +102,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
                 keys.push(node.app.tag_key(cp, 0).map_err(|e| e.to_string())?.0);
             }
             // A borrowed copy answers while the installed one catches up.
-            let installed = !crate::borrow::is_borrowed(cp.key) && (cp.chain_no == p.chain_no || node.extra.lock().unwrap().contains_key(cp.key)) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
+            let installed = !crate::borrow::is_borrowed(cp.key) && crate::chains::kept(node, cp) && node.chain.addresses_on(cp.chain_no).unwrap_or(false);
             Ok(json!(keys.iter().map(|k| {
                 let pk = arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap();
                 // Every address of the key (DigiByte: dgb1... to receive, its D... still counted).
@@ -130,7 +138,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             let chain = s("chain").ok_or("chain required")?;
             let mut v = crate::links::mine(node, &chain)?;
             // Borrowed chains: balances from the borrowed coins.
-            if let Some(cp) = arcade_chain::params::by_key(&chain).filter(|cp| crate::borrow::is_borrowed(cp.key)) {
+            if let Some(cp) = crate::chains::find(&chain).filter(|cp| crate::borrow::is_borrowed(cp.key)) {
                 for l in v.iter_mut() {
                     if let Some(sc) = l["address"].as_str().and_then(|a| arcade_ledger::address::script_for_address(cp, a)) {
                         l["balance"] = json!(crate::borrow::balance(node, cp, &sc));
@@ -250,7 +258,11 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "apps.owner_send" => crate::walletsvc::owner_send(node, &s("page").ok_or("page required")?, &req["request"]),
         "realtime.join" => {
             let who = s("member").filter(|m| !m.is_empty()).map(|m| (m, Some(req["cred"].clone()).filter(|c| !c.is_null())));
-            crate::realtime::join_as(node, &s("page").ok_or("page required")?, &s("game").unwrap_or_default(), &s("room").ok_or("room required")?, who)
+            let j = crate::realtime::join_as(node, &s("page").ok_or("page required")?, &s("game").unwrap_or_default(), &s("room").ok_or("room required")?, who)?;
+            if req["fast"] == true {
+                crate::realtime::fast::want_fast(j["token"].as_str().unwrap_or(""));
+            }
+            Ok(j)
         }
         "realtime.cert" => crate::realtime::cert(node, &s("address").ok_or("address required")?),
         "tx.coins" => crate::sitesvc::coins(node, req),
@@ -261,6 +273,30 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
         "realtime.leave" => crate::realtime::leave(node, &s("token").ok_or("token required")?),
         "realtime.poll" => crate::realtime::poll(&s("token").ok_or("token required")?, req["wait"].as_u64().unwrap_or(0)),
         "realtime.status" => Ok(crate::realtime::status(node)),
+        "realtime.fast" => {
+            let to: Vec<String> = req["to"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::realtime::fast::send(node, &s("token").ok_or("token required")?, req["data"].as_str(), req["b64"].as_str(), &to, req["reliable"] == true)
+        }
+        "realtime.media" => {
+            let to: Vec<String> = req["to"].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::realtime::fast::media(node, &s("token").ok_or("token required")?, &s("b64").ok_or("b64 required")?, &to)
+        }
+        "trade.leg" => crate::tradesvc::leg(node, &req["give"], &req["take"], &s("buyer").unwrap_or_default()),
+        "trade.open" => crate::tradesvc::open(node, &s("sealed").unwrap_or_default()),
+        "trade.fill" => crate::tradesvc::fill(node, &req["leg"], &req["expect"], &s("peer").unwrap_or_default(), req["send"] == true),
+        "trade.items" => crate::tradesvc::items(node),
+        "trade.watch" => Ok(crate::tradesvc::watch(node, &s("txid").unwrap_or_default(), s("inscription").as_deref(), s("owner").as_deref())),
+        "trade.who" => crate::tradesvc::who(node, &s("address").unwrap_or_default()),
+        "prize.seed" => crate::prizesvc::seed(node, &s("page").unwrap_or_default(), req),
+        "prize.claim" => crate::prizesvc::claim(node, &s("page").unwrap_or_default(), req, req["send"] == true),
+        "referee.get" => Ok(crate::refereesvc::setting(node)),
+        "referee.set" => crate::refereesvc::set(node, &s("url").unwrap_or_default()),
+        "collections.known_get" => Ok(serde_json::json!({"known": crate::knowncoll::enabled(node)})),
+        "collections.known_set" => crate::knowncoll::set(node, req["on"] == true),
+        "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
+        "ring.send" => crate::ringsvc::send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &s("line").unwrap_or_default(), &s("link").unwrap_or_default()),
+        "ring.waiting" => Ok(crate::ringsvc::waiting(node)),
+        "ring.get" => Ok(crate::ringsvc::get(node, &s("id").ok_or("id required")?, &s("page").ok_or("page required")?)),
         "apps.node" => match s("op").as_deref().unwrap_or("") {
             "identity" => crate::msgsvc::node_identity(node),
             "send" => crate::msgsvc::node_send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &req["body"]),
@@ -459,6 +495,11 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             }
         }
         c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
+        c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
+        "swap.place" => crate::swaps::place(node, &req["give"], &req["get"]),
+        "swap.book" => Ok(json!(crate::swaps::book(node))),
+        "swap.take" => crate::swaps::take(node, &s("node").ok_or("node required")?, &s("order").ok_or("order required")?),
+        "swap.list" => Ok(json!(crate::swaps::swaps(node))),
         "chains.offers" => Ok(json!(node.offers.lock().unwrap().iter().map(|(id, o)| json!({"node": id, "addr": o.addr, "at": o.at, "bk": o.bk, "cr": o.cr})).collect::<Vec<_>>())),
         "chains.peers" => {
             let p = arcade_chain::params::by_key(&s("key").ok_or("key required")?).ok_or("unknown chain")?;
@@ -474,6 +515,15 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!({"measured": m, "chains": crate::chains::list(node)}))
         }
         "chains.status" => crate::chains::status(node, &s("key").ok_or("key required")?),
+        "arc.status" => crate::arcsvc::status(node),
+        "arc.block" => crate::arcsvc::block(req),
+        "arc.submit" => crate::arcsvc::submit(req),
+        "arc.pool" => crate::arcsvc::pool(req),
+        "arc.catalog" => crate::arcsvc::catalog(node),
+        "arc.segment_root" => crate::arcsvc::segment_root(node, req),
+        "arc.seal" => crate::arcsvc::seal(&node.self_arc(), req),
+        "arc.replicas" => crate::arcsvc::replicas(node),
+        "arc.open" => crate::arcsvc::open(node, req),
         "chains.add" => {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::chains::add(&node.self_arc(), &s("key").ok_or("key required")?, &s("mode").unwrap_or_else(|| "full".into()), with)

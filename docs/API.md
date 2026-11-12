@@ -8,8 +8,12 @@ Everything the desktop app does goes through one set of commands. Programs reach
 | JSON-RPC 2.0 | sidecar apps on this computer | `POST http://127.0.0.1:8420/rpc` | Basic auth with the cookie file `<home>/.cookie` (`__cookie__:<secret>`, new each start) | every command |
 | Web API | websites (their server code) and other programs | `http://127.0.0.1:8420/api/v1/<group>/<name>` | none for **public**; otherwise `Authorization: Bearer ak_...` (keys made in the app's API tab) | commands allowed by the key |
 
-**Only this computer.** `/rpc` and `/api/v1` answer only requests from this computer that didn't come
-through a proxy (requests carrying `X-Forwarded-For`, `Forwarded` or `X-Real-IP` are refused). The
+**Only this computer.** `/rpc` and `/api/v1` answer only requests from this computer, addressed to
+`127.0.0.1`, `localhost` or `[::1]` with the arcade's port (the `Host` header), that didn't come
+through a proxy (requests carrying `X-Forwarded-For`, `Forwarded` or `X-Real-IP` are refused). A
+reverse proxy or tunnel that adds none of those (a plain `proxy_pass`, `ssh -L`, `socat`) would make
+its visitors look like this computer: run arcaded with `--behind-proxy` there, and nothing over the
+web port counts as this computer (programs then use the socket). Answers carry no CORS headers. The
 operator can open the HTTP port (`arcaded --http-bind 0.0.0.0`) and serve a website from it
 (`--site DIR`): visitors then get the site's pages and inscription content (`/content/<id>`,
 `/inscription/<id>`), never the API. A public website calls the API from its own server code.
@@ -88,7 +92,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `tx.coins` | `/api/v1/tx/coins` | public | addresses, chain? | Spendable coins of up to 500 addresses (confirmed, not spent by a waiting transaction, and unconfirmed outputs), to build a transaction for a browser to sign. Home or installed chain, Addresses index on. |
+| `tx.coins` | `/api/v1/tx/coins` | public | addresses, chain? | Spendable coins of up to 500 addresses (confirmed, not spent by a waiting transaction, and unconfirmed outputs), to build a transaction for a browser to sign. Coins carrying an ord inscription, and coins of at most 0.01 that no ord index can vouch for, are listed under `held_back` instead (not in `total`), so a payment built from the list never spends an inscription. Home or installed chain, Addresses index on. |
 | `tx.activity` | `/api/v1/tx/activity` | public | addresses, since?, chain? | What changed for up to 500 addresses: history rows above height since, and waiting transactions paying or spending them; height to pass as since next time. |
 | `tx.fee` | `/api/v1/tx/fee` | public | chain? | The fee rate (per 1000 bytes) and dust limit this arcade builds transactions with. |
 | `tx.broadcast` | `/api/v1/tx/broadcast` | post | hex, chain? | Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network. |
@@ -311,12 +315,25 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `realtime.join` | `/api/v1/realtime/join` | local | page, room, game?, member?, cred? | Join a room over the mesh as this arcade's player (game defaults to the page): a token, me and the members. A website joins for its user with member (their address, or a guest id) and cred {a, x, s} signed over realtime.cert's words. |
+| `realtime.join` | `/api/v1/realtime/join` | local | page, room, game?, member?, cred?, fast? | Join a room over the mesh as this arcade's player (game defaults to the page): a token, me and the members; fast: true also takes the fast lane (realtime.fast). A website joins for its user with member (their address, or a guest id) and cred {a, x, s} signed over realtime.cert's words. |
 | `realtime.cert` | `/api/v1/realtime/cert` | public | address | The words an address signs (Core signmessage) to play through this arcade, and their expiry: a website's user signs them in the browser and the site passes {a: address, x: expires, s: signature} to realtime.join. |
 | `realtime.send` | `/api/v1/realtime/send` | local | token, data?, b64? | Send to everyone in the room: text or base64 bytes, at most 512 bytes, about 5 a second. |
 | `realtime.leave` | `/api/v1/realtime/leave` | local | token | Leave the room. |
 | `realtime.poll` | `/api/v1/realtime/poll` | local | token, wait? | Room events for this seat (join, leave, message), waiting up to wait ms (15000 at most); a seat not polled for 30 s is let go. |
+| `realtime.fast` | `/api/v1/realtime/fast` | local | token, to, data?, b64?, reliable? | Send to some players of the room over the fast lane between arcades (a seat joined with fast): text or base64 bytes, at most 16 KB, about 240 a second; to names the players (up to 64). Reaches those who play here or through an arcade with a lane up (realtime.lanes); unreliable sends waiting to go out are replaced by the newest, reliable ones keep their order. Heard as fast events. |
+| `realtime.media` | `/api/v1/realtime/media` | local | token, to, b64 | A piece of the app window's encoded camera, microphone or screen (up to 60 KB) for some players of the room, over direct links between arcades only; dropped when the link is behind. Heard as mchunk events (the window's own, never the page's). |
+| `realtime.lanes` | `/api/v1/realtime/lanes` | local | token | Which players of the seat's room the fast lane reaches now (up), and how (routes: direct link or relay). |
+| `referee.get` | `/api/v1/referee/get` | read | — | The referee arcade this one asks for seeds when a page names none, and whose key /r/verified trusts by default: {url, pubkey}, or {} when none is set. |
+| `referee.set` | `/api/v1/referee/set` | admin | url | Name the referee arcade (https://...): its key is read from its /r/referee. An empty url clears it. |
 | `realtime.status` | `/api/v1/realtime/status` | read | — | Rooms this arcade has players in, and the routes it knows to other arcades' rooms. |
+
+### Ring
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `ring.send` | `/api/v1/ring/send` | local | page, to, line?, link? | Ring an address from this arcade's player, for the app whose page asks (arcade.realtime.ring): rung, and why not. It reaches them only if they have Notifications on for that app and the caller in their address book. The line (80 characters at most) and link (200) share what one room message carries (about 145 bytes); longer is an error. |
+| `ring.waiting` | `/api/v1/ring/waiting` | local | — | What is ringing this arcade's player now; asking also says the app is open, so it can be rung here (the arcade holds its ring room only while this is asked within 20 s and some app has Notifications on). |
+| `ring.get` | `/api/v1/ring/get` | local | id, page | The ring an app was opened from (arcade.realtime.ringed), for that app only: from, tag, link, line, at. |
 
 ### Inscribe
 

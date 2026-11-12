@@ -14,6 +14,7 @@
     });
   }
   window.addEventListener('message', function (e) {
+    if (e.source !== window.parent) return;          // only the arcade window that framed this page
     var m = e.data;
     if (!m || m.arcade !== 'groups' || !waiting[m.seq]) return;
     var w = waiting[m.seq]; delete waiting[m.seq]; clearTimeout(w.t);
@@ -29,6 +30,9 @@
     people: function () { return ask({ op: 'people' }).then(function (r) { return r.people; }); },
     add: function (id, members) { return ask({ op: 'add', group: id, members: members }, 600000).then(function (r) { return r.group; }); },
     create: function (name, members) { return ask({ op: 'create', name: name, members: members }, 600000).then(function (r) { return r.group; }); },
-    save: function (name, bytes) { return ask({ op: 'save', name: name, data: bytes }); }
+    save: function (name, bytes) {                       // the frame cannot save a file: the arcade window does
+      var data = bytes && bytes.buffer ? bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) : bytes;
+      return ask({ op: 'save', name: name, data: data }, 600000);
+    }
   };
 })();

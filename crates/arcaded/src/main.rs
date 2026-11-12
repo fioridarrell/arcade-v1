@@ -7,15 +7,22 @@
 
 mod accountsvc;
 mod addrsvc;
+mod collsvc;
+mod knowncoll;
 mod announce;
 mod api;
 mod apikeys;
+mod arcborrow;
+mod arcseal;
+mod arcseg;
+mod arcsvc;
 mod borrow;
 mod appsvc;
 mod walletsvc;
 mod coinsend;
 mod ddsvc;
 mod commands;
+mod diskfree;
 mod chainsvc;
 mod chains;
 mod claims;
@@ -38,18 +45,28 @@ mod lxfetch;
 mod meshsource;
 mod miner;
 mod meshsvc;
+mod ddmarket;
+mod marketsvc;
+mod swaps;
 mod meshview;
 mod mempoolshare;
 mod msgsvc;
+mod namesites;
 mod ordtypes;
 mod staker;
 mod sitesvc;
 mod grpsvc;
 mod feedsvc;
 mod node;
+mod ordsafe;
 mod peerbook;
 mod psync;
 mod realtime;
+mod pagechain;
+mod prizesvc;
+mod refereesvc;
+mod tradesvc;
+mod ringsvc;
 mod rpc;
 mod sizes;
 mod udpsvc;
@@ -62,21 +79,6 @@ mod secretbox;
 use node::Node;
 use std::sync::{Arc, Mutex};
 
-pub fn default_home() -> std::path::PathBuf {
-    if let Some(h) = std::env::var_os("ARCADE_HOME") {
-        return h.into();
-    }
-    // The installed service lives in /var/lib/arcade.
-    let system = std::path::Path::new("/var/lib/arcade");
-    if system.join("arcaded.sock").exists() || system.join("arcade.mdbx").exists() {
-        return system.to_path_buf();
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
-    base.join("arcade")
-}
-
 /// Run the service at low CPU and disk priority (threads made later inherit it), so games
 /// and the desktop stay smooth while chains catch up. Off unless ARCADE_NICE is set (e.g. 10).
 fn be_polite() {
@@ -84,11 +86,28 @@ fn be_polite() {
     if nice == 0 {
         return;
     }
+    #[cfg(unix)]
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, nice);
         // ioprio_set(IOPRIO_WHO_PROCESS, this thread, best-effort class 2, level 7: the lowest).
         let _ = libc::syscall(libc::SYS_ioprio_set, 1, 0, (2 << 13) | 7);
     }
+    #[cfg(windows)]
+    unsafe {
+        // Windows has no ionice. Below-normal for a modest nice, idle for 11 through 19.
+        let class: u32 = if nice >= 11 { 0x0000_0040 } else { 0x0000_4000 };
+        set_priority_class(class);
+    }
+}
+
+#[cfg(windows)]
+unsafe fn set_priority_class(class: u32) {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetCurrentProcess() -> *mut std::ffi::c_void;
+        fn SetPriorityClass(process: *mut std::ffi::c_void, class: u32) -> i32;
+    }
+    SetPriorityClass(GetCurrentProcess(), class);
 }
 
 /// glibc gives each thread that allocates under contention its own 64 MB arena, and memory
@@ -117,9 +136,11 @@ fn tame_malloc() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tame_malloc() {}
 
-/// Set by SIGTERM / SIGINT; the "stop" thread flushes and exits.
+/// Set by SIGTERM / SIGINT (Linux), a console control event (Windows), or the
+/// `arcaded.stop` file. The "stop" thread flushes and exits.
 static STOP_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn on_stop_signal(_: libc::c_int) {
     // A second SIGTERM / Ctrl-C while the caches are being written: leave at once (the next
     // start winds the tip back, as before this flush existed). _exit is async-signal-safe.
@@ -128,18 +149,58 @@ extern "C" fn on_stop_signal(_: libc::c_int) {
     }
 }
 
-/// On SIGTERM (systemctl stop, kill) or SIGINT (Ctrl-C): write every chain's coin cache to the
-/// database, then exit. Without this a restart while catching up threw away everything since
-/// the last cache flush (up to 10 minutes of blocks): the tip was wound back to "coins_at".
-fn stop_cleanly_on_signal(node: Arc<Node>) {
+#[cfg(windows)]
+unsafe extern "system" fn on_console_ctrl(ctrl: u32) -> i32 {
+    // CTRL_C_EVENT, CTRL_BREAK_EVENT, CTRL_CLOSE_EVENT, CTRL_LOGOFF_EVENT, CTRL_SHUTDOWN_EVENT.
+    match ctrl {
+        0 | 1 | 2 | 5 | 6 => {
+            if STOP_ASKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                unsafe { libc::_exit(1) };
+            }
+            1
+        }
+        _ => 0,
+    }
+}
+
+#[cfg(unix)]
+fn install_stop_handler() {
     unsafe {
         libc::signal(libc::SIGTERM, on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
         libc::signal(libc::SIGINT, on_stop_signal as extern "C" fn(libc::c_int) as libc::sighandler_t);
     }
+}
+
+#[cfg(windows)]
+fn install_stop_handler() {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn SetConsoleCtrlHandler(handler: Option<unsafe extern "system" fn(u32) -> i32>, add: i32) -> i32;
+    }
+    unsafe {
+        SetConsoleCtrlHandler(Some(on_console_ctrl), 1);
+    }
+}
+
+/// On SIGTERM (systemctl stop, kill), SIGINT (Ctrl-C), a Windows console close / shutdown, or
+/// a file named `arcaded.stop` in the data folder: write every chain's coin cache to the
+/// database, then exit. Without this a restart while catching up threw away everything since
+/// the last cache flush (up to 10 minutes of blocks): the tip was wound back to "coins_at".
+/// The Windows installer creates `arcaded.stop` because stopping a scheduled task does not
+/// deliver a console event the way `systemctl stop` delivers SIGTERM.
+fn stop_cleanly_on_signal(node: Arc<Node>) {
+    install_stop_handler();
+    let stop_file = node.home.join("arcaded.stop");
+    // A previous stop that was killed mid-flush must not shut the next start down.
+    let _ = std::fs::remove_file(&stop_file);
     std::thread::Builder::new()
         .name("stop".into())
         .spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_millis(200));
+            if stop_file.exists() {
+                let _ = std::fs::remove_file(&stop_file);
+                STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
             if STOP_ASKED.load(std::sync::atomic::Ordering::SeqCst) {
                 // Stop connecting blocks first; a batch already writing finishes (flush_coins
                 // waits for the write lock), then nothing new lands in a cache.
@@ -165,11 +226,13 @@ fn stop_cleanly_on_signal(node: Arc<Node>) {
 const USAGE: &str = "arcaded: the Arcade V1.0 service (normally started by the installer's service).
 
 usage: arcaded [options]
-  --home DIR            the arcade's folder (default ~/.local/share/arcade)
+  --home DIR            the arcade's folder (default: $ARCADE_HOME, else %LOCALAPPDATA%\\arcade on Windows, ~/.local/share/arcade on Linux)
   --home-mode shared    keep the home chain in shared storage (default full)
   --http-port N|0       local web port for the app (0: none)
   --http-bind ADDR      address the web port listens on
   --site DIR            serve this folder as the app
+  --behind-proxy        the web port is reached through a reverse proxy or tunnel: nothing
+                        over it counts as this computer (the API answers the socket only)
   --mesh-port N|0       mesh port (default 8421; 0: none)
   --mesh-peer HOST:PORT also link to this arcade (repeatable)
   --no-mesh             no mesh links at all
@@ -182,13 +245,45 @@ usage: arcaded [options]
 /// Hold an exclusive lock on DIR/arcaded.lock for the life of the process (released by the
 /// kernel when it exits, crashes included).
 fn lock_home(home: &std::path::Path) -> Result<std::fs::File, String> {
-    use std::os::fd::AsRawFd;
     let path = home.join("arcaded.lock");
     let f = std::fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path).map_err(|e| format!("{}: {e}", path.display()))?;
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if !try_lock_exclusive(&f) {
         return Err(format!("another arcaded is already running in {}", home.display()));
     }
     Ok(f)
+}
+
+#[cfg(unix)]
+fn try_lock_exclusive(f: &std::fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
+}
+
+#[cfg(windows)]
+fn try_lock_exclusive(f: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    #[repr(C)]
+    struct Overlapped {
+        internal: usize,
+        internal_high: usize,
+        offset: u64,
+        event: *mut std::ffi::c_void,
+    }
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn LockFileEx(
+            file: *mut std::ffi::c_void,
+            flags: u32,
+            reserved: u32,
+            low: u32,
+            high: u32,
+            overlapped: *mut Overlapped,
+        ) -> i32;
+    }
+    let mut ov = Overlapped { internal: 0, internal_high: 0, offset: 0, event: std::ptr::null_mut() };
+    // LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY. One byte is enough; the lock
+    // lives as long as `f` does.
+    unsafe { LockFileEx(f.as_raw_handle() as *mut _, 0x2 | 0x1, 0, 1, 0, &mut ov) != 0 }
 }
 
 fn main() {
@@ -210,7 +305,7 @@ fn main() {
         .position(|a| a == "--home")
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from)
-        .unwrap_or_else(default_home);
+        .unwrap_or_else(arcade_local::default_home);
     let mesh = !args.iter().any(|a| a == "--no-mesh");
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let mesh_port: Option<u16> = match opt("--mesh-port").map(|v| v.parse::<u16>().expect("--mesh-port N")) {
@@ -221,7 +316,15 @@ fn main() {
     let extra_peers: Vec<String> =
         args.iter().enumerate().filter(|(_, a)| *a == "--mesh-peer").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
     let no_seeds = args.iter().any(|a| a == "--no-seeds");
+    let fresh = !home.exists();
     std::fs::create_dir_all(&home).expect("create home");
+    // A home made here holds the wallet and its key file: this user only. One made by the package (StateDirectory,
+    // shared with the arcade group) keeps its mode.
+    #[cfg(unix)]
+    if fresh {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&home, std::fs::Permissions::from_mode(0o700));
+    }
     // One arcaded per home: a second one would fight over the databases and the socket.
     let _lock = match lock_home(&home) {
         Ok(f) => f,
@@ -243,7 +346,7 @@ fn main() {
         params: &arcade_chain::params::PEPECOIN_TEST,
         identity,
         tx_outbox: Mutex::new(Vec::new()),
-        mesh_outbox: Mutex::new(Vec::new()),
+        mesh_outbox: Mutex::new(Default::default()),
         links: Mutex::new(Default::default()),
         mesh_tips: Mutex::new(Default::default()),
         sync_state: Mutex::new("starting".into()),
@@ -269,9 +372,21 @@ fn main() {
     });
     let _ = node.me.set(Arc::downgrade(&node));
     chains::start_home(&node).expect("home indexes");
+    // A local ARCADE test chain (stand-in rules; closed test networks only), which this
+    // arcade can then install in Chains & Coins: crate::arcsvc.
+    if let Some(settings) = opt("--arc-local") {
+        if let Err(e) = arcsvc::define(&node, std::path::Path::new(&settings)) {
+            eprintln!("arcaded: --arc-local: {e}");
+            std::process::exit(1);
+        }
+    } else if let Err(e) = arcsvc::define_text(&node, arcsvc::TESTNET_SETTINGS) {
+        eprintln!("arcaded: the built-in ARCADE testnet: {e}");
+    }
     chains::start_saved(&node);
     borrow::start(node.clone());
+    swaps::start(node.clone());
     ordtypes::init(&node);
+    namesites::init(&node);
     // A home chain far behind (a fresh install): installed from copies when the mesh has them.
     v1import::auto_home(node.clone());
     sizes::load(&node);
@@ -305,7 +420,19 @@ fn main() {
     }
     {
         let n = node.clone();
+        std::thread::Builder::new().name("collections".into()).spawn(move || collsvc::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("known collections".into()).spawn(move || knowncoll::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
         std::thread::Builder::new().name("rooms".into()).spawn(move || realtime::run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
+        std::thread::Builder::new().name("rings".into()).spawn(move || ringsvc::run(n)).unwrap();
     }
     {
         let n = node.clone();
@@ -371,18 +498,24 @@ fn main() {
             .unwrap();
     }
     if mesh {
-        let mut seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
-        // Every arcade we learned of before is a seed too.
+        let seeds: Vec<String> = if no_seeds { vec![] } else { meshsvc::SEEDS.iter().map(|s| s.to_string()).collect() };
+        // Every arcade we learned of before is tried too, as an address we heard of (public
+        // addresses only; seeds and --peer may be anything).
+        let mut heard: Vec<(String, &'static str)> = Vec::new();
         if !no_seeds {
+            meshsvc::prune_peers(&node);
             for p in node.app.peers().unwrap_or_default() {
                 let a = if p.host.starts_with("wss://") { p.host.clone() } else if p.host.contains(':') { format!("[{}]:{}", p.host, p.port) } else { format!("{}:{}", p.host, p.port) };
-                if !seeds.contains(&a) {
-                    seeds.push(a);
+                if !seeds.contains(&a) && !extra_peers.contains(&a) && !heard.iter().any(|(x, _)| *x == a) {
+                    heard.push((a, if p.source == "chain" { "chain" } else { "gossip" }));
                 }
             }
         }
         for a in seeds.into_iter().chain(extra_peers) {
             meshsvc::dial(&node, a);
+        }
+        for (a, src) in heard {
+            meshsvc::dial_heard(&node, a, src);
         }
         // Arcades that announce themselves on chain (MESH records), checked every 10 minutes.
         if !no_seeds {
@@ -417,10 +550,11 @@ fn main() {
             bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),
             port: http_port,
             site: opt("--site").map(std::path::PathBuf::from),
+            behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
         };
         let n = node.clone();
         std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, o)).unwrap();
     }
     stop_cleanly_on_signal(node.clone());
-    api::serve(node, home.join("arcaded.sock"));
+    api::serve(node, arcade_local::socket_path(&home));
 }

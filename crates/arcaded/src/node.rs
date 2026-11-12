@@ -68,6 +68,62 @@ fn two_arcades_behind_one_address_are_two_links() {
     assert!(links.lock().unwrap().is_empty());
 }
 
+/// Frames waiting to be sent to every mesh link: the latest OUTBOX_RING only, numbered in
+/// order, so a link sends each once and one that fell behind (or a new one) starts at the
+/// oldest still kept.
+#[derive(Debug, Default)]
+pub struct Outbox {
+    /// Number of the oldest frame kept.
+    start: usize,
+    frames: std::collections::VecDeque<Value>,
+}
+
+pub const OUTBOX_RING: usize = 2000;
+
+impl Outbox {
+    pub fn push(&mut self, f: Value) {
+        self.frames.push_back(f);
+        while self.frames.len() > OUTBOX_RING {
+            self.frames.pop_front();
+            self.start += 1;
+        }
+    }
+
+    #[cfg(test)]
+    pub fn len(&self) -> usize {
+        self.frames.len()
+    }
+
+    #[cfg(test)]
+    pub fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    #[cfg(test)]
+    pub fn last(&self) -> Option<&Value> {
+        self.frames.back()
+    }
+
+    /// The frames numbered `from` on (those still kept), and the number after the last.
+    pub fn since(&self, from: usize) -> (Vec<Value>, usize) {
+        (self.frames.iter().skip(from.saturating_sub(self.start)).cloned().collect(), self.start + self.frames.len())
+    }
+}
+
+#[test]
+fn outbox_is_a_ring() {
+    let mut o = Outbox::default();
+    for n in 0..OUTBOX_RING + 10 {
+        o.push(serde_json::json!(n));
+    }
+    assert_eq!(o.len(), OUTBOX_RING);
+    let (all, next) = o.since(0);
+    assert_eq!((all.len(), all[0].clone(), next), (OUTBOX_RING, serde_json::json!(10), OUTBOX_RING + 10));
+    let (some, _) = o.since(OUTBOX_RING + 5);
+    assert_eq!(some, vec![serde_json::json!(OUTBOX_RING + 5), serde_json::json!(OUTBOX_RING + 6), serde_json::json!(OUTBOX_RING + 7), serde_json::json!(OUTBOX_RING + 8), serde_json::json!(OUTBOX_RING + 9)]);
+    assert!(o.since(next).0.is_empty());
+}
+
 pub struct Node {
     pub home: std::path::PathBuf,
     /// "__cookie__:<secret>" for /rpc (written to <home>/.cookie at start).
@@ -81,7 +137,7 @@ pub struct Node {
     /// Raw transactions waiting to be sent to coin peers.
     pub tx_outbox: Mutex<Vec<Vec<u8>>>,
     /// Frames waiting to be sent to every mesh link.
-    pub mesh_outbox: Mutex<Vec<Value>>,
+    pub mesh_outbox: Mutex<Outbox>,
     pub links: Mutex<BTreeMap<String, LinkInfo>>,
     pub mesh_tips: Mutex<BTreeMap<String, MeshTip>>,
     pub sync_state: Mutex<String>,
@@ -208,6 +264,9 @@ impl Node {
     /// then shared, fixed and seeded ones. Peers resting after failures are left out.
     pub fn coin_candidates(&self, p: &arcade_chain::params::ChainParams) -> Vec<String> {
         let mut v = crate::peerbook::candidates(self, p.net);
+        if std::env::var("ARCADE_COIN_PEERS").is_ok_and(|x| !x.trim().is_empty()) {
+            return v; // only the peers named for this chain (crate::peerbook::forced)
+        }
         for a in self.coin_candidates_static(p) {
             if !v.contains(&a) && !crate::peerbook::is_resting(self, p.net, &a) {
                 v.push(a);
@@ -216,15 +275,12 @@ impl Node {
         v
     }
 
-    /// Shared, fixed and DNS-seeded peers (no address book).
+    /// Shared, DNS-seeded and fixed peers (no address book). The DNS seeds come before the fixed
+    /// list: they answer with nodes that are up now, where a fixed list goes stale (Shibacoin's
+    /// had 9 of 10 gone, 2026-11-11).
     pub fn coin_candidates_static(&self, p: &arcade_chain::params::ChainParams) -> Vec<String> {
         use std::net::ToSocketAddrs;
         let mut v: Vec<String> = self.coin_peers.lock().unwrap().get(p.net).map(|s| s.iter().cloned().collect()).unwrap_or_default();
-        for f in p.fixed_peers {
-            if !v.iter().any(|x| x == f) {
-                v.push(f.to_string());
-            }
-        }
         for d in p.dns_seeds {
             let mut found: Vec<String> = (*d, p.p2p_port).to_socket_addrs().into_iter().flatten().map(|a| a.to_string()).collect();
             if found.is_empty() {
@@ -237,6 +293,41 @@ impl Node {
                 }
             }
         }
+        for f in p.fixed_peers {
+            if !v.iter().any(|x| x == f) {
+                v.push(f.to_string());
+            }
+        }
         v
     }
+
+    /// The first of `addrs` to answer, dialing [`DIAL_AT_ONCE`] at a time with a short timeout
+    /// (one at a time with 20 s each, a list of dead seeds took minutes). The others that
+    /// answer at the same time are let go.
+    pub fn dial_first(p: &'static arcade_chain::params::ChainParams, addrs: &[String], relay: bool) -> Option<arcade_chain::p2p::Peer> {
+        for batch in addrs.chunks(DIAL_AT_ONCE) {
+            let (tx, rx) = std::sync::mpsc::channel();
+            for a in batch {
+                let (tx, a) = (tx.clone(), a.clone());
+                std::thread::spawn(move || {
+                    let _ = tx.send(arcade_chain::p2p::Peer::connect_with(p, &a, DIAL_TIMEOUT, relay).ok());
+                });
+            }
+            drop(tx);
+            // The first that answers; when every one of the batch failed, the next batch.
+            while let Ok(got) = rx.recv() {
+                if let Some(peer) = got {
+                    // Back to the read timeout the sync uses once linked.
+                    let _ = peer.set_read_timeout(std::time::Duration::from_secs(20));
+                    return Some(peer);
+                }
+            }
+        }
+        None
+    }
 }
+
+/// Coin peers dialed at once when looking for one.
+pub const DIAL_AT_ONCE: usize = 8;
+/// How long a dial (connect and handshake) may take.
+pub const DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);

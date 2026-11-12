@@ -6,8 +6,8 @@
 //! - Opens `play` only when that page has the same creator, else the card's own page.
 //! - Likes, dislikes, comments and tips on any version count for the app (home chain feed acts).
 //! - Popular = hot(likes − dislikes + 0.5·comments, block time); New = newest first. Starred first.
-//! - Copycats: a card that looks like an earlier card by another creator (cards::looks_like) is
-//!   hidden until the operator clears it; trusted publishers are never flagged.
+//! - Copycats: a card that looks like an earlier card of a listed app by another creator
+//!   (cards::looks_like) is hidden until the operator clears it; trusted publishers are never flagged.
 //! - Installing keeps (chain, creator, name): it always opens the newest version.
 
 use crate::node::Node;
@@ -58,24 +58,62 @@ fn app_id(chain: &str, creator: &str, key: &str) -> String {
     format!("{chain}:{creator}:{key}")
 }
 
-/// Every app on every ledger chain, grouped and resolved.
+/// The inscription rows of chain `p` that may be app cards (HTML whose record names a game or
+/// an app), from this arcade's ledger.
+pub fn card_rows(node: &Node, p: &ChainParams) -> Vec<Value> {
+    let c = p.chain_no;
+    let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &KeyBuf::new().u16(c).done())).unwrap_or_default();
+    rows.into_iter()
+        .filter_map(|(_, v)| serde_json::from_slice::<Value>(&v).ok())
+        .filter(|v| v["content_type"].as_str().unwrap_or("").to_ascii_lowercase().starts_with("text/html"))
+        .filter(|v| v["json"].as_str().is_some_and(|j| j.contains("\"game\"") || j.contains("\"app\"")))
+        .map(|v| json!({"txid": v["txid"], "number": v["number"], "creator": v["creator"], "json": v["json"], "block_height": v["block_height"], "position": v["position"]}))
+        .collect()
+}
+
+/// Card rows of chains this arcade only borrows, from an arcade on the mesh that keeps their
+/// ledger: kept here, asked again in the background every 10 minutes (the store never waits).
+static BORROWED_CARDS: std::sync::Mutex<BTreeMap<String, (std::time::Instant, Vec<Value>)>> = std::sync::Mutex::new(BTreeMap::new());
+
+fn borrowed_card_rows(node: &Node, kept: &[&'static ChainParams]) -> Vec<(&'static ChainParams, Vec<Value>)> {
+    let mut out = Vec::new();
+    for p in arcade_chain::params::ALL_CHAINS.iter().copied() {
+        if kept.iter().any(|k| k.chain_no == p.chain_no) || !crate::borrow::is_borrowed(p.key) {
+            continue;
+        }
+        let (stale, rows) = match BORROWED_CARDS.lock().unwrap().get(p.key) {
+            Some((at, rows)) => (at.elapsed().as_secs() > 600, rows.clone()),
+            None => (true, Vec::new()),
+        };
+        if stale {
+            // Marked fresh now, so one ask at a time; the answer replaces it when it comes.
+            BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows.clone()));
+            let n = node.self_arc();
+            std::thread::spawn(move || {
+                if let Ok(v) = crate::explorer::handle(&n, "explorer.app_cards", &json!({"chain": p.key})) {
+                    let got = v["rows"].as_array().cloned().unwrap_or_default();
+                    BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), got));
+                }
+            });
+        }
+        out.push((p, rows));
+    }
+    out
+}
+
+/// Every app on every ledger chain (this arcade's, and the chains it borrows), grouped and resolved.
 fn gather(node: &Node) -> Vec<App> {
     let mut apps = Vec::new();
     let home = node.params.chain_no;
     let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, home).unwrap_or_default();
-    for p in ledger_chains(node) {
+    let kept = ledger_chains(node);
+    let mut chains: Vec<(&'static ChainParams, Vec<Value>)> = kept.iter().map(|p| (*p, card_rows(node, p))).collect();
+    chains.extend(borrowed_card_rows(node, &kept));
+    for (p, rows) in chains {
         let c = p.chain_no;
-        let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::INSCRIPTION, &KeyBuf::new().u16(c).done())).unwrap_or_default();
         let mut by: BTreeMap<(String, String), Vec<Ver>> = BTreeMap::new();
-        for (_, v) in rows {
-            let Ok(v) = serde_json::from_slice::<Value>(&v) else { continue };
-            if !v["content_type"].as_str().unwrap_or("").to_ascii_lowercase().starts_with("text/html") {
-                continue;
-            }
+        for v in rows {
             let j = v["json"].as_str().unwrap_or("");
-            if !(j.contains("\"game\"") || j.contains("\"app\"")) {
-                continue;
-            }
             let Some(card) = cards::parse(j) else { continue };
             let creator = v["creator"].as_str().unwrap_or("").to_string();
             by.entry((creator.clone(), card.key())).or_default().push(Ver {
@@ -105,8 +143,13 @@ fn block_time(node: &Node, c: u16, h: u64) -> u64 {
 /// Copycat flags: the newest card of each app compared with earlier cards by other creators.
 fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
     let trusted: BTreeSet<String> = meta_get(node, "apps_trusted").as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    // What a card can be mistaken for is an app the store still lists: not one its creator removed,
+    // and not one the operator confirmed as a copy.
     let mut all: Vec<(&Ver, &str)> = Vec::new();
     for a in apps {
+        if a.removed || meta_get(node, &format!("cardwatch:{}:{}", a.chain.key, a.versions[0].txid)) == "confirmed" {
+            continue;
+        }
         for v in &a.versions {
             all.push((v, a.chain.key));
         }
@@ -321,6 +364,23 @@ pub fn set_perms(node: &Node, id: &str, set: &Value) -> Result<Value, String> {
     }
     meta_put(node, &format!("appperm:{id}"), &v)?;
     Ok(v)
+}
+
+/// Ids of the apps whose Notifications switch is on.
+pub fn notify_ids(node: &Node) -> Vec<String> {
+    let rows = node.app.store.read(|r| r.scan_prefix(arcade_app::META, b"appperm:")).unwrap_or_default();
+    rows.into_iter()
+        .filter(|(_, v)| serde_json::from_slice::<Value>(v).is_ok_and(|v| v["notify"] == true))
+        .filter_map(|(k, _)| String::from_utf8(k).ok().map(|k| k["appperm:".len()..].to_string()))
+        .collect()
+}
+
+/// The app a page belongs to (the txid of any of its versions, on any chain kept here):
+/// its id, name and chain, and the txid its card goes by.
+pub fn of_page(node: &Node, txid: &str) -> Option<Value> {
+    let a = gather(node).into_iter().find(|a| a.versions.iter().any(|v| v.txid == txid))?;
+    let first = &a.versions[0];
+    Some(json!({"id": app_id(a.chain.key, &first.creator, &first.card.key()), "name": first.card.name, "chain": a.chain.key, "txid": first.txid}))
 }
 
 /// Operator's verdict on a flagged card: "clear" (show it) or "confirm" (keep it hidden).

@@ -34,6 +34,7 @@ mod coreboot;
 mod coreshare;
 mod leveldb;
 mod crsource;
+mod crvia;
 mod explorer;
 mod faucet;
 mod http;

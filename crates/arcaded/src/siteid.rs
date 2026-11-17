@@ -2,7 +2,7 @@
 //! in, side by side, so each site (and each user) picks.
 //!
 //! **ARCADE ID, no password** (built on Digi-ID, created by the DigiByte community: its QR codes,
-//! callback and signed URI are used unchanged, so DigiByte Go and every Digi-ID wallet work; an
+//! callback and signed URI are used unchanged, so Digi-ID wallets (Coinomi is the one digi-id.io names) work; an
 //! ARCADE wallet may answer with a key on any chain it holds and says which in `chain`):
 //!   id.start       a code for the site to show: digiid://<host><path>?x=<nonce>
 //!   id.callback    what the wallet posted to the site's callback URL, checked here
@@ -384,7 +384,7 @@ mod tests {
         // Signed with another prefix or over another code: refused.
         assert!(callback(&addr, &uri, &signmessage(&sk, ARCADE_MAGIC, &uri), None).is_err());
         assert!(callback(&addr, &format!("{uri}0"), &signmessage(&sk, DIGIID_MAGICS[0], &format!("{uri}0")), None).is_err());
-        // DigiByte Go's answer: in, once.
+        // A Digi-ID wallet's answer: in, once.
         let sig = signmessage(&sk, DIGIID_MAGICS[0], &uri);
         assert!(callback(&addr, &uri, &sig, None).is_ok());
         assert!(callback(&addr, &uri, &sig, None).is_err());

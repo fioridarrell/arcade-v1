@@ -98,6 +98,25 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `tx.fee` | `/api/v1/tx/fee` | public | chain? | The fee rate (per 1000 bytes) and dust limit this arcade's wallet builds transactions with on that chain (kept or borrowed). |
 | `tx.broadcast` | `/api/v1/tx/broadcast` | post | hex, chain? | Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network. On a borrowed chain it goes to the lenders' nodes, which check it; refused by all, it is not sent. |
 
+### Id
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `id.start` | `/api/v1/id/start` | public | host, path?, http? | ARCADE ID sign-in (no password; built on Digi-ID, created by the DigiByte community): a code for a website to show as a QR code, digiid://host/path?x=nonce (path default /digiid/callback; http: true for a plain-http test address). DigiByte Go and every Digi-ID wallet answer it; an ARCADE wallet may answer with a key on any chain it holds. Lasts 5 minutes, works once. |
+| `id.callback` | `/api/v1/id/callback` | public | address, uri, signature, chain? | What the wallet posted to the website's callback URL, checked: a code from id.start, not used or run out, signed by address (Core signmessage over uri: Digi-ID's DigiByte prefix, or with chain that chain's prefix or ARCADE's). |
+| `id.poll` | `/api/v1/id/poll` | public | nonce | A sign-in code's state for the website's page: waiting, done (once: the address that signed and its chain; chain null = a Digi-ID wallet's key for this site), expired or unknown. The website links that address to its user. |
+| `id.link_start` | `/api/v1/id/link_start` | public | key, host | Add a device with no password: the new browser's one-time public key (hex) in; a code, a 6-digit number and the QR text (arcadelink://host/code?k=key) out. The user's other device scans it, shows the same number (the first 4 bytes of sha256("ARCADE/link\0" + code + "\0" + key), mod 1,000,000) and sends the 12 words sealed to that key. |
+| `id.link_send` | `/api/v1/id/link_send` | public | code, sealed | The other device's sealed message for the new browser (sealed to its key: this arcade only passes it on), once per code. |
+| `id.link_poll` | `/api/v1/id/link_poll` | public | code | The new browser collects what was sent: waiting, done (once: sealed and the key it is sealed to), expired or unknown. |
+
+### Vault
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `vault.put` | `/api/v1/vault/put` | public | tag, address, pubkey, blob, signature | Password accounts: keep @tag's sealed record here (the 12 words sealed under the password in the browser: {kdf: PBKDF2-SHA512, iterations, salt, nonce, sealed}; nothing here can open it). address = the one @tag names on chain; signature = its Core signmessage (ARCADE's prefix) over "ARCADE vault @tag address pubkey sha256", sha256 of the record as {kdf, iterations, salt, nonce, sealed} JSON. Replaces an older one. |
+| `vault.get` | `/api/v1/vault/get` | public | tag, here? | @tag's sealed record {tag, address, pubkey, blob, from?}: kept here, else (unless here) from the arcade that holds it. The shape of the original arcades' /signin/<tag>: a website serving it there lets other arcades find accounts made on it. |
+| `vault.delete` | `/api/v1/vault/delete` | public | tag, signature | Drop @tag's sealed record here ("stop using a password"): signature = @tag's address signing "ARCADE vault delete @tag address sha256" of the record kept. The account then opens on this site with ARCADE ID or its 12 words. |
+
 ### Wallet
 
 | method | route | needs | params | what |
@@ -367,6 +386,28 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `rpc.help` | `/api/v1/rpc/help` | public | — | Every command, its parameters and what it needs. |
 | `rpc.info` | `/api/v1/rpc/info` | local | — | Where the RPC and the web API are, and the cookie file. |
+
+## Sign-in for websites
+
+A website wired to the arcade can let its users in **with a password, with ARCADE ID and no password, or both**.
+Either way the 12 words are the account and stay in the user's browser; the website's server keeps its own sessions.
+
+**Password** (the original arcades' way). Sign-up: the browser seals the words under the password and signs
+"ARCADE vault @tag address pubkey sha256" with the @tag's address; the server passes it to `vault.put`. Sign-in: the
+server hands the browser `vault.get`'s sealed record, and the password opens it there. Serve `vault.get`'s answer at
+`https://<site>/signin/<tag>` too, so other arcades can sign in accounts made on the site.
+
+**ARCADE ID, no password** (built on [Digi-ID](https://www.digi-id.io), created by the DigiByte community). Sign-in:
+`id.start` gives a code; the page shows it as a QR code; the wallet posts its answer to the site's callback URL, which
+passes it to `id.callback`; the page asks `id.poll` until it is done and gets the address that signed, which the site
+links to its user. A new device gets the wallet from one the user already has: `id.link_start` with the new browser's
+one-time public key gives a QR code and a 6-digit number; the other device scans it, shows the same number, and sends
+the words sealed to that key with `id.link_send`; the new browser collects them with `id.link_poll` and keeps them
+locked on the device (a passkey, for one). The arcade only passes the sealed message on; nothing it keeps can open it.
+
+**Both.** Offer the password and ARCADE ID side by side. A user who turns the password off: `vault.delete`, signed
+by the @tag's address, drops the sealed record, and the account then opens on the site with ARCADE ID or the 12
+words only.
 
 ## The explorer for apps
 

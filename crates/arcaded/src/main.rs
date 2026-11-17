@@ -80,6 +80,7 @@ mod namesites;
 mod ordtypes;
 mod staker;
 mod sitesvc;
+mod siteid;
 mod grpsvc;
 mod feedsvc;
 mod follows;

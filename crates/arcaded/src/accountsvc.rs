@@ -252,7 +252,7 @@ fn ask_from(asked: &str, v: &Value) -> String {
 
 /// The sealed vault for @tag: from `from` if given, else from whichever known arcade holds it
 /// (up to 8 asked at once). Its address must be the one the @tag names on chain.
-fn find_vault(node: &Node, tag: &str, from: Option<&str>) -> Result<(String, Value), String> {
+pub(crate) fn find_vault(node: &Node, tag: &str, from: Option<&str>) -> Result<(String, Value), String> {
     let owner = arcade_ledger::index::tag_row(&node.chain, node.ledger_home().chain_no, tag)
         .map_err(|e| e.to_string())?
         .map(|r| r.address)

@@ -717,7 +717,7 @@ const aidLink = () => $("w-aid-code").value.trim().startsWith("arcadelink://");
 $("w-aid-code").addEventListener("input", () => { $("w-aid-chain").hidden = aidLink(); $("w-aid-confirm").hidden = true; });
 $("w-aid-check").addEventListener("click", async () => {
   const b = $("w-aid-check");
-  b.disabled = true; $("w-aid-confirm").hidden = true;
+  b.disabled = true; $("w-aid-confirm").hidden = true; msg($("w-aid-msg"), "");
   try {
     if (aidLink()) {
       const r = await api("id.link_answer", { qr: $("w-aid-code").value });
@@ -729,24 +729,24 @@ $("w-aid-check").addEventListener("click", async () => {
       $("w-aid-send").textContent = `Sign in to ${r.host}`;
     }
     $("w-aid-confirm").hidden = false;
-    msg($("w-msg"), "");
-  } catch (e) { msg($("w-msg"), e.message, "bad"); }
+    msg($("w-aid-msg"), "");
+  } catch (e) { msg($("w-aid-msg"), e.message, "bad"); }
   finally { b.disabled = false; }
 });
 $("w-aid-cancel").addEventListener("click", () => { $("w-aid-confirm").hidden = true; });
 $("w-aid-send").addEventListener("click", async () => {
   const b = $("w-aid-send");
-  b.disabled = true;
+  b.disabled = true; msg($("w-aid-msg"), aidLink() ? "Sending…" : "Signing in…");
   try {
     if (aidLink()) {
       const r = await api("id.link_answer", { qr: $("w-aid-code").value, send: true });
-      msg($("w-msg"), `Sent: ${r.tag ? "@" + r.tag : "your account"} opens in the browser on ${r.host}.`, "ok");
+      msg($("w-aid-msg"), `Sent: ${r.tag ? "@" + r.tag : "your account"} opens in the browser on ${r.host}.`, "ok");
     } else {
       const r = await api("id.answer", { code: $("w-aid-code").value, chain: $("w-aid-chain").value, send: true });
-      msg($("w-msg"), `Signed in to ${r.host}: the site's page continues by itself.`, "ok");
+      msg($("w-aid-msg"), `Signed in to ${r.host}: the site's page continues by itself.`, "ok");
     }
     $("w-aid-confirm").hidden = true; $("w-aid-code").value = ""; $("w-aid-chain").hidden = false;
-  } catch (e) { msg($("w-msg"), e.message, "bad"); }
+  } catch (e) { msg($("w-aid-msg"), e.message, "bad"); }
   finally { b.disabled = false; }
 });
 

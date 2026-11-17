@@ -11,6 +11,7 @@
 //!   id.link_start  the new browser's one-time public key in, a code + a 6-digit number out
 //!   id.link_send   the user's other device sends the words sealed to that key (the arcade can't open them)
 //!   id.link_poll   the new browser collects them, once
+//!   id.link_answer the desktop app as that other device: the number shown, then the words sealed and sent
 //!
 //! **Password** (the original arcades' way): the browser seals the 12 words under the password
 //! and the site keeps that sealed record; any arcade may ask for it, only the password opens it.
@@ -41,6 +42,8 @@ pub const CODE_SECONDS: u64 = 300;
 const MAX_WAITING: usize = 10_000;
 /// Largest sealed message a device link carries, and largest sealed record (bytes of JSON).
 const MAX_SEALED: usize = 16_384;
+/// Most free @tags reserved here at once (vault.put before a claim on chain).
+const MAX_RESERVED: usize = 50_000;
 /// Digi-ID wallets sign with DigiByte's prefix (BitID ones with Bitcoin's).
 const DIGIID_MAGICS: [&str; 2] = ["DigiByte Signed Message:\n", "Bitcoin Signed Message:\n"];
 /// ARCADE's own prefix, which any chain's answer may use (arcade/llm.py MAGIC).
@@ -200,21 +203,40 @@ pub fn link_number(code: &str, key: &str) -> String {
     format!("{:06}", u32::from_be_bytes([h[0], h[1], h[2], h[3]]) % 1_000_000)
 }
 
-/// id.link_start: the new browser's one-time public key (hex, 32 to 65 bytes) in; a code, the
-/// number to compare and the QR text (arcadelink://<host>/<code>?k=<key>) out.
-pub fn link_start(key: &str, host: &str) -> R {
+/// id.link_start: the new browser's one-time public key (hex, 32 to 65 bytes; an X25519 key for
+/// the app's sender) in; a code, the number to compare and the QR text out:
+/// arcadelink://<host>/<code>?k=<key>[&a=<via>]. `via`: the https address of this arcade's API
+/// when the site isn't served by it (a site with no node of its own); the other device sends to
+/// <via>/api/v1/id/link_send, else to https://<host>/api/v1/id/link_send.
+pub fn link_start(key: &str, host: &str, via: Option<&str>) -> R {
     let key = key.trim().to_lowercase();
     let len = hex::decode(&key).map(|b| b.len()).unwrap_or(0);
     if !(32..=65).contains(&len) {
         return Err("key: the new browser's one-time public key, in hex".into());
     }
     let host = clean_host(host)?;
+    let via = match via.map(str::trim).filter(|v| !v.is_empty()) {
+        Some(v) => Some(clean_via(v)?),
+        None => None,
+    };
     let code = random_hex(16);
     let t = now();
     let mut m = LINKS.lock().unwrap();
     prune(&mut m, |l: &Link| l.at, t);
     m.insert(code.clone(), Link { key: key.clone(), at: t, sealed: None });
-    Ok(json!({"code": code, "number": link_number(&code, &key), "qr": format!("arcadelink://{host}/{code}?k={key}"), "expires_in": CODE_SECONDS}))
+    let qr = match &via {
+        Some(v) => format!("arcadelink://{host}/{code}?k={key}&a={v}"),
+        None => format!("arcadelink://{host}/{code}?k={key}"),
+    };
+    Ok(json!({"code": code, "number": link_number(&code, &key), "qr": qr, "expires_in": CODE_SECONDS}))
+}
+
+/// An arcade API's address for a link: https://host[:port] (http:// only for a test address on
+/// this network), no path.
+fn clean_via(v: &str) -> Result<String, String> {
+    let (scheme, rest) = if let Some(r) = v.strip_prefix("https://") { ("https://", r) } else if let Some(r) = v.strip_prefix("http://") { ("http://", r) } else { return Err("via: https://host of the arcade's API".into()) };
+    let h = clean_host(rest.trim_end_matches('/')).map_err(|_| "via: https://host of the arcade's API".to_string())?;
+    Ok(format!("{scheme}{h}"))
 }
 
 /// id.link_send: the other device's sealed message for the new browser (sealed to its key; the
@@ -252,6 +274,86 @@ pub fn link_poll(code: &str) -> R {
         return Ok(json!({"state": "expired"}));
     }
     Ok(json!({"state": "waiting", "expires_in": l.at + CODE_SECONDS - t}))
+}
+
+/// A device link as the other device reads it: arcadelink://host/code?k=key[&a=via].
+#[derive(Debug, PartialEq)]
+pub struct LinkCode {
+    pub host: String,
+    pub code: String,
+    pub key: [u8; 32],
+    /// Where id.link_send is posted.
+    pub send_to: String,
+}
+
+pub fn parse_link(text: &str) -> Result<LinkCode, String> {
+    let no = || "that isn't an ARCADE ID device link (arcadelink://…)".to_string();
+    let rest = text.trim().strip_prefix("arcadelink://").ok_or_else(no)?;
+    let (before, query) = rest.split_once('?').ok_or_else(no)?;
+    let (host, code) = before.split_once('/').ok_or_else(no)?;
+    let host = clean_host(host).map_err(|_| no())?;
+    if code.len() != 32 || !code.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(no());
+    }
+    let (mut key, mut via) = (None, None);
+    for kv in query.split('&') {
+        match kv.split_once('=') {
+            Some(("k", k)) => key = hex::decode(k).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()),
+            Some(("a", a)) => via = Some(clean_via(a)?),
+            _ => return Err(no()),
+        }
+    }
+    let key = key.ok_or("this link's key isn't one this app can send to (an X25519 key, 32 bytes)")?;
+    let send_to = format!("{}/api/v1/id/link_send", via.unwrap_or_else(|| format!("https://{host}")));
+    Ok(LinkCode { host, code: code.to_lowercase(), key, send_to })
+}
+
+/// Seal `plain` to the new browser's X25519 key: a one-time X25519 key of ours, AES-256-GCM under
+/// sha256("ARCADE/link\0" + shared + our key + theirs). {v: 1, kem: "X25519", epk, nonce, ct}, hex.
+pub fn seal_for(to: &[u8; 32], plain: &[u8]) -> Result<String, String> {
+    use aes_gcm::aead::{Aead, KeyInit};
+    let eph = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+    let epk = x25519_dalek::PublicKey::from(&eph);
+    let shared = eph.diffie_hellman(&x25519_dalek::PublicKey::from(*to));
+    let key = Sha256::new().chain_update(b"ARCADE/link\0").chain_update(shared.as_bytes()).chain_update(epk.as_bytes()).chain_update(to).finalize();
+    let mut nonce = [0u8; 12];
+    rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut nonce);
+    let ct = aes_gcm::Aes256Gcm::new_from_slice(&key).map_err(|e| e.to_string())?.encrypt(aes_gcm::Nonce::from_slice(&nonce), plain).map_err(|e| e.to_string())?;
+    Ok(json!({"v": 1, "kem": "X25519", "epk": hex::encode(epk.as_bytes()), "nonce": hex::encode(nonce), "ct": hex::encode(ct)}).to_string())
+}
+
+/// id.link_answer: the desktop app is the "other device". A device link in (arcadelink://…, shown
+/// by the new browser). Without send: the site, the number to compare with the one on the new
+/// browser's screen and the @tag that would be sent, to show before anything leaves. With send:
+/// the active account's 12 words (and its @tag), sealed to the new browser's key, sent to the
+/// arcade that holds the link.
+pub fn link_answer(node: &Node, qr: &str, send: bool) -> R {
+    let l = parse_link(qr)?;
+    let key_hex = hex::encode(l.key);
+    let phrase = node.app.phrase().map_err(|e| e.to_string())?;
+    let seed = arcade_wallet::keys::seed_from_phrase(&phrase).map_err(|e| e.to_string())?;
+    let home = node.ledger_home();
+    let pk = arcade_wallet::keys::tag_key(&seed[..], home.bip44_coin_type, 0).map_err(|e| e.to_string())?.public();
+    let address = arcade_wallet::keys::p2pkh_address(&pk, home.p2pkh_version);
+    let tag = crate::hometag::of_address(node, &address);
+    let shown = json!({"host": l.host, "number": link_number(&l.code, &key_hex), "tag": tag, "address": address, "send_to": l.send_to});
+    if !send {
+        return Ok(shown);
+    }
+    let sealed = seal_for(&l.key, json!({"words": phrase.as_str(), "tag": tag}).to_string().as_bytes())?;
+    let agent = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).redirects(0).user_agent("arcade-id/1.0").build();
+    let body = json!({"code": l.code, "sealed": sealed});
+    match agent.post(&l.send_to).set("Content-Type", "application/json").send_string(&body.to_string()) {
+        Ok(_) => {}
+        Err(ureq::Error::Status(n, r)) => {
+            let said: String = r.into_string().unwrap_or_default().chars().take(300).collect();
+            return Err(format!("the arcade behind {} said no ({n}): {said}", l.host));
+        }
+        Err(e) => return Err(format!("couldn't reach the arcade behind {}: {e}", l.host)),
+    }
+    let mut out = shown;
+    out["ok"] = json!(true);
+    Ok(out)
 }
 
 // ---------------- answering codes: the desktop app and a website's users ----------------
@@ -479,16 +581,23 @@ pub fn delete_words(tag: &str, address: &str, blob: &Value) -> String {
 
 /// The address @tag names on the home chain.
 fn owner(node: &Node, tag: &str) -> Result<String, String> {
-    arcade_ledger::index::tag_row(&node.chain, node.ledger_home().chain_no, tag)
-        .map_err(|e| e.to_string())?
-        .map(|r| r.address)
-        .ok_or_else(|| format!("@{tag} is not claimed"))
+    chain_owner(node, tag)?.ok_or_else(|| format!("@{tag} is not claimed"))
+}
+
+/// The address @tag names on the home chain, or None while nobody has claimed it.
+fn chain_owner(node: &Node, tag: &str) -> Result<Option<String>, String> {
+    Ok(arcade_ledger::index::tag_row(&node.chain, node.ledger_home().chain_no, tag).map_err(|e| e.to_string())?.map(|r| r.address))
 }
 
 /// vault.put: keep @tag's sealed record here ({tag, address, pubkey, blob, signature}):
-/// `address` must be the one @tag names on chain and `signature` its Core signmessage
-/// (ARCADE's prefix) over put_words. `pubkey`: the account's login key, as the original
-/// arcades keep it. Replaces an older record of the same @tag.
+/// `signature` is `address`'s Core signmessage (ARCADE's prefix) over put_words. `pubkey`: the
+/// account's login key, as the original arcades keep it. Replaces an older record of the same @tag
+/// made by the same address.
+///
+/// A claimed @tag: `address` must be the one it names on chain. A free one (a new account made on a
+/// website with no node, as the arcade sites' own sign-up does): `address` must be a home-chain
+/// address, and the record is kept as a reservation, first come, until the @tag is claimed on chain.
+/// A claim by that address keeps it; a claim by anybody else ends it (the chain wins).
 pub fn vault_put(node: &Node, req: &Value) -> R {
     let tag = clean_tag(req["tag"].as_str().unwrap_or(""))?;
     let address = req["address"].as_str().unwrap_or("").trim().to_string();
@@ -498,16 +607,56 @@ pub fn vault_put(node: &Node, req: &Value) -> R {
     if hex::decode(&pubkey).map(|b| b.len()).unwrap_or(0) != 32 && hex::decode(&pubkey).map(|b| b.len()).unwrap_or(0) != 33 {
         return Err("pubkey: the account's login public key, in hex".into());
     }
-    if owner(node, &tag)? != address {
-        return Err(format!("address: not the one @{tag} names on chain"));
-    }
+    let reserved = match chain_owner(node, &tag)? {
+        Some(o) if o == address => false,
+        Some(_) => return Err(format!("address: not the one @{tag} names on chain")),
+        None => {
+            if let Some(why) = arcade_ledger::tags::tag_problem(&tag) {
+                return Err(format!("tag: {why}"));
+            }
+            if crate::hometag::address_on(node.ledger_home(), &address).as_deref() != Some(address.as_str()) {
+                return Err(format!("address: a {} address (where @{tag} will be claimed)", node.ledger_home().name));
+            }
+            if kept(node, &tag).is_some_and(|v| v["address"] != address.as_str()) {
+                return Err(format!("@{tag} is already taken here: pick another name"));
+            }
+            if kept(node, &tag).is_none() && reservations(node) >= MAX_RESERVED {
+                return Err("this arcade holds as many new names as it takes for now: try again later".into());
+            }
+            true
+        }
+    };
     let words = put_words(&tag, &address, &pubkey, blob);
     if !arcade_wallet::keys::verifymessage(&address, req["signature"].as_str().unwrap_or(""), ARCADE_MAGIC, &words) {
         return Err(format!("signature: sign \"{words}\" with @{tag}'s address"));
     }
-    let rec = json!({"tag": tag, "address": address, "pubkey": pubkey, "blob": blob, "at": now()});
+    let mut rec = json!({"tag": tag, "address": address, "pubkey": pubkey, "blob": blob, "at": now()});
+    if reserved {
+        rec["reserved"] = json!(true);
+    }
     node.app.store.write(|w| w.put(arcade_app::META, &vault_key(&tag), rec.to_string().as_bytes())).map_err(|e| e.to_string())?;
-    Ok(json!({"ok": true, "tag": tag}))
+    Ok(json!({"ok": true, "tag": tag, "reserved": reserved}))
+}
+
+/// How many free @tags are reserved here (records kept with no claim on chain yet).
+fn reservations(node: &Node) -> usize {
+    node.app
+        .store
+        .read(|r| r.scan_prefix(arcade_app::META, b"sitevault/"))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(_, v)| serde_json::from_slice::<Value>(v).is_ok_and(|v| v["reserved"] == true))
+        .count()
+}
+
+/// Is `rec` still good for `tag`: its address holds the @tag on chain, or nobody does and it is a
+/// reservation.
+fn still_good(node: &Node, tag: &str, rec: &Value) -> bool {
+    match chain_owner(node, tag) {
+        Ok(Some(o)) => rec["address"] == o.as_str(),
+        Ok(None) => rec["reserved"] == true,
+        Err(_) => false,
+    }
 }
 
 fn kept(node: &Node, tag: &str) -> Option<Value> {
@@ -520,8 +669,8 @@ fn kept(node: &Node, tag: &str) -> Option<Value> {
 pub fn vault_get(node: &Node, tag: &str, here: bool) -> R {
     let tag = clean_tag(tag)?;
     if let Some(mut v) = kept(node, &tag) {
-        // Still this @tag's? A record whose @tag moved on is not handed out.
-        if owner(node, &tag).ok().as_deref() == v["address"].as_str() {
+        // Still this @tag's? A record whose @tag moved on (or was claimed by another) is not handed out.
+        if still_good(node, &tag, &v) {
             v.as_object_mut().map(|o| o.remove("at"));
             return Ok(v);
         }
@@ -540,7 +689,10 @@ pub fn vault_get(node: &Node, tag: &str, here: bool) -> R {
 pub fn vault_delete(node: &Node, tag: &str, signature: &str) -> R {
     let tag = clean_tag(tag)?;
     let v = kept(node, &tag).ok_or_else(|| format!("no sealed record of @{tag} here"))?;
-    let address = owner(node, &tag)?;
+    let address = match chain_owner(node, &tag)? {
+        Some(o) => o,
+        None => v["address"].as_str().unwrap_or("").to_string(),
+    };
     let words = delete_words(&tag, &address, &v["blob"]);
     if !arcade_wallet::keys::verifymessage(&address, signature, ARCADE_MAGIC, &words) {
         return Err(format!("signature: sign \"{words}\" with @{tag}'s address"));
@@ -551,6 +703,38 @@ pub fn vault_delete(node: &Node, tag: &str, signature: &str) -> R {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_device_link_is_read_strictly_and_sealed_for_its_key_only() {
+        use aes_gcm::aead::{Aead, KeyInit};
+        let theirs = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let pk = hex::encode(x25519_dalek::PublicKey::from(&theirs).as_bytes());
+        let code = "0123456789abcdef0123456789abcdef";
+        let l = parse_link(&format!("arcadelink://Dogenames.example/{code}?k={pk}&a=https://arcade.example")).unwrap();
+        assert_eq!(l.host, "dogenames.example");
+        assert_eq!(l.send_to, "https://arcade.example/api/v1/id/link_send");
+        assert_eq!(parse_link(&format!("arcadelink://site.example/{code}?k={pk}")).unwrap().send_to, "https://site.example/api/v1/id/link_send");
+        assert!(parse_link(&format!("arcadelink://site.example/{code}?k={pk}&x=1")).is_err());
+        assert!(parse_link(&format!("arcadelink://site.example/{code}?k=02{pk}")).is_err(), "only a 32-byte X25519 key");
+        assert!(parse_link(&format!("arcadelink://site.example/{code}?k={pk}&a=ftp://x")).is_err());
+        // The browser's side: the same key from the one-time key it kept.
+        let sealed: Value = serde_json::from_str(&seal_for(&l.key, b"hello words").unwrap()).unwrap();
+        let epk: [u8; 32] = hex::decode(sealed["epk"].as_str().unwrap()).unwrap().try_into().unwrap();
+        let shared = theirs.diffie_hellman(&x25519_dalek::PublicKey::from(epk));
+        let key = Sha256::new().chain_update(b"ARCADE/link\0").chain_update(shared.as_bytes()).chain_update(epk).chain_update(l.key).finalize();
+        let plain = aes_gcm::Aes256Gcm::new_from_slice(&key).unwrap()
+            .decrypt(aes_gcm::Nonce::from_slice(&hex::decode(sealed["nonce"].as_str().unwrap()).unwrap()), hex::decode(sealed["ct"].as_str().unwrap()).unwrap().as_slice())
+            .unwrap();
+        assert_eq!(plain, b"hello words");
+        let other = x25519_dalek::StaticSecret::random_from_rng(rand_core::OsRng);
+        let wrong = other.diffie_hellman(&x25519_dalek::PublicKey::from(epk));
+        let k2 = Sha256::new().chain_update(b"ARCADE/link\0").chain_update(wrong.as_bytes()).chain_update(epk).chain_update(l.key).finalize();
+        assert!(aes_gcm::Aes256Gcm::new_from_slice(&k2).unwrap().decrypt(aes_gcm::Nonce::from_slice(&hex::decode(sealed["nonce"].as_str().unwrap()).unwrap()), hex::decode(sealed["ct"].as_str().unwrap()).unwrap().as_slice()).is_err());
+        // The link's own via goes into its QR text.
+        let started = link_start(&pk, "dogenames.example", Some("https://arcade.example/")).unwrap();
+        assert!(started["qr"].as_str().unwrap().ends_with("&a=https://arcade.example"));
+        assert_eq!(parse_link(started["qr"].as_str().unwrap()).unwrap().code, started["code"].as_str().unwrap());
+    }
+
     use super::*;
     const WEB_DGB: &str = "DKiQzsnxYy6tmyfVWdVSDfABgEbaSRMXkq";
     const WEB_DOGE: &str = "DBjVd9hBikxmdpYwXpmZDJ9e5HfhJTVyko";
@@ -601,7 +785,7 @@ mod tests {
     #[test]
     fn a_device_link_passes_one_sealed_message() {
         let key = "02".to_string() + &"ab".repeat(32);
-        let l = link_start(&key, "example.com").unwrap();
+        let l = link_start(&key, "example.com", None).unwrap();
         let code = l["code"].as_str().unwrap();
         // The other device works the number out from what it scanned.
         assert_eq!(l["number"], link_number(code, &key).as_str());
@@ -615,7 +799,7 @@ mod tests {
         assert_eq!(got["sealed"], "c2VhbGVk");
         assert_eq!(got["key"], key.as_str());
         assert_eq!(link_poll(code).unwrap()["state"], "unknown");
-        assert!(link_start("nothex", "example.com").is_err());
+        assert!(link_start("nothex", "example.com", None).is_err());
     }
 
     #[test]

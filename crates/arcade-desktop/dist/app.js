@@ -711,13 +711,23 @@ $("w-pubaddr-send").addEventListener("click", async () => {
 });
 // ARCADE ID (Digi-ID) for other sites: a code pasted in, the site's name and this wallet's key for it shown first
 // (id.answer without send), then signed and sent to the site (with send), as a phone wallet does.
+// An arcadelink:// code is a device link instead (id.link_answer): the new browser's number is shown first, and only
+// when the person says it matches are the 12 words sealed to that browser's key and sent.
+const aidLink = () => $("w-aid-code").value.trim().startsWith("arcadelink://");
+$("w-aid-code").addEventListener("input", () => { $("w-aid-chain").hidden = aidLink(); $("w-aid-confirm").hidden = true; });
 $("w-aid-check").addEventListener("click", async () => {
   const b = $("w-aid-check");
   b.disabled = true; $("w-aid-confirm").hidden = true;
   try {
-    const r = await api("id.answer", { code: $("w-aid-code").value, chain: $("w-aid-chain").value });
-    $("w-aid-text").textContent = `Sign in to ${r.host} as ${r.address}${r.plain_http ? " (a test address over plain http)" : ""}? Only go on if ${r.host} is the site you're signing in to.`;
-    $("w-aid-send").textContent = `Sign in to ${r.host}`;
+    if (aidLink()) {
+      const r = await api("id.link_answer", { qr: $("w-aid-code").value });
+      $("w-aid-text").textContent = `Open ${r.tag ? "@" + r.tag : "this account"} in a new browser on ${r.host}? Only if that screen shows ${r.number}. Anyone you send this to can spend this account's coins, so only send it to your own browser.`;
+      $("w-aid-send").textContent = `The number is ${r.number}: send`;
+    } else {
+      const r = await api("id.answer", { code: $("w-aid-code").value, chain: $("w-aid-chain").value });
+      $("w-aid-text").textContent = `Sign in to ${r.host} as ${r.address}${r.plain_http ? " (a test address over plain http)" : ""}? Only go on if ${r.host} is the site you're signing in to.`;
+      $("w-aid-send").textContent = `Sign in to ${r.host}`;
+    }
     $("w-aid-confirm").hidden = false;
     msg($("w-msg"), "");
   } catch (e) { msg($("w-msg"), e.message, "bad"); }
@@ -728,9 +738,14 @@ $("w-aid-send").addEventListener("click", async () => {
   const b = $("w-aid-send");
   b.disabled = true;
   try {
-    const r = await api("id.answer", { code: $("w-aid-code").value, chain: $("w-aid-chain").value, send: true });
-    msg($("w-msg"), `Signed in to ${r.host}: the site's page continues by itself.`, "ok");
-    $("w-aid-confirm").hidden = true; $("w-aid-code").value = "";
+    if (aidLink()) {
+      const r = await api("id.link_answer", { qr: $("w-aid-code").value, send: true });
+      msg($("w-msg"), `Sent: ${r.tag ? "@" + r.tag : "your account"} opens in the browser on ${r.host}.`, "ok");
+    } else {
+      const r = await api("id.answer", { code: $("w-aid-code").value, chain: $("w-aid-chain").value, send: true });
+      msg($("w-msg"), `Signed in to ${r.host}: the site's page continues by itself.`, "ok");
+    }
+    $("w-aid-confirm").hidden = true; $("w-aid-code").value = ""; $("w-aid-chain").hidden = false;
   } catch (e) { msg($("w-msg"), e.message, "bad"); }
   finally { b.disabled = false; }
 });

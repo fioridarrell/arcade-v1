@@ -273,7 +273,8 @@ pub fn parse_code(text: &str) -> Result<Code, String> {
     let slash = before.find('/').ok_or_else(no)?;
     let (host, path) = before.split_at(slash);
     let (name, port) = host.split_once(':').unwrap_or((host, ""));
-    let name_ok = !name.is_empty() && name.len() <= 253 && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-');
+    // Host names are any case (DigiAssetX's code says digiassetX.com); kept lowercase, so a site is one site.
+    let name_ok = !name.is_empty() && name.len() <= 253 && name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '-');
     let port_ok = port.is_empty() && !host.contains(':') || (!port.is_empty() && port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit()));
     let path_ok = path.len() <= 201 && path.chars().all(|c| c.is_ascii_alphanumeric() || "._~/-".contains(c));
     let (nonce, plain) = match query.strip_suffix("&u=1") {
@@ -284,7 +285,7 @@ pub fn parse_code(text: &str) -> Result<Code, String> {
     if !(name_ok && port_ok && path_ok && nonce_ok) {
         return Err(no());
     }
-    Ok(Code { uri: uri.to_string(), host: host.to_string(), callback: format!("{}://{rest}", if plain { "http" } else { "https" }) })
+    Ok(Code { uri: uri.to_string(), host: host.to_lowercase(), callback: format!("{}://{rest}", if plain { "http" } else { "https" }) })
 }
 
 /// The web wallet's name for a chain (it says "main"/"test" for Pepecoin), and the arcade's.
@@ -622,7 +623,10 @@ mod tests {
         assert_eq!(c.host, "example.com");
         assert_eq!(c.callback, "https://example.com/digiid/callback?x=abcdef1234");
         assert_eq!(parse_code("digiid://test.example.com:8462/cb?x=abcdef1234&u=1").unwrap().callback, "http://test.example.com:8462/cb?x=abcdef1234&u=1");
-        for bad in ["https://example.com/cb?x=abcdef1234", "digiid://example.com/cb?x=short", "digiid://Example.com/cb?x=abcdef1234",
+        // As DigiAssetX shows it: a capital in the host, the bare root as the path.
+        let d = parse_code("digiid://digiassetX.com/?x=1ee9e1d0716a7642").unwrap();
+        assert_eq!((d.host.as_str(), d.callback.as_str()), ("digiassetx.com", "https://digiassetX.com/?x=1ee9e1d0716a7642"));
+        for bad in ["https://example.com/cb?x=abcdef1234", "digiid://example.com/cb?x=short", "digiid://exa_mple.com/cb?x=abcdef1234",
                     "digiid://example.com/cb?x=abcdef1234&u=1&z=2", "digiid://ex ample.com/cb?x=abcdef1234", "digiid://example.com?x=abcdef1234",
                     "digiid://user@example.com/cb?x=abcdef1234", "digiid://example.com/c?b?x=abcdef1234"] {
             assert!(parse_code(bad).is_err(), "{bad}");

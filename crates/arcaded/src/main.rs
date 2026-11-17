@@ -81,6 +81,8 @@ mod ordtypes;
 mod staker;
 mod sitesvc;
 mod siteid;
+mod sitesign;
+mod psbt;
 mod grpsvc;
 mod feedsvc;
 mod follows;
@@ -393,6 +395,7 @@ fn main() {
     tokensend::start(node.clone());
     ordtypes::init(&node);
     namesites::init(&node);
+    sitesign::boot(&node);
     // A home chain far behind (a fresh install): installed from copies when the mesh has them.
     v1import::auto_home(node.clone());
     sizes::load(&node);

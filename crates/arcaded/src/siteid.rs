@@ -55,7 +55,7 @@ fn now() -> u64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
 }
 
-fn random_hex(n: usize) -> String {
+pub(crate) fn random_hex(n: usize) -> String {
     let mut b = vec![0u8; n];
     rand_core::RngCore::fill_bytes(&mut rand_core::OsRng, &mut b);
     hex::encode(b)

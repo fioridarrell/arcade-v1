@@ -52,6 +52,7 @@
 
   <!-- Wallet -->
   <section id="wallet" class="tab">
+    <div id="aid-modal" class="aid-modal" hidden><div class="aid-sheet"><div class="aid-head"><b>ARCADE ID</b><span class="note" id="aid-who"></span><button class="small" id="aid-close" title="Close">✕</button></div><div id="aid-slot"></div></div></div>
     <p class="msg" id="w-loading">Loading the wallet…</p>
     <div id="w-none" hidden>
       <h1>Wallet</h1>
@@ -77,6 +78,7 @@
           <span id="w-logo"></span>
           <span class="wl-who" id="w-who"></span>
           <select id="w-pick" title="Which wallet"></select>
+          <button class="small aid-open" id="w-aid-open" title="ARCADE ID: sign in to sites, open your account in a new browser, approve what a site asks you to sign">ARCADE ID<span class="aid-dot" id="w-aid-dot" hidden></span></button>
         </div>
         <div class="wl-bal"><span id="w-trust"></span><span id="w-bal">—</span> <span class="wl-unit" id="w-unit"></span></div>
         <div class="wl-sub" id="w-sub"></div>
@@ -133,12 +135,34 @@
         <button data-wt="activity" class="on">Activity</button>
         <button data-wt="tokens">Tokens</button>
         <button data-wt="nfts">NFTs</button>
+        <button data-wt="functions">Functions</button>
       </div>
       <div id="w-pane"></div>
       <p class="wl-hint" id="w-note" hidden></p>
 
-      <details id="w-more">
-        <summary>Accounts, sign-in and linked wallets</summary>
+      <div id="w-functions" hidden>
+        <h2>ARCADE ID</h2>
+        <div id="aid-home"><div id="aid-panel">
+          <div id="aid-pending"></div>
+          <p class="note">Paste or scan a code from a site: <b>digiid://</b> signs you in to it (a key made for that one site), <b>arcadesign://</b> lets it ask this app to sign (you approve each one here; your words never leave this app), <b>arcadelink://</b> opens this account in a new browser. Check the site's name before you go on. ARCADE ID is built on <a href="https://www.digi-id.io" target="_blank" rel="noopener">Digi-ID</a>, created by the DigiByte community.</p>
+          <div class="row">
+            <input id="w-aid-code" placeholder="digiid://…, arcadesign://… or arcadelink://…" autocomplete="off" spellcheck="false">
+            <select id="w-aid-chain" title="the key to answer a Digi-ID code with">
+              <option value="dgb">DigiByte (Digi-ID)</option><option value="pep">Pepecoin</option><option value="doge">Dogecoin</option>
+              <option value="ltc">Litecoin</option><option value="btc">Bitcoin</option>
+            </select>
+            <button id="w-aid-scan" title="Read the QR code with this device's camera">Scan</button>
+            <button id="w-aid-check">Check</button>
+          </div>
+          <div id="aid-cam" hidden><video id="aid-video" playsinline muted></video><div class="row"><button id="aid-cam-stop">Stop camera</button></div></div>
+          <div id="w-aid-confirm" class="warn" hidden>
+            <div id="w-aid-text"></div>
+            <div class="row"><button class="primary" id="w-aid-send">Sign in</button><button id="w-aid-cancel">Cancel</button></div>
+          </div>
+          <p class="msg" id="w-aid-msg"></p>
+          <h3>Sites that can ask this app to sign</h3>
+          <div id="aid-sites" class="note">None yet.</div>
+        </div></div>
         <h2>Accounts</h2>
         <table><thead><tr><th>Account</th><th>Address</th><th>From</th><th></th></tr></thead><tbody id="w-accs"></tbody></table>
         <details id="w-signin-box">
@@ -150,23 +174,6 @@
             <input id="w-sfrom" placeholder="arcade (optional, e.g. dogecoinarcade.com)" autocomplete="off">
             <button class="primary" id="w-signin">Sign in</button>
           </div>
-        </details>
-        <details id="w-aid-box">
-          <summary>Sign in to a site with ARCADE ID (Digi-ID), or add a new browser</summary>
-          <p class="note">For a site that shows a Digi-ID code: copy the code (its digiid:// link) and paste it here, as you would scan it with a phone wallet such as Coinomi. This wallet signs in with a key made for that one site from your 12 words, never a key that holds coins. Check the site's name before you sign in. A site that offers "Sign in with your ARCADE app" shows an arcadelink:// code instead: paste it here and this account opens in that browser, after you check that both screens show the same 6-digit number. ARCADE ID is built on <a href="https://www.digi-id.io" target="_blank" rel="noopener">Digi-ID</a>, created by the DigiByte community.</p>
-          <div class="row">
-            <input id="w-aid-code" placeholder="digiid://… or arcadelink://…" autocomplete="off" spellcheck="false">
-            <select id="w-aid-chain" title="the key to answer with">
-              <option value="dgb">DigiByte (Digi-ID)</option><option value="pep">Pepecoin</option><option value="doge">Dogecoin</option>
-              <option value="ltc">Litecoin</option><option value="btc">Bitcoin</option>
-            </select>
-            <button id="w-aid-check">Check</button>
-          </div>
-          <div id="w-aid-confirm" class="warn" hidden>
-            <div id="w-aid-text"></div>
-            <div class="row"><button class="primary" id="w-aid-send">Sign in</button><button id="w-aid-cancel">Cancel</button></div>
-          </div>
-          <p class="msg" id="w-aid-msg"></p>
         </details>
         <h2>Linked wallets</h2>
         <p class="note">Attach another wallet on this chain to your @tag. The wallet's key and your @tag's key both sign the link, so other arcades can check it. The key is kept here, encrypted.</p>
@@ -183,7 +190,7 @@
           <div id="w-pubaddr-text"></div>
           <div class="row"><button class="primary" id="w-pubaddr-send">Publish now</button><button id="w-pubaddr-cancel">Cancel</button></div>
         </div>
-      </details>
+      </div>
     </div>
     <p class="msg" id="w-msg"></p>
   </section>

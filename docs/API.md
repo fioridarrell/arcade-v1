@@ -108,6 +108,8 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `id.link_start` | `/api/v1/id/link_start` | public | key, host | Add a device with no password: the new browser's one-time public key (hex) in; a code, a 6-digit number and the QR text (arcadelink://host/code?k=key) out. The user's other device scans it, shows the same number (the first 4 bytes of sha256("ARCADE/link\0" + code + "\0" + key), mod 1,000,000) and sends the 12 words sealed to that key. |
 | `id.link_send` | `/api/v1/id/link_send` | public | code, sealed | The other device's sealed message for the new browser (sealed to its key: this arcade only passes it on), once per code. |
 | `id.link_poll` | `/api/v1/id/link_poll` | public | code | The new browser collects what was sent: waiting, done (once: sealed and the key it is sealed to), expired or unknown. |
+| `id.answer` | `/api/v1/id/answer` | local | code, chain?, send? | Sign in to a Digi-ID site with this arcade's wallet (the active account), as a phone wallet such as Coinomi does: a digiid:// code in. Without send: the site's name, where the answer goes and this wallet's key for that site (SLIP-0013, never a key that holds coins; the same one the web wallet makes from the same words), to show first. With send: signed and sent to the site. chain: dgb (Digi-ID, the default) or another chain this wallet holds (ARCADE ID). |
+| `id.relay` | `/api/v1/id/relay` | public | uri, address, signature, chain? | A website's user signed a Digi-ID code in the browser; the site's server passes the answer here and the arcade sends it to the code's site (a page may not post to another site; a server may). Only a well-formed code, signed by that address, once, and only to a public internet address (never this computer or its network; no redirects). |
 
 ### Vault
 
@@ -404,6 +406,11 @@ links to its user. A new device gets the wallet from one the user already has: `
 one-time public key gives a QR code and a 6-digit number; the other device scans it, shows the same number, and sends
 the words sealed to that key with `id.link_send`; the new browser collects them with `id.link_poll` and keeps them
 locked on the device (a passkey, for one). The arcade only passes the sealed message on; nothing it keeps can open it.
+
+**Signing in to other Digi-ID sites.** The desktop app answers a Digi-ID code itself (`id.answer`), as a phone
+wallet such as Coinomi does. A website's users sign in the browser, and the site's server hands the answer to
+`id.relay`, which sends it on: a page can't post to another site, but the arcade can. Both make the same key for a
+site from the same 12 words.
 
 **Both.** Offer the password and ARCADE ID side by side. A user who turns the password off: `vault.delete`, signed
 by the @tag's address, drops the sealed record, and the account then opens on the site with ARCADE ID or the 12

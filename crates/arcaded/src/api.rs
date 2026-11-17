@@ -396,6 +396,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "id.link_start" => crate::siteid::link_start(&s("key").ok_or("key required")?, &s("host").ok_or("host required")?),
         "id.link_send" => crate::siteid::link_send(&s("code").ok_or("code required")?, &s("sealed").ok_or("sealed required")?),
         "id.link_poll" => crate::siteid::link_poll(&s("code").ok_or("code required")?),
+        "id.answer" => crate::siteid::answer(node, &s("code").ok_or("code required")?, s("chain").as_deref(), req["send"] == true),
+        "id.relay" => crate::siteid::relay(&s("uri").ok_or("uri required")?, &s("address").ok_or("address required")?, &s("signature").ok_or("signature required")?, s("chain").as_deref()),
         "vault.put" => crate::siteid::vault_put(node, req),
         "vault.get" => crate::siteid::vault_get(node, &s("tag").ok_or("tag required")?, req["here"] == true),
         "vault.delete" => crate::siteid::vault_delete(node, &s("tag").ok_or("tag required")?, &s("signature").ok_or("signature required")?),

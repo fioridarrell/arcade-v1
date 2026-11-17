@@ -18,6 +18,12 @@
 //!   vault.get      the sealed record of @tag: kept here, else from the arcade that holds it
 //!   vault.delete   drop it ("stop using a password"), signed the same way
 //!
+//! **Answering codes** (the other side: signing in TO a Digi-ID site with this arcade's wallet):
+//!   id.answer      the desktop app, as a phone wallet such as Coinomi does: a code in, the site's
+//!                  name and this wallet's key for it shown, then signed and sent straight to the site
+//!   id.relay       a website's users: the browser signs, the site's server passes the answer here,
+//!                  and the arcade sends it on (a page may not post to another site; a server may)
+//!
 //! Everything kept for a scan or a link lives in memory for five minutes and works once.
 
 use crate::node::Node;
@@ -55,7 +61,7 @@ fn random_hex(n: usize) -> String {
 /// A chain's own Core message prefix, where it is known.
 fn chain_magic(chain: &str) -> Option<&'static str> {
     Some(match chain {
-        "pep" | "peptest" | "pepregtest" | "arc" => ARCADE_MAGIC,
+        "pep" | "peptest" | "pepregtest" | "arc" | "main" | "test" => ARCADE_MAGIC,
         "doge" => "Dogecoin Signed Message:\n",
         "dgb" | "dgbtest" => "DigiByte Signed Message:\n",
         "ltc" | "ltctest" | "ltcregtest" => "Litecoin Signed Message:\n",
@@ -248,6 +254,185 @@ pub fn link_poll(code: &str) -> R {
     Ok(json!({"state": "waiting", "expires_in": l.at + CODE_SECONDS - t}))
 }
 
+// ---------------- answering codes: the desktop app and a website's users ----------------
+
+/// A Digi-ID code, read strictly: digiid://host[:port]/path?x=nonce[&u=1].
+#[derive(Debug, PartialEq)]
+pub struct Code {
+    pub uri: String,
+    pub host: String,
+    /// Where the answer goes: https://host/path?x=nonce (http:// with u=1, a test address).
+    pub callback: String,
+}
+
+pub fn parse_code(text: &str) -> Result<Code, String> {
+    let no = || "that isn't a Digi-ID or ARCADE ID code".to_string();
+    let uri = text.trim();
+    let rest = uri.strip_prefix("digiid://").ok_or_else(no)?;
+    let (before, query) = rest.split_once('?').ok_or_else(no)?;
+    let slash = before.find('/').ok_or_else(no)?;
+    let (host, path) = before.split_at(slash);
+    let (name, port) = host.split_once(':').unwrap_or((host, ""));
+    let name_ok = !name.is_empty() && name.len() <= 253 && name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '-');
+    let port_ok = port.is_empty() && !host.contains(':') || (!port.is_empty() && port.len() <= 5 && port.chars().all(|c| c.is_ascii_digit()));
+    let path_ok = path.len() <= 201 && path.chars().all(|c| c.is_ascii_alphanumeric() || "._~/-".contains(c));
+    let (nonce, plain) = match query.strip_suffix("&u=1") {
+        Some(n) => (n.strip_prefix("x=").ok_or_else(no)?, true),
+        None => (query.strip_prefix("x=").ok_or_else(no)?, false),
+    };
+    let nonce_ok = (8..=128).contains(&nonce.len()) && nonce.chars().all(|c| c.is_ascii_alphanumeric());
+    if !(name_ok && port_ok && path_ok && nonce_ok) {
+        return Err(no());
+    }
+    Ok(Code { uri: uri.to_string(), host: host.to_string(), callback: format!("{}://{rest}", if plain { "http" } else { "https" }) })
+}
+
+/// The web wallet's name for a chain (it says "main"/"test" for Pepecoin), and the arcade's.
+fn web_name(chain: &str) -> &str {
+    match chain {
+        "pep" => "main",
+        "peptest" => "test",
+        c => c,
+    }
+}
+fn arcade_key(chain: &str) -> &str {
+    match chain {
+        "main" => "pep",
+        "test" => "peptest",
+        c => c,
+    }
+}
+
+/// This wallet's key for `host` on `chain` (SLIP-0013, hierarchical keys for authentication, as
+/// Digi-ID derives one per site): m/13'/A'/B'/C'/D' from sha256(index || identity), identity
+/// "digiid://host" for DigiByte and "arcadeid://<chain>@host" otherwise (the web wallet's chain
+/// names), so the same 12 words are the same person to a site in the browser and in this app.
+/// Never the key that holds coins.
+pub fn site_key(seed: &[u8], chain: &str, host: &str, index: u32) -> Result<arcade_wallet::keys::XPriv, String> {
+    let c = web_name(chain);
+    let identity = if c == "dgb" { format!("digiid://{host}") } else { format!("arcadeid://{c}@{host}") };
+    let h = Sha256::new().chain_update(index.to_le_bytes()).chain_update(identity.as_bytes()).finalize();
+    const H: u32 = 0x8000_0000;
+    let le = |i: usize| u32::from_le_bytes([h[i], h[i + 1], h[i + 2], h[i + 3]]) % H + H;
+    let master = arcade_wallet::keys::XPriv::master(seed).map_err(|e| e.to_string())?;
+    master.derive(&[13 + H, le(0), le(4), le(8), le(12)]).map_err(|e| e.to_string())
+}
+
+/// The address a key answers with on a chain (P2PKH, compressed).
+fn site_address(key: &arcade_wallet::keys::XPriv, chain: &str) -> Result<String, String> {
+    let p = arcade_chain::params::by_key(arcade_key(chain)).ok_or_else(|| format!("chain: {chain} isn't a chain this arcade knows"))?;
+    Ok(arcade_ledger::address::base58check(p.p2pkh_version, &arcade_chain::hash::hash160(&key.public().serialize())))
+}
+
+/// The answer a wallet posts: {address, uri, signature[, chain]} (no chain = plain Digi-ID).
+pub fn answer_body(seed: &[u8], code: &Code, chain: &str) -> Result<Value, String> {
+    let c = web_name(chain.trim());
+    if NEVER.contains(&arcade_key(c)) {
+        return Err(format!("chain: {c} isn't one ARCADE ID answers with"));
+    }
+    let host = code.host.split(':').next().unwrap_or(&code.host);
+    let key = site_key(seed, c, host, 0)?;
+    let address = site_address(&key, c)?;
+    let magic = if c == "dgb" { DIGIID_MAGICS[0] } else { chain_magic(c).unwrap_or(ARCADE_MAGIC) };
+    let signature = arcade_wallet::keys::signmessage(&key.key, magic, &code.uri);
+    let mut body = json!({"address": address, "uri": code.uri, "signature": signature});
+    if c != "dgb" {
+        body["chain"] = json!(c);
+    }
+    Ok(body)
+}
+
+/// Whether an address is one a relay must never reach: this computer, the local network, and
+/// the like (so a website's users can't make this arcade post into its own network).
+fn private(ip: std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(a) => {
+            let o = a.octets();
+            a.is_loopback() || a.is_private() || a.is_link_local() || a.is_unspecified() || a.is_broadcast() || a.is_multicast() || a.is_documentation()
+                || o[0] == 0 || (o[0] == 100 && (64..128).contains(&o[1])) || (o[0] == 198 && (o[1] == 18 || o[1] == 19)) || o[0] >= 240
+        }
+        std::net::IpAddr::V6(a) => {
+            let s = a.segments();
+            a.is_loopback() || a.is_unspecified() || a.is_multicast() || (s[0] & 0xfe00) == 0xfc00 || (s[0] & 0xffc0) == 0xfe80
+                || a.to_ipv4_mapped().is_some_and(|v4| private(std::net::IpAddr::V4(v4)))
+        }
+    }
+}
+
+/// Post an answer to the site's callback. `public_only`: the host must resolve to public
+/// addresses only, checked as the connection is made (no redirects followed).
+fn post_answer(code: &Code, body: &Value, public_only: bool) -> Result<(u16, String), String> {
+    let mut b = ureq::AgentBuilder::new().timeout(std::time::Duration::from_secs(15)).redirects(0).user_agent("arcade-id/1.0");
+    if public_only {
+        b = b.resolver(|addr: &str| -> std::io::Result<Vec<std::net::SocketAddr>> {
+            use std::net::ToSocketAddrs;
+            let all: Vec<std::net::SocketAddr> = addr.to_socket_addrs()?.collect();
+            if all.is_empty() || all.iter().any(|a| private(a.ip())) {
+                return Err(std::io::Error::other("that site isn't on the public internet"));
+            }
+            Ok(all)
+        });
+    }
+    match b.build().post(&code.callback).set("Content-Type", "application/json").send_string(&body.to_string()) {
+        Ok(r) => Ok((r.status(), r.into_string().unwrap_or_default().chars().take(300).collect())),
+        Err(ureq::Error::Status(n, r)) => Ok((n, r.into_string().unwrap_or_default().chars().take(300).collect())),
+        Err(e) => Err(format!("{} didn't answer: {e}", code.host)),
+    }
+}
+
+/// id.answer: sign in to a Digi-ID site with this arcade's wallet (the active account), as a
+/// phone wallet does. Without send: the site's name, where the answer goes and this wallet's key
+/// for it, to show before anything is signed. With send: signed and sent to the site.
+pub fn answer(node: &Node, code: &str, chain: Option<&str>, send: bool) -> R {
+    let code = parse_code(code)?;
+    let chain = chain.map(str::trim).filter(|c| !c.is_empty()).unwrap_or("dgb");
+    let phrase = node.app.phrase().map_err(|e| e.to_string())?;
+    let seed = arcade_wallet::keys::seed_from_phrase(&phrase).map_err(|e| e.to_string())?;
+    let body = answer_body(&seed[..], &code, chain)?;
+    let shown = json!({"host": code.host, "callback": code.callback, "address": body["address"], "chain": web_name(chain), "plain_http": code.callback.starts_with("http:")});
+    if !send {
+        return Ok(shown);
+    }
+    let (status, said) = post_answer(&code, &body, false)?;
+    if !(200..300).contains(&status) {
+        return Err(format!("{} said no ({status}){}", code.host, if said.is_empty() { String::new() } else { format!(": {said}") }));
+    }
+    let mut out = shown;
+    out["ok"] = json!(true);
+    Ok(out)
+}
+
+static RELAYED: LazyLock<Mutex<HashMap<String, u64>>> = LazyLock::new(Default::default);
+
+/// id.relay: a website's user signed a code in the browser; the site's server passes the answer
+/// here and the arcade sends it to the code's site (a page may not post to another site, a
+/// server may). Only a well-formed code, signed by that address, once, to a public address.
+pub fn relay(uri: &str, address: &str, signature: &str, chain: Option<&str>) -> R {
+    let code = parse_code(uri)?;
+    let chain = chain.map(str::trim).filter(|c| !c.is_empty());
+    if chain.is_some_and(|c| NEVER.contains(&arcade_key(c))) {
+        return Err("chain: not one ARCADE ID answers with".into());
+    }
+    if !signed(address.trim(), signature.trim(), &code.uri, chain) {
+        return Err("the signature doesn't match that address and code".into());
+    }
+    let t = now();
+    {
+        let mut m = RELAYED.lock().unwrap();
+        prune(&mut m, |at: &u64| *at, t);
+        if m.contains_key(&code.uri) {
+            return Err("this code was already sent".into());
+        }
+        m.insert(code.uri.clone(), t);
+    }
+    let mut body = json!({"address": address.trim(), "uri": code.uri, "signature": signature.trim()});
+    if let Some(c) = chain {
+        body["chain"] = json!(c);
+    }
+    let (status, said) = post_answer(&code, &body, true)?;
+    Ok(json!({"ok": (200..300).contains(&status), "status": status, "said": said, "host": code.host}))
+}
+
 // ---------------- password accounts (sealed records) ----------------
 
 fn vault_key(tag: &str) -> Vec<u8> {
@@ -365,6 +550,8 @@ pub fn vault_delete(node: &Node, tag: &str, signature: &str) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+    const WEB_DGB: &str = "DKiQzsnxYy6tmyfVWdVSDfABgEbaSRMXkq";
+    const WEB_DOGE: &str = "DBjVd9hBikxmdpYwXpmZDJ9e5HfhJTVyko";
     use arcade_wallet::keys::signmessage;
     use arcade_wallet::secp256k1::{PublicKey, SecretKey, SECP256K1};
 
@@ -427,6 +614,53 @@ mod tests {
         assert_eq!(got["key"], key.as_str());
         assert_eq!(link_poll(code).unwrap()["state"], "unknown");
         assert!(link_start("nothex", "example.com").is_err());
+    }
+
+    #[test]
+    fn codes_are_read_strictly() {
+        let c = parse_code("digiid://example.com/digiid/callback?x=abcdef1234").unwrap();
+        assert_eq!(c.host, "example.com");
+        assert_eq!(c.callback, "https://example.com/digiid/callback?x=abcdef1234");
+        assert_eq!(parse_code("digiid://test.example.com:8462/cb?x=abcdef1234&u=1").unwrap().callback, "http://test.example.com:8462/cb?x=abcdef1234&u=1");
+        for bad in ["https://example.com/cb?x=abcdef1234", "digiid://example.com/cb?x=short", "digiid://Example.com/cb?x=abcdef1234",
+                    "digiid://example.com/cb?x=abcdef1234&u=1&z=2", "digiid://ex ample.com/cb?x=abcdef1234", "digiid://example.com?x=abcdef1234",
+                    "digiid://user@example.com/cb?x=abcdef1234", "digiid://example.com/c?b?x=abcdef1234"] {
+            assert!(parse_code(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn the_app_and_the_web_wallet_make_the_same_key_for_a_site() {
+        // "abandon ... about": the web wallet (arcadeid.js keyFor, run in a browser) gives these.
+        let seed = arcade_wallet::keys::seed_from_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about").unwrap();
+        let code = parse_code("digiid://example.com/digiid/callback?x=abcdef1234").unwrap();
+        let dgb = answer_body(&seed[..], &code, "dgb").unwrap();
+        assert_eq!(dgb["address"], WEB_DGB);
+        assert!(dgb.get("chain").is_none());
+        // and the answer is one id.callback takes
+        let s = start("example.com", None, false).unwrap();
+        let mine = parse_code(s["uri"].as_str().unwrap()).unwrap();
+        let b = answer_body(&seed[..], &mine, "dgb").unwrap();
+        assert!(callback(b["address"].as_str().unwrap(), &mine.uri, b["signature"].as_str().unwrap(), None).is_ok());
+        let doge = answer_body(&seed[..], &code, "doge").unwrap();
+        assert_eq!(doge["address"], WEB_DOGE);
+        assert_eq!(doge["chain"], "doge");
+        let pep = answer_body(&seed[..], &code, "pep").unwrap();
+        assert_eq!(pep["chain"], "main");
+        assert_eq!(pep["address"], answer_body(&seed[..], &code, "main").unwrap()["address"]);
+        assert!(answer_body(&seed[..], &code, "kot").is_err());
+    }
+
+    #[test]
+    fn a_relay_never_reaches_this_network() {
+        for ip in ["127.0.0.1", "10.1.2.3", "192.168.1.28", "172.16.0.1", "169.254.1.1", "100.64.0.1", "0.0.0.0", "::1", "fd00::1", "fe80::1", "::ffff:192.168.1.1"] {
+            assert!(private(ip.parse().unwrap()), "{ip}");
+        }
+        for ip in ["1.1.1.1", "104.21.94.55", "2606:4700::1"] {
+            assert!(!private(ip.parse().unwrap()), "{ip}");
+        }
+        // Not signed by that address: never sent.
+        assert!(relay("digiid://example.com/cb?x=abcdef1234", "DJ7z", "AAAA", None).is_err());
     }
 
     #[test]

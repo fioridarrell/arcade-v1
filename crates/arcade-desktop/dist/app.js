@@ -709,6 +709,32 @@ $("w-pubaddr-send").addEventListener("click", async () => {
   } catch (e) { msg($("w-msg"), e.message, "bad"); }
   finally { b.disabled = false; }
 });
+// ARCADE ID (Digi-ID) for other sites: a code pasted in, the site's name and this wallet's key for it shown first
+// (id.answer without send), then signed and sent to the site (with send), as a phone wallet does.
+$("w-aid-check").addEventListener("click", async () => {
+  const b = $("w-aid-check");
+  b.disabled = true; $("w-aid-confirm").hidden = true;
+  try {
+    const r = await api("id.answer", { code: $("w-aid-code").value, chain: $("w-aid-chain").value });
+    $("w-aid-text").textContent = `Sign in to ${r.host} as ${r.address}${r.plain_http ? " (a test address over plain http)" : ""}? Only go on if ${r.host} is the site you're signing in to.`;
+    $("w-aid-send").textContent = `Sign in to ${r.host}`;
+    $("w-aid-confirm").hidden = false;
+    msg($("w-msg"), "");
+  } catch (e) { msg($("w-msg"), e.message, "bad"); }
+  finally { b.disabled = false; }
+});
+$("w-aid-cancel").addEventListener("click", () => { $("w-aid-confirm").hidden = true; });
+$("w-aid-send").addEventListener("click", async () => {
+  const b = $("w-aid-send");
+  b.disabled = true;
+  try {
+    const r = await api("id.answer", { code: $("w-aid-code").value, chain: $("w-aid-chain").value, send: true });
+    msg($("w-msg"), `Signed in to ${r.host}: the site's page continues by itself.`, "ok");
+    $("w-aid-confirm").hidden = true; $("w-aid-code").value = "";
+  } catch (e) { msg($("w-msg"), e.message, "bad"); }
+  finally { b.disabled = false; }
+});
+
 $("w-signin").addEventListener("click", async () => {
   const b = $("w-signin");
   b.disabled = true; msg($("w-msg"), "Finding the arcade that holds your account and opening it (this takes a few seconds)…");

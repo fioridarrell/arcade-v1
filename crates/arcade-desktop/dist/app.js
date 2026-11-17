@@ -804,7 +804,7 @@ function aidCard(r) {
   const head = h("div", { class: "aid-req-head" }, h("b", {}, r.site), ` asks ${r.account ? "@" + r.account : "this account"} to sign`);
   const body = [];
   if (r.kind === "message") {
-    body.push(h("div", { class: "note" }, "A message (it proves you hold this address; it moves no coins):"), h("pre", { class: "aid-msgtext" }, r.message));
+    body.push(h("div", { class: "aid-sub" }, "A message (it proves you hold this address; it moves no coins):"), h("pre", { class: "aid-msgtext" }, r.message));
   } else {
     const net = Number(r.to_you || 0) - Number(r.from_you || 0);
     body.push(h("div", {}, `Spends ${aidDoge(r.from_you)} of your coins; ${aidDoge(r.to_you)} comes back to you; fee ${r.fee == null ? "unknown (not every coin's transaction is given)" : aidDoge(r.fee)}. You ${net < 0 ? "pay " + aidDoge(-net) : "receive " + aidDoge(net)} in all.`));
@@ -812,7 +812,7 @@ function aidCard(r) {
     const rows = r.outputs.map((o) => h("tr", {}, h("td", {}, String(o.index)), h("td", { class: "mono" }, o.to + (o.mine ? " (you)" : "")), h("td", { class: "num" }, aidDoge(o.value))));
     body.push(h("table", { class: "aid-outs" }, h("thead", {}, h("tr", {}, h("th", {}, "#"), h("th", {}, "Pays to"), h("th", { class: "num" }, "Amount"))), h("tbody", {}, rows)));
     const signs = r.inputs.filter((i) => i.sign).map((i) => `#${i.index} ${aidDoge(i.value)} (${i.hash_type})`).join(", ");
-    body.push(h("div", { class: "note" }, `Signs your coin${r.inputs.filter((i) => i.sign).length === 1 ? "" : "s"} ${signs}.${r.finalize ? "" : " The site finishes the transaction."}`));
+    body.push(h("div", { class: "aid-sub" }, `Signs your coin${r.inputs.filter((i) => i.sign).length === 1 ? "" : "s"} ${signs}.${r.finalize ? "" : " The site finishes the transaction."}`));
   }
   const out = h("p", { class: "msg" });
   const go = (ok) => async (ev) => {

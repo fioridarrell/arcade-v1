@@ -627,3 +627,5 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .aid-outs { width: 100%; }
 .aid-outs td.mono { font-family: var(--mono); word-break: break-all; }
 #w-aid-code { flex: 1; min-width: 16em; }
+.aid-sub { color: var(--muted); font-size: .92em; }
+.aid-req .msg:empty, #w-aid-msg:empty { display: none; }

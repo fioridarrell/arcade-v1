@@ -396,7 +396,8 @@ pub fn answer(node: &Node, code: &str, chain: Option<&str>, send: bool) -> R {
     }
     let (status, said) = post_answer(&code, &body, false)?;
     if !(200..300).contains(&status) {
-        return Err(format!("{} said no ({status}){}", code.host, if said.is_empty() { String::new() } else { format!(": {said}") }));
+        // DigiAssetX answers 500 "Unknown Error" every time and signs the person in anyway (2026-11-16): say so.
+        return Err(format!("{} answered with an error ({status}){}. Some Digi-ID sites sign you in anyway: look at the site.", code.host, if said.is_empty() { String::new() } else { format!(": {said}") }));
     }
     let mut out = shown;
     out["ok"] = json!(true);

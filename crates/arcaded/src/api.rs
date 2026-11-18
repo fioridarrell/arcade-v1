@@ -504,6 +504,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "a.search" => crate::arcledger::a_search(node, &s("q").unwrap_or_default()),
         "a.contact_add" => crate::arcledger::a_contact_add(node, &req),
         "a.contact_delete" => crate::arcledger::a_contact_delete(node, &s("id").ok_or("id required")?),
+        "a.wallets" => crate::walletproofs::a_wallets(node, &req),
+        "a.wallets_publish" => crate::walletproofs::publish(node, req["force"] == true),
         "a.post" => crate::arcledger::a_post(node, &s("text").ok_or("text required")?),
         "a.posts" => crate::arcledger::a_posts(node, &req),
         "ledger.balances" => crate::arcledger::balances(node, &s("address").ok_or("address required")?),

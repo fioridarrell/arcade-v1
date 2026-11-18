@@ -106,6 +106,7 @@ mod sizes;
 mod udpsvc;
 mod relaysvc;
 mod svcmesh;
+mod walletproofs;
 mod turnsvc;
 mod v1copy;
 mod vxshare;
@@ -463,6 +464,8 @@ fn main() {
         let n = node.clone();
         std::thread::Builder::new().name("svc".into()).spawn(move || svcmesh::run(n)).unwrap();
     }
+    // Wallet proofs on profiles (walletproofs): kept current by themselves once a profile is published.
+    walletproofs::run(node.clone());
     {
         let n = node.clone();
         std::thread::Builder::new().name("rooms".into()).spawn(move || realtime::run(n)).unwrap();

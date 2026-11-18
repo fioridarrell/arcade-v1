@@ -34,7 +34,11 @@ fn norm(node: &Node, mut v: Value, c: u16, times: &mut BTreeMap<(u16, u64), u64>
         u64::MAX
     } else {
         // Time first, then the height within the chain (blocks of one second keep their order).
-        let t = *times.entry((c, h)).or_insert_with(|| block_time(node, c, h as u32));
+        // (Rows read from a lender carry their block's time: this arcade may not have the header yet.)
+        let t = match v["_t"].as_u64() {
+            Some(t) => t,
+            None => *times.entry((c, h)).or_insert_with(|| block_time(node, c, h as u32)),
+        };
         t.saturating_mul(1 << 24).saturating_add(h & 0xff_ffff)
     };
     v["o"] = json!(o);
@@ -47,7 +51,7 @@ pub(crate) fn ledger_rows(node: &Node, table: &str) -> Vec<Value> {
     let mut times = BTreeMap::new();
     let mut out = Vec::new();
     for p in node.ledger_chains() {
-        for v in m::rows(&node.chain, table, p.chain_no).unwrap_or_default() {
+        for v in chain_rows(node, p, table) {
             out.push(norm(node, v, p.chain_no, &mut times));
         }
     }
@@ -56,10 +60,29 @@ pub(crate) fn ledger_rows(node: &Node, table: &str) -> Vec<Value> {
     out
 }
 
+/// One messages table of one ledger chain: this arcade's own rows, or, where it can't read the chain for itself yet,
+/// what arcades that keep it hold (crate::lentrows).
+/// what arcades that keep it hold besides (crate::lentrows): one row per txid, this arcade's own first.
+fn chain_rows(node: &Node, p: &'static arcade_chain::params::ChainParams, table: &str) -> Vec<Value> {
+    let own = m::rows(&node.chain, table, p.chain_no).unwrap_or_default();
+    let t = if table == m::POST { "post" } else if table == m::ACT { "act" } else { return own };
+    if !crate::lentrows::lent(node, p) {
+        return own;
+    }
+    crate::lentrows::merged(own, crate::lentrows::rows(node, p, t))
+}
+
 /// The acts on `target` from every ledger chain, [`norm`]ed and in one order (oldest first).
 pub(crate) fn ledger_acts_on(node: &Node, target: &str) -> Vec<Value> {
     let mut times = BTreeMap::new();
-    let mut out: Vec<Value> = node.ledger_chains().into_iter().flat_map(|p| m::acts_on(&node.chain, p.chain_no, target).into_iter().map(move |v| (p.chain_no, v))).collect::<Vec<_>>()
+    let on = |p: &'static arcade_chain::params::ChainParams| -> Vec<Value> {
+        let own = m::acts_on(&node.chain, p.chain_no, target);
+        if !crate::lentrows::lent(node, p) {
+            return own;
+        }
+        crate::lentrows::merged(own, crate::lentrows::rows(node, p, "act").into_iter().filter(|a| a["target"] == target).collect())
+    };
+    let mut out: Vec<Value> = node.ledger_chains().into_iter().flat_map(|p| on(p).into_iter().map(move |v| (p.chain_no, v))).collect::<Vec<_>>()
         .into_iter().map(|(c, v)| norm(node, v, c, &mut times)).collect();
     out.sort_by_key(|v| v["o"].as_u64().unwrap_or(u64::MAX));
     out
@@ -68,7 +91,11 @@ pub(crate) fn ledger_acts_on(node: &Node, target: &str) -> Vec<Value> {
 /// A post by txid on any ledger chain: (its chain, the row [`norm`]ed).
 fn find_post(node: &Node, txid: &str) -> Option<(u16, Value)> {
     let mut times = BTreeMap::new();
-    node.ledger_chains().into_iter().rev().find_map(|p| m::post(&node.chain, p.chain_no, txid).map(|v| (p.chain_no, norm(node, v, p.chain_no, &mut times))))
+    node.ledger_chains().into_iter().rev().find_map(|p| {
+        let v = m::post(&node.chain, p.chain_no, txid)
+            .or_else(|| crate::lentrows::lent(node, p).then(|| crate::lentrows::rows(node, p, "post").into_iter().find(|v| v["txid"] == txid)).flatten());
+        v.map(|v| (p.chain_no, norm(node, v, p.chain_no, &mut times)))
+    })
 }
 
 /// Acts waiting in the mempool, and posts too (shown at once, read live each time).
@@ -112,7 +139,7 @@ fn author(node: &Node, address: &str, cache: &mut BTreeMap<String, Value>) -> Va
     }
     let tag = crate::hometag::of_address(node, address);
     // The home chain's profile first, then an older chain's.
-    let prof = node.ledger_chains().into_iter().rev().find_map(|p| arcade_ledger::index::profile(&node.chain, p.chain_no, &crate::hometag::address_on(p, address)?).ok().flatten());
+    let prof = node.ledger_chains().into_iter().rev().find_map(|p| crate::msgsvc::profile_on(node, p, &crate::hometag::address_on(p, address)?));
     let v = json!({"address": address, "tag": tag, "name": prof.as_ref().map(|p| p["name"].clone()), "pfp": prof.as_ref().map(|p| p["pfp"].clone()), "key": prof.as_ref().map(|p| p["pubkey"].clone())});
     cache.insert(address.to_string(), v.clone());
     v

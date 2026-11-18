@@ -264,6 +264,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         // Messaging (home chain): the Messages tab and anything else that wants it.
         "msg.me" => crate::msgsvc::me(node),
         "ledger.write_chains" => Ok(crate::msgsvc::write_chains_status(node)),
+        // Posts, acts, message candidates and profiles read from lenders for chains this arcade can't read itself yet.
+        "ledger.lent" => Ok(crate::lentrows::status(node)),
         "msg.stats" => Ok(arcade_ledger::messages::counts(&node.chain, node.ledger_home().chain_no)),
         "msg.scan" => Ok(json!({"opened": crate::msgsvc::scan(node)?})),
         "msg.who" => crate::msgsvc::who(node, &s("name").ok_or("name required (@tag or address)")?),

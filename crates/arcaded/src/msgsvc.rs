@@ -164,7 +164,7 @@ fn rescan_group(node: &Node, gid: &str) -> Result<(), String> {
         let c = chain.chain_no;
         let mut cursor = None;
         loop {
-            let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
+            let batch = candidates_on(node, chain, cursor, 500)?;
             if batch.is_empty() {
                 break;
             }
@@ -172,7 +172,7 @@ fn rescan_group(node: &Node, gid: &str) -> Result<(), String> {
                 if cand["kind"] == env::SINGLE as u64 {
                     let payload = hex::decode(cand["payload"].as_str().unwrap_or("")).unwrap_or_default();
                     if let Ok(o) = env::open_single(&secret, &payload) {
-                        take(node, &me, &o, Some(gid.to_string()), cand, *h, block_time_on(node, c, *h))?;
+                        take(node, &me, &o, Some(gid.to_string()), cand, *h, cand_time(node, c, *h, cand))?;
                     }
                 }
                 cursor = Some((*h, *p));
@@ -209,13 +209,13 @@ pub fn scan(node: &Node) -> Result<usize, String> {
             .filter(|v| v.len() == 8)
             .map(|v| (u32::from_be_bytes(v[..4].try_into().unwrap()), u32::from_be_bytes(v[4..].try_into().unwrap())));
         loop {
-            let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
+            let batch = candidates_on(node, chain, cursor, 500)?;
             if batch.is_empty() {
                 break;
             }
             for (h, p, cand) in &batch {
                 let payload = hex::decode(cand["payload"].as_str().unwrap_or("")).unwrap_or_default();
-                let at = block_time_on(node, c, *h);
+                let at = cand_time(node, c, *h, cand);
                 match cand["kind"].as_u64().unwrap_or(0) as u8 {
                     env::SINGLE | env::API => {
                         if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_single(s, &payload)) {
@@ -286,6 +286,32 @@ pub fn scan(node: &Node) -> Result<usize, String> {
     Ok(opened)
 }
 
+/// Message candidates of one ledger chain after `after`: this arcade's own, or, where it can't read the chain for
+/// itself yet, what arcades that keep it hold (crate::lentrows). The scan's cursor is the same (height, position)
+/// either way, so it goes on from there once this arcade's own copy has caught up.
+fn candidates_on(node: &Node, p: &'static arcade_chain::params::ChainParams, after: Option<(u32, u32)>, limit: usize) -> Result<Vec<(u32, u32, Value)>, String> {
+    let own = arcade_ledger::messages::candidates(&node.chain, p.chain_no, after, limit).map_err(|e| e.to_string())?;
+    if !crate::lentrows::lent(node, p) {
+        return Ok(own);
+    }
+    // Both in (height, position) order, one row per place, this arcade's own first.
+    let mut all: std::collections::BTreeMap<(u32, u32), Value> = crate::lentrows::candidates(node, p, after, limit).into_iter().map(|(h, q, v)| ((h, q), v)).collect();
+    for (h, q, v) in own {
+        all.insert((h, q), v);
+    }
+    Ok(all.into_iter().take(limit).map(|((h, q), v)| (h, q, v)).collect())
+}
+
+/// A candidate's block time: the lender's word for one read from it (`_t`), else this arcade's header.
+fn cand_time(node: &Node, c: u16, h: u32, cand: &Value) -> u64 {
+    cand["_t"].as_u64().unwrap_or_else(|| block_time_on(node, c, h))
+}
+
+/// The profile published for `address` on ledger chain `p` (this arcade's own index, or lenders', crate::lentrows).
+pub(crate) fn profile_on(node: &Node, p: &'static arcade_chain::params::ChainParams, address: &str) -> Option<Value> {
+    arcade_ledger::index::profile(&node.chain, p.chain_no, address).ok().flatten().or_else(|| crate::lentrows::lent(node, p).then(|| crate::lentrows::profile(node, p, address)).flatten())
+}
+
 fn block_time_on(node: &Node, c: u16, h: u32) -> u64 {
     node.chain.hash_at(c, h).ok().flatten().and_then(|hash| node.chain.header(c, &hash).ok().flatten()).map(|r| r.header.time as u64).unwrap_or_else(arcade_app::now)
 }
@@ -321,8 +347,10 @@ fn profiles_by_key(node: &Node) -> BTreeMap<String, Value> {
     for chain in node.ledger_chains() {
         let c = chain.chain_no;
         let pre = KeyBuf::new().u16(c).done();
-        for (_, v) in node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::index::PROFILE, &pre)).unwrap_or_default() {
-            let Ok(mut v) = serde_json::from_slice::<Value>(&v) else { continue };
+        // Lenders' first where this arcade can't read the chain for itself yet, then its own (which win, coming later).
+        let mut rows: Vec<Value> = if crate::lentrows::lent(node, chain) { crate::lentrows::rows(node, chain, "profile") } else { Vec::new() };
+        rows.extend(node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::index::PROFILE, &pre)).unwrap_or_default().into_iter().filter_map(|(_, v)| serde_json::from_slice::<Value>(&v).ok()));
+        for mut v in rows {
             if let Some(a) = v["address"].as_str().map(|a| node.home_address(a)) {
                 v["address"] = json!(a);
             }
@@ -384,7 +412,7 @@ pub fn who(node: &Node, name: &str) -> Result<Value, String> {
     // The home chain's profile first, then the older chain's (a key announced there before the switch).
     let prof = node.ledger_chains().into_iter().rev().find_map(|chain| {
         let here = crate::hometag::address_on(chain, &address)?;
-        arcade_ledger::index::profile(&node.chain, chain.chain_no, &here).ok().flatten().filter(|p| p["stated"] == true || p["address"] == here.as_str())
+        profile_on(node, chain, &here).filter(|p| p["stated"] == true || p["address"] == here.as_str())
     });
     let Some(prof) = prof else {
         return Err(format!("{n} has not published a messaging key yet, so messages can't be sealed to them"));

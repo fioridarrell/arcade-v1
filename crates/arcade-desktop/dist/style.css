@@ -15,6 +15,9 @@
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
 body { margin: 0; font: 14px/1.5 system-ui, -apple-system, "Segoe UI", Ubuntu, sans-serif; background: var(--bg); color: var(--ink); }
+/* Chinese: the system's CJK font (macOS, Windows, Linux with fonts-noto-cjk or WenQuanYi). */
+html:lang(zh-Hans) body { font-family: system-ui, -apple-system, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", "Noto Sans CJK SC", "Source Han Sans SC", "WenQuanYi Micro Hei", sans-serif; }
+html:lang(ar) body { font-family: system-ui, -apple-system, "Segoe UI", "Noto Sans Arabic", "Noto Naskh Arabic", Tahoma, "Geeza Pro", sans-serif; }
 header { display: flex; align-items: center; justify-content: space-between; padding: 14px 20px; background: var(--panel); border-bottom: 1px solid var(--line); }
 .brand { font-weight: 700; font-size: 17px; display: flex; align-items: center; gap: 8px; }
 .brand small { color: var(--muted); font-weight: 500; }
@@ -649,3 +652,31 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 #w-aid-code { flex: 1; min-width: 16em; }
 .aid-sub { color: var(--muted); font-size: .92em; }
 .aid-req .msg:empty, #w-aid-msg:empty { display: none; }
+
+/* ---- right to left (Arabic, i18n.js sets dir="rtl") ----
+   Flex and grid rows mirror by themselves; these are the rules written for left to right. Code, addresses,
+   hashes and amounts stay left to right inside the mirrored layout. */
+[dir="rtl"] :is(code, pre, kbd, .mono, .phrase, #w-addr, #w-bal, .x-hash) { direction: ltr; unicode-bidi: isolate; }
+[dir="rtl"] :is(input:not([type="checkbox"]):not([type="radio"]), textarea) { unicode-bidi: plaintext; }
+[dir="rtl"] :is(th, td, .x-tbl th, .pp-table th, .menu button) { text-align: right; }
+[dir="rtl"] :is(.num, .x-tbl .num, .stages .sd) { text-align: left; }
+[dir="rtl"] :is(header #conn, .menu button .meta, .x-search, #w-pick, .x-open, .earn-h .switch, .earning .eword, .df-t, .aid-head #aid-close) { margin-left: 0; margin-right: auto; }
+[dir="rtl"] .x-dhead .x-open { margin-right: 8px; }
+[dir="rtl"] :is(.events time, .events .kind, .mode input, header .brand, .trust, .arcade .who, .vouch) { margin-right: 0; margin-left: 6px; }
+[dir="rtl"] :is(.idx small, .idx small.sz, .chip.arc, .badge) { margin-left: 0; margin-right: 6px; }
+[dir="rtl"] button.small { margin-left: 0; margin-right: 8px; }
+[dir="rtl"] :is(.addix button.small, .wl-addrrow button.small) { margin-right: 0; }
+[dir="rtl"] .caret { margin-left: 0; margin-right: 2px; }
+[dir="rtl"] .menu { left: auto; right: 0; }
+[dir="rtl"] .x-search svg { left: auto; right: 11px; }
+[dir="rtl"] .x-search input { padding: 0 34px 0 12px; }
+[dir="rtl"] .caution { border-left-width: 1px; border-right-width: 4px; }
+[dir="rtl"] .fd-sub { margin-left: 0; margin-right: 16px; border-left: 0; border-right: 3px solid var(--line); border-radius: 10px 0 0 10px; }
+[dir="rtl"] .ap-comment { padding-left: 0; padding-right: 8px; border-left: 0; border-right: 2px solid var(--line); }
+[dir="rtl"] .ap-list { padding-left: 0; padding-right: 18px; }
+[dir="rtl"] .howto { padding-left: 0; padding-right: 1.3em; }
+[dir="rtl"] .mx-item .s { padding-right: 0; padding-left: 24px; }
+[dir="rtl"] .mx-item .badge { right: auto; left: 10px; }
+[dir="rtl"] #rings { right: auto; left: 16px; }
+[dir="rtl"] :is(.df-ref, .df-text, .df-media, .df-tags, .df-foot) { margin-left: 0; margin-right: 38px; }
+@media (max-width: 640px) { [dir="rtl"] :is(.df-ref, .df-text, .df-media, .df-tags, .df-foot) { margin-right: 0; } }

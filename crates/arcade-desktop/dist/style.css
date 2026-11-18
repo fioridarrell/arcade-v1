@@ -577,6 +577,7 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 #people input:not([type=file]):not([type=checkbox]), #people textarea { width: 100%; }
 .pp-addrs { display: grid; gap: 6px; }
 .pp-addr { display: grid; grid-template-columns: 90px minmax(0, 1fr) auto; gap: 8px; align-items: center; }
+.pp-addr .mono { overflow-wrap: anywhere; min-width: 0; }
 .pp-ok { color: var(--accent); font-size: 12px; white-space: nowrap; }
 .pp-no { color: var(--muted); font-size: 12px; white-space: nowrap; }
 .pp-fee { display: flex; justify-content: space-between; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line); }

@@ -102,6 +102,16 @@ pub fn publish(node: &Node, force: bool) -> Result<Value, String> {
             }
         }
     }
+    // Every record of the set, or none: a set cut short by coins running out would leave the card with some of them.
+    let records = want.len().div_ceil(aproto::MAX_WALLETS).max(1) as u64;
+    let need = records * (300_000 + arcade_arc::params::DUST);
+    let (_, _, sk) = crate::arcledger::sender(node, p)?;
+    let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk));
+    let have: u64 = crate::claims::arc_coins(node, p, &script).iter().map(|u| u.value).sum::<u64>()
+        + crate::arcsvc::waiting_outputs(&script).iter().map(|o| o.1).sum::<u64>();
+    if have < need {
+        return Ok(json!({"sent": false, "why": format!("waiting for ARCADE: {records} records need about {} ARCADE, the wallet has {}", need as f64 / 1e8, have as f64 / 1e8), "proofs": want_set.len()}));
+    }
     let proofs: Vec<WalletProof> = want
         .iter()
         .map(|(coin, address, sk, compressed)| WalletProof { coin: coin.clone(), address: address.clone(), sig: aproto::sign_wallet_proof(sk, *compressed, &owner, coin, address) })

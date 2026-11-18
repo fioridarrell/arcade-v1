@@ -160,6 +160,7 @@ I18N.add("ru", {
 "Borrow": "Занять",
 "Borrowed": "Занята",
 "Borrowed until ticked · ticked, it syncs first": "Заимствуется, пока не отмечена · отмеченная, синхронизируется первой",
+"Borrowed until ticked · ticked, it syncs here": "Заимствуется, пока не отмечена · отмеченная, синхронизируется здесь",
 "Borrowed · at block {0} · from block {1} · {2} coin": "Занята · на блоке {0} · с блока {1} · монет: {2}",
 "Borrowed · at block {0} · from block {1} · {2} coins": "Занята · на блоке {0} · с блока {1} · монет: {2}",
 "Borrowed · waiting for an arcade that lends {0} · from block {1} · {2} coin": "Занята · ждём arcade, который одалживает {0} · с блока {1} · монет: {2}",

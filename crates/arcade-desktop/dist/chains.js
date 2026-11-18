@@ -581,7 +581,8 @@
     const anyHidden = chains.some((c) => c.hidden);
     // Ticked: what is installed or queued, and, once chains have been hidden, every chain still shown.
     // The ARCADE chain is borrowed until it is installed (Martin 2026-11-18), like any chain: ticked once installed.
-    planTicked = new Set(chains.filter((c) => !c.home && (c.arcade ? c.installed : (c.installed || c.queued || (anyHidden && !c.hidden)))).map((c) => c.key));
+    // The home chain too (Pepecoin testnet): borrowed until it is installed, ticked once installed.
+    planTicked = new Set(chains.filter((c) => (c.arcade || c.home) ? c.installed : (c.installed || c.queued || (anyHidden && !c.hidden))).map((c) => c.key));
     $("cp-skip").textContent = planFirst ? "Skip for now" : "Cancel";
     pmsg("");
     renderPlan();
@@ -614,7 +615,7 @@
     $("cp-list").replaceChildren(
       // Installed: stays (Start never removes a chain). Not installed: borrowed from arcades that keep it until ticked.
       ...arc.map((c) => row(c, !!c.installed, c.installed ? "Installed · always shown" : "Borrowed until ticked · ticked, it syncs first")),
-      ...home.map((c) => row(c, true, "This arcade's home chain · always installed")),
+      ...home.map((c) => row(c, !!c.installed, c.installed ? "Installed · always shown" : "Borrowed until ticked · ticked, it syncs here")),
       ...rest.map((c) => row(c, false, note(c))));
     $("cp-modes").replaceChildren(...PLAN_MODES.map(([k, t, d]) => {
       const l = document.createElement("label"); l.className = "mode" + (k === planMode ? " sel" : "");

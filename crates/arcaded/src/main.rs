@@ -12,6 +12,7 @@ mod updater;
 mod handlegate;
 mod lentrows;
 mod hometag;
+mod homeinst;
 mod addrsvc;
 mod collsvc;
 mod knowncoll;
@@ -409,6 +410,8 @@ fn main() {
             std::process::exit(1);
         }
     }
+    // Pepecoin testnet installed here, or borrowed until someone installs it (crate::homeinst).
+    homeinst::init(&node);
     chains::start_saved(&node);
     borrow::start(node.clone());
     swaps::start(node.clone());
@@ -427,6 +430,10 @@ fn main() {
         std::thread::Builder::new().name("home shares".into()).spawn(move || loop {
             std::thread::sleep(std::time::Duration::from_secs(shares::every().max(first)));
             first = 0;
+            if !homeinst::installed() {
+                *n.home_share_note.lock().unwrap() = "borrowed: not installed here".into();
+                continue;
+            }
             let note = shares::balance(&n, n.params).unwrap_or_else(|e| format!("balancing paused: {e}"));
             *n.home_share_note.lock().unwrap() = note;
         }).unwrap();

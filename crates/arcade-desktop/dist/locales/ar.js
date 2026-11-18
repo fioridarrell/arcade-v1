@@ -160,6 +160,7 @@ I18N.add("ar", {
 "Borrow": "استعارة",
 "Borrowed": "مُستعارة",
 "Borrowed until ticked · ticked, it syncs first": "مُستعارة حتى تُحدَّد · عند تحديدها تُزامَن أولًا",
+"Borrowed until ticked · ticked, it syncs here": "مُستعارة حتى تُحدَّد · عند تحديدها تُزامَن هنا",
 "Borrowed · at block {0} · from block {1} · {2} coin": "مُستعارة · عند الكتلة {0} · من الكتلة {1} · {2} عملة",
 "Borrowed · at block {0} · from block {1} · {2} coins": "مُستعارة · عند الكتلة {0} · من الكتلة {1} · {2} عملات",
 "Borrowed · waiting for an arcade that lends {0} · from block {1} · {2} coin": "مُستعارة · في انتظار arcade يُعير {0} · من الكتلة {1} · {2} عملة",

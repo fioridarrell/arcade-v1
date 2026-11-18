@@ -70,6 +70,10 @@ pub fn auto_home(node: Arc<Node>) {
             let mut told = false;
             loop {
                 std::thread::sleep(Duration::from_secs(60));
+                // Not installed here (crate::homeinst): borrowed, nothing to install from copies.
+                if !crate::homeinst::installed() {
+                    continue;
+                }
                 let (lag, _) = crate::borrow::home_lag(&node);
                 let running = jobs().get(node.params.key).is_some_and(|x| x.phase != "done" && x.phase != "failed");
                 let done = jobs().get(node.params.key).is_some_and(|x| x.phase == "done");

@@ -554,6 +554,9 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             if !node.app.has_wallet().map_err(|e| e.to_string())? {
                 return Err("create a wallet first (arcade wallet create)".into());
             }
+            if !crate::homeinst::installed() {
+                return Err(format!("{} is borrowed here, not installed: install it in Chains & Coins to mine it", node.params.name));
+            }
             let threads = s("threads").and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(1));
             if node.miner.running.swap(true, Ordering::Relaxed) {
                 return Ok(json!({"running": true, "note": "already mining"}));

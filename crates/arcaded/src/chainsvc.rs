@@ -28,7 +28,7 @@ fn follow_offers(node: &Node, syncer: &Syncer) {
         if their <= ours() {
             continue;
         }
-        if crate::coreboot::held(p.key) {
+        if crate::coreboot::held(p.key) || !crate::homeinst::installed() {
             return;
         }
         let short = &id[..id.len().min(12)];
@@ -47,7 +47,7 @@ fn follow_offers(node: &Node, syncer: &Syncer) {
             continue;
         }
         loop {
-            if crate::coreboot::held(p.key) {
+            if crate::coreboot::held(p.key) || !crate::homeinst::installed() {
                 return;
             }
             set_state(node, format!("no coin peer reachable; following via arcade {short} ({how}): block {} of {their}", ours()));
@@ -89,7 +89,7 @@ fn mesh_bootstrap(node: &Node, syncer: &Syncer) {
         }
         loop {
             // A copy is being taken in (docs/V1SHARE.md): leave the chain to it.
-            if crate::coreboot::held(p.key) {
+            if crate::coreboot::held(p.key) || !crate::homeinst::installed() {
                 return;
             }
             let h = syncer.sync_headers_once(&mut src);
@@ -113,15 +113,25 @@ fn mesh_bootstrap(node: &Node, syncer: &Syncer) {
     }
 }
 
+/// While the home chain isn't installed here (crate::homeinst): no coin peers, no blocks; borrowed meanwhile.
+fn wait_installed(node: &Node) {
+    while !crate::homeinst::installed() {
+        set_state(node, "borrowed from other arcades (not installed here)".into());
+        std::thread::sleep(Duration::from_secs(5));
+    }
+}
+
 pub fn run(node: Arc<Node>) {
     let p = node.params;
     let syncer = Syncer::new(&node.chain, p);
+    wait_installed(&node);
     if node.mesh_bootstrap {
         // Give mesh links a moment to announce themselves.
         std::thread::sleep(Duration::from_secs(8));
         mesh_bootstrap(&node, &syncer);
     }
     loop {
+        wait_installed(&node);
         set_state(&node, "finding a coin peer".into());
         let candidates = node.coin_candidates(p);
         let Some(mut peer) = Node::dial_first(p, &candidates[..candidates.len().min(DIAL_ROUND)], true)
@@ -150,6 +160,10 @@ pub fn run(node: Arc<Node>) {
             continue;
         }
         loop {
+            // Removed (chains.remove): this peer goes, and the chain waits to be installed again.
+            if !crate::homeinst::installed() {
+                break;
+            }
             // A copy is being taken in (docs/V1SHARE.md): stand still until it is.
             let stop = std::sync::atomic::AtomicBool::new(false);
             if crate::coreboot::park(p.key, &stop, &|s| set_state(&node, s)) {

@@ -303,6 +303,55 @@
         default: throw new Error("groups ops are list, read, send, leave, seal, open, people, add, create and save");
       }
     },
+    // The public feed (arcade.feed): reads for any app; posts, acts, follows and mutes only with its Feed switch on
+    // (they pay fees from this wallet, in this operator's name: the Feed app has it on from the start).
+    async feed(m) {
+      const reads = ["read", "channels", "file", "chains", "me", "follows"];
+      if (!reads.includes(m.op) && !(m.op === "settings" && !m.set)) {
+        const p = await perms();
+        if (!p.feed) throw new Error("off: turn on Feed on this app's card");
+        if (Date.now() - lastSend < 400) throw new Error("busy: wait a moment");
+        lastSend = Date.now();
+      }
+      const chain = (c) => (typeof c === "string" && /^[a-z0-9]{2,12}$/.test(c) ? c : undefined);
+      switch (m.op) {
+        case "read": {
+          const v = m.view || {};
+          const order = ["popular", "new", "newest", "friends"].includes(v.order) ? v.order : "popular";
+          return { result: await api("feed", { order, channel: String(v.channel || ""), tag: v.tag ? String(v.tag).replace(/^@/, "") : undefined,
+            limit: Math.max(1, Math.min(100, Number(v.limit) || 30)), offset: Math.max(0, Number(v.offset) || 0) }) };
+        }
+        case "channels": return { result: await api("feed.channels") };
+        case "settings": return { result: m.set ? await api("feed.settings", { set: { hide_muted: !!m.set.hide_muted, contacts_only: !!m.set.contacts_only } }) : await api("feed.settings") };
+        case "file": return { result: await api("feed.file", { txid: String(m.txid || "") }) };
+        case "chains": return { result: await api("ledger.write_chains") };
+        case "me": { const r = await api("start.status").catch(() => ({})); return { result: { address: r.address || "", tag: r.tag || "" } }; }
+        case "follows": return { result: await api("follows", { who: String(m.who || "") || undefined }) };
+        case "post": {
+          const p = m.post || {};
+          const text = String(p.text || "");
+          const f = p.file && typeof p.file === "object" ? { name: String(p.file.name || "file").slice(0, 120), type: String(p.file.type || "application/octet-stream").slice(0, 100), data: String(p.file.data || "") } : undefined;
+          if (!text.trim() && !f) throw new Error("nothing to post");
+          if (text.length > 4000) throw new Error("too long: at most 4000 characters");
+          return { result: await api("feed.post", { text, channel: String(p.channel || "").slice(0, 40), file: f, chain: chain(p.chain) }) };
+        }
+        case "act": {
+          const kinds = ["like", "unlike", "dislike", "undislike", "reply", "share", "tip", "edit", "delete"];
+          if (!kinds.includes(m.kind)) throw new Error("kind: " + kinds.join(", "));
+          if (!/^[0-9a-f]{64}$/.test(String(m.target || ""))) throw new Error("target: a post's txid");
+          const amount = Math.max(0, Math.floor(Number(m.amount) || 0));
+          if (m.kind === "tip") {
+            // A tip moves coins: shown on its own card first, outside the app's reach.
+            const yes = await oneCard(() => card(`Tip from ${appName}?`, [`Send a tip of ${(amount / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "")} to the post's author?`], "Send tip"));
+            if (!yes) throw new Error("declined");
+          }
+          return { result: await api("feed.act", { kind: m.kind, target: m.target, text: String(m.text || "").slice(0, 4000), amount, chain: chain(m.chain) }) };
+        }
+        case "follow": return { result: await api("follow", { who: String(m.who || ""), on: m.on !== false }) };
+        case "mute": return { result: await api(m.on === false ? "mute.remove" : "mute.add", { address: String(m.address || "") }) };
+        default: throw new Error("feed ops are read, channels, settings, file, chains, me, follows, post, act, follow and mute");
+      }
+    },
     async storage(m) {
       const r = await api("apps.storage", { page: here, op: m.op, key: m.key, value: m.value });
       return r;

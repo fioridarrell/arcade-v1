@@ -278,6 +278,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         // Messaging (home chain): the Messages tab and anything else that wants it.
         "msg.me" => crate::msgsvc::me(node),
         "ledger.write_chains" => Ok(crate::msgsvc::write_chains_status(node)),
+        // Posts, acts, message candidates and profiles read from lenders for chains this arcade can't read itself yet.
+        "ledger.lent" => Ok(crate::lentrows::status(node)),
         "msg.stats" => Ok(arcade_ledger::messages::counts(&node.chain, node.ledger_home().chain_no)),
         "msg.scan" => Ok(json!({"opened": crate::msgsvc::scan(node)?})),
         "msg.who" => crate::msgsvc::who(node, &s("name").ok_or("name required (@tag or address)")?),
@@ -516,6 +518,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "a.search" => crate::arcledger::a_search(node, &s("q").unwrap_or_default()),
         "a.contact_add" => crate::arcledger::a_contact_add(node, &req),
         "a.contact_delete" => crate::arcledger::a_contact_delete(node, &s("id").ok_or("id required")?),
+        "a.wallets" => crate::walletproofs::a_wallets(node, &req),
+        "a.wallets_publish" => crate::walletproofs::publish(node, req["force"] == true),
         "a.post" => crate::arcledger::a_post(node, &s("text").ok_or("text required")?),
         "a.posts" => crate::arcledger::a_posts(node, &req),
         "ledger.balances" => crate::arcledger::balances(node, &s("address").ok_or("address required")?),

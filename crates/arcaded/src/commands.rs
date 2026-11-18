@@ -71,7 +71,7 @@ cmds! {
     "svc.attach" Local "service" "API socket only: attach a helper program for a service; the connection then carries its requests (docs/MODELS-APP.md).";
     "svc.offers" Read "service?" "Services offered over the mesh: each arcade's offer, its @tag, public name, pay_to and link state.";
     "svc.services" Read "" "The service helpers attached to this arcade, with their offers and open requests.";
-    "svc.ask" Local "to, service, body, timeout?, stream?" "Ask a service at an arcade (node id) over the mesh; answers collected (bytes as base64), or streamed line by line on the socket.";
+    "svc.ask" Local "to, service, body, timeout?, stream?" "Ask a service at an arcade (node id, or \"self\" for this one) over the mesh; answers collected (bytes as base64), or streamed line by line on the socket.";
     "svc.pay" Wallet "to, amount, memo" "Pay ARCADE to an address with a memo of up to 80 bytes (a service's credit).";
     "svc.paid" Read "txid, memo?" "Whether a payment is in a block, what it paid this arcade's address, and whether the memo is in it.";
     "events" Read "n?, kind?" "Recent activity (newest first), optionally of one kind.";
@@ -133,6 +133,7 @@ cmds! {
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";
     "faucet.arc" Wallet "address" "The user faucet: ask the mesh to top a website user's ARCADE address up to 0.05 ARCADE, in two coins (once per address a day; a website calls it when a user signs in). This arcade's own wallet gets 1 ARCADE once from the node faucet instead.";
     "ledger.write_chains" Read "" "Where this wallet can write its posts, acts and messages (ARCADE, Pepecoin testnet, and Pepecoin, Dogecoin, DigiByte where kept or borrowed): each with its balance, which is the default now, and whether ARCADE is stalled (writes then go to Pepecoin testnet). feed.post, feed.act, follow and msg.send take chain to pick one.";
+    "ledger.lent" Read "" "Chains whose posts, acts, messages and profiles are also read from other arcades (their copy here borrowed or still catching up): rows held per table and how fresh.";
     "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today; node_faucet: node-gift asks, gifts paid today, nodes known paid, and this arcade's own gift.";
     // Messaging
     "msg.me" Read "" "Your messaging key, fingerprint and whether it is published.";
@@ -201,6 +202,8 @@ cmds! {
     "a.search" Read "q" "Published profiles and @tags matching a name or @tag, for the address book.";
     "a.contact_add" Wallet "tag | address" "Add someone to your address book from their published profile.";
     "a.contact_delete" Wallet "id" "Remove an address book entry.";
+    "a.wallets" Read "tag? | address?" "The wallet addresses someone has proven they hold on the ARCADE chain (every coin; A:// op 7), yours when neither; for yours also what would be proven now.";
+    "a.wallets_publish" Wallet "force?" "Publish proofs of this wallet's addresses on every coin and of each imported wallet (each signs with its own key), when they differ from the chain's; done by itself after a profile is published.";
     "a.post" Wallet "text" "Post to your followers on the ARCADE chain.";
     "a.posts" Read "tag? | address? | following?, limit?" "Posts, newest first.";
     "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";
@@ -242,6 +245,7 @@ cmds! {
     "explorer.dogefeed_address" Public "chain?, address, direction?, type?, cursor?, limit?, counts?" "An address on D://: its counts (posts, likes given and received, followers, following, tips, linked keys) and activity (direction out: what it did; in: what paid it).";
     "explorer.dogefeed_keys" Public "chain?" "The D:// registrars this arcade checks records against: DogeFeed's, this arcade's own, and any the operator added.";
     "explorer.held" Public "chain?, address, offset?, limit?, order?" "The ord inscriptions an address holds, a page at a time by number (order old or new; limit 100, at most 500), without content: {total, items: [{id, n, h, ct, size, at, p}]}.";
+    "explorer.msg_rows" Public "chain?, table (post, act, cand or profile), after?, limit?" "A page of one posts-and-messages table in key order after `after` (hex): {rows: [{k, v, t}], more, indexed}. What an arcade whose own copy is borrowed or catching up reads instead.";
     "explorer.names" Public "chain?" "Names.";
     "explorer.name" Public "chain?, name" "One name.";
     "explorer.maps" Public "chain?" "Maps.";

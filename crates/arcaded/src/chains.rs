@@ -267,10 +267,26 @@ fn launch(node: &Arc<Node>, key: &str, mode: &str, mut indexes: Vec<String>, add
     Ok(())
 }
 
-/// Install a chain (by hand only), with the indexes the user opted into.
 // ---------------- one install at a time (Martin): the others wait in a queue ----------------
+//
+// The queue (META install_queue) holds two kinds of entries, next first:
+// - an install: {key, mode, with, at}: the chain is installed (add_now) at its turn;
+// - a resume: {key, resume: true, at}: a chain paused by chains.start_now to make way for
+//   another one. At its turn it is un-paused. Only these entries resume a chain: a chain
+//   paused by hand (chains.pause) stays paused, and pausing or resuming by hand drops its
+//   resume entry.
+// Queued chains start one at a time, after the home chain and the ARCADE chain (when it is
+// installed here) have caught up.
 
 const QUEUE: &[u8] = b"install_queue";
+/// Chains left out of the Coins & chains list (chains.hide, chains.plan): display only.
+const HIDDEN: &[u8] = b"hidden_chains";
+/// Set once the startup chooser was answered (chains.plan) or skipped.
+const PLAN_DONE: &[u8] = b"chain_plan_done";
+/// The storage modes the startup chooser offers.
+pub const PLAN_MODES: &[&str] = &["full", "shared", "chain"];
+/// Queue edits are made one at a time (the queue thread and the commands).
+static QLOCK: Mutex<()> = Mutex::new(());
 
 fn queue(node: &Node) -> Vec<Value> {
     node.app.store.read(|r| r.get(arcade_app::META, QUEUE)).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
@@ -282,13 +298,26 @@ fn save_queue(node: &Node, q: &[Value]) {
 
 /// The chain still being synced or taken in (not caught up yet), if any: the home chain first
 /// (Martin 2026-11-12: while Pepecoin testnet syncs, other installs wait in the queue as they do
-/// behind any other chain), then the installed ones.
+/// behind any other chain), then the ARCADE chain when it is installed here, then the installed ones.
 pub fn installing_now(node: &Node) -> Option<&'static ChainParams> {
     if home_syncing(node) {
         return Some(node.params);
     }
+    if let Some(p) = arcade_syncing() {
+        return Some(p);
+    }
+    busy_runs(node).into_iter().next()
+}
+
+/// The ARCADE chain, when it is installed here and hasn't caught up yet.
+fn arcade_syncing() -> Option<&'static ChainParams> {
+    crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p) && !crate::arcsvc::ready())
+}
+
+/// Installed chains that run (not paused) and haven't caught up yet.
+fn busy_runs(node: &Node) -> Vec<&'static ChainParams> {
     let runs: Vec<Arc<ChainRun>> = node.extra.lock().unwrap().values().cloned().collect();
-    runs.into_iter().filter(|r| !r.paused.load(Ordering::Relaxed)).map(|r| r.params).find(|p| !crate::borrow::installed_ready(node, p))
+    runs.into_iter().filter(|r| !r.paused.load(Ordering::Relaxed)).map(|r| r.params).filter(|p| !crate::borrow::installed_ready(node, p)).collect()
 }
 
 /// Whether the home chain isn't caught up: no block yet, more than 10 behind the best height
@@ -304,71 +333,352 @@ fn home_busy(tip: u32, lag: u32, addresses_ready: bool) -> bool {
     tip == 0 || lag > 10 || !addresses_ready
 }
 
-/// Position (1 = next) of a chain waiting to be installed.
+/// Whether a queue entry resumes a paused chain (rather than installing one).
+fn is_resume(e: &Value) -> bool {
+    e["resume"] == true
+}
+
+fn resume_entry(key: &str, at: u64) -> Value {
+    json!({"key": key, "resume": true, "at": at})
+}
+
+/// What a queue entry does at its turn.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Next {
+    /// Un-pause an installed chain (it was paused by chains.start_now).
+    Resume(String),
+    /// Install a chain.
+    Install { key: String, mode: String, with: Vec<String> },
+}
+
+pub(crate) fn next_of(e: &Value) -> Next {
+    let key = e["key"].as_str().unwrap_or("").to_string();
+    if is_resume(e) {
+        return Next::Resume(key);
+    }
+    let with = e["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+    Next::Install { key, mode: e["mode"].as_str().unwrap_or("full").to_string(), with }
+}
+
+/// Chain keys in the order the chooser queues them: smallest reported size first, chains with
+/// no reported size last, each group in the order given.
+pub(crate) fn by_size(mut keys: Vec<(String, Option<u64>)>) -> Vec<String> {
+    keys.sort_by_key(|(_, b)| (b.is_none(), b.unwrap_or(0)));
+    keys.into_iter().map(|(k, _)| k).collect()
+}
+
+/// chains.queue_first: `key`'s entry moves to the front of the queue.
+pub(crate) fn move_first(q: &mut Vec<Value>, key: &str) -> Result<(), String> {
+    let i = q.iter().position(|e| e["key"] == key).ok_or_else(|| format!("{key} isn't waiting in the queue"))?;
+    let e = q.remove(i);
+    q.insert(0, e);
+    Ok(())
+}
+
+/// chains.start_now: `key`'s entry leaves the queue (it starts now, and is returned) and the
+/// chains paused to make way for it go to the front as resume entries, in the order given, so
+/// they continue right after it. Older entries of the paused chains give way to the new ones.
+pub(crate) fn take_for_now(q: &mut Vec<Value>, key: &str, paused: &[&str], at: u64) -> Result<Value, String> {
+    let i = q.iter().position(|e| e["key"] == key).ok_or_else(|| format!("{key} isn't waiting in the queue"))?;
+    let e = q.remove(i);
+    q.retain(|x| !paused.iter().any(|k| x["key"] == *k));
+    for (j, k) in paused.iter().enumerate() {
+        q.insert(j, resume_entry(k, at));
+    }
+    Ok(e)
+}
+
+/// The hidden list with `key` hidden or shown again (kept sorted, once each).
+pub(crate) fn with_hidden(mut list: Vec<String>, key: &str, hidden: bool) -> Vec<String> {
+    list.retain(|k| k != key);
+    if hidden {
+        list.push(key.to_string());
+    }
+    list.sort();
+    list
+}
+
+/// What chains.plan leaves hidden: every chain in `all` not chosen, except those that are
+/// always shown (the home chain, the ARCADE chain).
+pub(crate) fn plan_hidden(all: &[&str], chosen: &[&str], always: &[&str]) -> Vec<String> {
+    let mut out: Vec<String> = all.iter().filter(|k| !chosen.contains(k) && !always.contains(k)).map(|k| k.to_string()).collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// Position (1 = next) of a chain waiting in the queue (to be installed, or to resume).
 pub fn queued_at(node: &Node, key: &str) -> Option<usize> {
     queue(node).iter().position(|e| e["key"] == key).map(|i| i + 1)
 }
 
 /// chains.unqueue: take a chain out of the install queue.
 pub fn unqueue(node: &Node, key: &str) -> Result<Value, String> {
+    let _g = QLOCK.lock().unwrap();
     let mut q = queue(node);
     let n = q.len();
+    let resume = q.iter().any(|e| e["key"] == key && is_resume(e));
     q.retain(|e| e["key"] != key);
     if q.len() == n {
         return Err(format!("{key} isn't waiting to be installed"));
     }
     save_queue(node, &q);
-    // A drive chosen for it is forgotten with it (crate::chaindrive).
-    if let Some(p) = by_key(key) {
+    // A drive chosen for it is forgotten with it (crate::chaindrive); an installed chain keeps its own.
+    if let Some(p) = by_key(key).filter(|_| !resume) {
         let _ = node.chain.set_place(p.chain_no, None);
     }
     Ok(json!({"unqueued": key}))
 }
 
-/// chains.queue: the chains waiting to be installed, next first, with the mode and indexes each asked for.
+/// chains.queue: the chains waiting in the queue, next first, with the mode and indexes each asked
+/// for (resume: a paused chain that continues at its turn), the chain installing now, and the
+/// startup chooser's state.
 pub fn queue_list(node: &Node) -> Value {
     let rows: Vec<Value> = queue(node)
         .iter()
         .enumerate()
         .map(|(i, e)| {
             let key = e["key"].as_str().unwrap_or("");
-            json!({"position": i + 1, "key": key, "name": by_key(key).map(|p| p.name), "mode": e["mode"], "with": e["with"], "at": e["at"]})
+            json!({"position": i + 1, "key": key, "name": by_key(key).map(|p| p.name), "mode": e["mode"], "with": e["with"], "at": e["at"], "resume": is_resume(e)})
         })
         .collect();
-    json!({"installing": installing_now(node).map(|p| p.key), "queue": rows})
+    json!({"installing": installing_now(node).map(|p| p.key), "queue": rows, "hidden": hidden(node), "plan_done": plan_done(node)})
 }
 
-/// Every 20 s: when no chain is being installed, the next one in the queue starts.
+/// Every 20 s: when no chain is being installed, the next entry in the queue gets its turn.
 pub fn run_queue(node: Arc<Node>) {
     std::thread::Builder::new()
         .name("install-queue".into())
         .spawn(move || loop {
             std::thread::sleep(Duration::from_secs(20));
-            if installing_now(&node).is_some() {
-                continue;
-            }
-            let mut q = queue(&node);
-            if q.is_empty() {
-                continue;
-            }
-            let e = q.remove(0);
-            save_queue(&node, &q);
-            let key = e["key"].as_str().unwrap_or("").to_string();
-            let with: Vec<String> = e["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-            match add_now(&node, &key, e["mode"].as_str().unwrap_or("full"), with) {
-                Ok(_) => {
-                    let _ = node.app.event("chains", &format!("installing {key} (its turn in the queue)"));
-                }
-                Err(err) => {
-                    // A drive chosen for it is forgotten (crate::chaindrive): a later add starts afresh.
-                    if let Some(p) = by_key(&key) {
-                        let _ = node.chain.set_place(p.chain_no, None);
-                    }
-                    let _ = node.app.event("chains", &format!("could not install {key} from the queue: {err}"));
-                }
-            }
+            queue_step(&node);
         })
         .unwrap();
+}
+
+/// One turn of the queue: when nothing is being installed, the next entry installs its chain or
+/// resumes it.
+fn queue_step(node: &Arc<Node>) {
+    if installing_now(node).is_some() {
+        return;
+    }
+    let e = {
+        let _g = QLOCK.lock().unwrap();
+        let mut q = queue(node);
+        if q.is_empty() {
+            return;
+        }
+        let e = q.remove(0);
+        save_queue(node, &q);
+        e
+    };
+    match next_of(&e) {
+        Next::Resume(key) => {
+            let run = node.extra.lock().unwrap().get(key.as_str()).cloned();
+            match run {
+                Some(r) if r.paused.load(Ordering::Relaxed) => match set_paused(node, &key, false) {
+                    Ok(_) => {
+                        let _ = node.app.event("chains", &format!("resuming {key} (its turn in the queue)"));
+                    }
+                    Err(err) => {
+                        let _ = node.app.event("chains", &format!("could not resume {key} from the queue: {err}"));
+                    }
+                },
+                // Already running again, or removed meanwhile: nothing to do.
+                _ => {}
+            }
+        }
+        Next::Install { key, mode, with } => match add_now(node, &key, &mode, with) {
+            Ok(_) => {
+                let _ = node.app.event("chains", &format!("installing {key} (its turn in the queue)"));
+            }
+            Err(err) => {
+                // A drive chosen for it is forgotten (crate::chaindrive): a later add starts afresh.
+                if let Some(p) = by_key(&key) {
+                    let _ = node.chain.set_place(p.chain_no, None);
+                }
+                let _ = node.app.event("chains", &format!("could not install {key} from the queue: {err}"));
+            }
+        },
+    }
+}
+
+/// A queued chain's key as the queue holds it (any capitalisation, old mesh names).
+fn queued_key(key: &str) -> String {
+    by_key(key).map(|p| p.key.to_string()).unwrap_or_else(|| key.to_string())
+}
+
+/// chains.queue_first: a queued chain moves to the front of the queue (it is next).
+pub fn queue_first(node: &Node, key: &str) -> Result<Value, String> {
+    let key = queued_key(key);
+    let _g = QLOCK.lock().unwrap();
+    let mut q = queue(node);
+    move_first(&mut q, &key)?;
+    save_queue(node, &q);
+    let _ = node.app.event("chains", &format!("{key} is next in the queue"));
+    Ok(json!({"key": key, "position": 1}))
+}
+
+/// chains.start_now: a queued chain starts now. The chain being installed is paused and goes back
+/// into the queue right after it, as a resume entry. Refused while the home chain or the ARCADE
+/// chain is catching up: other chains wait for those.
+pub fn start_now(node: &Arc<Node>, key: &str) -> Result<Value, String> {
+    let key = queued_key(key);
+    let _g = QLOCK.lock().unwrap();
+    let mut q = queue(node);
+    if !q.iter().any(|e| e["key"] == key.as_str()) {
+        return Err(format!("{key} isn't waiting in the queue"));
+    }
+    if home_syncing(node) {
+        return Err(format!("{} is this arcade's home chain and is still catching up; it can't be paused, and other chains start once it has caught up", node.params.name));
+    }
+    if let Some(p) = arcade_syncing() {
+        return Err(format!("the {} chain is still catching up; it can't be paused, and other chains start once it has caught up", p.name));
+    }
+    let busy: Vec<&'static ChainParams> = busy_runs(node).into_iter().filter(|p| p.key != key).collect();
+    for (i, p) in busy.iter().enumerate() {
+        if let Err(e) = set_paused(node, p.key, true) {
+            // (A chain moving to another drive can't be paused.) The ones paused so far run again.
+            for q in &busy[..i] {
+                let _ = set_paused(node, q.key, false);
+            }
+            return Err(e);
+        }
+    }
+    let paused: Vec<&str> = busy.iter().map(|p| p.key).collect();
+    let e = take_for_now(&mut q, &key, &paused, arcade_app::now())?;
+    save_queue(node, &q);
+    for p in &busy {
+        let _ = node.app.event("chains", &format!("paused {} to start {key} now; it continues after it", p.name));
+    }
+    let out = match next_of(&e) {
+        Next::Resume(k) => set_paused(node, &k, false),
+        Next::Install { key: k, mode, with } => add_now(node, &k, &mode, with).inspect_err(|_| {
+            if let Some(p) = by_key(&k) {
+                let _ = node.chain.set_place(p.chain_no, None);
+            }
+        }),
+    }?;
+    let _ = node.app.event("chains", &format!("starting {key} now"));
+    Ok(json!({"started": key, "paused": paused, "status": out}))
+}
+
+/// chains.pause / chains.resume by hand: a resume entry for the chain is dropped, so the queue
+/// never resumes a chain the user paused.
+pub fn pause_by_hand(node: &Node, key: &str, paused: bool) -> Result<Value, String> {
+    let out = set_paused(node, key, paused)?;
+    let key = queued_key(key);
+    let _g = QLOCK.lock().unwrap();
+    let mut q = queue(node);
+    let n = q.len();
+    q.retain(|e| !(e["key"] == key.as_str() && is_resume(e)));
+    if q.len() != n {
+        save_queue(node, &q);
+    }
+    Ok(out)
+}
+
+// ---------------- hidden chains and the startup chooser ----------------
+
+fn hidden(node: &Node) -> Vec<String> {
+    node.app.store.read(|r| r.get(arcade_app::META, HIDDEN)).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+fn save_hidden(node: &Node, list: &[String]) {
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, HIDDEN, &serde_json::to_vec(list).unwrap()));
+}
+
+/// Whether the startup chooser has been answered or skipped. An arcade that already has chains
+/// installed by hand counts as having chosen.
+pub fn plan_done(node: &Node) -> bool {
+    node.app.store.read(|r| r.get(arcade_app::META, PLAN_DONE)).ok().flatten().is_some() || !node.extra.lock().unwrap().is_empty()
+}
+
+fn set_plan_done(node: &Node) {
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, PLAN_DONE, b"1"));
+}
+
+/// The chains that are always shown: the home chain and the ARCADE chain.
+fn always_shown(node: &Node) -> Vec<&'static str> {
+    std::iter::once(node.params.key).chain(crate::arcsvc::defined().map(|p| p.key)).collect()
+}
+
+/// chains.hide: leave a chain out of the Coins & chains list, or show it again. Display only:
+/// an installed chain keeps running, nothing is removed or paused.
+pub fn hide(node: &Node, key: &str, hide: bool) -> Result<Value, String> {
+    if crate::arcsvc::defines(key) {
+        return Err("the ARCADE chain is always shown".into());
+    }
+    let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
+    if p.chain_no == node.params.chain_no {
+        return Err(format!("{} is this arcade's home chain and is always shown", p.name));
+    }
+    let list = with_hidden(hidden(node), p.key, hide);
+    save_hidden(node, &list);
+    Ok(json!({"key": p.key, "hidden": hide, "hidden_chains": list}))
+}
+
+/// chains.plan: the startup chooser's answer. The chosen chains are shown and queued (smallest
+/// reported size for `mode` first, unknown sizes last; no indexes), every other chain is hidden,
+/// and the ARCADE chain is installed when it isn't yet (it syncs first). Chains already
+/// installed or queued keep their place: nothing is removed. `skip`: only remembers that the
+/// chooser was answered.
+pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result<Value, String> {
+    if skip {
+        set_plan_done(node);
+        return Ok(json!({"skipped": true}));
+    }
+    if !PLAN_MODES.contains(&mode) {
+        return Err(format!("mode must be one of {}", PLAN_MODES.join(", ")));
+    }
+    let mut chosen: Vec<&'static ChainParams> = Vec::new();
+    for k in keys {
+        if crate::arcsvc::defines(k) {
+            continue;
+        }
+        let p = by_key(k).ok_or_else(|| format!("unknown chain {k}"))?;
+        if !chosen.iter().any(|c| c.key == p.key) {
+            chosen.push(p);
+        }
+    }
+    // Checked before anything changes, so a refusal changes nothing.
+    for p in &chosen {
+        check(p, mode, &[])?;
+    }
+    // The ARCADE chain first: queued chains wait until it has caught up.
+    let mut arcade = Value::Null;
+    if let Some(a) = crate::arcsvc::defined().filter(|a| !crate::arcsvc::runs(a)) {
+        crate::arcsvc::install(node)?;
+        crate::borrow::manage(node);
+        arcade = json!(a.key);
+    }
+    let all: Vec<&str> = ALL_CHAINS.iter().map(|p| p.key).collect();
+    let chosen_keys: Vec<&str> = chosen.iter().map(|p| p.key).collect();
+    let hide = plan_hidden(&all, &chosen_keys, &always_shown(node));
+    save_hidden(node, &hide);
+    let queued = {
+        let _g = QLOCK.lock().unwrap();
+        let mut q = queue(node);
+        let installed: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+        let fresh: Vec<(String, Option<u64>)> = chosen
+            .iter()
+            .filter(|p| p.chain_no != node.params.chain_no && !installed.iter().any(|k| k == p.key) && !q.iter().any(|e| e["key"] == p.key))
+            .map(|p| (p.key.to_string(), crate::sizes::for_chain(node, p.key)["modes"][mode].as_u64()))
+            .collect();
+        let order = by_size(fresh);
+        let at = arcade_app::now();
+        for k in &order {
+            q.push(json!({"key": k, "mode": mode, "with": [], "at": at}));
+        }
+        save_queue(node, &q);
+        order
+    };
+    set_plan_done(node);
+    let _ = node.app.event("chains", &format!("chains chosen: {} queued ({mode}), {} hidden", queued.len(), hide.len()));
+    // The first one starts at once when nothing is being installed (else at its turn).
+    let n = node.clone();
+    std::thread::spawn(move || queue_step(&n));
+    Ok(json!({"queued": queued, "hidden": hide, "arcade": arcade, "mode": mode}))
 }
 
 /// chains.add: install a chain now, or, while another chain is still being installed, put it
@@ -393,6 +703,7 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
         }
         // The same checks as at its turn, so a typo fails now and not hours later; the queue keeps the checked list.
         let indexes = check(p, mode, &indexes)?;
+        let _g = QLOCK.lock().unwrap();
         let mut q = queue(node);
         if let Some(i) = q.iter().position(|e| e["key"] == p.key) {
             return Ok(json!({"queued": true, "key": p.key, "position": i + 1, "behind": busy.key}));
@@ -721,6 +1032,16 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
         node.chain.remove_indexer(r.params.chain_no, ix);
     }
     save(node);
+    // A resume entry for it goes too.
+    {
+        let _g = QLOCK.lock().unwrap();
+        let mut q = queue(node);
+        let n = q.len();
+        q.retain(|e| e["key"] != key);
+        if q.len() != n {
+            save_queue(node, &q);
+        }
+    }
     let n = node.clone();
     let c = r.params.chain_no;
     let name = r.params.name;
@@ -1074,12 +1395,30 @@ fn quick_list(node: &Node) -> Value {
                "ord": !arcade && ord_start(p).is_some(), "tokens": if arcade { None } else { arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()) },
                "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "queued": queued_at(node, p.key)})
     };
-    json!(ALL_CHAINS.iter().map(|p| row(p, false)).chain(crate::arcsvc::defined().map(|p| row(p, true))).collect::<Vec<_>>())
+    let mut rows: Vec<Value> = ALL_CHAINS.iter().map(|p| row(p, false)).chain(crate::arcsvc::defined().map(|p| row(p, true))).collect();
+    mark_rows(node, &mut rows, None);
+    json!(rows)
+}
+
+/// Each `chains.list` row's place in the plan: hidden (chains.hide), whether its queue entry is a
+/// resume, and whether it is the chain being installed now (`installing`, when known).
+fn mark_rows(node: &Node, rows: &mut [Value], installing: Option<Option<&str>>) {
+    let hidden = hidden(node);
+    let q = queue(node);
+    for r in rows.iter_mut() {
+        let key = r["key"].as_str().unwrap_or("").to_string();
+        r["hidden"] = json!(hidden.contains(&key));
+        r["queued_resume"] = json!(q.iter().any(|e| e["key"] == key.as_str() && is_resume(e)));
+        r["installing"] = match installing {
+            Some(k) => json!(k == Some(key.as_str())),
+            None => Value::Null,
+        };
+    }
 }
 
 pub fn list(node: &Node) -> Value {
     let q = queue(node);
-    json!(ALL_CHAINS
+    let mut rows: Vec<Value> = ALL_CHAINS
         .iter()
         .map(|p| {
             let st = status(node, p.key).unwrap_or(json!({}));
@@ -1094,7 +1433,10 @@ pub fn list(node: &Node) -> Value {
                    "queued_with": q.iter().find(|e| e["key"] == p.key).map(|e| e["with"].clone())})
         })
         .chain(crate::arcsvc::row(node))
-        .collect::<Vec<_>>())
+        .collect();
+    let installing = installing_now(node).map(|p| p.key);
+    mark_rows(node, &mut rows, Some(installing));
+    json!(rows)
 }
 
 
@@ -1856,5 +2198,108 @@ mod p2p_parallel_tests {
         // Tried a minute ago: the one-peer path runs for a while first; after the rest, again.
         assert!(!p2p_parallel_due(976_000, 589_000, Some(Duration::from_secs(60))));
         assert!(p2p_parallel_due(976_000, 589_000, Some(P2P_PARALLEL_REST)));
+    }
+}
+
+#[cfg(test)]
+mod plan_queue_tests {
+    use super::*;
+
+    fn keys(q: &[Value]) -> Vec<String> {
+        q.iter().map(|e| format!("{}{}", e["key"].as_str().unwrap(), if is_resume(e) { "+resume" } else { "" })).collect()
+    }
+
+    fn install(key: &str) -> Value {
+        json!({"key": key, "mode": "full", "with": [], "at": 1})
+    }
+
+    #[test]
+    fn the_chooser_queues_smallest_first_and_unknown_sizes_last() {
+        let order = by_size(vec![
+            ("btc".into(), Some(700_000_000_000)),
+            ("kot".into(), None),
+            ("flop".into(), Some(2_000_000_000)),
+            ("doge".into(), Some(90_000_000_000)),
+            ("wjk".into(), None),
+            ("dgb".into(), Some(2_000_000_000)),
+        ]);
+        assert_eq!(order, ["flop", "dgb", "doge", "btc", "kot", "wjk"], "equal sizes and unknown sizes keep the order given");
+        assert!(by_size(vec![]).is_empty());
+    }
+
+    #[test]
+    fn queue_first_moves_a_chain_to_the_front() {
+        let mut q = vec![install("doge"), install("ltc"), install("btc")];
+        move_first(&mut q, "btc").unwrap();
+        assert_eq!(keys(&q), ["btc", "doge", "ltc"]);
+        move_first(&mut q, "btc").unwrap();
+        assert_eq!(keys(&q), ["btc", "doge", "ltc"], "already first: unchanged");
+        assert!(move_first(&mut q, "kot").unwrap_err().contains("isn't waiting"));
+        assert_eq!(keys(&q), ["btc", "doge", "ltc"], "a refusal leaves the queue as it was");
+    }
+
+    #[test]
+    fn start_now_puts_the_paused_chain_right_after_the_chosen_one() {
+        let mut q = vec![install("doge"), install("ltc"), install("btc")];
+        // ltc starts now while dgb was being installed: dgb resumes next.
+        let e = take_for_now(&mut q, "ltc", &["dgb"], 5).unwrap();
+        assert_eq!(next_of(&e), Next::Install { key: "ltc".into(), mode: "full".into(), with: vec![] });
+        assert_eq!(keys(&q), ["dgb+resume", "doge", "btc"]);
+        assert_eq!(q[0]["at"], 5);
+        // Nothing being installed: the chosen one just leaves the queue.
+        let e = take_for_now(&mut q, "btc", &[], 6).unwrap();
+        assert_eq!(e["key"], "btc");
+        assert_eq!(keys(&q), ["dgb+resume", "doge"]);
+        // Then doge starts now while ltc installs: ltc resumes first, dgb after it.
+        take_for_now(&mut q, "doge", &["ltc"], 7).unwrap();
+        assert_eq!(keys(&q), ["ltc+resume", "dgb+resume"]);
+        assert!(take_for_now(&mut q, "kot", &["ltc"], 8).unwrap_err().contains("isn't waiting"));
+        assert_eq!(keys(&q), ["ltc+resume", "dgb+resume"], "a refusal leaves the queue as it was");
+    }
+
+    #[test]
+    fn a_paused_chain_gets_one_resume_entry() {
+        // dgb already waits to resume further back; pausing it again for another chain moves it up, once.
+        let mut q = vec![install("doge"), install("ltc"), resume_entry("dgb", 1)];
+        take_for_now(&mut q, "ltc", &["dgb"], 2).unwrap();
+        assert_eq!(keys(&q), ["dgb+resume", "doge"]);
+        // A resume entry can be started now too: it un-pauses its chain.
+        let e = take_for_now(&mut q, "dgb", &["doge"], 3).unwrap();
+        assert_eq!(next_of(&e), Next::Resume("dgb".into()));
+        assert_eq!(keys(&q), ["doge+resume"]);
+    }
+
+    #[test]
+    fn only_resume_entries_resume() {
+        assert_eq!(next_of(&resume_entry("dgb", 1)), Next::Resume("dgb".into()));
+        assert_eq!(next_of(&json!({"key": "dgb", "mode": "chain", "with": ["addresses"]})), Next::Install { key: "dgb".into(), mode: "chain".into(), with: vec!["addresses".into()] });
+        // Entries queued before resume entries existed: an install, full by default.
+        assert_eq!(next_of(&json!({"key": "kot"})), Next::Install { key: "kot".into(), mode: "full".into(), with: vec![] });
+        assert_eq!(next_of(&json!({"key": "kot", "resume": false, "mode": "full"})), Next::Install { key: "kot".into(), mode: "full".into(), with: vec![] });
+    }
+
+    #[test]
+    fn hiding_and_the_plan_never_hide_the_home_or_arcade_chain() {
+        let h = with_hidden(vec![], "doge", true);
+        let h = with_hidden(h, "btc", true);
+        let h = with_hidden(h, "doge", true);
+        assert_eq!(h, ["btc", "doge"], "sorted, once each");
+        assert_eq!(with_hidden(h, "doge", false), ["btc"]);
+        let all = ["peptest", "pep", "doge", "dgb", "btc"];
+        assert_eq!(plan_hidden(&all, &["doge"], &["peptest", "arctest"]), ["btc", "dgb", "pep"]);
+        assert_eq!(plan_hidden(&all, &all, &["peptest"]), Vec::<String>::new());
+    }
+
+    #[test]
+    fn hide_is_kept_on_the_arcade() {
+        let node = &crate::sitesvc::tests::shared().node;
+        let home = node.params.key;
+        let other = ALL_CHAINS.iter().map(|p| p.key).find(|k| *k != home).unwrap();
+        assert!(hide(node, home, true).unwrap_err().contains("always shown"));
+        assert_eq!(hide(node, other, true).unwrap()["hidden"], true);
+        assert!(hidden(node).iter().any(|k| k == other));
+        assert_eq!(hide(node, &other.to_uppercase(), false).unwrap()["key"], other, "any capitalisation");
+        assert!(!hidden(node).iter().any(|k| k == other));
+        assert!(hide(node, "nosuchcoin", true).is_err());
     }
 }

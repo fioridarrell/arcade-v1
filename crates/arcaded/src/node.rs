@@ -247,6 +247,14 @@ impl Node {
         if home.chain_no != self.params.chain_no && !crate::borrow::is_borrowed(self.params.key) {
             out.push(self.params);
         }
+        // The mainnet coins kept here with posts and messages indexed (crate::chains::MESSAGE_CHAINS; Martin 2026-11-17,
+        // option C): read beside the home chain.
+        let extra: Vec<&'static arcade_chain::params::ChainParams> = self.extra.lock().unwrap().values().map(|r| r.params).collect();
+        for p in extra {
+            if crate::chains::MESSAGE_CHAINS.contains(&p.key) && self.chain.indexers_for(p.chain_no).contains(&"messages.v1") && !out.iter().any(|o| o.chain_no == p.chain_no) {
+                out.push(p);
+            }
+        }
         out.push(home);
         out
     }

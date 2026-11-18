@@ -89,7 +89,6 @@
   // Services over the mesh (arcade.svc, docs/SVC.md): asking in the player's name, and managing this computer's
   // helper, each after a yes once a window and service; each payment and new key on its own card.
   const svcAskYes = {}, svcLocalYes = {};
-  let svcMe = null;
   const doors = {
     async svc(m) {
       const service = String(m.service || "");
@@ -131,8 +130,7 @@
             `${appName} asks to make a key that lets programs on this computer use ${service} with your credit.`], "Make key"));
           if (!yes) throw new Error("Cancelled.");
         }
-        if (!svcMe) svcMe = (await api("status")).node_id;
-        const r = await api("svc.ask", { to: svcMe, service, body, timeout: 1200 });
+        const r = await api("svc.ask", { to: "self", service, body, timeout: 1200 });
         return { result: r.last };
       }
       throw new Error("svc ops are offers, ask and local");
@@ -165,9 +163,8 @@
         if (req.seller) body.seller = String(req.seller); else body.model = req.model || "";
         if (req.seller && req.model) body.model = req.model;
         for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "tools", "tool_choice", "response_format", "seed"]) if (req[k] !== undefined) body[k] = req[k];
-        if (!svcMe) svcMe = (await api("status")).node_id;
         let r;
-        try { r = (await api("svc.ask", { to: svcMe, service: "models", body, timeout: 600 })).last; }
+        try { r = (await api("svc.ask", { to: "self", service: "models", body, timeout: 600 })).last; }
         catch (e) {
           if (/no models service/.test(String(e && e.message || e))) throw new Error("shared models need the Models app's helper (arcade-models) running on this computer");
           throw e;

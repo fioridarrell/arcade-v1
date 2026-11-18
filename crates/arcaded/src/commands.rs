@@ -71,7 +71,7 @@ cmds! {
     "svc.attach" Local "service" "API socket only: attach a helper program for a service; the connection then carries its requests (docs/MODELS-APP.md).";
     "svc.offers" Read "service?" "Services offered over the mesh: each arcade's offer, its @tag, public name, pay_to and link state.";
     "svc.services" Read "" "The service helpers attached to this arcade, with their offers and open requests.";
-    "svc.ask" Local "to, service, body, timeout?, stream?" "Ask a service at an arcade (node id) over the mesh; answers collected (bytes as base64), or streamed line by line on the socket.";
+    "svc.ask" Local "to, service, body, timeout?, stream?" "Ask a service at an arcade (node id, or \"self\" for this one) over the mesh; answers collected (bytes as base64), or streamed line by line on the socket.";
     "svc.pay" Wallet "to, amount, memo" "Pay ARCADE to an address with a memo of up to 80 bytes (a service's credit).";
     "svc.paid" Read "txid, memo?" "Whether a payment is in a block, what it paid this arcade's address, and whether the memo is in it.";
     "events" Read "n?, kind?" "Recent activity (newest first), optionally of one kind.";

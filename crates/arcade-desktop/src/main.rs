@@ -31,7 +31,7 @@ const APP_WINDOW_COMMANDS: &[&str] = &[
     "group.add", "group.app_list", "group.app_read", "group.create", "group.leave", "group.open", "group.say", "group.seal",
     "inscribe", "inscribe.estimate", "prize.claim", "prize.seed",
     "realtime.fast", "realtime.join", "realtime.lanes", "realtime.leave", "realtime.media", "realtime.poll", "realtime.send",
-    "ring.get", "ring.send",
+    "ring.get", "ring.send", "svc.ask", "svc.offers",
     "trade.fill", "trade.items", "trade.leg", "trade.open", "trade.watch", "trade.who",
     "wallet.approve", "wallet.deny", "wallet.preview", "wallet.requests",
 ];

@@ -31,7 +31,6 @@
   <button data-tab="chains">Chains &amp; Coins</button>
   <button data-tab="mine">Mine</button>
   <button data-tab="activity">Activity</button>
-  <button data-tab="models">Models</button>
   <button data-tab="apitab">API</button>
   <button data-tab="options">Options</button>
 </nav>
@@ -301,49 +300,6 @@
   </section>
 
   <!-- API: sidecar apps (JSON-RPC with the cookie) and websites (web API with keys) -->
-  <!-- Models: shared AI models on the mesh, paid in ARCADE (models.js, docs/LLM.md) -->
-  <section id="models" class="tab wide">
-    <h1>Models</h1>
-    <p class="s">AI models shared by arcades on the mesh: chat models and voices. Buy credit with ARCADE at a seller, then use it here, from apps, or from any OpenAI program. Unused credit can be asked back.</p>
-    <h2>On offer</h2>
-    <table><thead><tr><th>Model</th><th>Seller</th><th class="num">ARCADE / M in</th><th class="num">ARCADE / M out</th><th class="num">Your credit</th><th>Record</th><th></th></tr></thead><tbody id="md-offers"><tr><td colspan="7" class="s">Loading…</td></tr></tbody></table>
-    <p class="msg" id="md-msg"></p>
-
-    <h2>Try a model</h2>
-    <div class="card">
-      <div class="row"><select id="md-pick" style="flex:1;min-width:16em"></select><select id="md-voice" hidden></select></div>
-      <textarea id="md-ask" rows="3" placeholder="Ask something" style="width:100%"></textarea>
-      <div class="row"><button class="primary" id="md-send">Send</button><span class="s" id="md-cost"></span></div>
-      <pre id="md-reply" class="md-reply" hidden></pre>
-      <audio id="md-audio" controls hidden style="width:100%"></audio>
-    </div>
-
-    <h2>Use it from OpenAI programs</h2>
-    <div class="card">
-      <p>Base URL <code id="md-base"></code>, model <code>name@seller</code> (or a bare name: one you have credit at, else the cheapest), key from below. Works with coding tools, chat apps and the OpenAI libraries on this computer. Voices answer <code>audio/speech</code>.</p>
-      <table><thead><tr><th>Key</th><th>Made</th><th></th></tr></thead><tbody id="md-keys"></tbody></table>
-      <div class="row"><input id="md-kname" placeholder="Name (the program it is for)"><button id="md-knew">Make key</button></div>
-      <div id="md-kout" class="warn" hidden></div>
-      <div class="k" style="margin-top:12px">Auto top-up</div>
-      <div class="row"><label><input type="checkbox" id="md-auto"> Buy again when credit at a seller falls under</label>
-        <input id="md-floor" type="number" min="0" step="0.1" style="width:6em"> ARCADE: buy <input id="md-amt" type="number" min="0" step="0.1" style="width:6em"> ARCADE, at most <input id="md-cap" type="number" min="0" step="1" style="width:6em"> ARCADE a day <button class="small" id="md-autosave">Save</button></div>
-    </div>
-
-    <h2>Share your model</h2>
-    <div class="card">
-      <p class="s">Run any OpenAI-compatible model server on this computer (vLLM, llama.cpp, Ollama, LM Studio, or a voice server such as CSM) and earn ARCADE from every arcade that uses it. Buyers prepay credit to your arcade; replies are charged by your server's token count, speech by the characters read; a reply that fails costs nothing.</p>
-      <div id="md-servers"></div>
-      <div class="row"><button class="small" id="md-addsrv">Add a server</button><button id="md-scan">Find models</button></div>
-      <table><thead><tr><th>Share</th><th>Model</th><th class="num">ARCADE / M in</th><th class="num">ARCADE / M out</th></tr></thead><tbody id="md-mine"><tr><td colspan="4" class="s">Find the server's models first.</td></tr></tbody></table>
-      <div class="row">
-        <label>Requests at once <input id="md-atonce" type="number" min="1" max="32" style="width:5em"></label>
-        <label>Longest reply <input id="md-maxout" type="number" min="16" max="131072" style="width:7em"> tokens</label>
-        <label><input type="checkbox" id="md-refunds"> Give unused credit back when asked</label>
-      </div>
-      <div class="row"><label><input type="checkbox" id="md-on"> Share with the mesh</label><button class="primary" id="md-save">Save</button><span class="s" id="md-earned"></span></div>
-      <p class="msg" id="md-smsg"></p>
-    </div>
-  </section>
 
   <section id="apitab" class="tab">
     <h1>API</h1>
@@ -553,7 +509,6 @@
 <script src="feed.js"></script>
 <script src="people.js"></script>
 <script src="apitab.js"></script>
-<script src="models.js"></script>
 <script src="apps.js"></script>
 <script src="rings.js"></script>
 <script src="options.js"></script>

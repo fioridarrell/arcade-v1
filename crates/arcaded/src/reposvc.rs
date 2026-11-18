@@ -3,7 +3,9 @@
 //!
 //! - `POST /r/repo/<op>` (an app page's pass): files a request as `/r/send` does; Arcade V1.0 shows it over the app
 //!   for Approve or Refuse. Ops: `push` (blobs the page made: git packs, their indexes and a manifest; then the push
-//!   record once the manifest is in a block), `fork`, `maintainer`, `item_open`, `item_comment`, `item_state`.
+//!   record once the manifest is in a block; from rules version 4 the record names `base`, the manifest the push was
+//!   built on, and the ledger refuses it if the repository moved on, unless `force`), `fork`, `maintainer`,
+//!   `item_open`, `item_comment`, `item_state`.
 //! - `GET /r/repo/req/<id>`: where a request stands (`repo.state`: working, done or failed, with its txids).
 //! - `GET /r/repo/me`: this wallet's @tag on the ARCADE chain (the author of what it writes).
 //!
@@ -109,9 +111,23 @@ fn check(node: &Node, op: &str, b: &Value) -> Result<(String, String, Value, Vec
                 let what = format!("merge pull request #{n} into @{f} ({} new KB)", total.div_ceil(1000));
                 return Ok((what, f.clone(), json!({"repo": f, "branch": branch, "message": msg, "merge": n}), files));
             }
-            let what = format!("push {}{} to @{f} ({} new KB)", if msg.is_empty() { "a commit".into() } else { format!("“{msg}”") },
+            // Rules version 4 (ARCADE #10): the push names the manifest it was built on: the page's `base` when it
+            // gives one ("" for a new repository), else its manifest's `prev` (null for a new repository: the Git app
+            // sets it to the manifest it read), else the repository's manifest now, when the request is made. The
+            // ledger refuses it if the repository moves on before it lands, unless `force`.
+            let base = match (b["base"].as_str(), m.get("prev")) {
+                (Some(x), _) => x.trim().to_lowercase(),
+                (None, Some(Value::String(p))) => p.trim().to_lowercase(),
+                (None, Some(Value::Null)) => String::new(),
+                _ => crate::arcledger::repo_manifest(node, &f).unwrap_or_default(),
+            };
+            if !base.is_empty() && !(base.len() == 64 && base.bytes().all(|c| c.is_ascii_hexdigit())) {
+                return Err("base is a manifest blob id (64 hex), or \"\" for a new repository".into());
+            }
+            let force = b["force"] == true;
+            let what = format!("{}push {}{} to @{f} ({} new KB)", if force { "force-" } else { "" }, if msg.is_empty() { "a commit".into() } else { format!("“{msg}”") },
                 if branch.is_empty() { String::new() } else { format!(" on {branch}") }, total.div_ceil(1000));
-            Ok((what, f.clone(), json!({"repo": f, "branch": branch, "message": msg, "new": !exists(&f)}), files))
+            Ok((what, f.clone(), json!({"repo": f, "branch": branch, "message": msg, "new": !exists(&f), "base": base, "force": force}), files))
         }
         "fork" => {
             let src = full(s(b, "from"), None)?;
@@ -304,7 +320,7 @@ pub fn start(node: &Node, r: &Value) -> Result<(String, u64, Vec<Value>), String
                     note(&n, &id, "working", "pointing the repository at the new commit", &txids, None);
                     let v = match a["merge"].as_u64() {
                         Some(num) => retry(stop, || crate::arcledger::item_state(&n, &json!({"repo": s(a, "repo"), "number": num, "state": "merged", "manifest": manifest})))?,
-                        None => retry(stop, || crate::arcledger::repo_push(&n, s(a, "repo"), &manifest))?,
+                        None => retry(stop, || crate::arcledger::repo_push(&n, s(a, "repo"), &manifest, a["base"].as_str(), a["force"] == true))?,
                     };
                     txids.push(tx(&v));
                     let _ = std::fs::remove_dir_all(dir(&n, &id));

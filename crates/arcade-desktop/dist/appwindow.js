@@ -83,7 +83,8 @@
   // The ring this window was opened from, if any (arcade.realtime.ringed).
   const ringId = /^[0-9a-f]{16}$/.test(q.get("ring") || "") ? q.get("ring") : "";
 
-  // Shared models (arcade.llm, docs/LLM.md): the app spends this wallet's model credit only after a yes, once a window.
+  // Shared models (arcade.llm, through the Models app's helper): the app spends this wallet's model credit only after a
+  // yes, once a window.
   let llmYes = false;
   // Services over the mesh (arcade.svc, docs/SVC.md): asking in the player's name, and managing this computer's
   // helper, each after a yes once a window and service; each payment and new key on its own card.
@@ -136,16 +137,19 @@
       }
       throw new Error("svc ops are offers, ask and local");
     },
+    // arcade.llm (the original API, APP_API.md B4) over the Models app's service (docs/SVC.md): offers straight from the
+    // mesh; chats through this computer's arcade-models helper, paid from this wallet's credit at the seller.
     async llm(m) {
       if (m.op === "offers") {
-        const list = await api("llm.offers");
-        // Chat models only here: voices are for OpenAI programs and the Models tab.
-        const chat = list.map((o) => ({ ...o, models: o.models.filter((x) => x.kind !== "speech") })).filter((o) => o.models.length);
+        const list = await api("svc.offers", { service: "models" });
+        const chat = list.filter((o) => o.offer && Array.isArray(o.offer.models))
+          .map((o) => ({ ...o, models: o.offer.models.filter((x) => x.kind !== "speech") })).filter((o) => o.models.length);
+        const coins = (u) => Number(u || 0) / 1e8;
         return { offers: chat.map((o) => ({
-          seller: o.seller, here: o.here, name: o.name || "", tag: o.tag || "", max_out: o.max_out,
-          free: o.models.every((x) => x.free), models: o.models.map((x) => ({ id: x.id })),
-          prices: o.models.map((x) => ({ leg: "arctest", label: "ARCADE per million tokens", model: x.id, in: x.in, out: x.out })),
-          credit: o.credit,
+          seller: o.arcade, here: o.here, name: o.name || "", tag: o.tag || "", max_out: o.offer.max_out,
+          free: o.models.every((x) => !x.in && !x.out), models: o.models.map((x) => ({ id: x.id })),
+          prices: o.models.map((x) => ({ leg: "arctest", label: "ARCADE per million tokens", model: x.id, in: coins(x.in), out: coins(x.out) })),
+          credit: null,
         })) };
       }
       if (m.op === "chat") {
@@ -157,9 +161,17 @@
           if (!yes) throw new Error("Cancelled.");
           llmYes = true;
         }
-        const args = { messages: req.messages, model: req.model || undefined, seller: req.seller || undefined };
-        for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "tools", "tool_choice", "response_format", "seed"]) if (req[k] !== undefined) args[k] = req[k];
-        const r = await api("llm.chat", args);
+        const body = { what: "chat_at", messages: req.messages };
+        if (req.seller) body.seller = String(req.seller); else body.model = req.model || "";
+        if (req.seller && req.model) body.model = req.model;
+        for (const k of ["max_tokens", "max_completion_tokens", "temperature", "top_p", "stop", "tools", "tool_choice", "response_format", "seed"]) if (req[k] !== undefined) body[k] = req[k];
+        if (!svcMe) svcMe = (await api("status")).node_id;
+        let r;
+        try { r = (await api("svc.ask", { to: svcMe, service: "models", body, timeout: 600 })).last; }
+        catch (e) {
+          if (/no models service/.test(String(e && e.message || e))) throw new Error("shared models need the Models app's helper (arcade-models) running on this computer");
+          throw e;
+        }
         return { content: r.content, reasoning: r.reasoning, usage: r.usage, cost: r.cost, left: r.left, seller: r.seller, model: r.model, leg: "arctest" };
       }
       if (m.op === "image") throw new Error("pictures aren't shared on this arcade yet");

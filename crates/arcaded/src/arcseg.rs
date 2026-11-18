@@ -195,11 +195,12 @@ pub fn coins_record(node: &Node, p: &ChainParams, h: u32) -> Option<Vec<u8>> {
 /// The index families, with the indexer each comes from (the riders come with ord's).
 const JOURNALED: &[(u8, &str)] = {
     use arcade_chaindb::journal::*;
-    &[(ORD, "ord.v1"), (LEDGER, "ledger.v1"), (PROFILES, "profiles.v1"), (MESSAGES, "messages.v1"), (NAMES, "ord.v1"), (TOKENS, "ord.v1"), (MAPS, "ord.v1"), (TAGS, "tags.v1")]
+    &[(ORD, "ord.v1"), (LEDGER, "ledger.v1"), (PROFILES, "profiles.v1"), (MESSAGES, "messages.v1"), (NAMES, "ord.v1"), (TOKENS, "ord.v1"), (MAPS, "ord.v1"), (TAGS, "tags.v1"), (DOGEFEED, "dproto.v1")]
 };
 
 /// The journal family of an index as Chains & Coins names it; None for an index with no journal (addresses,
-/// collections, dogefeed, ...), which is never sealed and earns nothing.
+/// collections, ...), which is never sealed and earns nothing. Dogefeed's is listed from rules version 4 only
+/// ([`listing_at`], segment::family_at).
 pub fn index_family(index: &str) -> Option<u8> {
     use arcade_chaindb::journal::*;
     Some(match index {
@@ -209,6 +210,7 @@ pub fn index_family(index: &str) -> Option<u8> {
         "names" => NAMES,
         "tokens" => TOKENS,
         "maps" => MAPS,
+        "dogefeed" => DOGEFEED,
         _ => return None,
     })
 }
@@ -227,8 +229,16 @@ fn journal_span(node: &Node, p: &ChainParams, family: u8) -> Option<(u32, u32)> 
     Some((start, to))
 }
 
-/// The families of a chain this arcade can cut: the blocks, and every journaled index.
-pub fn families(node: &Node, p: &ChainParams) -> Vec<u8> {
+/// The ARCADE network, and the height of its next block: what [`families`] is asked with (which families the catalog
+/// takes, segment::family_at). None while no ARCADE chain is defined here. Never call it holding the chain's lock.
+pub fn listing_at() -> Option<(Net, u64)> {
+    let net = crate::arcsvc::svc_net().or_else(|| crate::arcsvc::defined_net().map(|d| d.0))?;
+    Some((net, crate::arcsvc::height().map_or(0, |h| h + 1)))
+}
+
+/// The families of a chain this arcade can cut: the blocks, and every journaled index the catalog of `net` takes at
+/// ARCADE height `at` (dogefeed from rules version 4).
+pub fn families(node: &Node, p: &ChainParams, net: &Net, at: u64) -> Vec<u8> {
     let mut v = vec![segment::FAMILY_BLOCKS];
     if crate::arcsvc::runs(p) {
         // The ARCADE chain's blobs, sealed and paid as its blocks are.
@@ -236,7 +246,7 @@ pub fn families(node: &Node, p: &ChainParams) -> Vec<u8> {
     } else {
         // The coins each block spends: from the blocks, on every coin kept here.
         v.push(segment::FAMILY_COINS);
-        v.extend(JOURNALED.iter().map(|(f, _)| *f).filter(|f| journal_span(node, p, *f).is_some()));
+        v.extend(JOURNALED.iter().map(|(f, _)| *f).filter(|f| segment::family_at(net, *f, at) && journal_span(node, p, *f).is_some()));
     }
     v
 }
@@ -254,6 +264,7 @@ pub fn family_name(family: u8) -> &'static str {
         TOKENS => "tokens",
         MAPS => "maps",
         TAGS => "tags",
+        DOGEFEED => "dogefeed",
         segment::FAMILY_COINS => "coins",
         segment::FAMILY_BLOBS => "blobs",
         _ => "index",
@@ -322,11 +333,11 @@ pub fn root_of(node: &Node, p: &ChainParams, family: u8, first: u64, last: u64) 
     Some((bytes, root))
 }
 
-/// The listed chains of `net` this arcade keeps in full.
-pub fn kept(node: &Node, net: &Net) -> Vec<&'static ChainParams> {
-    net.listed
-        .iter()
-        .filter_map(|k| match crate::arcsvc::defined().filter(|d| d.key == *k) {
+/// The listed chains of `net` this arcade keeps in full, as listed for the block at `height` (the next block's: a
+/// chain listed from a rules version is offered, sealed and watched from its height on).
+pub fn kept(node: &Node, net: &Net, height: u64) -> Vec<&'static ChainParams> {
+    net.listed_at(height)
+        .filter_map(|k| match crate::arcsvc::defined().filter(|d| d.key == k) {
             // The ARCADE chain itself, while it runs here.
             Some(d) => crate::arcsvc::runs(d).then_some(d),
             None => node.chain_params(k).filter(|p| node.mode_of(p.key).as_deref() == Some("full") && crate::chains::kept(node, p)),
@@ -336,8 +347,8 @@ pub fn kept(node: &Node, net: &Net) -> Vec<&'static ChainParams> {
 
 /// One round: measure, then offer the next segment of each kept chain nobody offered, and
 /// attest every waiting entry this arcade made the same root for. `catalog` is the chain's
-/// now; `weight` this arcade's draw weight.
-pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64) {
+/// now; `weight` this arcade's draw weight; `height` the next block's.
+pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64, height: u64) {
     let me = node.identity.verifying_key().to_bytes();
     // Items the chain is past: an entry for heights already listed or no longer next, an
     // attestation of an entry that no longer waits (and isn't waiting here either).
@@ -351,8 +362,8 @@ pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64) {
         .collect();
     forget(&stale);
     let mut more = false;
-    for p in kept(node, net) {
-        for family in families(node, p) {
+    for p in kept(node, net, height) {
+        for family in families(node, p, net, height) {
             more |= measure(node, p, family, 50);
             if weight == 0 {
                 continue;
@@ -432,16 +443,16 @@ const FREE_FLOOR: u64 = 2_000_000_000;
 /// segment that is lost or set aside costs no data. When a range ends with a full segment's bytes in, the table goes on the end
 /// and the segment becomes a replica to register. Blocks first, then each index, per coin; one run at a time, in the
 /// background.
-pub fn auto_seal(node: &Node, net: &Net, catalog: &Catalog) {
+pub fn auto_seal(node: &Node, net: &Net, catalog: &Catalog, height: u64) {
     if crate::arcseal::sealing().is_some() {
         return;
     }
     // Every chain and family with work this round, each in turn: the ARCADE chain has newly settled blocks almost
     // every round, and taking only the first with work starved the families after it.
-    let work: Vec<(&'static ChainParams, u8)> = kept(node, net)
+    let work: Vec<(&'static ChainParams, u8)> = kept(node, net, height)
         .into_iter()
         .filter(|p| crate::arcsvc::runs(p) || earn_on(node, p.key))
-        .flat_map(|p| families(node, p).into_iter().filter(|f| seal_work(node, net, p, *f).is_some_and(|(next, settled)| next <= settled)).map(move |f| (p, f)))
+        .flat_map(|p| families(node, p, net, height).into_iter().filter(|f| seal_work(node, net, p, *f).is_some_and(|(next, settled)| next <= settled)).map(move |f| (p, f)))
         .collect();
     let Some(&(p0, f0)) = work.first() else {
         *SEAL_NOTE.lock().unwrap() = String::new();
@@ -557,10 +568,25 @@ fn prune_sealed(node: &Node, p: &'static ChainParams, first: u64, last: u64) -> 
     let c = p.chain_no;
     let mut freed = 0;
     let bs: Vec<u32> = (first..=last).filter_map(|h| Some(node.chain.header(c, &node.chain.hash_at(c, h as u32).ok()??).ok()??.b)).filter(|b| *b != 0).collect();
-    for chunk in bs.chunks(1000) {
-        freed += node.chain.prune_blocks(p, chunk).unwrap_or(0);
-    }
+    freed += prune_gently(node, p, &bs).0;
     freed
+}
+
+/// Blocks pruned in commits short enough to leave the chain's write lock to the others between them: tip sync, the
+/// coin-cache flush, the HTTP readers. 1,000 Litecoin blocks in one commit (millions of rows on a 766 GB file) held
+/// it for minutes, back to back, and the JB20B's website hung behind it (2026-11-17). Stops early when the arcade is
+/// stopping (the rest stays as plain copies). (bytes freed, whether all went).
+pub fn prune_gently(node: &Node, p: &ChainParams, bs: &[u32]) -> (u64, bool) {
+    const BLOCKS_PER_COMMIT: usize = 25;
+    let mut freed = 0;
+    for chunk in bs.chunks(BLOCKS_PER_COMMIT) {
+        if arcade_chaindb::db::STOPPING.load(std::sync::atomic::Ordering::Relaxed) {
+            return (freed, false);
+        }
+        freed += node.chain.prune_blocks(p, chunk).unwrap_or(0);
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    (freed, true)
 }
 
 /// Where Earn ARCADE stands for a coin: sealed up to which height of how many.
@@ -668,11 +694,11 @@ pub(crate) fn payout_of(node: &Node, net: &Net, p: &ChainParams) -> Option<block
 }
 
 /// What the Chains & Coins row and arc.status say about it.
-pub fn status(node: &Node, net: &Net, full: u64) -> serde_json::Value {
-    let chains: Vec<serde_json::Value> = kept(node, net)
+pub fn status(node: &Node, net: &Net, full: u64, height: u64) -> serde_json::Value {
+    let chains: Vec<serde_json::Value> = kept(node, net, height)
         .iter()
         .map(|p| {
-            let fams: Vec<serde_json::Value> = families(node, p)
+            let fams: Vec<serde_json::Value> = families(node, p, net, height)
                 .into_iter()
                 .map(|f| {
                     let ranges = CUTS.lock().unwrap().get(&(p.chain_no, f)).map(|c| c.ranges.len()).unwrap_or(0);
@@ -693,6 +719,22 @@ mod tests {
 
     fn entry(first: u64, poster: u8) -> Item {
         Item::CatalogEntry(CatalogEntry { chain: "peptest".into(), family: 0, first, last: first + RANGE - 1, bytes: 9, manifest: [0; 32], root: [poster; 32], poster: [poster; 32], sig: [0; 64] })
+    }
+
+    #[test]
+    fn dogefeed_is_a_journaled_family_collections_is_not() {
+        use arcade_chaindb::journal::DOGEFEED;
+        assert_eq!(DOGEFEED, segment::FAMILY_DOGEFEED);
+        assert_eq!(index_family("dogefeed"), Some(DOGEFEED));
+        assert_eq!(family_name(DOGEFEED), "dogefeed");
+        assert!(JOURNALED.contains(&(DOGEFEED, "dproto.v1")));
+        assert_eq!(index_family("collections"), None);
+        assert!(!segment::FAMILIES.contains(&segment::FAMILY_COLLECTIONS));
+        // The families before it keep their numbers and names.
+        for (ix, f) in [("ord", 1), ("ledger", 2), ("profiles", 3), ("names", 5), ("tokens", 6), ("maps", 7)] {
+            assert_eq!(index_family(ix), Some(f));
+        }
+        assert_eq!(JOURNALED.iter().map(|j| j.0).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5, 6, 7, 8, 12]);
     }
 
     #[test]

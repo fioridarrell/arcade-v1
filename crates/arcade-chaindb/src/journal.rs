@@ -10,8 +10,10 @@
 //! collapse into the row's value after it. A height before the index starts has the empty
 //! record (four zero bytes).
 //!
-//! Families: 1 ord, 2 ledger, 3 profiles, 4 messages, 5 names, 6 tokens, 7 maps, 8 tags (0 is
-//! the blocks). The riders on the ord index (names, tokens, maps) journal apart from it.
+//! Families: 1 ord, 2 ledger, 3 profiles, 4 messages, 5 names, 6 tokens, 7 maps, 8 tags, 12
+//! dogefeed (0 is the blocks; 11 is kept for collections, which has no journal yet). The riders on
+//! the ord index (names, tokens, maps) journal apart from it. Dogefeed's journals are written on
+//! every network; the ARCADE catalog lists them from rules version 4 (arcade_arc::segment::family_at).
 
 use crate::schema::{k_journal, k_state, JOURNAL, STATE};
 use crate::undo::Logged;
@@ -27,6 +29,8 @@ pub const NAMES: u8 = 5;
 pub const TOKENS: u8 = 6;
 pub const MAPS: u8 = 7;
 pub const TAGS: u8 = 8;
+/// The dogefeed (D://) index (arcade_ledger::dproto), journaled from its start like the others.
+pub const DOGEFEED: u8 = 12;
 /// The coins each block spends (not a journal of tables: made from the blocks themselves, arcaded::arcseg::coins_record).
 pub const COINS: u8 = 9;
 

@@ -1418,7 +1418,7 @@ fn tag_page(x: &Ctx, t: &str) -> R {
     let mut addrs: Vec<(String, &str)> = Vec::new();
     if x.p.chain_no == home.chain_no {
         addrs.push((row.address.clone(), "the @tag's address"));
-    } else if let Some(a) = crate::hometag::address_on(x.p, &row.address).filter(|_| x.p.chain_no == x.node.ledger_home().chain_no || crate::arcsvc::runs(x.p)) {
+    } else if let Some(a) = crate::hometag::address_on(x.p, &row.address).filter(|_| x.p.chain_no == x.node.ledger_home().chain_no || x.p.chain_no == x.node.params.chain_no || crate::arcsvc::runs(x.p)) {
         // The same key on this chain (one key, one wallet on ARCADE and the ledger home).
         addrs.push((a, "the @tag's key on this chain"));
     }

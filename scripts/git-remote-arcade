@@ -12,7 +12,9 @@ each fits a block), publishes each piece from this computer's arcade wallet, the
 and once that is in a block a signed push record points @owner/name at it. Any size works: big pushes are several
 transactions, each paid at the blob price (about 0.01 ARCADE per kB). The first push to a name under your own @tag
 creates the repository; only the owner and its maintainers can push. A push that isn't a fast-forward is refused unless
-forced (`git push --force` / `+ref`), as on any git host.
+forced (`git push --force` / `+ref`), as on any git host. The push record names the manifest this push was built on
+(read at the start of the push); from ARCADE rules version 4 the chain refuses the record if @owner/name moved on in
+between (another push landed first: fetch and push again), unless the push was forced, which replaces whatever is there.
 
 A fetch reads the manifest's packs over the same socket (git index-pack checks every object). Without this helper,
 any git clones the same repository from an arcade's web address: git clone http://<arcade>/git/@owner/name
@@ -208,7 +210,9 @@ def push(name, specs):
         time.sleep(5)
     else:
         raise RuntimeError("the manifest never got into a block")
-    p = retry({"cmd": "ledger.repo_push", "name": name, "manifest": new_mid}, why=("not enough", "could not build"))
+    force = any(f for f, _, _ in specs)
+    p = retry({"cmd": "ledger.repo_push", "name": name, "manifest": new_mid, "base": mid or "", "force": force},
+              why=("not enough", "could not build"))
     log(f"pushed: {name} -> manifest {new_mid[:16]}… (record {p['txid'][:16]}…); it shows once that is in a block")
     for d in new:
         out.setdefault(d, None)

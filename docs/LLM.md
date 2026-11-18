@@ -1,6 +1,10 @@
 # Shared models (LLM inference for ARCADE)
 
-Status: LIVE in v0.1.98 (chat, PR #239); **speech** (voices, §7) built on branch claude/llm-speech 2026-11-16. Martin 2026-11-16: "add open AI API to arcade V1 so that someone with a local model can
+Status: **MOVED OUT OF ARCADED** (2026-11-16, Martin: "we're supposed to have the AI marketplace as its own app only
+using the arcade mesh"). It is now the Models app (inscribed by @strawberry on arctest) and its helper program
+`arcade-models` (`@strawberry/arcade-models` on ARCADE), on arcaded's general service channel (docs/SVC.md). This file
+is kept as the design history: the pricing, paying and checking rules below are what the helper does. Was LIVE in
+v0.1.98 (chat, PR #239) and v0.1.100 (speech, §7) inside arcaded. Martin 2026-11-16: "add open AI API to arcade V1 so that someone with a local model can
 share their inference to the network in exchange. They should earn arcade coin." Decided: **buyers pay sellers**
 (a market, as the original arcade's LLM service); no minted reward, no change to the ARCADE coin's rules.
 

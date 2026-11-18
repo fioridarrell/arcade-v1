@@ -479,9 +479,15 @@ impl Engine<'_, '_, '_> {
             Some(Err(e)) => return Ok(Err(format!("malformed repository record: {e}"))),
             None => return Ok(Err("malformed repository record".into())),
         };
+        // Rules version 4 (ARCADE #10): op 7 pushes name their base and are checked against it; below, op 7 is
+        // unknown, refused as it was before version 4.
+        let v4 = crate::repos::base_checked(self.c, self.h as u64);
+        if !v4 && matches!(op, crate::repos::RepoOp::PushOnto { .. }) {
+            return Ok(Err("malformed repository record: unknown repository op".into()));
+        }
         let me = (EngineTags { e: self }).tag_of(&r.atx.sender)?;
         let mut st = EngineRepos { e: self, r };
-        Ok(crate::repos::apply(&mut st, &op, me.as_deref())?.map_err(String::from))
+        Ok(crate::repos::apply_at(&mut st, &op, me.as_deref(), v4)?.map_err(String::from))
     }
 
     // ---------- process ----------

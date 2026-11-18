@@ -34,7 +34,7 @@ Legend: **have** = V1.0 does it (maybe under another name), **part** = some of i
 | wl | welcome records (test coins) | have |
 | fr | operator fruit-name handout | missing |
 | op me | who runs this arcade (tag, name, version, hosts, sites) | missing |
-| lm | shared LLM service | V1.0 own wire (llmsvc.rs, docs/LLM.md): ARCADE-paid, not the original's frames |
+| lm | shared LLM service | gone from arcaded (2026-11-16): the Models app's helper (arcade-models) uses the general `sv` service frames (svcmesh.rs, docs/SVC.md) |
 | pk | themes | missing |
 | st, ud, pu, tu, ui | STUN, UDP links, NAT punch, TURN credentials, introductions | missing |
 | (V1.0 only) bk, pp, sz, sh | blocks, coin peers, sizes, shared storage | new |
@@ -62,7 +62,7 @@ Legend: **have** = V1.0 does it (maybe under another name), **part** = some of i
 | DogeFeedX `/dogefeedx/*` (≈60 pages + `/dogefeedx/api/*` + network) | alternate UI | missing |
 | Lite console `/lite*`, `/api/terminal/*`, `/api/v1/run`, `/api/v1/routes`, `/api/v1/whoami` | console over HTTP, self-description | part: the `arcade` CLI has its own commands; no HTTP console |
 | JSON-RPC `/rpc/{which}` (omni_* and da_* methods), `/rpc/work/{net}` | bots, remote miners | missing (`cr` serves Core-style RPC to the mesh only) |
-| LLM `/v1/*`, `/account/llm/*`, `/admin/api/llm*` | shared LLM | `/openai/v1/*` (models, chat/completions, audio/speech; sk-arcade- keys) + `llm.*` commands (docs/LLM.md) |
+| LLM `/v1/*`, `/account/llm/*`, `/admin/api/llm*` | shared LLM | moved to the Models app (2026-11-16): its helper arcade-models serves `http://127.0.0.1:8440/v1` (models, chat/completions, audio/speech; sk-arcade- keys); arcaded's `/openai/v1/*` answers 410 with where it went; `llm.*` commands removed (docs/SVC.md) |
 | Realtime `/realtime/*` | rooms, calls (ICE/STUN) | missing |
 | Bootstraps `/bootstrap/{name}`, `/source*`, `/clone`, `/.well-known/dogecoinarcade.json`, `/instances*` | index copies, own source, directory | missing |
 | Shared walks `/coins/walk/*`, `/peer/address/{address}/coins` | help another arcade's address walk | missing (V1.0 indexes every address itself) |

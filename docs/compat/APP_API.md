@@ -204,6 +204,9 @@ text ≤ 60; one question at a time ("busy: ..."); only claimed tags ("no name: 
   time; refusal "declined"; unknown group "not a group of yours".
 
 ## B4. /r/llm.js → arcade.llm (no timeout; parts {part:true, delta} → onToken)
+  V1.0 (2026-11-16): the window answers arcade.llm over arcade.svc (docs/SVC.md): offers from the mesh (service
+  "models"), chat through this computer's arcade-models helper (op chat_at), one yes per window; credit isn't listed (the
+  Models app shows it); no helper = "shared models need the Models app's helper (arcade-models)".
 - offers() → [{seller, here, free, name, tag, models:[{id}], prices:[{leg, label, in, out}], max_out}];
   chat(req) (OpenAI chat fields + seller, leg) → {content, reasoning, usage:{tokens_in, tokens_out}, cost, left,
   seller, leg}; image(req {prompt, size, image, seller, leg, model}) → {png, url, seed, cost, left, seller, leg}.

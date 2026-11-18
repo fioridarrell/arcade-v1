@@ -602,9 +602,6 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .pp-hit:last-child { border-bottom: 0; }
 .pp-hit .s { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .pp-home { font-size: 11px; padding: 1px 8px; }
-/* Models tab (models.js) */
-.md-reply { white-space: pre-wrap; background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 10px; max-height: 360px; overflow: auto; }
-#md-offers td .small + .small { margin-left: 4px; }
 /* How far a mesh answer is vouched for (common.js vouchDot): the trust colours, with fallbacks. */
 .vouch { display: inline-block; width: 9px; height: 9px; border-radius: 50%; margin-right: 6px; vertical-align: 0; flex: none; background: var(--trust-grey, #6f7973); }
 .vouch.green { background: var(--trust-green, #2e8b44); }

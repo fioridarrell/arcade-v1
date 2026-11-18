@@ -164,6 +164,10 @@ impl Indexer for DprotoIndexer {
     fn name(&self) -> &'static str {
         "dproto.v1"
     }
+    /// Its tables are journaled as family DOGEFEED (docs/ARCADECHAIN.md §2.2; listed from rules version 4).
+    fn journals(&self) -> Vec<(u8, Vec<&'static str>)> {
+        vec![(arcade_chaindb::journal::DOGEFEED, tables())]
+    }
     fn tables(&self) -> Vec<TableDef> {
         tables().into_iter().map(TableDef::plain).collect()
     }

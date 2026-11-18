@@ -223,8 +223,26 @@ impl Node {
     /// The ledger's home chain (docs/HOMECHAIN.md): where @tags, profiles, follows, posts, messages, linked wallets and
     /// the operator's handle proof are written, and read first. `params` is a coin chain (Pepecoin testnet's sync,
     /// miner, mempool and welcome faucet); the two are one chain until HOMECHAIN.md phase 3 moves the ledger to ARCADE.
+    /// Phase 3: the ARCADE chain when it runs here, else `params` (an arcade without ARCADE yet).
     pub fn ledger_home(&self) -> &'static arcade_chain::params::ChainParams {
-        self.params
+        crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).unwrap_or(self.params)
+    }
+
+    /// The chains the ledger is read from, oldest first: the old home (Pepecoin testnet, whose follows, posts and
+    /// messages stay readable as history) when ARCADE is home and the old home is kept here, then the home.
+    pub fn ledger_chains(&self) -> Vec<&'static arcade_chain::params::ChainParams> {
+        let home = self.ledger_home();
+        let mut out = Vec::new();
+        if home.chain_no != self.params.chain_no && !crate::borrow::is_borrowed(self.params.key) {
+            out.push(self.params);
+        }
+        out.push(home);
+        out
+    }
+
+    /// An address in any chain's p2pkh form as the home chain's: the same key hash (one key, one person).
+    pub fn home_address(&self, address: &str) -> String {
+        crate::hometag::address_on(self.ledger_home(), address).unwrap_or_else(|| address.to_string())
     }
 
     /// Our node id: the Ed25519 identity key in hex.

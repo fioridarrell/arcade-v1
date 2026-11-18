@@ -67,7 +67,8 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
     let tag = if restored { crate::claims::find_own_tag(node, true) } else { None };
     // Test coins for the first handle come by themselves: asked for now, so they are
     // usually here by the time a handle is picked (a restored wallet may have some).
-    if tag.is_none() {
+    // On ARCADE as the home chain (crate::claims::claim_home) the node faucet's ARCADE pays the claim instead.
+    if tag.is_none() && !crate::arcsvc::runs(crate::claims::claim_home(node)) {
         if let Ok((k, _)) = node.app.tag_key(p, 0) {
             let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
             if crate::claims::coins(node, &script).is_empty() {
@@ -75,6 +76,8 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
             }
         }
     }
+    // And this arcade's 1 ARCADE from the node faucet (crate::arcfaucet), asked now rather than at the next round.
+    crate::arcfaucet::node_gift_ask(node);
     Ok(json!({"phrase": if restored { Value::Null } else { json!(words) }, "restored": restored, "tag": tag}))
 }
 
@@ -136,20 +139,6 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "svc.pay" => crate::svcmesh::pay(node, req),
         "svc.paid" => crate::svcmesh::paid(node, req),
         "svc.attach" => Err("svc.attach is for the API socket only (it keeps the connection)".into()),
-        "llm.status" => Ok(crate::llmsvc::status(node)),
-        "llm.set" => crate::llmsvc::set(node, &req),
-        "llm.scan" => crate::llmsvc::scan(node, &req),
-        "llm.offers" => Ok(crate::llmsvc::list_offers(node)),
-        "llm.balance" => crate::llmsvc::balance(node, &req),
-        "llm.topup" => crate::llmsvc::topup(node, &req),
-        "llm.refund" => crate::llmsvc::ask_refund(node, &req),
-        "llm.chat" => crate::llmsvc::chat_cmd(node, &req),
-        "llm.speak" => crate::llmsvc::speak_cmd(node, &req),
-        "llm.auto" => crate::llmsvc::auto_set(node, &req),
-        "llm.keys" => crate::llmsvc::keys(node),
-        "llm.key_new" => crate::llmsvc::key_new(node, &req),
-        "llm.key_drop" => crate::llmsvc::key_drop(node, &req),
-        "llm.usage" => Ok(crate::llmsvc::usage(node, &req)),
         "mesh.dials" => Ok(crate::meshsvc::dials_status()),
         "mesh.name" => Ok(json!({"name": crate::meshsvc::public_name(node)})),
         "mesh.name_set" => crate::meshsvc::set_public_name(node, req["name"].as_str().ok_or("name required (\"\" clears it)")?),
@@ -488,7 +477,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         // The ledger on the ARCADE chain (§15 step 7).
         "ledger.announce" => crate::arcledger::announce(node),
         "ledger.profile" => crate::arcledger::profile(node, &req),
-        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?),
+        "ledger.repo_push" => crate::arcledger::repo_push(node, &s("name").ok_or("name required")?, &s("manifest").ok_or("manifest required")?, s("base").as_deref(), req["force"] == true),
         "ledger.repo_maintainer" => crate::arcledger::repo_maintainer(node, &s("name").ok_or("name required")?, &s("tag").ok_or("tag required")?, req["add"] != false),
         "ledger.repo_fork" => crate::arcledger::repo_fork(node, &s("from").ok_or("from required")?, &s("name").ok_or("name required")?),
         "ledger.item_open" => crate::arcledger::item_open(node, &req),
@@ -526,13 +515,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "faucet.arc" => {
             // A website signs a user in and names their ARCADE address; without one, this wallet's.
+            // (The user faucet: for a website's users only. An arcade's own wallet has the node faucet.)
             match s("address").filter(|a| !a.is_empty()) {
                 Some(a) => crate::arcfaucet::ask(node, &a),
-                None => {
-                    let ap = crate::arcsvc::defined().ok_or("this arcade doesn't know the ARCADE chain")?;
-                    let (k, _) = node.app.tag_key(ap, 0).map_err(|e| e.to_string())?;
-                    crate::arcfaucet::ask(node, &k.address)
-                }
+                None => Err("faucet.arc tops up a website user's ARCADE address: name it (address). This arcade's own wallet gets its ARCADE from the node faucet (faucet.arc_status)".into()),
             }
         }
         "faucet.arc_status" => Ok(crate::arcfaucet::status(node)),

@@ -273,8 +273,8 @@ fn take(rec: Record) -> bool {
 
 fn check_entry(s: &Settings, e: &CatalogEntry) -> bool {
     let least = (e.last - e.first + 1).checked_mul(arcade_arc::segment::ROW).and_then(|t| t.checked_add(s.segment_bytes));
-    s.net.listed.contains(&e.chain.as_str())
-        && arcade_arc::segment::FAMILIES.contains(&e.family)
+    s.net.is_listed_at(&e.chain, 0)
+        && arcade_arc::segment::family_at(&s.net, e.family, 0)
         && arcade_arc::segment::whole_ranges(e.first, e.last)
         && least.is_some_and(|l| e.bytes >= l)
         && block::verify(&e.poster, &e.message(&s.net), &e.sig)
@@ -485,9 +485,9 @@ fn take_part(node: &Arc<Node>) {
     let ph = current_phase(node);
     let mut guard = MINE.lock().unwrap();
     let mine = guard.get_or_insert_with(Mine::default);
-    // Seal what Earn ARCADE is on for, before the list closes (the same sealing as on the chain).
+    // Seal what Earn ARCADE is on for, before the list closes (the same sealing as on the chain; block 0's listed chains).
     if matches!(ph, Phase::Before | Phase::Open) {
-        crate::arcseg::auto_seal(node, &net, &Catalog::new(net, s.segment_bytes));
+        crate::arcseg::auto_seal(node, &net, &Catalog::new(net, s.segment_bytes), 0);
     }
     let replicas: Vec<crate::arcseal::Replica> = crate::arcseal::replicas(node, &net).into_iter().filter(|r| crate::arcseg::earn_on(node, &r.chain)).collect();
     match ph {

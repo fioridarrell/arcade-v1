@@ -29,8 +29,9 @@ pub const FAMILY_BLOCKS: u8 = 0;
 /// (arcade_chaindb::journal) in place of its block.
 pub const FAMILY_ORD: u8 = 1;
 /// The families (2 to 8: the other indexes in the same layout, arcade_chaindb::journal: ledger,
-/// profiles, messages, names, tokens, maps, tags) the catalog lists.
-pub const FAMILIES: &[u8] = &[FAMILY_BLOCKS, FAMILY_ORD, 2, 3, 4, 5, 6, 7, 8, FAMILY_COINS, FAMILY_BLOBS];
+/// profiles, messages, names, tokens, maps, tags; 12 dogefeed from rules version 4) the catalog
+/// lists. Which of them it takes at a height: [`family_at`].
+pub const FAMILIES: &[u8] = &[FAMILY_BLOCKS, FAMILY_ORD, 2, 3, 4, 5, 6, 7, 8, FAMILY_COINS, FAMILY_BLOBS, FAMILY_DOGEFEED];
 /// The coins each block spends (Martin 2026-11-12): with the blocks, everything the coin tables and the address index
 /// are rebuilt from. Per height: u32 count, then per input of every transaction but the coinbase, in block order: the
 /// coin's txid (32), vout (u32), value (u64), the height it was made at (u32), 1 if a coinbase made it else 0, its
@@ -40,6 +41,19 @@ pub const FAMILY_COINS: u8 = 9;
 /// count, then each as a varint length and its bytes (a block that brought none: the count 0). Sealed, audited and paid
 /// as any family, so the arcades that keep the blobs are paid for keeping them.
 pub const FAMILY_BLOBS: u8 = 10;
+/// The collections index's journals: kept for it, not listed (no chain-agreed journal yet: the collections are read
+/// by a background pass, not in the block's commit, from transaction bodies an arcade may not hold).
+pub const FAMILY_COLLECTIONS: u8 = 11;
+/// The dogefeed (D://) index's journals (arcade_chaindb::journal::DOGEFEED), in the same layout as ord's: listed from
+/// rules version 4 (ARCADE issue #6, testnet only so far).
+pub const FAMILY_DOGEFEED: u8 = 12;
+
+/// Whether the catalog takes entries of `family` in the ARCADE block at `height`: one of [`FAMILIES`], and dogefeed
+/// only from rules version 4 ([`params::rules_v4`]); before that it is refused as an unknown family is.
+pub fn family_at(net: &params::Net, family: u8, height: u64) -> bool {
+    FAMILIES.contains(&family) && (family != FAMILY_DOGEFEED || params::rules_v4(net, height))
+}
+
 /// Bytes of one table row.
 pub const ROW: u64 = 8;
 

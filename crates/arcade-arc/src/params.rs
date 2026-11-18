@@ -32,7 +32,8 @@ pub const AUDIT_SAMPLE: usize = 4;
 pub const REGISTRATION_LEAVES: usize = 16;
 /// Audits in a row a replica may fail before it is removed.
 pub const MAX_MISSED_AUDITS: u32 = 3;
-/// Blocks after a first passed audit before a replica counts for the writer draw.
+/// Blocks after a first passed audit before a replica counts for the writer draw (below rules version 4; see
+/// [`draw_weight_wait`]).
 pub const DRAW_WEIGHT_WAIT: u64 = 200;
 /// An arcade never leaves its chain for one that splits off further back than this.
 pub const REORG_LIMIT: u64 = 100;
@@ -96,8 +97,11 @@ pub struct Net {
     pub tag: &'static [u8],
     /// Block 0's time (seconds since 1970, UTC). `None` until the testnet's date is set.
     pub genesis_time: Option<u64>,
-    /// The listed chains (§2.3), by V1.0's keys: only their segments can be in the catalog.
+    /// The listed chains (§2.3), by V1.0's keys: only their segments can be in the catalog. Consensus reads them at a
+    /// height, through [`Net::listed_at`].
     pub listed: &'static [&'static str],
+    /// The chains listed from rules version 4 on ([`rules_v4`], ARCADE issue #6), on top of `listed`.
+    pub listed_v4: &'static [&'static str],
     /// Target seconds between blocks, as the difficulty follows the clock: [`BLOCK_SECONDS`]. Only a local
     /// test chain (`--arc-local` settings, `block_seconds`) sets less, so its tests see many epochs and audit
     /// periods in minutes.
@@ -118,7 +122,22 @@ pub const BLOB_WINDOW: u64 = 30 * 24 * 3600;
 
 /// The newest rules version this arcade knows. Version 2 (time keepers, §6.2): a block's proof of time may come in
 /// up to [`MAX_POT_RUNS`] runs one after another. Version 3 (blobs, §15 step 1): blob records and a block's blob section.
-pub const RULES_KNOWN: u32 = 3;
+/// Version 4 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20): see [`rules_v4`].
+pub const RULES_KNOWN: u32 = 4;
+
+/// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
+/// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the
+/// dogefeed journal family paid (#6; collections stays unpaid: its index isn't built the same on every arcade); a repository push names the manifest it was based on (#10); draw weight from a
+/// replica's first passed audit (#11); index catalog entries confirmed by a tenth of the draw weight (#14); the draw
+/// seed's proof of time in up to [`MAX_POT_RUNS`] runs (#20).
+pub fn rules_v4(net: &Net, height: u64) -> bool {
+    net.rules_at(height) >= 4
+}
+
+/// The first height where [`rules_v4`] holds, if any (a network's rules versions rise with height).
+pub fn rules_v4_from(net: &Net) -> Option<u64> {
+    net.rules.iter().find(|(v, _)| *v >= 4).map(|(_, h)| *h)
+}
 
 /// The most runs a block's proof of time may come in from rules version 2 (a time keeper serving the 8 lowest
 /// candidates of a height; the 8th candidate's proof is 8 runs).
@@ -146,6 +165,30 @@ pub fn pot_runs(net: &Net, height: u64) -> usize {
     }
 }
 
+/// The most runs the proof of time behind the draw seed of the epoch the block at `height` starts may come in: up to
+/// [`MAX_POT_RUNS`] from rules version 4 (#20: made in saved pieces, so a restart carries on instead of starting
+/// over), one run before.
+pub fn seed_runs(net: &Net, height: u64) -> usize {
+    if rules_v4(net, height) {
+        MAX_POT_RUNS
+    } else {
+        1
+    }
+}
+
+/// Blocks after its first passed audit, in the block at `height`, before a replica counts for the writer draw: none
+/// from rules version 4 (#11, testnet only: it counts from the next block), [`DRAW_WEIGHT_WAIT`] before. Mainnet's
+/// schedule has no version 4, so mainnet keeps the 200-block wait and with it §6.3's guarantee (REORG_LIMIT <
+/// DRAW_WEIGHT_WAIT: nothing registered on a secret branch counts for the draw before the branch is too old to take).
+/// The testnet gives that guarantee up on purpose (Martin 2026-11-16).
+pub fn draw_weight_wait(net: &Net, height: u64) -> u64 {
+    if rules_v4(net, height) {
+        0
+    } else {
+        DRAW_WEIGHT_WAIT
+    }
+}
+
 /// The ARCADE mesh protocol this arcade speaks, and the oldest it takes ARCADE frames from (§14.21).
 pub const PROTOCOL: u32 = 1;
 pub const MIN_PROTOCOL: u32 = 1;
@@ -154,6 +197,18 @@ impl Net {
     /// The rules version a block at `height` carries.
     pub fn rules_at(&self, height: u64) -> u32 {
         self.rules.iter().rev().find(|(_, from)| *from <= height).map_or(1, |(v, _)| *v)
+    }
+
+    /// The listed chains (§2.3) for the block at `height`: `listed`, and `listed_v4` where [`rules_v4`] holds. A catalog
+    /// entry is judged at its block's height; views ask for the next block's.
+    pub fn listed_at(&self, height: u64) -> impl Iterator<Item = &'static str> + '_ {
+        let more: &'static [&'static str] = if rules_v4(self, height) { self.listed_v4 } else { &[] };
+        self.listed.iter().chain(more).copied()
+    }
+
+    /// Whether `chain` (V1.0's key) is listed for the block at `height`.
+    pub fn is_listed_at(&self, chain: &str, height: u64) -> bool {
+        self.listed_at(height).any(|c| c == chain)
     }
 }
 
@@ -167,6 +222,9 @@ pub const MAINNET: Net = Net {
     // 2027-01-01 00:00:00 UTC.
     genesis_time: Some(1_798_761_600),
     listed: &["arc", "pep", "peptest", "doge", "dgb", "flop", "wjk", "kot", "ltc", "btc"],
+    // Mainnet's list is unchanged by rules version 4 (#6 lists Shibacoin, Bellscoin, Luckycoin and Junkcoin on the
+    // testnet only, and mainnet has no version 4 height).
+    listed_v4: &[],
     block_seconds: BLOCK_SECONDS,
     rules: &[(2, 0)],
     audit_period: AUDIT_PERIOD_BLOCKS,
@@ -183,10 +241,13 @@ pub const TESTNET: Net = Net {
     genesis_time: None,
     // The main network's, and the other test chains: small, so cheap to try things on.
     listed: &["arctest", "pep", "peptest", "doge", "dgb", "dgbtest", "flop", "wjk", "kot", "ltc", "ltctest", "btc"],
+    // Rules version 4 (#6): Shibacoin, Bellscoin, Luckycoin and Junkcoin, from its height.
+    listed_v4: &["shic", "bel", "lky", "jkc"],
     block_seconds: BLOCK_SECONDS,
     // Restarted 2026-11-15 (Martin: "restart + carry ledger"): version 3 (blobs, the tenth with its challenge window, on
     // top of version 2's time keepers and writer's share) from block 0. The chain before ran 1 from 0 and 2 from 1,065.
-    rules: &[(3, 0)],
+    // Version 4 from block 1,000 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20; released in v0.1.106).
+    rules: &[(3, 0), (4, 1_000)],
     audit_period: AUDIT_PERIOD_BLOCKS,
     blob_window: BLOB_WINDOW,
 };
@@ -204,8 +265,12 @@ mod tests {
     fn the_numbers_fit_together() {
         assert_eq!(BLOCK_REWARD * EPOCH_BLOCKS, 5_000 * COIN);
         assert_eq!(AUDIT_PERIOD_BLOCKS * BLOCK_SECONDS, 2 * 86_400);
-        // Nothing registered on a secret branch can count before the branch is too old (§6.3).
+        // Nothing registered on a secret branch can count before the branch is too old (§6.3). Mainnet has no rules
+        // version 4, so this holds there at every height; the testnet drops the wait from version 4 (#11).
         assert!(REORG_LIMIT < DRAW_WEIGHT_WAIT);
+        assert!((0..1_000_000).step_by(997).all(|h| REORG_LIMIT < draw_weight_wait(&MAINNET, h)));
+        let v4 = Net { rules: &[(3, 0), (4, 500)], ..TESTNET };
+        assert_eq!((draw_weight_wait(&v4, 499), draw_weight_wait(&v4, 500)), (DRAW_WEIGHT_WAIT, 0));
         // The draw seed's proof of time ends before the epoch it is for begins (§6.1).
         assert!(DRAW_SEED_BLOCKS + DRAW_SEED_TIME_BLOCKS < EPOCH_BLOCKS);
         assert_eq!(epoch_start(0), 0);
@@ -217,11 +282,35 @@ mod tests {
     fn a_block_carries_the_rules_version_of_its_height() {
         let net = Net { rules: &[(1, 0), (2, 5_000), (3, 9_000)], ..TESTNET };
         assert_eq!((net.rules_at(0), net.rules_at(4_999), net.rules_at(5_000), net.rules_at(10_000)), (1, 1, 2, 3));
+        assert_eq!(rules_v4_from(&net), None);
+        let v4 = Net { rules: &[(3, 0), (4, 700)], ..TESTNET };
+        assert_eq!(rules_v4_from(&v4), Some(700));
+        assert!(!rules_v4(&v4, 699) && rules_v4(&v4, 700) && rules_v4(&v4, 10_000));
         // Every version scheduled on the real networks is one this arcade knows.
         for n in [MAINNET, TESTNET] {
             assert!(n.rules.iter().all(|(v, _)| *v <= RULES_KNOWN));
             assert!(n.rules.windows(2).all(|w| w[0].0 < w[1].0 && w[0].1 < w[1].1));
         }
+    }
+
+    #[test]
+    fn shibacoin_bellscoin_luckycoin_and_junkcoin_are_listed_from_rules_version_4_on_the_testnet() {
+        let four = ["shic", "bel", "lky", "jkc"];
+        let v4 = Net { rules: &[(3, 0), (4, 700)], ..TESTNET };
+        for c in four {
+            assert!(!v4.is_listed_at(c, 0) && !v4.is_listed_at(c, 699), "{c} below the v4 height");
+            assert!(v4.is_listed_at(c, 700) && v4.is_listed_at(c, 10_000), "{c} from the v4 height");
+        }
+        assert_eq!(v4.listed_at(699).collect::<Vec<_>>(), TESTNET.listed);
+        assert_eq!(v4.listed_at(700).count(), TESTNET.listed.len() + 4);
+        // The chains listed before stay listed at every height.
+        assert!(TESTNET.listed.iter().all(|c| v4.is_listed_at(c, 0) && v4.is_listed_at(c, 700)));
+        // Mainnet's list doesn't change, even at a version 4 height.
+        let main4 = Net { rules: &[(2, 0), (4, 700)], ..MAINNET };
+        for c in four {
+            assert!(!MAINNET.is_listed_at(c, u64::MAX) && !main4.is_listed_at(c, 700) && !main4.is_listed_at(c, u64::MAX));
+        }
+        assert_eq!(main4.listed_at(700).collect::<Vec<_>>(), MAINNET.listed);
     }
 
     #[test]

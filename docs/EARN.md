@@ -118,7 +118,9 @@ Two weights, kept apart on purpose:
   audit, from the block holding its registration proof. The pot is shared by this.
 - **Draw weight** (`draw_weight`): what writes blocks, offers and attests catalog entries, and makes serving checks.
   A replica counts **200 blocks after its first passed audit** (`DRAW_WEIGHT_WAIT`, longer than the 100-block reorg
-  limit, so weight registered on a secret branch can't write there). Genesis bytes count from block 0.
+  limit, so weight registered on a secret branch can't write there). Genesis bytes count from block 0. **Rules version
+  4 (testnet only):** no wait: a replica counts from the block after its first passed audit (one still waiting when
+  version 4 begins counts from then); `draw_weight_wait` in `arc.earn` shows 0. Mainnet keeps the 200 blocks.
 - A key whose **reveal demand or transaction challenge is answered** (it challenged good data) has **no draw weight
   for one audit period** (`silenced_until`). Its pay weight is untouched. A key proved to have **signed two blocks on
   one parent** loses everything: replicas removed, accrued pay to the pot, no weight ever again.
@@ -130,16 +132,18 @@ then it can't post or attest catalog entries: it depends on arcades with draw we
 
 ### Chains
 
-Only the network's **listed** chains (`params.rs`, `listed`; adding one is a rules version):
+Only the network's **listed** chains (`params.rs`, `Net::listed_at`: `listed`, plus `listed_v4` from the rules version 4
+height; adding one is a rules version):
 
 | Network | Listed |
 |---|---|
-| Testnet (`arctest`) | arctest, pep, peptest, doge, dgb, dgbtest, flop, wjk, kot, ltc, ltctest, btc |
+| Testnet (`arctest`) | arctest, pep, peptest, doge, dgb, dgbtest, flop, wjk, kot, ltc, ltctest, btc; **from rules version 4** also shic, bel, lky, jkc |
 | Mainnet (`arc`) | arc, pep, peptest, doge, dgb, flop, wjk, kot, ltc, btc |
 
-Coins & Chains also offers Shibacoin (shic), Bellscoin (bel), Luckycoin (lky) and Junkcoin (jkc): they are **not paid on
-either network** today, and their Earn ARCADE line says so instead of a switch that reads on (issue #6). The ARCADE
-chain itself is always sealed while it runs here; it has no switch.
+Shibacoin (shic), Bellscoin (bel), Luckycoin (lky) and Junkcoin (jkc) are paid on the **testnet from the rules version 4
+height** (issue #6): before it their Earn ARCADE line says "not paid on this network" instead of a switch that reads on,
+and at it the line flips (it reads the next block's height), segments of them are offered, sealed and can earn. On
+mainnet they are not paid. The ARCADE chain itself is always sealed while it runs here; it has no switch.
 
 ### Families
 
@@ -151,9 +155,18 @@ A coin kept in full is cut into these families (`arcseg::families`):
 | coins (what each block spends) | 9 | always, made from the blocks |
 | ord, ledger, profiles, messages, names, tokens, maps, tags | 1 to 8 | only when the index's journals run here **from the index's start**: an index taken in as a copy isn't sealed or offered until it is rebuilt |
 | blobs | 10 | the ARCADE chain only |
+| dogefeed (D://, Dogecoin only) | 12 | **rules version 4 (testnet) only**, from its activation height; journals from the index's start, as above |
 
-Indexes with **no journal family** are never sealed and never paid: **addresses, collections, dogefeed** (runes and
-dunes when they come). `arc.earn` lists them under `unpaid_indexes`.
+Indexes with **no journal family** are never sealed and never paid: **addresses, collections** (runes and dunes when
+they come). `arc.earn` lists them under `unpaid_indexes`, and dogefeed too where version 4 doesn't apply (mainnet, or
+the testnet below the version 4 height).
+
+**Rules version 4 (testnet):** the dogefeed index journals each block as family 12 and is sealed, listed and paid like
+the other index families. Its journals run from the index's start only when it was built here from block 6,300,000
+with this release or later: an arcade that already had the index (it has no journals for the heights before) must
+remove and rebuild it to earn from it. Collections keeps number 11 but stays unpaid: it is read by a background pass
+outside the block's commit, from transaction bodies an arcade may not hold, so no two arcades are sure to have the
+same journal.
 
 ### Listing
 
@@ -162,7 +175,9 @@ A segment is offered by an arcade with draw weight that keeps the chain (and the
 - **blocks and coins**: by more than **a tenth** of the draw weight (rules version 3). Such a segment is in a
   **challenge window** of 100 blocks (`CHALLENGE_WINDOW`): listed, but no replica of it registers until the window
   is over.
-- **every index family**: by more than **half** of the draw weight.
+- **every index family**: by more than **half** of the draw weight. **Rules version 4 (testnet only):** by more than
+  a tenth too, with the same challenge window, so one of the two genesis writers lists an index segment alone.
+  Mainnet keeps half.
 
 On the testnet today the draw weight is the two genesis writers' (the GX10 and the JB20B), so only the chains and
 families they keep can be listed, and an index family needs both of them. A sealed segment that isn't listed shows

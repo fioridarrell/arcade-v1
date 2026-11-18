@@ -375,6 +375,18 @@ pub fn seed_task(net: &Net, from: &Entry, branch: &impl Branch) -> (Hash, u64) {
     (time::draw_seed_challenge(net, &from.draw_seed, &draws), steps.max(1))
 }
 
+/// Whether `proof` shows the `steps` steps from `challenge` behind the draw seed of the epoch the block at `height`
+/// starts (§6.1): one run before rules version 4; from version 4 (#20) up to [`params::MAX_POT_RUNS`] runs one after
+/// another, as a block's own proof of time (§6.2), so it can be made in saved pieces. The squaring is the same however
+/// it is cut, so the output (and the draw seed made from it) is the one a single run gives.
+fn seed_proof_holds(net: &Net, proofs: &impl TimeProofs, challenge: &Hash, steps: u64, proof: &TimeProof, height: u64) -> bool {
+    if params::rules_v4(net, height) {
+        proofs.verify_pot(challenge, steps, proof, params::seed_runs(net, height))
+    } else {
+        proofs.verify(challenge, steps, proof)
+    }
+}
+
 /// Step 2: a header against the blocks before it, the last of them `parent`. `weight_bound`
 /// is the most its writer could weigh; `named` the block this arcade's release names for the
 /// height, when it names one.
@@ -410,7 +422,7 @@ pub fn check_header(net: &Net, proofs: &impl TimeProofs, parent: &Entry, branch:
     let draw_seed = if height % params::EPOCH_BLOCKS == 0 {
         let proof = header.draw_seed.as_ref().ok_or(ChainError::DrawSeed)?;
         let (challenge, steps) = seed_task(net, parent, branch);
-        if !proofs.verify(&challenge, steps, proof) {
+        if !seed_proof_holds(net, proofs, &challenge, steps, proof, height) {
             return Err(ChainError::DrawSeed);
         }
         time::draw_seed(net, &proof.output)
@@ -832,7 +844,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         let seed = if height % params::EPOCH_BLOCKS == 0 {
             let proof = draw_seed?;
             let (challenge, steps) = seed_task(&self.net, parent, &self.branch(parent));
-            if !self.proofs.verify(&challenge, steps, proof) {
+            if !seed_proof_holds(&self.net, &self.proofs, &challenge, steps, proof, height) {
                 return None;
             }
             time::draw_seed(&self.net, &proof.output)
@@ -873,7 +885,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         let seed = if height % params::EPOCH_BLOCKS == 0 {
             let proof = draw_seed?;
             let (challenge, steps) = seed_task(&self.net, parent, &self.branch(parent));
-            if !self.proofs.verify(&challenge, steps, proof) {
+            if !seed_proof_holds(&self.net, &self.proofs, &challenge, steps, proof, height) {
                 return None;
             }
             time::draw_seed(&self.net, &proof.output)
@@ -1297,6 +1309,94 @@ pub(crate) mod tests {
         extra.header.draw_seed = Some(short);
         let who = ranked(&c)[0];
         assert!(c.accept(resigned(extra, who), LATE).is_err());
+    }
+
+    /// A test stand-in for a proof of time made in several runs (the [`StandIn`] takes single runs only): its proof
+    /// bytes are the earlier runs' steps, 8 bytes each, and its output the stand-in's single-run output, as the real
+    /// one's output is the same however it is cut. Single runs are the [`StandIn`]'s own.
+    #[derive(Debug, Clone, Copy, Default)]
+    struct InRuns;
+
+    impl InRuns {
+        fn prove(challenge: &Hash, steps: u64, earlier: &[u64]) -> TimeProof {
+            TimeProof { output: StandIn.prove(challenge, steps).output, proof: earlier.iter().flat_map(|n| n.to_le_bytes()).collect() }
+        }
+    }
+
+    impl TimeProofs for InRuns {
+        fn verify(&self, challenge: &Hash, steps: u64, proof: &TimeProof) -> bool {
+            StandIn.verify(challenge, steps, proof)
+        }
+
+        fn verify_pot(&self, challenge: &Hash, steps: u64, proof: &TimeProof, most: usize) -> bool {
+            if proof.proof.is_empty() {
+                return self.verify(challenge, steps, proof);
+            }
+            if proof.proof.len() % 8 != 0 || proof.proof.len() / 8 + 1 > most.max(1) {
+                return false;
+            }
+            let used = proof.proof.chunks_exact(8).map(|c| u64::from_le_bytes(c.try_into().unwrap())).try_fold(0u64, |a, n| if n > 0 { a.checked_add(n) } else { None });
+            used.is_some_and(|u| u < steps) && proof.output == StandIn.prove(challenge, steps).output
+        }
+
+        fn takes_time(&self) -> bool {
+            false
+        }
+    }
+
+    /// From rules version 4 (#20) the proof behind an epoch's draw seed may come in up to 8 runs, as a block's own: the
+    /// epoch's first block, a draw on it and a time keeper's check of another's draw all take it. Below, one run only.
+    #[test]
+    fn from_rules_4_a_draw_seed_proof_may_come_in_runs() {
+        // Rules version 4 from block 100 (the second epoch's first block), or from the block after it.
+        const AT: Net = Net { rules: &[(1, 0), (2, 1), (3, 2), (4, 100)], ..TESTNET };
+        const AFTER: Net = Net { rules: &[(1, 0), (2, 1), (3, 2), (4, 101)], ..TESTNET };
+        for (net, v4) in [(AT, true), (AFTER, false)] {
+            let list: Vec<_> = HOLDERS.iter().map(|&who| (vrf::public_key(&secret(who)), who as u64 * GIB, address(who))).collect();
+            let mut c: TestChain = Chain::new(net, &genesis(), StandIn, FixedHolders::new(&net, &list).unwrap(), &[]);
+            let blocks = grow_to(&mut c, 99);
+            let mut p = Chain::new(net, &genesis(), InRuns, FixedHolders::new(&net, &list).unwrap(), &[]);
+            for b in blocks {
+                assert!(matches!(p.accept(b, LATE), Ok(Accepted::Tip { .. })));
+            }
+            assert_eq!(params::rules_v4(&net, 100), v4);
+            let (challenge, steps) = p.draw_seed_task(&p.tip().id).unwrap();
+            assert!(steps > params::MAX_POT_RUNS as u64);
+            let whole = StandIn.prove(&challenge, steps);
+            let cut = InRuns::prove(&challenge, steps, &[1, steps / 2]);
+            let nine = InRuns::prove(&challenge, steps, &[1; params::MAX_POT_RUNS]);
+            assert!(p.proofs().verify_pot(&challenge, steps, &cut, params::MAX_POT_RUNS) && !p.proofs().verify(&challenge, steps, &cut));
+            // The draw seed comes from the output alone: the same however the proof is cut.
+            assert_eq!(time::draw_seed(&net, &cut.output), time::draw_seed(&net, &whole.output));
+
+            let who = ranked(&c)[0];
+            let key = vrf::public_key(&secret(who));
+            let ticket = p.ticket(&secret(who), Some(&whole)).unwrap();
+            assert_eq!(p.ticket(&secret(who), Some(&cut)), v4.then(|| ticket.clone()));
+            assert_eq!(p.ticket(&secret(who), Some(&nine)), None);
+            let weight = p.storage().weight(&key);
+            let drawn = p.candidate(&key, weight, &ticket.vrf_proof, Some(&whole));
+            assert!(drawn.is_some());
+            assert_eq!(p.candidate(&key, weight, &ticket.vrf_proof, Some(&cut)), if v4 { drawn } else { None });
+            assert_eq!(p.candidate(&key, weight, &ticket.vrf_proof, Some(&nine)), None);
+
+            // The epoch's first block with the proof in runs: the same draw, so only the proof changes.
+            let good = block_by(&c, who, next_time(&c), &[], Vec::new());
+            let with = |proof: &TimeProof| {
+                let mut b = good.clone();
+                b.header.draw_seed = Some(proof.clone());
+                b.header.sign(&net, &SigningKey::from_bytes(&secret(who)));
+                b
+            };
+            assert_eq!(p.accept(with(&nine), LATE), Err(ChainError::DrawSeed));
+            if v4 {
+                assert!(matches!(p.accept(with(&cut), LATE), Ok(Accepted::Tip { .. })));
+                assert_eq!(p.tip().draw_seed, time::draw_seed(&net, &whole.output));
+            } else {
+                assert_eq!(p.accept(with(&cut), LATE), Err(ChainError::DrawSeed));
+                assert!(matches!(p.accept(good, LATE), Ok(Accepted::Tip { .. })));
+            }
+        }
     }
 
     #[test]

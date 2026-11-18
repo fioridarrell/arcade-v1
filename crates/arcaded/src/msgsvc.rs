@@ -160,23 +160,26 @@ fn take(node: &Node, me: &[u8; 32], o: &env::Opened, group: Option<String>, cand
 fn rescan_group(node: &Node, gid: &str) -> Result<(), String> {
     let Some((secret, _)) = crate::grpsvc::secrets(node).into_iter().find(|(_, id)| id == gid) else { return Ok(()) };
     let me = keys(node)?.public_bytes();
-    let c = node.ledger_home().chain_no;
-    let mut cursor = None;
-    loop {
-        let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
-        if batch.is_empty() {
-            return Ok(());
-        }
-        for (h, p, cand) in &batch {
-            if cand["kind"] == env::SINGLE as u64 {
-                let payload = hex::decode(cand["payload"].as_str().unwrap_or("")).unwrap_or_default();
-                if let Ok(o) = env::open_single(&secret, &payload) {
-                    take(node, &me, &o, Some(gid.to_string()), cand, *h, block_time(node, *h))?;
-                }
+    for chain in node.ledger_chains() {
+        let c = chain.chain_no;
+        let mut cursor = None;
+        loop {
+            let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
+            if batch.is_empty() {
+                break;
             }
-            cursor = Some((*h, *p));
+            for (h, p, cand) in &batch {
+                if cand["kind"] == env::SINGLE as u64 {
+                    let payload = hex::decode(cand["payload"].as_str().unwrap_or("")).unwrap_or_default();
+                    if let Ok(o) = env::open_single(&secret, &payload) {
+                        take(node, &me, &o, Some(gid.to_string()), cand, *h, block_time_on(node, c, *h))?;
+                    }
+                }
+                cursor = Some((*h, *p));
+            }
         }
     }
+    Ok(())
 }
 
 /// Rewrite a kept message row (read marks).
@@ -191,75 +194,78 @@ pub fn scan(node: &Node) -> Result<usize, String> {
     }
     let k = keys(node)?;
     let me = k.public_bytes();
-    let c = node.ledger_home().chain_no;
-    let ck = cursor_key(&k.fingerprint());
-    let mut cursor: Option<(u32, u32)> = node
-        .app
-        .store
-        .read(|r| r.get(arcade_app::META, &ck))
-        .ok()
-        .flatten()
-        .filter(|v| v.len() == 8)
-        .map(|v| (u32::from_be_bytes(v[..4].try_into().unwrap()), u32::from_be_bytes(v[4..].try_into().unwrap())));
     let mut opened = 0;
     let groups = crate::grpsvc::secrets(node);
-    loop {
-        let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
-        if batch.is_empty() {
-            break;
-        }
-        for (h, p, cand) in &batch {
-            let payload = hex::decode(cand["payload"].as_str().unwrap_or("")).unwrap_or_default();
-            let at = block_time(node, *h);
-            match cand["kind"].as_u64().unwrap_or(0) as u8 {
-                env::SINGLE | env::API => {
-                    if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_single(s, &payload)) {
-                        if take(node, &me, &o, g, cand, *h, at)? {
-                            opened += 1;
-                        }
-                    }
-                }
-                env::CHUNK => {
-                    if let Some((id, cd, piece)) = env::chunk_parts(&payload) {
-                        let from = cand["from"].as_str().unwrap_or("");
-                        let base = KeyBuf::new().bytes(from.as_bytes()).u8(0).bytes(&id).done();
-                        let mut pk = base.clone();
-                        pk.extend_from_slice(&cd.to_be_bytes());
-                        let rec = json!({"txid": cand["txid"], "piece": hex::encode(&piece)});
-                        node.app.store.write(|w| w.put(arcade_app::MAIL_PARTS, &pk, rec.to_string().as_bytes())).map_err(|e| e.to_string())?;
-                        let rows = node.app.store.read(|r| r.scan_prefix(arcade_app::MAIL_PARTS, &base)).map_err(|e| e.to_string())?;
-                        let cds: Vec<u16> = rows.iter().map(|(k, _)| u16::from_be_bytes([k[k.len() - 2], k[k.len() - 1]])).collect();
-                        if cds.len() == cds.iter().copied().max().unwrap_or(0) as usize + 1 {
-                            let vals: Vec<Value> = rows.iter().filter_map(|(_, v)| serde_json::from_slice(v).ok()).collect();
-                            let parts: Vec<(u16, Vec<u8>)> = cds.iter().zip(&vals).map(|(cd, v)| (*cd, hex::decode(v["piece"].as_str().unwrap_or("")).unwrap_or_default())).collect();
-                            if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_chunks(s, id, &mut parts.clone())) {
-                                // Known by the first chunk's txid (countdown highest).
-                                let mut order: Vec<(u16, String)> = cds.iter().zip(&vals).map(|(cd, v)| (*cd, v["txid"].as_str().unwrap_or("").to_string())).collect();
-                                order.sort_by(|a, b| b.0.cmp(&a.0));
-                                let mut first = cand.clone();
-                                first["txid"] = json!(order[0].1);
-                                first["txids"] = json!(order.iter().map(|x| x.1.clone()).collect::<Vec<_>>());
-                                if take(node, &me, &o, g, &first, *h, at)? {
-                                    opened += 1;
-                                }
-                            }
-                            node.app.store.write(|w| {
-                                for (k, _) in &rows {
-                                    w.del(arcade_app::MAIL_PARTS, k)?;
-                                }
-                                Ok(())
-                            }).map_err(|e| e.to_string())?;
-                        }
-                    }
-                }
-                _ => {}
+    // Every ledger chain: the old home's history and new messages from arcades not updated yet, then the home.
+    for chain in node.ledger_chains() {
+        let c = chain.chain_no;
+        let ck = if chain.chain_no == node.params.chain_no { cursor_key(&k.fingerprint()) } else { [cursor_key(&k.fingerprint()), format!(":{}", chain.key).into_bytes()].concat() };
+        let mut cursor: Option<(u32, u32)> = node
+            .app
+            .store
+            .read(|r| r.get(arcade_app::META, &ck))
+            .ok()
+            .flatten()
+            .filter(|v| v.len() == 8)
+            .map(|v| (u32::from_be_bytes(v[..4].try_into().unwrap()), u32::from_be_bytes(v[4..].try_into().unwrap())));
+        loop {
+            let batch = arcade_ledger::messages::candidates(&node.chain, c, cursor, 500).map_err(|e| e.to_string())?;
+            if batch.is_empty() {
+                break;
             }
-            cursor = Some((*h, *p));
+            for (h, p, cand) in &batch {
+                let payload = hex::decode(cand["payload"].as_str().unwrap_or("")).unwrap_or_default();
+                let at = block_time_on(node, c, *h);
+                match cand["kind"].as_u64().unwrap_or(0) as u8 {
+                    env::SINGLE | env::API => {
+                        if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_single(s, &payload)) {
+                            if take(node, &me, &o, g, cand, *h, at)? {
+                                opened += 1;
+                            }
+                        }
+                    }
+                    env::CHUNK => {
+                        if let Some((id, cd, piece)) = env::chunk_parts(&payload) {
+                            let from = cand["from"].as_str().unwrap_or("");
+                            let base = KeyBuf::new().bytes(from.as_bytes()).u8(0).bytes(&id).done();
+                            let mut pk = base.clone();
+                            pk.extend_from_slice(&cd.to_be_bytes());
+                            let rec = json!({"txid": cand["txid"], "piece": hex::encode(&piece)});
+                            node.app.store.write(|w| w.put(arcade_app::MAIL_PARTS, &pk, rec.to_string().as_bytes())).map_err(|e| e.to_string())?;
+                            let rows = node.app.store.read(|r| r.scan_prefix(arcade_app::MAIL_PARTS, &base)).map_err(|e| e.to_string())?;
+                            let cds: Vec<u16> = rows.iter().map(|(k, _)| u16::from_be_bytes([k[k.len() - 2], k[k.len() - 1]])).collect();
+                            if cds.len() == cds.iter().copied().max().unwrap_or(0) as usize + 1 {
+                                let vals: Vec<Value> = rows.iter().filter_map(|(_, v)| serde_json::from_slice(v).ok()).collect();
+                                let parts: Vec<(u16, Vec<u8>)> = cds.iter().zip(&vals).map(|(cd, v)| (*cd, hex::decode(v["piece"].as_str().unwrap_or("")).unwrap_or_default())).collect();
+                                if let Some((o, g)) = open_any(&k.secret, &groups, |s| env::open_chunks(s, id, &mut parts.clone())) {
+                                    // Known by the first chunk's txid (countdown highest).
+                                    let mut order: Vec<(u16, String)> = cds.iter().zip(&vals).map(|(cd, v)| (*cd, v["txid"].as_str().unwrap_or("").to_string())).collect();
+                                    order.sort_by(|a, b| b.0.cmp(&a.0));
+                                    let mut first = cand.clone();
+                                    first["txid"] = json!(order[0].1);
+                                    first["txids"] = json!(order.iter().map(|x| x.1.clone()).collect::<Vec<_>>());
+                                    if take(node, &me, &o, g, &first, *h, at)? {
+                                        opened += 1;
+                                    }
+                                }
+                                node.app.store.write(|w| {
+                                    for (k, _) in &rows {
+                                        w.del(arcade_app::MAIL_PARTS, k)?;
+                                    }
+                                    Ok(())
+                                }).map_err(|e| e.to_string())?;
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+                cursor = Some((*h, *p));
+            }
+            let (h, p) = cursor.unwrap();
+            let mut v = h.to_be_bytes().to_vec();
+            v.extend_from_slice(&p.to_be_bytes());
+            node.app.store.write(|w| w.put(arcade_app::META, &ck, &v)).map_err(|e| e.to_string())?;
         }
-        let (h, p) = cursor.unwrap();
-        let mut v = h.to_be_bytes().to_vec();
-        v.extend_from_slice(&p.to_be_bytes());
-        node.app.store.write(|w| w.put(arcade_app::META, &ck, &v)).map_err(|e| e.to_string())?;
     }
     // Waiting in the mempool: shown at once (single-transaction messages; chunks wait for blocks).
     for (tx, atx) in crate::claims::pending_arcade(node) {
@@ -280,8 +286,7 @@ pub fn scan(node: &Node) -> Result<usize, String> {
     Ok(opened)
 }
 
-fn block_time(node: &Node, h: u32) -> u64 {
-    let c = node.ledger_home().chain_no;
+fn block_time_on(node: &Node, c: u16, h: u32) -> u64 {
     node.chain.hash_at(c, h).ok().flatten().and_then(|hash| node.chain.header(c, &hash).ok().flatten()).map(|r| r.header.time as u64).unwrap_or_else(arcade_app::now)
 }
 
@@ -311,13 +316,19 @@ pub fn run(node: std::sync::Arc<Node>) {
 
 /// Published profiles on the home chain by messaging key (hex).
 fn profiles_by_key(node: &Node) -> BTreeMap<String, Value> {
-    let c = node.ledger_home().chain_no;
-    let pre = KeyBuf::new().u16(c).done();
     let mut out: BTreeMap<String, Value> = BTreeMap::new();
-    for (_, v) in node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::index::PROFILE, &pre)).unwrap_or_default() {
-        let Ok(v) = serde_json::from_slice::<Value>(&v) else { continue };
-        if let Some(k) = v["pubkey"].as_str() {
-            out.insert(k.to_string(), v);
+    // Oldest chain first, so the home chain's profile of a key wins; addresses shown in the home chain's form.
+    for chain in node.ledger_chains() {
+        let c = chain.chain_no;
+        let pre = KeyBuf::new().u16(c).done();
+        for (_, v) in node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::index::PROFILE, &pre)).unwrap_or_default() {
+            let Ok(mut v) = serde_json::from_slice::<Value>(&v) else { continue };
+            if let Some(a) = v["address"].as_str().map(|a| node.home_address(a)) {
+                v["address"] = json!(a);
+            }
+            if let Some(k) = v["pubkey"].as_str() {
+                out.insert(k.to_string(), v);
+            }
         }
     }
     out
@@ -348,10 +359,9 @@ pub fn mutes(node: &Node) -> BTreeMap<String, u64> {
 
 /// Who a messaging key is: contact name, published name, @tag, address.
 fn person(node: &Node, key: &str, fallback_address: &str, profiles: &BTreeMap<String, Value>, contacts: &BTreeMap<String, Value>) -> Value {
-    let c = node.ledger_home().chain_no;
     let prof = profiles.get(key);
     let address = prof.and_then(|p| p["address"].as_str()).filter(|_| prof.is_some_and(|p| p["stated"] == true)).unwrap_or(fallback_address).to_string();
-    let tag = if address.is_empty() { None } else { arcade_ledger::index::tag_of(&node.chain, c, &address).ok().flatten() };
+    let tag = if address.is_empty() { None } else { crate::hometag::of_address(node, &address) };
     let contact = contacts.get(key);
     let fp = hex::decode(key).ok().and_then(|b| <[u8; 32]>::try_from(b).ok()).map(|b| arcade_msg::keys::fingerprint(&b)).unwrap_or_default();
     json!({
@@ -363,7 +373,6 @@ fn person(node: &Node, key: &str, fallback_address: &str, profiles: &BTreeMap<St
 
 /// Who `name` is (@tag or address) and their published messaging key.
 pub fn who(node: &Node, name: &str) -> Result<Value, String> {
-    let c = node.ledger_home().chain_no;
     let n = name.trim();
     // "@name", or a bare name that isn't an address (people type handles without the @).
     let tag = n.strip_prefix('@').or_else(|| arcade_ledger::address::p2pkh_hash_of(node.ledger_home(), n).is_none().then_some(n));
@@ -372,8 +381,12 @@ pub fn who(node: &Node, name: &str) -> Result<Value, String> {
         Some(t) => crate::hometag::owner(node, t).and_then(|(_, a)| crate::hometag::address_on(node.ledger_home(), &a)).ok_or_else(|| format!("@{t} is not claimed"))?,
         None => n.to_string(),
     };
-    let prof = arcade_ledger::index::profile(&node.chain, c, &address).map_err(|e| e.to_string())?;
-    let Some(prof) = prof.filter(|p| p["stated"] == true || p["address"] == address.as_str()) else {
+    // The home chain's profile first, then the older chain's (a key announced there before the switch).
+    let prof = node.ledger_chains().into_iter().rev().find_map(|chain| {
+        let here = crate::hometag::address_on(chain, &address)?;
+        arcade_ledger::index::profile(&node.chain, chain.chain_no, &here).ok().flatten().filter(|p| p["stated"] == true || p["address"] == here.as_str())
+    });
+    let Some(prof) = prof else {
         return Err(format!("{n} has not published a messaging key yet, so messages can't be sealed to them"));
     };
     let key = prof["pubkey"].as_str().unwrap_or("").to_string();
@@ -544,7 +557,65 @@ fn coins_text(p: &arcade_chain::params::ChainParams, sats: u64) -> String {
     format!("{} {} coins", arcade_ledger::amount::trimmed8(sats), p.name)
 }
 
-pub fn send_payloads_with(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
+pub fn send_payloads_with(node: &Node, payloads: &[Vec<u8>], extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
+    let p = node.ledger_home();
+    if crate::arcsvc::runs(p) {
+        return send_payloads_arc(node, p, payloads, extra);
+    }
+    send_payloads_coin(node, payloads, extra)
+}
+
+/// The ARCADE chain as the ledger home (HOMECHAIN.md phase 3): each record a transaction into its own pool, spending
+/// confirmed coins and this wallet's change still waiting there; one OP_RETURN up to ARCADE_CLASS_C_MAX bytes.
+fn send_payloads_arc(node: &Node, p: &'static arcade_chain::params::ChainParams, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
+    let (_, _, sk) = sender_key(node)?;
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+    let coins_now = || {
+        let mut coins = crate::claims::arc_coins(node, p, &script);
+        coins.extend(crate::arcsvc::waiting_outputs(&script).into_iter().map(|(op, value)| arcade_wallet::tx::Utxo { outpoint: op, value, script: script.clone() }));
+        coins
+    };
+    let fee_per_kb = 2 * arcade_arc::params::MIN_FEE_PER_KB;
+    let build = |pl: &[u8], extra: Vec<arcade_wallet::tx::TxOutSpec>, coins: &[arcade_wallet::tx::Utxo]| {
+        arcade_wallet::tx::build_arcade_with(p, &arcade_wallet::tx::any_data(pl), extra, &sk, coins, fee_per_kb, arcade_arc::params::DUST,
+            arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
+            .map_err(|e| format!("could not build the message transaction: {e}"))
+    };
+    // The whole batch paid for before any of it goes (a group invite half sent is worse than none).
+    if payloads.len() > 1 {
+        let coins = coins_now();
+        let have: u64 = coins.iter().map(|c| c.value).sum();
+        let mut need = 0u64;
+        for pl in payloads {
+            let tx = build(pl, extra.clone(), &coins)?;
+            let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
+            let back: u64 = tx.outputs.iter().filter(|o| o.script_pubkey == script).map(|o| o.value).sum();
+            need += ins.saturating_sub(back);
+        }
+        if need > have {
+            return Err(format!("this needs about {} in {} transactions and the wallet has {}: nothing was sent", coins_text(p, need), payloads.len(), coins_text(p, have)));
+        }
+    }
+    let (mut txids, mut fees) = (Vec::new(), 0u64);
+    for pl in payloads {
+        let coins = coins_now();
+        let tx = build(pl, std::mem::take(&mut extra), &coins)?;
+        match crate::ownwait::send_arc(node, &tx) {
+            Ok((id, fee)) => {
+                fees += fee;
+                txids.push(id.to_hex());
+            }
+            Err(e) if txids.is_empty() => return Err(format!("the message transaction was refused ({e}); nothing was sent")),
+            Err(e) => return Err(format!("only {} of {} transactions went out; the rest was refused ({e})", txids.len(), payloads.len())),
+        }
+    }
+    WAKE.store(true, std::sync::atomic::Ordering::Relaxed);
+    Ok((txids, fees))
+}
+
+/// A coin chain as the ledger home (an arcade without the ARCADE chain).
+fn send_payloads_coin(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
     let p = node.ledger_home();
     let (_, _, sk) = sender_key(node)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
@@ -765,6 +836,9 @@ pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
         return Err("make or restore a wallet first".into());
     }
     let home = node.ledger_home();
+    if crate::arcsvc::runs(home) {
+        return Err("your profile is on the ARCADE chain (the home chain): publish it from People (Publish profile), which lists your addresses".into());
+    }
     let (address, tag, sk) = sender_key(node)?;
     let tag = tag.ok_or("claim an @tag first: the addresses go on your @tag's profile")?;
     // The explorer reads a profile where its @tag is held; one held only on ARCADE has its profile there (ledger.announce).

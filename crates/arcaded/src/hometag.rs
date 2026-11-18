@@ -37,7 +37,11 @@ pub fn owner(node: &Node, tag: &str) -> Option<(&'static ChainParams, String)> {
 /// The @tag held by the key of `address` (given in any chain's form): ARCADE first, then the ledger home.
 pub fn of_address(node: &Node, address: &str) -> Option<String> {
     let h = key_hash(address)?;
-    chains(node).into_iter().find_map(|p| tag_of(&node.chain, p.chain_no, &base58check(p.p2pkh_version, &h)).ok().flatten())
+    // On ARCADE a tag is filed under the chain's own form when claimed there, or under the old home's (Pepecoin
+    // testnet's) form when the ledger snapshot carried it over: both are asked.
+    chains(node).into_iter().find_map(|p| {
+        [p.p2pkh_version, node.params.p2pkh_version].into_iter().find_map(|v| tag_of(&node.chain, p.chain_no, &base58check(v, &h)).ok().flatten())
+    })
 }
 
 /// Does the key of `address` hold `tag` (by [`owner`])?

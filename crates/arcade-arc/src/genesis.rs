@@ -287,8 +287,8 @@ pub fn finalize(net: &Net, segment_bytes: u64, closed: &ClosedList, beacon_1: &H
 /// An entry's own checks (chain, family, whole ranges, a full segment, its poster's signature), as block 0's catalog makes them.
 fn check_entry_alone(net: &Net, segment_bytes: u64, e: &CatalogEntry) -> bool {
     let least = (e.last - e.first + 1).checked_mul(crate::segment::ROW).and_then(|t| t.checked_add(segment_bytes));
-    net.listed.contains(&e.chain.as_str())
-        && crate::segment::FAMILIES.contains(&e.family)
+    net.is_listed_at(&e.chain, 0)
+        && crate::segment::family_at(net, e.family, 0)
         && crate::segment::whole_ranges(e.first, e.last)
         && least.is_some_and(|l| e.bytes >= l)
         && block::verify(&e.poster, &e.message(net), &e.sig)

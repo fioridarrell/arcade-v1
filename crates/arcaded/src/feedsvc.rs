@@ -17,8 +17,43 @@ use arcade_msg::public::{Act, FeedAct, Post};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
-fn c(node: &Node) -> u16 {
-    node.ledger_home().chain_no
+/// Where the home chain's blocks start in the order key ([`ledger_rows`]): above any older chain's height.
+const HOME_BASE: u64 = 1 << 40;
+
+/// A row read from ledger chain `c` (history: an older chain than the home): addresses in the home chain's form (one
+/// key, one person, whichever chain it wrote on), its chain `c`, and its order key `o` (older chains' history first,
+/// then the home chain's blocks, then what is waiting).
+fn norm(node: &Node, mut v: Value, c: u16, history: bool) -> Value {
+    if let Some(a) = v["from"].as_str().map(|a| node.home_address(a)) {
+        v["from"] = json!(a);
+    }
+    if let Some(outs) = v["outs"].as_array() {
+        let outs: Vec<Value> = outs.iter().map(|o| json!([o[0].as_str().map(|a| node.home_address(a)), o[1]])).collect();
+        v["outs"] = json!(outs);
+    }
+    let h = v["h"].as_u64().unwrap_or(0);
+    v["c"] = json!(c);
+    v["o"] = json!(if h == 0 { u64::MAX } else if history { h } else { HOME_BASE + h });
+    v
+}
+
+/// A messages table's rows from every ledger chain (HOMECHAIN.md phase 3: the old home's posts and acts stay readable
+/// as history), oldest chain first, each [`norm`]ed.
+pub(crate) fn ledger_rows(node: &Node, table: &str) -> Vec<Value> {
+    let home = node.ledger_home().chain_no;
+    let mut out = Vec::new();
+    for p in node.ledger_chains() {
+        for v in m::rows(&node.chain, table, p.chain_no).unwrap_or_default() {
+            out.push(norm(node, v, p.chain_no, p.chain_no != home));
+        }
+    }
+    out
+}
+
+/// A post by txid on any ledger chain: (its chain, the row [`norm`]ed).
+fn find_post(node: &Node, txid: &str) -> Option<(u16, Value)> {
+    let home = node.ledger_home().chain_no;
+    node.ledger_chains().into_iter().rev().find_map(|p| m::post(&node.chain, p.chain_no, txid).map(|v| (p.chain_no, norm(node, v, p.chain_no, p.chain_no != home))))
 }
 
 /// Acts waiting in the mempool, and posts too (shown at once, read live each time).
@@ -36,7 +71,7 @@ fn pending(node: &Node) -> (Vec<Value>, Vec<Value>) {
         match a.get(5) {
             Some(&arcade_msg::envelope::GROUP) => {
                 if let Some(post) = Post::parse(a) {
-                    let mut v = json!({"txid": txid, "from": atx.sender, "channel": post.channel, "nick": post.nick, "text": post.text, "h": 0, "p": 0});
+                    let mut v = json!({"txid": txid, "from": node.home_address(&atx.sender), "channel": post.channel, "nick": post.nick, "text": post.text, "h": 0, "p": 0, "o": u64::MAX});
                     if let Some(f) = &post.file {
                         v["file"] = json!({"name": f.name, "type": f.mime, "size": f.bytes.len()});
                     }
@@ -45,8 +80,8 @@ fn pending(node: &Node) -> (Vec<Value>, Vec<Value>) {
             }
             Some(&arcade_msg::envelope::FEED_ACT) => {
                 if let Some(act) = FeedAct::parse(a) {
-                    let outs: Vec<Value> = tx.outputs.iter().filter_map(|o| arcade_ledger::address::address_of(&o.script_pubkey, p).filter(|ad| *ad != atx.sender).map(|ad| json!([ad, o.value]))).collect();
-                    acts.push(json!({"txid": txid, "from": atx.sender, "kind": act.act as u8, "target": act.target, "text": act.text, "outs": outs, "h": 0}));
+                    let outs: Vec<Value> = tx.outputs.iter().filter_map(|o| arcade_ledger::address::address_of(&o.script_pubkey, p).filter(|ad| *ad != atx.sender).map(|ad| json!([node.home_address(&ad), o.value]))).collect();
+                    acts.push(json!({"txid": txid, "from": node.home_address(&atx.sender), "kind": act.act as u8, "target": act.target, "text": act.text, "outs": outs, "h": 0, "o": u64::MAX}));
                 }
             }
             _ => {}
@@ -60,8 +95,9 @@ fn author(node: &Node, address: &str, cache: &mut BTreeMap<String, Value>) -> Va
     if let Some(v) = cache.get(address) {
         return v.clone();
     }
-    let tag = arcade_ledger::index::tag_of(&node.chain, c(node), address).ok().flatten();
-    let prof = arcade_ledger::index::profile(&node.chain, c(node), address).ok().flatten();
+    let tag = crate::hometag::of_address(node, address);
+    // The home chain's profile first, then an older chain's.
+    let prof = node.ledger_chains().into_iter().rev().find_map(|p| arcade_ledger::index::profile(&node.chain, p.chain_no, &crate::hometag::address_on(p, address)?).ok().flatten());
     let v = json!({"address": address, "tag": tag, "name": prof.as_ref().map(|p| p["name"].clone()), "pfp": prof.as_ref().map(|p| p["pfp"].clone()), "key": prof.as_ref().map(|p| p["pubkey"].clone())});
     cache.insert(address.to_string(), v.clone());
     v
@@ -83,7 +119,7 @@ struct Resolved {
 fn resolve(post_txid: &str, post_author: &str, acts: &[Value], me: &str) -> Resolved {
     let on: Vec<&Value> = acts.iter().filter(|a| a["target"] == post_txid).collect();
     let k = |a: &Value| a["kind"].as_u64().unwrap_or(0) as u8;
-    let order = |a: &Value| (a["h"].as_u64().map(|h| if h == 0 { u64::MAX } else { h }).unwrap_or(u64::MAX), a["txid"].as_str().unwrap_or("").to_string());
+    let order = |a: &Value| (a["o"].as_u64().or_else(|| a["h"].as_u64().filter(|h| *h > 0)).unwrap_or(u64::MAX), a["txid"].as_str().unwrap_or("").to_string());
     let latest = |kind: u8| on.iter().filter(|a| k(a) == kind && a["from"] == post_author).max_by_key(|a| order(a)).copied();
     let hidden = latest(Act::Delete as u8).is_some();
     let text = latest(Act::Edit as u8).and_then(|a| a["text"].as_str().map(String::from));
@@ -140,16 +176,16 @@ pub struct View {
 
 /// The feed: posts (with their replies threaded under them), resolved and ordered.
 pub fn feed(node: &Node, v: &View) -> Result<Value, String> {
-    let cc = c(node);
-    let mut posts = m::rows(&node.chain, m::POST, cc).map_err(|e| e.to_string())?;
-    let mut acts = m::rows(&node.chain, m::ACT, cc).map_err(|e| e.to_string())?;
+    let mut posts = ledger_rows(node, m::POST);
+    let mut acts = ledger_rows(node, m::ACT);
     let (pp, pa) = pending(node);
     let known: BTreeSet<String> = posts.iter().filter_map(|p| p["txid"].as_str().map(String::from)).collect();
     posts.extend(pp.into_iter().filter(|p| !known.contains(p["txid"].as_str().unwrap_or(""))));
     let known_acts: BTreeSet<String> = acts.iter().filter_map(|a| a["txid"].as_str().map(String::from)).collect();
     acts.extend(pa.into_iter().filter(|a| !known_acts.contains(a["txid"].as_str().unwrap_or(""))));
     let me = crate::msgsvc::sender_key(node).map(|(a, _, _)| a).unwrap_or_default();
-    let muted = crate::msgsvc::mutes(node);
+    // Muted accounts kept by address (any chain's form) or messaging key: addresses as the home chain's.
+    let muted: BTreeMap<String, u64> = crate::msgsvc::mutes(node).into_iter().map(|(k, v)| (node.home_address(&k), v)).collect();
     let settings = settings(node);
     let friends = friend_addresses(node);
     let following: BTreeSet<String> = if v.order == "following" { crate::follows::following_of(node, &me).into_iter().collect() } else { BTreeSet::new() };
@@ -165,8 +201,8 @@ pub fn feed(node: &Node, v: &View) -> Result<Value, String> {
             }
             let replies: Vec<Value> = if depth < 6 {
                 let mut rs = r.replies.clone();
-                rs.sort_by_key(|a| a["h"].as_u64().map(|h| if h == 0 { u64::MAX } else { h }).unwrap_or(u64::MAX));
-                rs.iter().filter_map(|a| go(node, &json!({"txid": a["txid"], "from": a["from"], "text": a["text"], "h": a["h"]}), acts, me, muted, cache, depth + 1)).collect()
+                rs.sort_by_key(|a| a["o"].as_u64().or_else(|| a["h"].as_u64().filter(|h| *h > 0)).unwrap_or(u64::MAX));
+                rs.iter().filter_map(|a| go(node, &json!({"txid": a["txid"], "from": a["from"], "text": a["text"], "h": a["h"], "o": a["o"], "c": a["c"]}), acts, me, muted, cache, depth + 1)).collect()
             } else {
                 vec![]
             };
@@ -204,11 +240,13 @@ pub fn feed(node: &Node, v: &View) -> Result<Value, String> {
             continue;
         };
         let h = p["h"].as_u64().unwrap_or(0);
+        let pc = p["c"].as_u64().map(|c| c as u16).unwrap_or(node.ledger_home().chain_no);
         // Age from the block's time (as the original), 0 while waiting.
-        let age_h = if h == 0 { 0.0 } else { now.saturating_sub(block_time(node, h as u32)) as f64 / 3600.0 };
+        let age_h = if h == 0 { 0.0 } else { now.saturating_sub(block_time(node, pc, h as u32)) as f64 / 3600.0 };
         let hot = (1.0 + row["score"].as_f64().unwrap_or(0.0)) / (age_h + 2.0).powf(1.5);
         row["age_hours"] = json!(age_h);
-        let newest = if h == 0 { u64::MAX } else { h * 100_000 + p["p"].as_u64().unwrap_or(0) };
+        let o = p["o"].as_u64().unwrap_or(u64::MAX);
+        let newest = if o == u64::MAX { u64::MAX } else { o.saturating_mul(100_000).saturating_add(p["p"].as_u64().unwrap_or(0)) };
         out.push((hot, newest, row));
     }
     if v.order == "popular" {
@@ -221,15 +259,14 @@ pub fn feed(node: &Node, v: &View) -> Result<Value, String> {
     Ok(json!({"posts": page, "total": total, "offset": v.offset, "order": v.order}))
 }
 
-fn block_time(node: &Node, h: u32) -> u64 {
-    let cc = c(node);
+fn block_time(node: &Node, cc: u16, h: u32) -> u64 {
     node.chain.hash_at(cc, h).ok().flatten().and_then(|hash| node.chain.header(cc, &hash).ok().flatten()).map(|r| r.header.time as u64).unwrap_or(0)
 }
 
 /// Channels with their post counts.
 pub fn channels(node: &Node) -> Value {
     let mut n: BTreeMap<String, usize> = BTreeMap::new();
-    for p in m::rows(&node.chain, m::POST, c(node)).unwrap_or_default() {
+    for p in ledger_rows(node, m::POST) {
         *n.entry(p["channel"].as_str().unwrap_or("main").to_string()).or_default() += 1;
     }
     json!(n.into_iter().map(|(k, v)| json!({"channel": k, "posts": v})).collect::<Vec<_>>())
@@ -240,7 +277,7 @@ fn friend_addresses(node: &Node) -> BTreeSet<String> {
     let mut out = BTreeSet::new();
     for c in crate::msgsvc::contacts_list(node).as_array().cloned().unwrap_or_default() {
         if let Some(a) = c["address"].as_str().filter(|a| !a.is_empty()) {
-            out.insert(a.to_string());
+            out.insert(node.home_address(a));
         }
     }
     out
@@ -292,15 +329,14 @@ pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Re
     if hex::decode(target).map(|b| b.len()) != Ok(32) {
         return Err("target is a post's txid".into());
     }
-    let cc = c(node);
     let mut extra = Vec::new();
     if act == Act::Tip {
         if amount == 0 {
             return Err("a tip needs an amount".into());
         }
         // The author: a post's sender, or a reply's.
-        let author = m::post(&node.chain, cc, target).and_then(|p| p["from"].as_str().map(String::from))
-            .or_else(|| m::rows(&node.chain, m::ACT, cc).ok()?.into_iter().find(|a| a["txid"] == target).and_then(|a| a["from"].as_str().map(String::from)))
+        let author = find_post(node, target).and_then(|(_, p)| p["from"].as_str().map(String::from))
+            .or_else(|| ledger_rows(node, m::ACT).into_iter().find(|a| a["txid"] == target).and_then(|a| a["from"].as_str().map(String::from)))
             .ok_or("that post isn't in a block yet; tip it once it is")?;
         // A tip is a wallet spend: P2PKH of the home chain only.
         let script = arcade_ledger::address::p2pkh_script_for_address(node.ledger_home(), &author).ok_or("bad author address")?;
@@ -312,8 +348,8 @@ pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Re
 }
 
 pub fn file(node: &Node, txid: &str) -> Result<Value, String> {
-    let p = m::post(&node.chain, c(node), txid).ok_or("no such post")?;
-    let bytes = m::file(&node.chain, c(node), txid).ok_or("this post has no file")?;
+    let (c, p) = find_post(node, txid).ok_or("no such post")?;
+    let bytes = m::file(&node.chain, c, txid).ok_or("this post has no file")?;
     use base64::Engine;
     Ok(json!({"name": p["file"]["name"], "type": p["file"]["type"], "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
 }

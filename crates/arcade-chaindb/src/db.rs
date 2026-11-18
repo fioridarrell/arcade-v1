@@ -515,8 +515,10 @@ pub struct ChainDb {
     batches: std::sync::Mutex<std::collections::HashMap<usize, Arc<std::sync::Mutex<()>>>>,
     /// Indexers and the chains they run on.
     indexers: std::sync::RwLock<Vec<(u16, Arc<dyn Indexer>)>>,
-    /// Coin caches of chains catching up (see CoinCache).
-    caches: std::sync::Mutex<std::collections::HashMap<u16, CoinCache>>,
+    /// Coin caches of chains catching up (see CoinCache), each behind its own lock: the map's lock is held only to find
+    /// one. (One lock for every chain's cache, held through a whole batch, let one slow chain stop all the others: the
+    /// JB20B's Litecoin batches of minutes froze every chain, 2026-11-17.)
+    caches: std::sync::Mutex<std::collections::HashMap<u16, Arc<std::sync::Mutex<CoinCache>>>>,
     /// Coin cache budget in bytes (0 = no cache): ARCADE_COIN_CACHE_MB, or set_coin_cache_mb.
     cache_bytes: std::sync::atomic::AtomicUsize,
     /// Address builds running now: per chain, each step's progress (addrbuild).
@@ -541,6 +543,9 @@ fn ix_key(c: u16, name: &str) -> Vec<u8> {
 /// writes are the last word (a block connected after its chain's flush would land in a new
 /// cache that is lost, winding the tip back again at the next start).
 pub static STOPPING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// How long a stop waits for one chain's batch to finish before leaving that chain's coin cache unwritten.
+pub const STOP_BATCH_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// The directory name of a chain's own file: its key (`chains/doge/chain.mdbx`), or `c<number>`
 /// for a chain number no params know (tests).
@@ -985,7 +990,7 @@ impl ChainDb {
         self.legacy.clone()
     }
 
-    fn batch_of(&self, s: &Store) -> Arc<std::sync::Mutex<()>> {
+    pub(crate) fn batch_of(&self, s: &Store) -> Arc<std::sync::Mutex<()>> {
         self.batches.lock().unwrap().entry(s.id()).or_default().clone()
     }
 
@@ -1009,18 +1014,56 @@ impl ChainDb {
 
     /// Whether a chain's coin cache is empty (everything is in the database).
     pub fn coins_settled(&self, c: u16) -> bool {
-        self.caches.lock().unwrap().get(&c).is_none_or(|cc| cc.is_empty())
+        // A cache busy right now (its chain connecting a batch) counts as not settled, without waiting for it.
+        let Some(cc) = self.caches.lock().unwrap().get(&c).cloned() else { return true };
+        let settled = match cc.try_lock() {
+            Ok(cc) => cc.is_empty(),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner().is_empty(),
+            Err(std::sync::TryLockError::WouldBlock) => false,
+        };
+        settled
+    }
+
+    /// Chain `c`'s coin cache (made empty when it has none yet).
+    pub(crate) fn cache_of(&self, c: u16) -> Arc<std::sync::Mutex<CoinCache>> {
+        self.caches.lock().unwrap().entry(c).or_default().clone()
     }
 
     /// Stopping: wait for a batch being connected to commit (or roll back), then write every
     /// coin cache, then sync every file (an error there comes back as chain u16::MAX). Nothing connects afterwards (STOPPING is set first by the caller).
     pub fn flush_all_for_stop(&self) -> Vec<(u16, Result<()>)> {
+        self.flush_all_for_stop_within(STOP_BATCH_WAIT)
+    }
+
+    /// [`flush_all_for_stop`], waiting at most `wait` for each chain's batch: a chain whose batch is still busy then
+    /// (a thread stuck inside one long step held it for hours on the JB20B, 2026-11-17, and the stop never ended) is
+    /// left unflushed. Its next start winds its tip back to the coins written (as a second stop signal did by hand).
+    pub fn flush_all_for_stop_within(&self, wait: std::time::Duration) -> Vec<(u16, Result<()>)> {
         let mut out = Vec::new();
         for c in 0..=255u16 {
             if !self.coins_settled(c) {
                 let lock = self.batch_of(&self.store(c));
-                let _batch = lock.lock().unwrap_or_else(|e| e.into_inner());
-                out.push((c, self.flush_coins(c)));
+                let t = std::time::Instant::now();
+                let mut said = false;
+                let batch = loop {
+                    match lock.try_lock() {
+                        Ok(g) => break Some(g),
+                        Err(std::sync::TryLockError::Poisoned(e)) => break Some(e.into_inner()),
+                        Err(std::sync::TryLockError::WouldBlock) if t.elapsed() < wait => {
+                            // Named, so a stop that takes long says what it waits on.
+                            if !said && t.elapsed() > std::time::Duration::from_secs(10) {
+                                eprintln!("arcaded: stopping: waiting for chain {c}'s batch to finish (at most {}s)", wait.as_secs());
+                                said = true;
+                            }
+                            std::thread::sleep(std::time::Duration::from_millis(100))
+                        }
+                        Err(std::sync::TryLockError::WouldBlock) => break None,
+                    }
+                };
+                match batch {
+                    Some(_batch) => out.push((c, self.flush_coins(c))),
+                    None => out.push((c, Err(other(format!("its batch was still busy after {}s: left for the next start to wind back", wait.as_secs()))))),
+                }
             }
         }
         // The files are written without a flush per commit: put them on disk now, or the next
@@ -1035,11 +1078,12 @@ impl ChainDb {
 
     /// Write a chain's coin cache to the database now (it matches the current tip).
     pub fn flush_coins(&self, c: u16) -> Result<()> {
+        let Some(cache) = self.caches.lock().unwrap().get(&c).cloned() else { return Ok(()) };
         self.store(c).write(|w| {
-            let mut caches = self.caches.lock().unwrap();
-            if let Some(cc) = caches.get_mut(&c).filter(|cc| !cc.is_empty()) {
+            let mut cc = cache.lock().unwrap_or_else(|e| e.into_inner());
+            if !cc.is_empty() {
                 if let Some(tip) = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)) {
-                    flush_cache(w, c, cc, &tip)?;
+                    flush_cache(w, c, &mut cc, &tip)?;
                 }
             }
             Ok(())
@@ -2107,8 +2151,9 @@ impl ChainDb {
             } else {
                 None
             };
-            let mut caches = self.caches.lock().unwrap();
-            let cc = caches.entry(c).or_default();
+            let cache = self.cache_of(c);
+            let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+            let cc = &mut *guard;
             if defer {
                 cc.log_txs = addr == Addr::Log;
             }

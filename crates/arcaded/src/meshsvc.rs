@@ -40,6 +40,9 @@ const MAX_HEARD_DIALS: usize = 32;
 /// for a while and then let it through, so one bad minute must not lose an arcade.
 const HEARD_TRIES: u32 = 3;
 const HEARD_RETRY: u64 = 15 * 60;
+/// A heard name that doesn't resolve is tried less and less often: HEARD_RETRY, doubled each round it still fails to
+/// resolve, at most this long (ARCADE #12: dead trycloudflare names were looked up every 15 minutes for days).
+const NAME_RETRY_MAX: u64 = 4 * 3600;
 const HEARD_KEEP: u64 = 2 * 86400;
 /// Most parked addresses kept (the oldest-failing is let go first).
 const MAX_PARKED: usize = 512;
@@ -126,6 +129,8 @@ struct Parked {
     since: u64,
     /// When to dial it next.
     next: u64,
+    /// Rounds in a row its name didn't resolve (0 once it resolves or links).
+    unresolved: u32,
 }
 
 fn parked() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String, Parked>> {
@@ -133,21 +138,40 @@ fn parked() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<String,
     P.get_or_init(Default::default).lock().unwrap()
 }
 
-/// Park `addr` after a round of failed dials (`started`: when this round began failing):
-/// false if it has failed for HEARD_KEEP and is let go.
-fn park(addr: &str, src: &'static str, started: u64, at: u64) -> bool {
+/// Park `addr` after a round of failed dials (`started`: when this round began failing; `unresolved`: the last
+/// failure was its name not resolving): the wait until the next round, or None if it has failed for HEARD_KEEP and
+/// is let go.
+fn park(addr: &str, src: &'static str, started: u64, at: u64, unresolved: bool) -> Option<u64> {
     let mut p = parked();
     let since = p.get(addr).map(|x| x.since).unwrap_or(started).min(started);
     if at.saturating_sub(since) >= HEARD_KEEP {
         p.remove(addr);
-        return false;
+        return None;
     }
-    p.insert(addr.to_string(), Parked { src, since, next: at + HEARD_RETRY });
+    let rounds = if unresolved { p.get(addr).map_or(0, |x| x.unresolved) + 1 } else { 0 };
+    let wait = name_retry(rounds);
+    p.insert(addr.to_string(), Parked { src, since, next: at + wait, unresolved: rounds });
     while p.len() > MAX_PARKED {
         let oldest = p.iter().min_by_key(|(_, x)| x.since).map(|(a, _)| a.clone()).unwrap();
         p.remove(&oldest);
     }
-    true
+    Some(wait)
+}
+
+/// The wait before the next round for a heard address whose name failed to resolve `rounds` rounds in a row.
+fn name_retry(rounds: u32) -> u64 {
+    if rounds <= 1 {
+        return HEARD_RETRY;
+    }
+    HEARD_RETRY.saturating_mul(1u64 << (rounds - 1).min(16)).min(NAME_RETRY_MAX)
+}
+
+/// Whether a dial failed because the name didn't resolve (no address to try), not because the far side refused.
+fn lookup_failed(err: &str) -> bool {
+    let e = err.to_ascii_lowercase();
+    ["name resolution", "failed to lookup address", "name or service not known", "no address associated", "nodename nor servname", "cannot resolve", "no such host"]
+        .iter()
+        .any(|m| e.contains(m))
 }
 
 /// Parked addresses due again at `at` (they stay parked until a dial links or gives up).
@@ -351,9 +375,10 @@ fn on_coin_peers(node: &Node, h: &Value) {
 }
 
 /// How long to wait after `fails` failed dials in a row; None: let a heard address go.
-/// The last dials: (to a bare IP?, how long, failure, when). ARCADE #12: on a network that lets an arcade reach only
-/// addresses it looked up by name, every dial to a bare IP is refused within a millisecond or two; `mesh.dials` says so.
-type Dial = (bool, u64, Option<String>, u64);
+/// The last dials: (to a bare IP?, how long, failure, when, the address dialed). ARCADE #12: on a network that lets an
+/// arcade reach only addresses it looked up by name, every dial to a bare IP is refused within a millisecond or two;
+/// `mesh.dials` says so.
+type Dial = (bool, u64, Option<String>, u64, String);
 
 fn dials() -> std::sync::MutexGuard<'static, std::collections::VecDeque<Dial>> {
     static D: std::sync::OnceLock<std::sync::Mutex<std::collections::VecDeque<Dial>>> = std::sync::OnceLock::new();
@@ -365,7 +390,7 @@ fn note_dial(addr: &str, took: Duration, err: Option<String>) {
     let host = host.rsplit_once(':').map(|x| x.0).unwrap_or(host).trim_matches(|c| c == '[' || c == ']');
     let ip = host.parse::<std::net::IpAddr>().is_ok();
     let mut d = dials();
-    d.push_back((ip, took.as_millis() as u64, err.map(|e| e.chars().take(120).collect()), now()));
+    d.push_back((ip, took.as_millis() as u64, err.map(|e| e.chars().take(120).collect()), now(), addr.chars().take(200).collect()));
     while d.len() > 100 {
         d.pop_front();
     }
@@ -381,7 +406,7 @@ pub fn dials_status() -> Value {
     let fast = to_ips.iter().filter(|x| x.2.is_some() && x.1 < FAST_REFUSAL_MS).count();
     let ip_ok = to_ips.iter().filter(|x| x.2.is_none()).count();
     let name_ok = d.iter().filter(|x| !x.0 && x.2.is_none()).count();
-    let gated = to_ips.len() >= 10 && ip_ok == 0 && fast * 10 >= to_ips.len() * 8;
+    let gated = looks_gated(to_ips.len(), fast);
     let note = if gated {
         Some(format!("{fast} of the last {} dials to bare IPs were refused in under {FAST_REFUSAL_MS} ms{}: this network seems to allow only addresses looked up by name. Links by name (wss://…) and through a relay still work (ARCADE #12).",
             to_ips.len(), if name_ok > 0 { ", while names connect" } else { "" }))
@@ -392,8 +417,15 @@ pub fn dials_status() -> Value {
         "to_ips": {"tried": to_ips.len(), "linked": ip_ok, "refused_fast": fast},
         "names_linked": name_ok,
         "note": note,
-        "last": d.iter().rev().take(20).map(|x| json!({"ip": x.0, "ms": x.1, "error": x.2, "at": x.3})).collect::<Vec<_>>(),
+        "last": d.iter().rev().take(20).map(|x| json!({"addr": x.4, "ip": x.0, "ms": x.1, "error": x.2, "at": x.3})).collect::<Vec<_>>(),
     })
+}
+
+/// Whether the last dials to bare IPs look like a network that refuses them: at least 5 of them, and more than three
+/// in four refused within FAST_REFUSAL_MS. A link or two among them doesn't hide it (ARCADE #12: on such a network an
+/// address just looked up by name is let through for a while, so a bare-IP dial to it can link).
+fn looks_gated(tried: usize, refused_fast: usize) -> bool {
+    tried >= 5 && refused_fast * 4 > tried * 3
 }
 
 /// The name other arcades may dial this one by (`mesh.name_set`): a wss:// URL or host:port, shared in "hi" so a
@@ -455,8 +487,8 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
                 match (wait, heard) {
                     (Some(w), _) => eprintln!("mesh: dial {addr} failed ({fails} in a row): {e}; next try in {} s", w.as_secs()),
                     (None, Some(src)) => {
-                        if park(&addr, src, failing_since, now()) {
-                            eprintln!("mesh: dial {addr} failed ({fails} in a row): {e}; trying again every {} min", HEARD_RETRY / 60);
+                        if let Some(w) = park(&addr, src, failing_since, now(), lookup_failed(&e.to_string())) {
+                            eprintln!("mesh: dial {addr} failed ({fails} in a row): {e}; trying again in {} min", w / 60);
                         } else {
                             eprintln!("mesh: dial {addr} failed: {e}; failing for {} h, let go", HEARD_KEEP / 3600);
                         }
@@ -882,9 +914,6 @@ fn serve_loop(
             "ka" => {} // TCP keepalive while frames go over UDP
             // Relayed links (crate::relaysvc): as the relay, or as one side.
             "rl" => crate::relaysvc::on_frame(node, link, &f)?,
-            // Shared models (crate::llmsvc): an answer to our ask over this link (crvia), else an offer or an ask.
-            "lm" if crate::crvia::on_answer(peer, &f) => {}
-            "lm" => crate::llmsvc::on_frame(node, peer, &f),
             // Services over the mesh (crate::svcmesh): an answer to our ask (crvia), else an offer or an ask.
             "sv" if crate::crvia::on_answer(peer, &f) => {}
             "sv" => crate::svcmesh::on_frame(node, peer, &f),
@@ -1107,8 +1136,15 @@ mod tests {
         let s = dials_status();
         assert_eq!(s["to_ips"]["refused_fast"], 12);
         assert!(s["note"].as_str().unwrap().contains("names connect"));
-        // A dial to a bare IP that links: not gated.
+        // A dial to a bare IP that links among them (an address just looked up by name, ARCADE #12): still noted.
         note_dial("203.0.113.99:8421", Duration::from_millis(30), None);
+        let s = dials_status();
+        assert!(s["note"].is_string(), "one link doesn't hide it");
+        assert_eq!(s["last"][0]["addr"], "203.0.113.99:8421", "each dial names its address");
+        // Most bare-IP dials linking: an ordinary network, no note.
+        for i in 0..12 {
+            note_dial(&format!("198.51.100.{i}:8421"), Duration::from_millis(30), None);
+        }
         assert!(dials_status()["note"].is_null());
         dials().clear();
     }
@@ -1147,6 +1183,34 @@ mod tests {
         assert!(!d.iter().any(|a| a.contains("127.0.0.1") || a.contains("192.168.7.9") || a.contains("10.0.0.1") || a.contains("fe80")), "nothing dialed");
     }
 
+    /// The DNS-gated note: most bare-IP dials refused fast, even with a link or two among them; never on a few dials or
+    /// on refusals that took a round trip.
+    #[test]
+    fn the_gated_note_shows_through_a_link_or_two() {
+        assert!(looks_gated(20, 18), "18 of 20 refused fast, 2 linked (simone_node's node)");
+        assert!(looks_gated(5, 4));
+        assert!(!looks_gated(4, 4), "too few dials to say");
+        assert!(!looks_gated(20, 15), "three in four is not more than three in four");
+        assert!(!looks_gated(20, 2), "an ordinary network: refusals came from the far side");
+    }
+
+    /// A heard name that doesn't resolve is tried less often each round, up to NAME_RETRY_MAX; a round that resolves
+    /// (refused or linked) goes back to HEARD_RETRY.
+    #[test]
+    fn dead_names_back_off() {
+        assert!(lookup_failed("io: failed to lookup address information: Temporary failure in name resolution"));
+        assert!(lookup_failed("handshake: cannot resolve dead.trycloudflare.com:443"));
+        assert!(!lookup_failed("io: Connection refused (os error 111)") && !lookup_failed("io: connection timed out"));
+        let a = "dead-name.trycloudflare.example:8421";
+        let waits: Vec<u64> = (0..8).map(|i| park(a, "gossip", 1000, 1000 + i * 10, true).unwrap()).collect();
+        assert_eq!(&waits[..5], &[HEARD_RETRY, 2 * HEARD_RETRY, 4 * HEARD_RETRY, 8 * HEARD_RETRY, 16 * HEARD_RETRY]);
+        assert!(waits.iter().all(|w| *w <= NAME_RETRY_MAX) && waits[7] == NAME_RETRY_MAX, "capped: {waits:?}");
+        assert!(due(1070 + HEARD_RETRY).iter().all(|(x, _)| x != a), "not due at the old 15 minutes");
+        assert_eq!(park(a, "gossip", 1000, 2000, false), Some(HEARD_RETRY), "it resolved: back to the usual wait");
+        assert_eq!(park(a, "gossip", 1000, 2010, true), Some(HEARD_RETRY), "the count started over");
+        parked().remove(a);
+    }
+
     #[test]
     fn heard_addresses_are_let_go_and_gossip_peers_capped() {
         assert!(retry_after(HEARD_TRIES - 1, true).is_some());
@@ -1155,11 +1219,11 @@ mod tests {
         // Past the quick tries a heard address is parked, dialed again every HEARD_RETRY,
         // and let go only after HEARD_KEEP of failing.
         let a = "203.0.113.77:8421";
-        assert!(park(a, "gossip", 1000, 1040));
+        assert_eq!(park(a, "gossip", 1000, 1040, false), Some(HEARD_RETRY));
         assert!(due(1040 + HEARD_RETRY - 1).iter().all(|(x, _)| x != a), "not due yet");
         assert!(due(1040 + HEARD_RETRY).iter().any(|(x, s)| x == a && *s == "gossip"), "due again");
-        assert!(park(a, "gossip", 5000, 5000), "a later round keeps the first failure time");
-        assert!(!park(a, "gossip", 9000, 1000 + HEARD_KEEP), "let go after HEARD_KEEP");
+        assert!(park(a, "gossip", 5000, 5000, false).is_some(), "a later round keeps the first failure time");
+        assert!(park(a, "gossip", 9000, 1000 + HEARD_KEEP, false).is_none(), "let go after HEARD_KEEP");
         assert!(due(u64::MAX).iter().all(|(x, _)| x != a));
         let node = &crate::sitesvc::tests::shared().node;
         let t = now();

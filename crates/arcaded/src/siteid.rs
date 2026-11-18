@@ -584,9 +584,10 @@ fn owner(node: &Node, tag: &str) -> Result<String, String> {
     chain_owner(node, tag)?.ok_or_else(|| format!("@{tag} is not claimed"))
 }
 
-/// The address @tag names on the home chain, or None while nobody has claimed it.
+/// The address @tag's holder has (ARCADE first, as `hometag::owner` finds it), in the ledger home's form, or None
+/// while nobody has claimed it.
 fn chain_owner(node: &Node, tag: &str) -> Result<Option<String>, String> {
-    Ok(arcade_ledger::index::tag_row(&node.chain, node.ledger_home().chain_no, tag).map_err(|e| e.to_string())?.map(|r| r.address))
+    Ok(crate::hometag::owner(node, tag).map(|(_, a)| node.home_address(&a)))
 }
 
 /// vault.put: keep @tag's sealed record here ({tag, address, pubkey, blob, signature}):
@@ -607,17 +608,19 @@ pub fn vault_put(node: &Node, req: &Value) -> R {
     if hex::decode(&pubkey).map(|b| b.len()).unwrap_or(0) != 32 && hex::decode(&pubkey).map(|b| b.len()).unwrap_or(0) != 33 {
         return Err("pubkey: the account's login public key, in hex".into());
     }
+    // A vault may name its address in any chain's form (the same key); compared in the ledger home's.
+    let home = node.home_address(&address);
     let reserved = match chain_owner(node, &tag)? {
-        Some(o) if o == address => false,
+        Some(o) if o == home => false,
         Some(_) => return Err(format!("address: not the one @{tag} names on chain")),
         None => {
             if let Some(why) = arcade_ledger::tags::tag_problem(&tag) {
                 return Err(format!("tag: {why}"));
             }
-            if crate::hometag::address_on(node.ledger_home(), &address).as_deref() != Some(address.as_str()) {
+            if crate::hometag::address_on(node.ledger_home(), &address).is_none() {
                 return Err(format!("address: a {} address (where @{tag} will be claimed)", node.ledger_home().name));
             }
-            if kept(node, &tag).is_some_and(|v| v["address"] != address.as_str()) {
+            if kept(node, &tag).is_some_and(|v| node.home_address(v["address"].as_str().unwrap_or("")) != home) {
                 return Err(format!("@{tag} is already taken here: pick another name"));
             }
             if kept(node, &tag).is_none() && reservations(node) >= MAX_RESERVED {
@@ -653,7 +656,7 @@ fn reservations(node: &Node) -> usize {
 /// reservation.
 fn still_good(node: &Node, tag: &str, rec: &Value) -> bool {
     match chain_owner(node, tag) {
-        Ok(Some(o)) => rec["address"] == o.as_str(),
+        Ok(Some(o)) => node.home_address(rec["address"].as_str().unwrap_or("")) == o,
         Ok(None) => rec["reserved"] == true,
         Err(_) => false,
     }

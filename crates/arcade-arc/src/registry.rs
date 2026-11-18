@@ -224,9 +224,11 @@ struct Replica {
     /// Audits missed in a row (§5.3): it stops counting at the first, and is removed at
     /// [`params::MAX_MISSED_AUDITS`]; a passed audit counts it again.
     missed: u32,
-    /// The height from which it counts for the writer draw (§4, §6.3): [`params::DRAW_WEIGHT_WAIT`] blocks after its
-    /// first passed audit; none before one. Longer than the reorg limit, so weight registered on a secret branch
-    /// can't write blocks there before the branch is too old to be taken.
+    /// The height from which it counts for the writer draw (§4, §6.3): [`params::draw_weight_wait`] blocks after its
+    /// first passed audit; none before one. Below rules version 4 that is 200, longer than the reorg limit, so weight
+    /// registered on a secret branch can't write blocks there before the branch is too old to be taken. From version 4
+    /// (testnet only) it is the audit's own height, and every replica past its first passed audit counts, whatever
+    /// height was set here before ([`Registry::counts_from`]).
     draw_from: Option<u64>,
 }
 
@@ -612,12 +614,22 @@ impl Registry {
     }
 
     /// An owner's draw weight for the next block (§4, §6.1): its replicas that passed an audit DRAW_WEIGHT_WAIT or
-    /// more blocks ago and haven't missed one since.
+    /// more blocks ago (from rules version 4 on the testnet: that passed one at all) and haven't missed one since.
     pub fn owner_draw_weight(&self, k: &Key) -> u64 {
         let next = self.blocks.len() as u64 + 1;
         self.owners.get(k).map_or(0, |o| {
-            o.replicas.iter().filter_map(|id| self.replicas.get(id)).filter(|r| r.missed == 0 && r.draw_from.is_some_and(|f| f <= next)).map(|r| self.share(&r.segment)).sum()
+            o.replicas.iter().filter_map(|id| self.replicas.get(id)).filter(|r| r.missed == 0 && self.counts_from(r).is_some_and(|f| f <= next)).map(|r| self.share(&r.segment)).sum()
         })
+    }
+
+    /// The height from which a replica counts for the draw, as seen for the next block: its `draw_from`, but from
+    /// rules version 4 (#11, testnet only) no later than the next block. A replica whose first passed audit came
+    /// before version 4 and whose 200 blocks hadn't run out by then counts from the version's first block; one that
+    /// passes after counts from the block after its audit's. Deterministic: only the stored height and the next
+    /// block's height decide, and rules versions only go up.
+    fn counts_from(&self, r: &Replica) -> Option<u64> {
+        let next = self.blocks.len() as u64 + 1;
+        r.draw_from.map(|f| if params::rules_v4(&self.net, next) { f.min(next) } else { f })
     }
 
     /// What an owner's audits since its last turn decide (§5.3): `None` when it had none (no
@@ -1129,7 +1141,7 @@ impl Registry {
 
     /// The height from which a registered replica counts for the writer draw (none before its first passed audit).
     pub fn draw_from(&self, id: &Hash) -> Option<u64> {
-        self.replicas.get(id).and_then(|r| r.draw_from)
+        self.replicas.get(id).and_then(|r| self.counts_from(r))
     }
 
     /// The height until which a key has no draw weight (its challenge or reveal demand was answered), if it has none now.
@@ -1232,10 +1244,10 @@ impl Registry {
         let mut a = self.audits[&owner].clone();
         a.picks[i].passed = true;
         self.put(Op::Audits(owner, Some(a)), ops);
-        // Its first passed audit: it counts for the writer draw DRAW_WEIGHT_WAIT blocks on. One that had missed counts
-        // again from now (a re-audit).
+        // Its first passed audit: it counts for the writer draw DRAW_WEIGHT_WAIT blocks on (from rules version 4 on the
+        // testnet, from the next block). One that had missed counts again from now (a re-audit).
         if r.draw_from.is_none() || r.missed > 0 {
-            let draw_from = r.draw_from.or(Some(height + params::DRAW_WEIGHT_WAIT));
+            let draw_from = r.draw_from.or(Some(height + params::draw_weight_wait(&self.net, height)));
             self.put(Op::Replica(o.replica, Some(Replica { draw_from, missed: 0, ..r })), ops);
         }
         Ok(())
@@ -1628,7 +1640,7 @@ impl Registry {
     /// An owner's replicas: their bytes, the audits each missed in a row, and the height each counts for the draw from.
     pub fn replicas_of(&self, owner: &Key) -> Vec<(u64, u32, Option<u64>)> {
         self.owners.get(owner).map_or_else(Vec::new, |o| {
-            o.replicas.iter().filter_map(|id| self.replicas.get(id)).map(|r| (r.bytes, r.missed, r.draw_from)).collect()
+            o.replicas.iter().filter_map(|id| self.replicas.get(id)).map(|r| (r.bytes, r.missed, self.counts_from(r))).collect()
         })
     }
 
@@ -1733,7 +1745,8 @@ mod tests {
     use crate::sloth::{DATA_LEAF, SEALED_LEAF};
     use ed25519_dalek::SigningKey;
 
-    const NET: Net = TESTNET;
+    // The testnet's rules before version 4 (its schedule now has v4 from block 1,000): tests that want v4 make their own.
+    const NET: Net = Net { rules: &[(3, 0)], ..TESTNET };
 
     fn key(who: u8) -> (SigningKey, Key) {
         let s = SigningKey::from_bytes(&[who; 32]);
@@ -2211,6 +2224,61 @@ mod tests {
         run_to(&mut r, first + 4 * P);
         assert!(!r.registered(&id));
         assert_eq!(r.holders_of(&segs[0].e.segment(&NET)), 0);
+    }
+
+    /// Owner 2's replica of `registered()` through its first passed audit on `net`'s rules: the registry, the
+    /// replica and the height of the block that held the passing opening.
+    fn first_audit_passed(net: Net) -> (Registry, Hash, u64) {
+        let (mut r, id) = registered();
+        r.net = net;
+        let (k2, segs) = (key(2).1, listed(1).1);
+        let x = seal(&k2, &segs[0]);
+        let t = turn(&NET, &Earner::Owner(k2));
+        let first = (18..).find(|h| h % P == t).unwrap();
+        run_to(&mut r, first);
+        let pk = r.audits_of(&k2)[0].clone();
+        run_to(&mut r, pk.at);
+        let (ac, pick_seed) = answer(&r, &x, &segs[0], &id, pk.at);
+        r.step(&[Item::AuditCommit(ac)], &at(pk.at + 1)).unwrap();
+        let challenge = pk.at + 1 + params::CHALLENGE_DELAY;
+        run_to(&mut r, challenge);
+        let op = opening(&r, &x, &segs[0], &id, &pick_seed, challenge);
+        r.step(&[Item::AuditOpening(op)], &at(challenge + 1)).unwrap();
+        assert!(r.audits_of(&k2)[0].passed);
+        (r, id, challenge + 1)
+    }
+
+    #[test]
+    fn from_rules_version_4_a_replica_draws_right_after_its_first_passed_audit() {
+        let k2 = key(2).1;
+        // Below version 4 (the testnet as it is): DRAW_WEIGHT_WAIT blocks after the passing block, not one before.
+        let (mut r, id, passed) = first_audit_passed(NET);
+        assert_eq!((r.weight(&k2), r.draw_from(&id)), (0, Some(passed + params::DRAW_WEIGHT_WAIT)));
+        run_to(&mut r, passed + params::DRAW_WEIGHT_WAIT - 2);
+        assert_eq!(r.weight(&k2), 0, "the next block is one before the wait ends");
+        run_to(&mut r, passed + params::DRAW_WEIGHT_WAIT - 1);
+        assert!(r.weight(&k2) > 0);
+
+        // Version 4 from block 1: it counts for the very next block.
+        const V4: Net = Net { rules: &[(3, 0), (4, 1)], ..NET };
+        let (r4, id4, passed4) = first_audit_passed(V4);
+        assert_eq!(r4.blocks.len() as u64, passed4);
+        assert_eq!(r4.draw_from(&id4), Some(passed4));
+        assert_eq!(r4.weight(&k2), r4.owner_pay_weight(&k2), "all of its replica counts at once");
+        assert!(r4.weight(&k2) > 0);
+
+        // A replica that passed below version 4 and still waits when version 4 begins counts from version 4's first
+        // block; before it, as before.
+        let (mut r, id, passed) = first_audit_passed(NET);
+        let v4_at = passed + 50;
+        r.net = Net { rules: Box::leak(vec![(3, 0), (4, v4_at)].into_boxed_slice()), ..NET };
+        run_to(&mut r, v4_at - 2);
+        assert_eq!((r.weight(&k2), r.draw_from(&id)), (0, Some(passed + params::DRAW_WEIGHT_WAIT)));
+        run_to(&mut r, v4_at - 1);
+        assert!(r.weight(&k2) > 0);
+        assert_eq!(r.draw_from(&id), Some(v4_at));
+        // The stored height is the old one: only the rules at the block being decided changed.
+        assert_eq!(r.replicas[&id].draw_from, Some(passed + params::DRAW_WEIGHT_WAIT));
     }
 
     #[test]

@@ -33,7 +33,7 @@ pub fn pool(node: &Node) -> Pool {
     use arcade_ledger::payload::{decode, Msg};
     let token_pairs = led::gates(node.params).token_pairs_from.is_some();
     let mut out = Pool::default();
-    for (tx, atx) in crate::claims::pending_arcade(node) {
+    for (tx, atx) in crate::claims::pending_arcade_on(node, node.params) {
         let Ok(d) = decode(&atx.payload) else { continue };
         let base = |sale: u32, sa: u64, want: u32, wa: u64| Order {
             txid: tx.txid.to_hex(),

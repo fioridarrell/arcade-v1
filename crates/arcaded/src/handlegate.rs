@@ -78,7 +78,9 @@ fn own() -> std::sync::MutexGuard<'static, Option<(String, Value)>> {
 pub fn own_proof(node: &Node) -> Option<(String, Value)> {
     let made = match crate::msgsvc::sender_key(node) {
         Ok((addr, Some(tag), sk)) => {
-            let net = node.ledger_home().key;
+            // Named as before (Pepecoin testnet), so arcades on the release before ARCADE was home still check it; the
+            // holder is found by key hash on ARCADE either way (crate::hometag).
+            let net = node.params.key;
             let sig = arcade_wallet::keys::signmessage(&sk, arcade_wallet::keys::PEPECOIN_MAGIC, &words(&node.id_hex(), &tag, net));
             Some((tag, json!({"net": net, "addr": addr, "sig": sig})))
         }
@@ -130,7 +132,7 @@ fn verify(node: &Node, peer: &str, head: &Value) -> Option<String> {
     }
     // The handle must be held by that address's key in our own index: on ARCADE, else on that chain (the ledger
     // home; no index of it here: we can't tell, so it doesn't count). docs/HOMECHAIN.md phase 2.
-    node.chain_params(net)?;
+    node.chain_params(net).or_else(|| crate::arcsvc::params_for(net))?;
     crate::hometag::holds(node, tag, addr).then(|| tag.to_string())
 }
 

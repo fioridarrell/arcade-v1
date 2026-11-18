@@ -19,8 +19,8 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade tag claim <tag>         claim @tag (asks the mesh for test coins if needed)
   arcade tag list                your claims and their status
   arcade faucet                  ask the mesh for test coins
-  arcade faucet arc [address]    top an ARCADE address up to 0.01 (once a day; default: your wallet's)
-  arcade faucet arc status       ARCADE top-up asks and what this arcade paid today
+  arcade faucet arc <address>    top a website user's ARCADE address up to 0.05 (once a day)
+  arcade faucet arc status       ARCADE top-ups and node-faucet gifts: asks and what this arcade paid
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
   arcade chain list                         chains you can install, and their state (queued ones with their place)

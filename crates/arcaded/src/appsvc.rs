@@ -77,6 +77,10 @@ fn ledger_chains(node: &Node) -> Vec<&'static ChainParams> {
 fn creator_tag(node: &Node, p: &ChainParams, creator: &str) -> Option<String> {
     use arcade_ledger::index::tag_of;
     let home = node.ledger_home();
+    // An app on the old home (Pepecoin testnet) once ARCADE is home: its creator's tag by key hash (crate::hometag).
+    if p.chain_no == node.params.chain_no && home.chain_no != p.chain_no {
+        return tag_of(&node.chain, p.chain_no, creator).ok().flatten().or_else(|| crate::hometag::of_address(node, creator));
+    }
     if p.chain_no == home.chain_no {
         return tag_of(&node.chain, p.chain_no, creator).ok().flatten();
     }
@@ -242,8 +246,7 @@ fn borrowed_card_rows(node: &Node, kept: &[&'static ChainParams]) -> Vec<(&'stat
 /// Every app on every ledger chain (this arcade's, and the chains it borrows), grouped and resolved.
 fn gather(node: &Node) -> Vec<App> {
     let mut apps = Vec::new();
-    let home = node.ledger_home().chain_no;
-    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, home).unwrap_or_default();
+    let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let kept = ledger_chains(node);
     let mut chains: Vec<(&'static ChainParams, Vec<Value>)> = kept.iter().map(|p| (*p, card_rows(node, p))).collect();
     // A chain kept here that is still catching up (borrowed meanwhile) hasn't reached the blocks most apps were
@@ -256,7 +259,6 @@ fn gather(node: &Node) -> Vec<App> {
     }
     chains.extend(borrowed_card_rows(node, &kept));
     for (p, rows) in chains {
-        let c = p.chain_no;
         let mut by: BTreeMap<(String, String), Vec<Ver>> = BTreeMap::new();
         for v in rows {
             let j = v["json"].as_str().unwrap_or("");
@@ -284,8 +286,9 @@ fn gather(node: &Node) -> Vec<App> {
         for (_, mut vs) in by {
             vs.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
             let newest = &vs[0];
-            // Removed: the creator's DELETE on the newest card (home chain feed acts).
-            let removed = c == home && acts.iter().any(|a| a["kind"] == 6 && a["target"] == newest.txid.as_str() && a["from"] == newest.creator.as_str());
+            // Removed: the creator's DELETE on the newest card (feed acts on any ledger chain, by the creator's key).
+            let creator = node.home_address(&newest.creator);
+            let removed = acts.iter().any(|a| a["kind"] == 6 && a["target"] == newest.txid.as_str() && a["from"] == creator.as_str());
             apps.push(App { chain: p, versions: vs, removed });
         }
     }
@@ -373,7 +376,7 @@ pub fn stars_of(text: &str) -> Option<(u8, &str)> {
 
 /// Where an act sits in time: its block height (unconfirmed last), then its txid.
 fn act_order(a: &Value) -> (u64, String) {
-    (a["h"].as_u64().filter(|h| *h > 0).unwrap_or(1 << 60), a["txid"].as_str().unwrap_or("").to_string())
+    (a["o"].as_u64().or_else(|| a["h"].as_u64().filter(|h| *h > 0)).unwrap_or(u64::MAX), a["txid"].as_str().unwrap_or("").to_string())
 }
 
 /// Every edit (kind 5) and delete (kind 6) keyed by (target txid, writer), built once per request
@@ -459,7 +462,7 @@ fn ratings(comments: &[Value], me: &str) -> Value {
 fn social(acts: &[Value], fx: &Fixes, txids: &BTreeSet<String>, me: &str) -> Value {
     let on: Vec<&Value> = acts.iter().filter(|a| txids.contains(a["target"].as_str().unwrap_or(""))).collect();
     let k = |a: &Value| a["kind"].as_u64().unwrap_or(0);
-    let order = |a: &Value| (a["h"].as_u64().filter(|h| *h > 0).unwrap_or(1 << 60), a["txid"].as_str().unwrap_or("").to_string());
+    let order = |a: &Value| (a["o"].as_u64().or_else(|| a["h"].as_u64().filter(|h| *h > 0)).unwrap_or(u64::MAX), a["txid"].as_str().unwrap_or("").to_string());
     let mut likes: BTreeMap<String, (u64, (u64, String))> = BTreeMap::new();
     let mut dislikes: BTreeMap<String, (u64, (u64, String))> = BTreeMap::new();
     for a in &on {
@@ -561,7 +564,7 @@ pub fn categories() -> Value {
 pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &str) -> Value {
     let apps = gather(node);
     let fl = flags(node, &apps);
-    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.ledger_home().chain_no).unwrap_or_default();
+    let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let fx = fixes(&acts);
     let me = me(node);
     let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
@@ -603,7 +606,7 @@ pub fn installed(node: &Node) -> Value {
     let ids = installed_ids(node);
     let apps = gather(node);
     let fl = flags(node, &apps);
-    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.ledger_home().chain_no).unwrap_or_default();
+    let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let fx = fixes(&acts);
     let me = me(node);
     let set: BTreeSet<String> = ids.iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
@@ -663,7 +666,7 @@ pub fn card(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let (a, id) = find(node, chain, txid)?;
     let apps = vec![a];
     let fl = flags(node, &gather(node));
-    let acts = arcade_ledger::messages::rows(&node.chain, arcade_ledger::messages::ACT, node.ledger_home().chain_no).unwrap_or_default();
+    let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let fx = fixes(&acts);
     let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
     let mut e = entry(node, &apps[0], &acts, &fx, &me(node), fl.get(&apps[0].versions[0].txid), &installed, &starred_ids(node));

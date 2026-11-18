@@ -379,9 +379,30 @@ pub fn build_send_keys(
     dust: u64,
     time: u32,
 ) -> Result<Tx, String> {
+    build_send_outputs(p, &[(to_script, amount)], keys, coins, change_script, fee_per_kb, dust, time)
+}
+
+/// As [`build_send_keys`], to several outputs at once ((script, amount) each; a faucet's payment in two coins).
+#[allow(clippy::too_many_arguments)]
+pub fn build_send_outputs(
+    p: &ChainParams,
+    to: &[(&[u8], u64)],
+    keys: &[SecretKey],
+    coins: &[Utxo],
+    change_script: &[u8],
+    fee_per_kb: u64,
+    dust: u64,
+    time: u32,
+) -> Result<Tx, String> {
+    if to.is_empty() {
+        return Err("nothing to send".into());
+    }
+    let amount = to.iter().try_fold(0u64, |a, (_, v)| add(a, *v)).map_err(|e| e.to_string())?;
     let mut sorted: Vec<&Utxo> = coins.iter().collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
-    let fee_for = |c: &[Utxo]| fee_for_size(p, estimate_vsize_coins(c, &[to_script.len(), change_script.len()]) as u64, fee_per_kb);
+    let mut lens: Vec<usize> = to.iter().map(|(s, _)| s.len()).collect();
+    lens.push(change_script.len());
+    let fee_for = |c: &[Utxo]| fee_for_size(p, estimate_vsize_coins(c, &lens) as u64, fee_per_kb);
     let mut chosen: Vec<Utxo> = Vec::new();
     let mut have = 0u64;
     for u in sorted {
@@ -396,10 +417,10 @@ pub fn build_send_keys(
     if chosen.is_empty() || have < need {
         return Err(BuildError::InsufficientFunds { have, need }.to_string());
     }
-    if amount < dust {
-        return Err(format!("{amount} is below the network's dust limit ({dust})"));
+    if let Some((_, v)) = to.iter().find(|(_, v)| *v < dust) {
+        return Err(format!("{v} is below the network's dust limit ({dust})"));
     }
-    let mut outs = vec![TxOutSpec { value: amount, script: to_script.to_vec() }];
+    let mut outs: Vec<TxOutSpec> = to.iter().map(|(s, v)| TxOutSpec { value: *v, script: s.to_vec() }).collect();
     let change = have - need;
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script.to_vec() });

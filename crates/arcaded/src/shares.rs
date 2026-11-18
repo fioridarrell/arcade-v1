@@ -465,9 +465,10 @@ pub fn balance(node: &Node, p: &'static ChainParams) -> Result<String, String> {
                     }
                 }
             }
-            let mut freed = 0u64;
-            for chunk in bs.chunks(2000) {
-                freed += node.chain.prune_blocks(p, chunk).map_err(|e| e.to_string())?;
+            // Short commits (crate::arcseg::prune_gently); a stop midway leaves the range for the next pass.
+            let (freed, all) = crate::arcseg::prune_gently(node, p, &bs);
+            if !all {
+                return Ok("stopping: pruning left for the next pass".into());
             }
             gone.insert(r);
             set_pruned(node, p.net, &gone);

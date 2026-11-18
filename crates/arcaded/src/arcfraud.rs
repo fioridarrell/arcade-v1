@@ -188,7 +188,7 @@ fn watch(node: &Node) -> Result<(), String> {
     let Some(svc) = crate::arcsvc::svc() else { return Ok(()) };
     let net = svc.net();
     let reg = svc.registry();
-    for p in crate::arcseg::kept(node, &net) {
+    for p in crate::arcseg::kept(node, &net, svc.next_height()) {
         if crate::arcsvc::runs(p) || crate::borrow::is_borrowed(p.key) {
             continue;
         }

@@ -19,8 +19,37 @@
 //! - op 6, **state**: name ‖ number ‖ state (1 open, 2 closed, 3 merged) ‖ manifest (32, a merge's result, else zeros).
 //!   The author opens and closes their own; the owner and maintainers close, reopen and merge (a merge also moves the
 //!   repository to the manifest).
+//! - op 7, **push onto** (rules version 4, ARCADE issue #10): name ‖ manifest (32) ‖ base (32: the manifest the push was
+//!   built on, zeros for a repository's first push) ‖ flags (u8, bit 0 = force). From the height rules version 4 starts
+//!   ([`set_base_check_from`]) a push whose base isn't the repository's manifest when the record is applied is refused
+//!   unless forced, so a push made from an out-of-date copy can't silently replace a newer one. Below that height op 7
+//!   is unknown (refused, as before version 4). From that height an op 1 push (no base) only makes a new repository;
+//!   onto an existing one it is refused. Below it op 1 pushes replace as they always did.
 
 use crate::tags::TYPE_ANY_DATA;
+use std::collections::BTreeMap;
+use std::sync::RwLock;
+
+static BASE_FROM: RwLock<BTreeMap<u16, u64>> = RwLock::new(BTreeMap::new());
+
+/// The height from which chain `c`'s pushes are checked against their base (rules version 4,
+/// `arcade_arc::params::rules_v4`); None = never. Set by the ARCADE chain's service when it starts, before any block is
+/// indexed (as `tags::set_expiry`).
+pub fn set_base_check_from(c: u16, from: Option<u64>) {
+    let mut m = BASE_FROM.write().unwrap();
+    match from {
+        Some(h) => m.insert(c, h),
+        None => m.remove(&c),
+    };
+}
+
+/// Whether a push in chain `c`'s block at `height` is checked against its base (op 7 known).
+pub fn base_checked(c: u16, height: u64) -> bool {
+    BASE_FROM.read().unwrap().get(&c).is_some_and(|from| height >= *from)
+}
+
+/// The base that names "no repository yet".
+pub const NO_BASE: [u8; 32] = [0; 32];
 
 pub const MARKER: &[u8; 4] = b"REPO";
 pub const OP_PUSH: u8 = 1;
@@ -29,6 +58,7 @@ pub const OP_FORK: u8 = 3;
 pub const OP_OPEN: u8 = 4;
 pub const OP_COMMENT: u8 = 5;
 pub const OP_STATE: u8 = 6;
+pub const OP_PUSH_ONTO: u8 = 7;
 
 pub const KIND_ISSUE: u8 = 1;
 pub const KIND_PULL: u8 = 2;
@@ -39,6 +69,8 @@ pub const STATE_MERGED: u8 = 3;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RepoOp {
     Push { name: String, manifest: [u8; 32] },
+    /// A push naming the manifest it was built on (op 7, rules version 4).
+    PushOnto { name: String, manifest: [u8; 32], base: [u8; 32], force: bool },
     Maintainer { name: String, add: bool, tag: String },
     Fork { name: String, from: String },
     Open { name: String, kind: u8, body: [u8; 32] },
@@ -100,6 +132,15 @@ pub fn parse(payload: &[u8]) -> Option<Result<RepoOp, &'static str>> {
         let name = take_str(&mut rest)?.to_string();
         match d[5] {
             OP_PUSH => Ok(RepoOp::Push { name, manifest: rest.get(..32).ok_or("truncated")?.try_into().map_err(|_| "truncated")? }),
+            OP_PUSH_ONTO => {
+                let manifest: [u8; 32] = rest.get(..32).ok_or("truncated")?.try_into().map_err(|_| "truncated")?;
+                let base: [u8; 32] = rest.get(32..64).ok_or("truncated")?.try_into().map_err(|_| "truncated")?;
+                let flags = *rest.get(64).ok_or("truncated")?;
+                if flags > 1 {
+                    return Err("unknown push flags");
+                }
+                Ok(RepoOp::PushOnto { name, manifest, base, force: flags & 1 == 1 })
+            }
             OP_MAINTAINER => {
                 let (&add, mut r2) = rest.split_first().ok_or("truncated")?;
                 let tag = take_str(&mut r2)?.trim_start_matches('@').to_lowercase();
@@ -146,6 +187,16 @@ fn head(op: u8, name: &str) -> Vec<u8> {
 pub fn push_payload(name: &str, manifest: &[u8; 32]) -> Vec<u8> {
     let mut p = head(OP_PUSH, name);
     p.extend_from_slice(manifest);
+    p
+}
+
+/// A push built on manifest `base` ([`NO_BASE`] for a new repository), op 7: only for blocks where
+/// [`base_checked`] holds (rules version 4); below that, [`push_payload`].
+pub fn push_onto_payload(name: &str, manifest: &[u8; 32], base: &[u8; 32], force: bool) -> Vec<u8> {
+    let mut p = head(OP_PUSH_ONTO, name);
+    p.extend_from_slice(manifest);
+    p.extend_from_slice(base);
+    p.push(force as u8);
     p
 }
 
@@ -217,12 +268,21 @@ pub trait RepoStore {
     fn set_maintainer(&mut self, full: &str, tag: &str, on: bool) -> Result<(), Self::E>;
 }
 
-/// Apply one op from a sender whose @tag (if any) is `sender_tag`. Ok(Err) = invalid, nothing changed.
+/// Apply one op as below rules version 4 (op 7 unknown). Ok(Err) = invalid, nothing changed.
 pub fn apply<S: RepoStore>(s: &mut S, op: &RepoOp, sender_tag: Option<&str>) -> Result<Result<(), &'static str>, S::E> {
+    apply_at(s, op, sender_tag, false)
+}
+
+/// Apply one op from a sender whose @tag (if any) is `sender_tag`, in a block where rules version 4 does (`v4`) or
+/// doesn't apply. Ok(Err) = invalid, nothing changed.
+pub fn apply_at<S: RepoStore>(s: &mut S, op: &RepoOp, sender_tag: Option<&str>, v4: bool) -> Result<Result<(), &'static str>, S::E> {
+    if matches!(op, RepoOp::PushOnto { .. }) && !v4 {
+        return Ok(Err("unknown repository op"));
+    }
     let Some(me) = sender_tag else { return Ok(Err("repository records come from an @tag")) };
     let full = |n: &str| full_name(n, Some(me));
     match op {
-        RepoOp::Push { name, manifest } => {
+        RepoOp::Push { name, manifest } | RepoOp::PushOnto { name, manifest, .. } => {
             let f = match full(name) {
                 Ok(f) => f,
                 Err(e) => return Ok(Err(e)),
@@ -232,7 +292,22 @@ pub fn apply<S: RepoStore>(s: &mut S, op: &RepoOp, sender_tag: Option<&str>) -> 
             if !allowed {
                 return Ok(Err("only the owner and its maintainers push to a repository"));
             }
-            let r = match s.repo(&f)? {
+            let now = s.repo(&f)?;
+            // At version 4 a push onto an existing repository names its base (op 7); op 1 only makes a new one.
+            if v4 && matches!(op, RepoOp::Push { .. }) && now.is_some() {
+                return Ok(Err("from rules version 4 a push to an existing repository names its base (op 7)"));
+            }
+            if let RepoOp::PushOnto { base, force: false, .. } = op {
+                let current = now.as_ref().map_or(NO_BASE, |r| r.manifest);
+                if *base != current {
+                    return Ok(Err(if now.is_none() {
+                        "a repository's first push names no base"
+                    } else {
+                        "the push wasn't built on the repository's current manifest (fetch and push again, or force it)"
+                    }));
+                }
+            }
+            let r = match now {
                 Some(r) => Repo { manifest: *manifest, pushes: r.pushes + 1, ..r },
                 None if owner == me => Repo { manifest: *manifest, fork: None, pushes: 1 },
                 None => return Ok(Err("no such repository")),
@@ -376,6 +451,70 @@ mod tests {
         assert_eq!(full_name("@Alice/Demo", None), Ok("alice/demo".into()));
         assert_eq!(full_name("demo", Some("bob")), Ok("bob/demo".into()));
         assert!(full_name("demo", None).is_err() && full_name("alice/.git", None).is_err() && full_name("alice/a b", None).is_err());
+    }
+
+    #[test]
+    fn push_onto_reads_back_and_old_pushes_still_parse() {
+        let (m, b) = ([7u8; 32], [8u8; 32]);
+        // The op 1 record is byte for byte what it was, and reads as before.
+        let old = push_payload("demo", &m);
+        assert_eq!(old.len(), 4 + 4 + 2 + 1 + 4 + 32);
+        assert_eq!(parse(&old), Some(Ok(RepoOp::Push { name: "demo".into(), manifest: m })));
+        for force in [false, true] {
+            assert_eq!(parse(&push_onto_payload("alice/demo", &m, &b, force)), Some(Ok(RepoOp::PushOnto { name: "alice/demo".into(), manifest: m, base: b, force })));
+        }
+        let p = push_onto_payload("demo", &m, &NO_BASE, false);
+        assert!(matches!(parse(&p[..p.len() - 1]), Some(Err("truncated"))));
+        let mut bad = p.clone();
+        *bad.last_mut().unwrap() = 2;
+        assert_eq!(parse(&bad), Some(Err("unknown push flags")));
+    }
+
+    #[test]
+    fn a_push_is_checked_against_its_base_from_rules_v4() {
+        let mut s = Mem::default();
+        let (m1, m2, m3, m4) = ([1u8; 32], [2u8; 32], [3u8; 32], [4u8; 32]);
+        let onto = |n: &str, m, base, force| RepoOp::PushOnto { name: n.into(), manifest: m, base, force };
+        // Below version 4 op 7 is unknown, as before; nothing changes.
+        assert_eq!(apply_at(&mut s, &onto("demo", m1, NO_BASE, false), Some("alice"), false), Ok(Err("unknown repository op")));
+        assert_eq!(apply(&mut s, &onto("demo", m1, NO_BASE, true), Some("alice")), Ok(Err("unknown repository op")));
+        assert!(s.repos.is_empty());
+        // A first push names no base.
+        assert_eq!(apply_at(&mut s, &onto("demo", m1, m2, false), Some("alice"), true), Ok(Err("a repository's first push names no base")));
+        assert_eq!(apply_at(&mut s, &onto("demo", m1, NO_BASE, false), Some("alice"), true), Ok(Ok(())));
+        assert_eq!(s.repos["alice/demo"], Repo { manifest: m1, fork: None, pushes: 1 });
+        // Built on the manifest now: taken. Then a push built on the old one (the 2026-11-16 rollback) is refused.
+        assert_eq!(apply_at(&mut s, &onto("demo", m2, m1, false), Some("alice"), true), Ok(Ok(())));
+        assert_eq!(apply_at(&mut s, &onto("demo", m3, m1, false), Some("alice"), true),
+            Ok(Err("the push wasn't built on the repository's current manifest (fetch and push again, or force it)")));
+        assert_eq!(s.repos["alice/demo"], Repo { manifest: m2, fork: None, pushes: 2 });
+        // Forced, it replaces as a push always did.
+        assert_eq!(apply_at(&mut s, &onto("demo", m3, m1, true), Some("alice"), true), Ok(Ok(())));
+        assert_eq!(s.repos["alice/demo"], Repo { manifest: m3, fork: None, pushes: 3 });
+        // The owner/maintainer check still comes first.
+        assert_eq!(apply_at(&mut s, &onto("alice/demo", m4, m3, true), Some("bob"), true), Ok(Err("only the owner and its maintainers push to a repository")));
+        // An op 1 push (no base) onto an existing repository is refused at version 4, taken below it.
+        let plain = |n: &str, m| RepoOp::Push { name: n.into(), manifest: m };
+        assert_eq!(apply_at(&mut s, &plain("demo", m4), Some("alice"), true), Ok(Err("from rules version 4 a push to an existing repository names its base (op 7)")));
+        assert_eq!(s.repos["alice/demo"].manifest, m3);
+        assert_eq!(apply_at(&mut s, &plain("demo", m4), Some("alice"), false), Ok(Ok(())));
+        assert_eq!(s.repos["alice/demo"], Repo { manifest: m4, fork: None, pushes: 4 });
+        // An op 1 push that makes a new repository stays valid at version 4.
+        assert_eq!(apply_at(&mut s, &plain("fresh", m1), Some("alice"), true), Ok(Ok(())));
+        assert_eq!(s.repos["alice/fresh"], Repo { manifest: m1, fork: None, pushes: 1 });
+        // A fork's first push is built on the fork's manifest (its source's).
+        apply_at(&mut s, &RepoOp::Fork { name: "demo".into(), from: "alice/demo".into() }, Some("carol"), true).unwrap().unwrap();
+        assert!(apply_at(&mut s, &onto("demo", m1, NO_BASE, false), Some("carol"), true).unwrap().is_err());
+        assert_eq!(apply_at(&mut s, &onto("demo", m1, m4, false), Some("carol"), true), Ok(Ok(())));
+    }
+
+    #[test]
+    fn the_base_check_starts_at_its_height() {
+        set_base_check_from(9_998, Some(700));
+        assert!(!base_checked(9_998, 699) && base_checked(9_998, 700) && base_checked(9_998, 5_000));
+        assert!(!base_checked(9_997, 5_000));
+        set_base_check_from(9_998, None);
+        assert!(!base_checked(9_998, 5_000));
     }
 
     #[test]

@@ -98,14 +98,15 @@ pub fn pay(net: &Net, reg: &Registry, me: &Key, tip: u64) -> Value {
         "waits": wait.as_ref().map(|w| w.0),
         "why": wait.map(|w| w.1),
         // Pay is shared by pay weight (every registered replica that hasn't missed its last audit); blocks are written
-        // by draw weight (replicas DRAW_WEIGHT_WAIT blocks after their first passed audit).
+        // by draw weight (replicas DRAW_WEIGHT_WAIT blocks after their first passed audit; from rules version 4 on the
+        // testnet, right after it).
         "pay_weight": reg.owner_pay_weight(me),
         "draw_weight": reg.owner_draw_weight(me),
         "weight": reg.weight(me),
         "total_weight": reg.total_weight().min(u64::MAX as u128) as u64,
         "replicas": reps.len(),
         "replicas_not_drawing": draw_waiting,
-        "draw_weight_wait": params::DRAW_WEIGHT_WAIT,
+        "draw_weight_wait": params::draw_weight_wait(net, tip + 1),
         "silenced_until": reg.silenced_until(me),
         "verdicts": {"served": ok, "not_served": not},
         "held": held,

@@ -253,10 +253,8 @@ fn ask_from(asked: &str, v: &Value) -> String {
 /// The sealed vault for @tag: from `from` if given, else from whichever known arcade holds it
 /// (up to 8 asked at once). Its address must be the one the @tag names on chain.
 pub(crate) fn find_vault(node: &Node, tag: &str, from: Option<&str>) -> Result<(String, Value), String> {
-    let owner = arcade_ledger::index::tag_row(&node.chain, node.ledger_home().chain_no, tag)
-        .map_err(|e| e.to_string())?
-        .map(|r| r.address)
-        .ok_or_else(|| format!("@{tag} is not claimed"))?;
+    // The @tag's holder (ARCADE first, by key hash); a vault names its address in either chain's form.
+    let owner = crate::hometag::owner(node, tag).map(|(_, a)| node.home_address(&a)).ok_or_else(|| format!("@{tag} is not claimed"))?;
     let hosts: Vec<String> = match from {
         Some(h) => vec![bare_host(h.trim())],
         None => arcade_hosts(node),
@@ -269,7 +267,7 @@ pub(crate) fn find_vault(node: &Node, tag: &str, from: Option<&str>) -> Result<(
         for chunk in hosts.chunks(8) {
             let found = std::thread::scope(|s| {
                 let hs: Vec<_> = chunk.iter().map(|h| s.spawn(move || ask_vault(h, tag, here))).collect();
-                hs.into_iter().filter_map(|h| h.join().ok().flatten()).find(|(_, v)| v["address"] == owner.as_str())
+                hs.into_iter().filter_map(|h| h.join().ok().flatten()).find(|(_, v)| v["address"].as_str().is_some_and(|a| node.home_address(a) == owner))
             });
             if let Some(f) = found {
                 return Ok(f);
@@ -304,7 +302,8 @@ pub fn sign_in(node: &Node, tag: &str, password: &str, from: Option<&str>) -> Re
     let seed = arcade_wallet::keys::seed_from_phrase(&phrase).map_err(|e| e.to_string())?;
     let x = arcade_wallet::keys::tag_key(&seed[..], p.bip44_coin_type, 0).map_err(|e| e.to_string())?;
     let addr0 = arcade_wallet::keys::p2pkh_address(&x.public(), p.p2pkh_version);
-    if said["address"] != addr0.as_str() {
+    // The same key in either chain's form (an account made before ARCADE was home names its Pepecoin address).
+    if said["address"].as_str().map(|a| node.home_address(a)) != Some(node.home_address(&addr0)) {
         return Err(format!("these words give {addr0}, but @{tag} is {}", said["address"]));
     }
     let id = account_id(&login_pub);
@@ -318,8 +317,6 @@ pub fn sign_in(node: &Node, tag: &str, password: &str, from: Option<&str>) -> Re
     // Make the tag key known (slot 0) so the wallet and messages see it at once.
     let _ = node.app.tag_key(p, 0);
     let _ = node.app.event("wallet", &format!("signed in as @{tag} (from {host})"));
-    // 0.01 ARCADE a day for a:// (crate::arcfaucet).
-    crate::arcfaucet::ask_for_wallet(node);
 
     let imports = bring_imports(node, &host, &tag, password).unwrap_or_else(|e| json!({"error": e}));
     let mailbox = bring_mailbox(node, &host, &login, &mk).unwrap_or_else(|e| json!({"error": e}));

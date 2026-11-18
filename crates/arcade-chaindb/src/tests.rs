@@ -1145,3 +1145,78 @@ fn a_damaged_chain_file_is_set_aside_not_fatal() {
     db.connect_blocks(p, &[g]).unwrap();
     assert!(db.has_own_file(c), "and syncs again into a new file");
 }
+
+#[test]
+fn a_stop_doesnt_wait_forever_on_a_stuck_batch() {
+    // The JB20B (2026-11-17): a chain thread stuck inside one long step held its batch for hours, and the stop waited
+    // on it with every other chain's sync already halted. Now that chain is left for the next start to wind back.
+    let dir = tempfile::tempdir().unwrap();
+    let mut prev = Hash256::ZERO;
+    let mut blocks = Vec::new();
+    for i in 0..3u32 {
+        let b = block(prev, vec![tx(&[], &[(50, p2pkh(i as u8))], i)], i + 1);
+        prev = b.hash();
+        blocks.push(b);
+    }
+    let p = params_for(&blocks[0]);
+    let db = std::sync::Arc::new(ChainDb::open(&dir.path().join("chain.mdbx")).unwrap());
+    // Catching up (deferred, coin cache on): the coins wait in the cache for a flush.
+    db.set_coin_cache_mb(16);
+    for b in &blocks {
+        db.connect_blocks_checked(p, std::slice::from_ref(b), true).unwrap();
+    }
+    assert!(!db.coins_settled(p.chain_no), "a cache to write");
+    let lock = db.batch_of(&db.store(p.chain_no));
+    let (held, release) = (std::sync::mpsc::channel::<()>(), std::sync::mpsc::channel::<()>());
+    let stuck = std::thread::spawn(move || {
+        let _g = lock.lock().unwrap();
+        held.0.send(()).unwrap();
+        let _ = release.1.recv();
+    });
+    held.1.recv().unwrap();
+    let t = std::time::Instant::now();
+    let out = db.flush_all_for_stop_within(std::time::Duration::from_millis(300));
+    assert!(t.elapsed() < std::time::Duration::from_secs(5), "didn't wait on the stuck batch");
+    let r = out.iter().find(|(c, _)| *c == p.chain_no).expect("the chain is reported");
+    assert!(r.1.as_ref().is_err_and(|e| e.to_string().contains("still busy")), "{:?}", r.1);
+    assert!(!db.coins_settled(p.chain_no), "left unwritten");
+    release.0.send(()).unwrap();
+    stuck.join().unwrap();
+    // Free again: it is written.
+    assert!(db.flush_all_for_stop().iter().all(|(_, r)| r.is_ok()));
+    assert!(db.coins_settled(p.chain_no));
+}
+
+#[test]
+fn one_chain_busy_doesnt_stop_another() {
+    // The JB20B (2026-11-17): one lock held every chain's coin cache, taken for a whole batch, so Litecoin's batches of
+    // minutes stopped every other chain. Each chain's cache has its own lock now.
+    let dir = tempfile::tempdir().unwrap();
+    let g = block(Hash256::ZERO, vec![tx(&[], &[(50, p2pkh(1))], 0)], 1);
+    let pa = params_for(&g);
+    let pb: &'static ChainParams = {
+        let mut p = pa.clone();
+        p.chain_no = pa.chain_no + 1;
+        p.key = "otherchain";
+        Box::leak(Box::new(p))
+    };
+    let db = std::sync::Arc::new(ChainDb::open(&dir.path().join("chain.mdbx")).unwrap());
+    db.set_coin_cache_mb(16);
+    db.connect_blocks_checked(pa, std::slice::from_ref(&g), true).unwrap();
+    // Chain A's cache held, as by a batch that takes long.
+    let a = db.cache_of(pa.chain_no);
+    let _busy = a.lock().unwrap();
+    // Chain B connects meanwhile, and the stop's check on A doesn't wait for it.
+    let db2 = db.clone();
+    let gb = g.clone();
+    let t = std::time::Instant::now();
+    let h = std::thread::spawn(move || db2.connect_blocks_checked(pb, std::slice::from_ref(&gb), true).map(|t| t.height));
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while !h.is_finished() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(h.is_finished(), "chain B waited on chain A's cache");
+    assert_eq!(h.join().unwrap().unwrap(), 0);
+    assert!(t.elapsed() < std::time::Duration::from_secs(10));
+    assert!(!db.coins_settled(pa.chain_no), "busy counts as not settled, without waiting");
+}

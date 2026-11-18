@@ -32,13 +32,9 @@ pub fn address_of(node: &Node, target: &str) -> Option<String> {
 /// An @tag or an address, as an address on the home chain.
 pub fn resolve(node: &Node, who: &str) -> Result<String, String> {
     let who = who.trim();
-    let c = node.ledger_home().chain_no;
     match who.strip_prefix('@') {
-        Some(t) => Ok(arcade_ledger::index::tag_row(&node.chain, c, &t.to_lowercase())
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("@{t} is not claimed"))?
-            .address),
-        None if target_of(who).is_some() => Ok(who.to_string()),
+        Some(t) => crate::hometag::owner(node, t).map(|(_, a)| node.home_address(&a)).ok_or_else(|| format!("@{t} is not claimed")),
+        None if target_of(who).is_some() => Ok(node.home_address(who)),
         None => Err("give an @tag or an address".into()),
     }
 }
@@ -66,15 +62,19 @@ fn settle(acts: impl Iterator<Item = Value>, key: impl Fn(&Value) -> Option<Stri
 
 pub fn followers_of(node: &Node, address: &str) -> Vec<String> {
     let Some(t) = target_of(address) else { return vec![] };
-    let c = node.ledger_home().chain_no;
-    let mut acts = m::acts_on(&node.chain, c, &t);
+    // Every ledger chain's acts on the target (it names a key hash, the same on each), oldest chain first.
+    let mut acts: Vec<Value> = node.ledger_chains().into_iter().flat_map(|p| m::acts_on(&node.chain, p.chain_no, &t)).map(|mut a| {
+        if let Some(f) = a["from"].as_str().map(|f| node.home_address(f)) {
+            a["from"] = json!(f);
+        }
+        a
+    }).collect();
     acts.extend(waiting(node).into_iter().filter(|a| a["target"] == t.as_str()));
     settle(acts.into_iter(), |a| a["from"].as_str().filter(|f| *f != address).map(String::from))
 }
 
 pub fn following_of(node: &Node, address: &str) -> Vec<String> {
-    let c = node.ledger_home().chain_no;
-    let mut acts: Vec<Value> = m::rows(&node.chain, m::ACT, c).unwrap_or_default().into_iter().filter(|a| a["from"] == address).collect();
+    let mut acts: Vec<Value> = crate::feedsvc::ledger_rows(node, m::ACT).into_iter().filter(|a| a["from"] == address).collect();
     acts.extend(waiting(node).into_iter().filter(|a| a["from"] == address));
     settle(acts.into_iter(), |a| a["target"].as_str().and_then(|t| address_of(node, t)).filter(|x| x != address))
 }

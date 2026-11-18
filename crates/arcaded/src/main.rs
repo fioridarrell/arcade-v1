@@ -104,7 +104,6 @@ mod rpc;
 mod sizes;
 mod udpsvc;
 mod relaysvc;
-mod llmsvc;
 mod svcmesh;
 mod turnsvc;
 mod v1copy;
@@ -172,6 +171,9 @@ fn tame_malloc() {
 #[cfg(not(all(target_os = "linux", target_env = "gnu")))]
 fn tame_malloc() {}
 
+/// The most a stop spends writing the coin caches before it goes on without them.
+const STOP_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
 /// Set by SIGTERM / SIGINT; the "stop" thread flushes and exits.
 static STOP_ASKED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 /// Set by an update: after the clean stop, start the new arcaded in this process's place.
@@ -210,15 +212,31 @@ fn stop_cleanly_on_signal(node: Arc<Node>) {
                 eprintln!("arcaded: stopping: writing the coin caches (stop again to leave without writing them)");
                 let t = std::time::Instant::now();
                 // Waits for a batch still writing to commit first: its cache flush is only
-                // in the database once that batch commits.
-                for (c, r) in node.chain.flush_all_for_stop() {
-                    match r {
-                        Err(e) if c == u16::MAX => eprintln!("arcaded: a chain file not synced: {e}"),
-                        Err(e) => eprintln!("arcaded: chain {c}: coin cache not written: {e}"),
-                        Ok(()) => {}
+                // in the database once that batch commits. A chain whose batch stays busy is
+                // left for its next start to wind back (arcade_chaindb STOP_BATCH_WAIT), and the
+                // whole flush has STOP_DEADLINE: past it the stop goes on without it, as a second
+                // stop signal does (the JB20B waited for hours on a stuck chain, 2026-11-17).
+                let (done_tx, done_rx) = std::sync::mpsc::channel();
+                let n = node.clone();
+                let _ = std::thread::Builder::new().name("stop-flush".into()).spawn(move || {
+                    let _ = done_tx.send(n.chain.flush_all_for_stop());
+                });
+                match done_rx.recv_timeout(STOP_DEADLINE) {
+                    Ok(results) => {
+                        for (c, r) in results {
+                            match r {
+                                Err(e) if c == u16::MAX => eprintln!("arcaded: a chain file not synced: {e}"),
+                                Err(e) => eprintln!("arcaded: chain {c}: coin cache not written: {e}"),
+                                Ok(()) => {}
+                            }
+                        }
+                        eprintln!("arcaded: stopped ({:.1}s)", t.elapsed().as_secs_f64());
                     }
+                    Err(_) => eprintln!(
+                        "arcaded: stopped without finishing the coin caches after {}s (something holds the database): the next start winds back what wasn't written",
+                        STOP_DEADLINE.as_secs()
+                    ),
                 }
-                eprintln!("arcaded: stopped ({:.1}s)", t.elapsed().as_secs_f64());
                 if RESTART_ASKED.load(std::sync::atomic::Ordering::SeqCst) {
                     eprintln!("arcaded: starting the updated arcaded");
                     updater::exec_self();
@@ -440,11 +458,6 @@ fn main() {
         std::thread::Builder::new().name("dogefeed keys".into()).spawn(move || dproto::run(n)).unwrap();
     }
     {
-        // Shared models (docs/LLM.md): our offer said to the mesh, top-ups settled.
-        let n = node.clone();
-        std::thread::Builder::new().name("llm".into()).spawn(move || llmsvc::run(n)).unwrap();
-    }
-    {
         // Services over the mesh (svcmesh): helpers' offers said again while they stay attached.
         let n = node.clone();
         std::thread::Builder::new().name("svc".into()).spawn(move || svcmesh::run(n)).unwrap();
@@ -518,6 +531,7 @@ fn main() {
                         }
                         faucet::pay_asks(&n);
                         arcfaucet::pay(&n);
+                        arcfaucet::node_gift_ask(&n);
                         last = std::time::Instant::now();
                     }
                     claims::advance_all(&n);

@@ -1,5 +1,7 @@
 /* Arcade V1.0: arcade.llm for app pages (the original arcade's llm.js API, docs/compat/APP_API.md B4): shared AI
-   models on the mesh, paid from the player's ARCADE credit at each seller (docs/LLM.md).
+   models on the mesh, paid from the player's ARCADE credit at each seller. Since the marketplace moved into the Models
+   app, the window answers it over arcade.svc (docs/SVC.md): offers from the mesh, chats through this computer's
+   arcade-models helper (credit isn't listed here: the Models app shows it).
 
      arcade.llm.offers()  -> [{seller, here, free, name, tag, models:[{id}], prices:[{leg, label, model, in, out}], max_out, credit}]
      arcade.llm.chat(req) -> {content, reasoning, usage:{tokens_in, tokens_out}, cost, left, seller, model, leg}

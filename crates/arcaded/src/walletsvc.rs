@@ -669,7 +669,7 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
         node.tx_outbox.lock().unwrap().push(tx.raw.clone());
     }
     let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
-    let caution = if send { None } else { crate::ordsafe::caution(node, node.ledger_home(), &spent) };
+    let caution = if send { None } else { crate::ordsafe::caution(node, p, &spent) };
     Ok((tx.txid.to_hex(), fee, outs, caution))
 }
 
@@ -887,7 +887,7 @@ fn insc_transfer(payload: &[u8]) -> Option<[u8; 32]> {
 pub fn pending_moves(node: &Node, address: &str) -> (Vec<Value>, Vec<Value>) {
     use arcade_ledger::payload::{decode, Msg};
     let (mut inc, mut out) = (Vec::new(), Vec::new());
-    for (tx, atx) in crate::claims::pending_arcade(node) {
+    for (tx, atx) in crate::claims::pending_arcade_on(node, node.params) {
         // An INSC transfer (kind 2: "INSC", version 1, kind 2, the inscription's txid): its inscription is on its
         // way to the reference output.
         if let Some(insc) = insc_transfer(&atx.payload) {

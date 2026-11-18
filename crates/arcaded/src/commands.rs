@@ -74,20 +74,6 @@ cmds! {
     "svc.ask" Local "to, service, body, timeout?, stream?" "Ask a service at an arcade (node id) over the mesh; answers collected (bytes as base64), or streamed line by line on the socket.";
     "svc.pay" Wallet "to, amount, memo" "Pay ARCADE to an address with a memo of up to 80 bytes (a service's credit).";
     "svc.paid" Read "txid, memo?" "Whether a payment is in a block, what it paid this arcade's address, and whether the memo is in it.";
-    "llm.status" Admin "" "Shared models, selling side: the model server's address, the models shared and their prices (ARCADE per million tokens in and out), requests at once, longest reply, refunds, what the server has now, and what was earned.";
-    "llm.set" Admin "on?, servers? [{url, key?}] | url?, key?, models?, prices?, at_once?, max_out?, refunds?, own_free?" "Share this computer's model server (any OpenAI-compatible one: vLLM, llama.cpp, Ollama, LM Studio) with the mesh for ARCADE. prices = {model: {in, out}} in ARCADE per million tokens (0 or none: free); a speech model (OpenAI audio/speech, e.g. a CSM voice server) is priced by `in` per million characters. Several servers: servers = [{url, key}].";
-    "llm.scan" Admin "servers? | url?, key?" "The models a model server has (the one set, or one given before saving it).";
-    "llm.offers" Read "" "Every model on offer across the mesh: seller, @tag, prices (ARCADE per million tokens), busy, whether linked, this arcade's record of the seller and last known credit there.";
-    "llm.balance" Read "seller" "This wallet's credit at a seller (node id or @tag), its address to pay and the memo.";
-    "llm.topup" Local "seller, amount" "Buy model credit at a seller: pays amount ARCADE to its address with this wallet's memo; credited once the payment is in a block.";
-    "llm.refund" Local "seller" "Ask a seller to pay this wallet's unused credit back.";
-    "llm.chat" Local "model?, seller?, messages, max_tokens?, temperature?" "One reply from a shared model, paid from this wallet's credit at the seller (model \"name@seller\" or a bare name: ours, else one with credit, else free, else cheapest).";
-    "llm.speak" Local "model?, seller?, input, voice?, response_format?" "Speech from a shared voice model (text to speech), paid from this wallet's credit at the seller by the characters read; the audio comes back as base64.";
-    "llm.auto" Local "on?, floor?, amount?, daily_cap?" "Auto top-up: buy amount ARCADE of credit again when it falls under floor at a seller, at most daily_cap a day. Off by default.";
-    "llm.keys" Read "" "Keys for OpenAI programs (/openai/v1 on this computer), without their secrets.";
-    "llm.key_new" Local "name?" "A new sk-arcade- key for OpenAI programs (shown once); base URL http://127.0.0.1:<port>/openai/v1.";
-    "llm.key_drop" Local "id" "Revoke an OpenAI program key.";
-    "llm.usage" Read "n?" "Shared models: the latest requests this arcade sold, and its record of the sellers it bought from.";
     "events" Read "n?, kind?" "Recent activity (newest first), optionally of one kind.";
     "mempool" Public "" "Home chain transactions waiting for a block.";
     // For a website server in front of this arcade (its users hold their own keys)
@@ -145,8 +131,8 @@ cmds! {
     "start.status" Read "" "Getting started: wallet made, handle (claimed or being claimed), test coins asked for or here, synced.";
     "tag.list" Read "" "Your tag claims and their progress.";
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";
-    "faucet.arc" Wallet "address?" "Ask the mesh to top an ARCADE address up to 0.01 ARCADE (once per address a day; a website calls it when a user signs in). Without address: this wallet's.";
-    "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today.";
+    "faucet.arc" Wallet "address" "The user faucet: ask the mesh to top a website user's ARCADE address up to 0.05 ARCADE, in two coins (once per address a day; a website calls it when a user signs in). This arcade's own wallet gets 1 ARCADE once from the node faucet instead.";
+    "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today; node_faucet: node-gift asks, gifts paid today, nodes known paid, and this arcade's own gift.";
     // Messaging
     "msg.me" Read "" "Your messaging key, fingerprint and whether it is published.";
     "msg.stats" Public "" "How many message candidates, posts, acts and machine records the home chain holds.";
@@ -219,7 +205,7 @@ cmds! {
     "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";
     "ledger.tag_commit" Wallet "tag" "Commit ahead to claiming a released @tag on the ARCADE chain.";
     "ledger.tag_checkin" Wallet "" "Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot).";
-    "ledger.repo_push" Wallet "name, manifest" "Point @owner/name at a git manifest blob (owner or maintainer).";
+    "ledger.repo_push" Wallet "name, manifest, base?, force?" "Point @owner/name at a git manifest blob (owner or maintainer). From rules v4 the push names base (the manifest it was built on, \"\" for a new repo; default: the current one) and is refused if the repo moved on, unless force.";
     "ledger.repo_maintainer" Wallet "name, tag, add?" "Add or remove a maintainer of your repository.";
     "ledger.repo_fork" Wallet "from, name" "Fork @owner/name under your @tag.";
     "ledger.repo" Read "name" "A repository under an @tag: its manifest, maintainers and push history.";

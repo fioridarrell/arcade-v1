@@ -92,6 +92,15 @@ pub struct Store {
 }
 
 static NEXT_ID: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(1);
+/// How many free page numbers a write may gather from the free list (GC) while looking for
+/// a run of contiguous pages for a long value (MDBX_opt_rp_augment_limit). mdbx's default is
+/// a third of the file's pages; on a big fragmented file (the 766 GB LTC chain.mdbx, 31M free
+/// pages) that search took 30 s for a 1 MB value and 166 s for 2 MB, holding the write lock
+/// the whole time, so the ord walk and tip sync stalled. With this cap the same puts take
+/// milliseconds; a long value that finds no run in time goes at the end of the file instead
+/// (a little growth). 262,144 pages = 1 GiB of 4 KB pages.
+const GC_SEARCH_PAGES: u64 = 262_144;
+
 fn next_id() -> usize {
     NEXT_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
@@ -109,6 +118,7 @@ impl Store {
         let opts = DatabaseOptions {
             max_tables: Some(schema.tables.len() as u64 + 1 + ADDON_TABLE_SLOTS),
             no_sub_dir: true,
+            rp_augment_limit: Some(GC_SEARCH_PAGES),
             mode: Mode::ReadWrite(ReadWriteOptions {
                 sync_mode: if durable { SyncMode::Durable } else { SyncMode::SafeNoSync },
                 min_size: None,

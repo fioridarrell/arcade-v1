@@ -239,9 +239,7 @@ fn body_cap(node: &Node, r: &Req, is_local: bool) -> usize {
     let p = r.path.as_str();
     let rpc = p == "/rpc" || r.method == "POST" && (p == "/" || p.starts_with("/chain/"));
     let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim);
-    if rpc && cookie_ok(node, r) || p.starts_with("/api/v1/") && key.is_some_and(|k| crate::apikeys::known(node, k))
-        || p.starts_with("/openai/v1/") && key.is_some_and(|k| crate::llmsvc::key_ok(node, k))
-    {
+    if rpc && cookie_ok(node, r) || p.starts_with("/api/v1/") && key.is_some_and(|k| crate::apikeys::known(node, k)) {
         MAX_BODY
     } else if p.starts_with("/realtime/") {
         MAX_DOOR_BODY
@@ -590,12 +588,10 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         }
         return rpc(node, &mut s, &r);
     }
-    // Shared models for OpenAI programs (crate::llmsvc, docs/LLM.md): this computer only, with an sk-arcade- key.
-    if let Some(rest) = path.strip_prefix("/openai/v1/") {
-        if !is_local {
-            return openai_err(&mut s, "403 Forbidden", "the OpenAI door answers only this computer");
-        }
-        return openai_door(node, &mut s, &r, rest);
+    // The OpenAI door for shared models moved to the Models app's helper (arcade-models, docs/SVC.md): say where.
+    if path.starts_with("/openai/v1/") {
+        let v = json!({"error": {"message": "shared models moved to the Models app: run arcade-models beside this arcade and use its door, http://127.0.0.1:8440/v1, with a key made in the Models app", "type": "arcade", "code": "moved"}});
+        return respond(&mut s, "410 Gone", "application/json", &[], v.to_string().as_bytes());
     }
     if let Some(rest) = path.strip_prefix("/api/v1/") {
         if !is_local {
@@ -1650,153 +1646,5 @@ pub(crate) mod tests {
         assert!(read_head(&mut rd).is_none());
         assert!(started.elapsed() < Duration::from_millis(600), "{:?}", started.elapsed());
         client.join().unwrap();
-    }
-}
-
-fn openai_err(s: &mut TcpStream, status: &str, msg: &str) {
-    let v = json!({"error": {"message": msg, "type": "arcade", "code": null}});
-    respond(s, status, "application/json", &[], v.to_string().as_bytes());
-}
-
-/// `/openai/v1/models`, `/openai/v1/chat/completions` and `/openai/v1/audio/speech` (crate::llmsvc): a shared model, paid from this wallet's
-/// credit at its seller, as OpenAI programs ask for it.
-fn openai_door(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
-    let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(str::trim).unwrap_or("");
-    if !crate::llmsvc::key_ok(node, key) {
-        return openai_err(s, "401 Unauthorized", "an sk-arcade- key is needed (make one in the Models tab, or llm.key_new)");
-    }
-    match (r.method.as_str(), rest.trim_end_matches('/')) {
-        ("GET", "models") => respond(s, "200 OK", "application/json", &[], crate::llmsvc::openai_models(node).to_string().as_bytes()),
-        ("POST", "chat/completions") => {
-            let Ok(body) = serde_json::from_slice::<Value>(&r.body) else { return openai_err(s, "400 Bad Request", "the body isn't JSON") };
-            let asked = body["model"].as_str().unwrap_or("").to_string();
-            let (seller, model) = match crate::llmsvc::pick(node, &asked) {
-                Ok(x) => x,
-                Err(e) => return openai_err(s, "404 Not Found", &e),
-            };
-            let mut b = body.clone();
-            b["model"] = json!(model);
-            let id = format!("chatcmpl-arcade-{:016x}", rand_core::RngCore::next_u64(&mut rand_core::OsRng));
-            let created = arcade_app::now();
-            if body["stream"] == true {
-                let head = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-store\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-Content-Type-Options: nosniff\r\n\r\n";
-                if s.write_all(head.as_bytes()).is_err() {
-                    return;
-                }
-                let mut out = s.try_clone().ok();
-                let mut send = |t: &str| -> Result<(), String> {
-                    let Some(o) = out.as_mut() else { return Err("closed".into()) };
-                    o.write_all(format!("{:x}\r\n{t}\r\n", t.len()).as_bytes()).map_err(|_| "the program hung up".to_string())
-                };
-                let with_usage = body["stream_options"]["include_usage"] == true;
-                let r = crate::llmsvc::chat(node, &seller, &b, &mut |mut c| {
-                    if c["choices"].as_array().is_some_and(|a| a.is_empty()) && c["usage"].is_object() {
-                        return Ok(()); // the seller's usage chunk: ours comes last, with the cost
-                    }
-                    c["id"] = json!(id);
-                    c["model"] = json!(asked);
-                    c.as_object_mut().map(|o| o.remove("usage"));
-                    send(&format!("data: {c}\n\n"))
-                });
-                match r {
-                    Ok(last) => {
-                        if with_usage {
-                            let u = &last["usage"];
-                            let (i, o) = (u["tokens_in"].as_u64().unwrap_or(0), u["tokens_out"].as_u64().unwrap_or(0));
-                            let c = json!({"id": id, "object": "chat.completion.chunk", "created": created, "model": asked, "choices": [],
-                                           "usage": {"prompt_tokens": i, "completion_tokens": o, "total_tokens": i + o}, "arcade": last});
-                            let _ = send(&format!("data: {c}\n\n"));
-                        }
-                    }
-                    Err(e) => {
-                        let _ = send(&format!("data: {}\n\n", json!({"error": {"message": e, "type": "arcade"}})));
-                    }
-                }
-                let _ = send("data: [DONE]\n\n");
-                let _ = s.write_all(b"0\r\n\r\n");
-                return;
-            }
-            let (mut content, mut reasoning, mut finish) = (String::new(), String::new(), Value::Null);
-            let mut tools: Vec<Value> = Vec::new();
-            let r = crate::llmsvc::chat(node, &seller, &b, &mut |c| {
-                for ch in c["choices"].as_array().into_iter().flatten() {
-                    let d = &ch["delta"];
-                    content.push_str(d["content"].as_str().unwrap_or(""));
-                    reasoning.push_str(d["reasoning_content"].as_str().or(d["reasoning"].as_str()).unwrap_or(""));
-                    for t in d["tool_calls"].as_array().into_iter().flatten() {
-                        let i = t["index"].as_u64().unwrap_or(tools.len() as u64) as usize;
-                        while tools.len() <= i.min(63) {
-                            tools.push(json!({"id": "", "type": "function", "function": {"name": "", "arguments": ""}}));
-                        }
-                        let x = &mut tools[i.min(63)];
-                        if let Some(v) = t["id"].as_str() {
-                            x["id"] = json!(v);
-                        }
-                        if let Some(v) = t["function"]["name"].as_str() {
-                            x["function"]["name"] = json!(format!("{}{v}", x["function"]["name"].as_str().unwrap_or("")));
-                        }
-                        if let Some(v) = t["function"]["arguments"].as_str() {
-                            x["function"]["arguments"] = json!(format!("{}{v}", x["function"]["arguments"].as_str().unwrap_or("")));
-                        }
-                    }
-                    if !ch["finish_reason"].is_null() {
-                        finish = ch["finish_reason"].clone();
-                    }
-                }
-                Ok(())
-            });
-            match r {
-                Ok(last) => {
-                    let u = &last["usage"];
-                    let (i, o) = (u["tokens_in"].as_u64().unwrap_or(0), u["tokens_out"].as_u64().unwrap_or(0));
-                    let mut msg = json!({"role": "assistant", "content": content});
-                    if !reasoning.is_empty() {
-                        msg["reasoning_content"] = json!(reasoning);
-                    }
-                    if !tools.is_empty() {
-                        msg["tool_calls"] = json!(tools);
-                    }
-                    let v = json!({"id": id, "object": "chat.completion", "created": created, "model": asked,
-                                   "choices": [{"index": 0, "message": msg, "finish_reason": if finish.is_null() { json!("stop") } else { finish }}],
-                                   "usage": {"prompt_tokens": i, "completion_tokens": o, "total_tokens": i + o}, "arcade": last});
-                    respond(s, "200 OK", "application/json", &[], v.to_string().as_bytes())
-                }
-                Err(e) => openai_err(s, "502 Bad Gateway", &e),
-            }
-        }
-        ("POST", "audio/speech") => {
-            let Ok(body) = serde_json::from_slice::<Value>(&r.body) else { return openai_err(s, "400 Bad Request", "the body isn't JSON") };
-            let asked = body["model"].as_str().unwrap_or("").to_string();
-            let (seller, model) = match crate::llmsvc::pick(node, &asked) {
-                Ok(x) => x,
-                Err(e) => return openai_err(s, "404 Not Found", &e),
-            };
-            let mut b = body.clone();
-            b["model"] = json!(model);
-            // The head goes out with the first audio, so an error before it is a proper error answer.
-            let mut out = s.try_clone().ok();
-            let mut started = false;
-            let r = crate::llmsvc::speak(node, &seller, &b, &mut |ct, bytes| {
-                let Some(o) = out.as_mut() else { return Err("closed".into()) };
-                if !started {
-                    let head = format!("HTTP/1.1 200 OK\r\nContent-Type: {}\r\nCache-Control: no-store\r\nConnection: close\r\nTransfer-Encoding: chunked\r\nX-Content-Type-Options: nosniff\r\n\r\n", ct.unwrap_or("application/octet-stream"));
-                    o.write_all(head.as_bytes()).map_err(|_| "the program hung up".to_string())?;
-                    started = true;
-                }
-                if bytes.is_empty() {
-                    return Ok(());
-                }
-                o.write_all(format!("{:x}\r\n", bytes.len()).as_bytes()).and_then(|_| o.write_all(bytes)).and_then(|_| o.write_all(b"\r\n")).map_err(|_| "the program hung up".to_string())
-            });
-            match r {
-                Ok(_) if started => {
-                    let _ = s.write_all(b"0\r\n\r\n");
-                }
-                Ok(_) => openai_err(s, "502 Bad Gateway", "the seller sent no audio"),
-                Err(e) if !started => openai_err(s, if e.starts_with("not enough credit") { "402 Payment Required" } else { "502 Bad Gateway" }, &e),
-                Err(_) => {} // cut off: the program sees the audio end early
-            }
-        }
-        _ => openai_err(s, "404 Not Found", "this door has GET models, POST chat/completions and POST audio/speech"),
     }
 }

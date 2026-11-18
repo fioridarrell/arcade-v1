@@ -506,13 +506,14 @@
       }));
     $("c-pause").hidden = !!st.home || !!st.arcade; $("c-stop").hidden = !!st.home;
     $("c-pause").textContent = st.state === "paused" ? "Resume" : "Pause";
+    $("c-pause").dataset.paused = st.state === "paused" ? "1" : "";
   }
 
   $("c-close").onclick = $("c-cancel").onclick = () => { $("c-installer").hidden = true; watching = null; };
   $("c-go").onclick = install;
   $("c-pause").onclick = async () => {
     if (!watching) return;
-    const paused = $("c-pause").textContent === "Resume";
+    const paused = $("c-pause").dataset.paused === "1";      // not the label: it may be shown in another language
     try { showProgress(await api(paused ? "chains.resume" : "chains.pause", { key: watching })); } catch (e) { msg(e.message, true); }
   };
   let armed = false;

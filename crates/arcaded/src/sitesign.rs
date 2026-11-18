@@ -22,6 +22,10 @@
 //! seconds, shows each one (`id.sign_pending`: for a PSBT the coins it signs, every output, the
 //! fee, and whether a signed coin carries an inscription, checked with this arcade's ord index or
 //! the mesh's), and `id.sign_decide {id, ok}` signs it and answers, or says no.
+//!
+//! What it signs: the account's own P2PKH coins, and an inscription's reveal (D:// style) when the
+//! site names that input with ALL: a P2SH coin whose redeem script locks it to the account's key
+//! after OP_CODESEPARATOR (see crate::psbt). The reveal is left as a partial signature.
 use crate::node::Node;
 use crate::psbt::{self, Psbt};
 use arcade_chain::params::DOGECOIN_MAIN;
@@ -307,8 +311,10 @@ fn hash_name(t: u32) -> &'static str {
     }
 }
 
-/// Which inputs to sign, with which hash type: those named (each must be this wallet's), or every input of this wallet's.
-fn plan(ps: &Psbt, req: &Value, mine: &[u8]) -> Result<Vec<(usize, u32)>, String> {
+/// Which inputs to sign, with which hash type, and whether each is an inscription reveal: those named
+/// (each must be this wallet's coin, or a reveal locked to its key), or every input of this wallet's.
+/// A reveal is signed only when named, and only with ALL.
+fn plan(ps: &Psbt, req: &Value, mine: &[u8]) -> Result<Vec<(usize, u32, bool)>, String> {
     let named = req["inputToSign"].as_array();
     let list: Vec<(usize, u32)> = match named {
         Some(a) => a
@@ -327,18 +333,28 @@ fn plan(ps: &Psbt, req: &Value, mine: &[u8]) -> Result<Vec<(usize, u32)>, String
     if list.is_empty() {
         return Err("there's nothing of this wallet's to sign in it".into());
     }
-    for (i, h) in &list {
-        if *i >= ps.inputs.len() {
+    let mut out = Vec::new();
+    for (i, h) in list {
+        if i >= ps.inputs.len() {
             return Err(format!("there is no input {i}"));
         }
-        if ps.input(*i).coin.as_ref().map(|(_, s)| s.as_slice()) != Some(mine) {
+        let coin = ps.input(i).coin;
+        if coin.as_ref().map(|(_, s)| s.as_slice()) == Some(mine) {
+            if hash_name(h) == "not offered" {
+                return Err(format!("input {i} asks for hash type {h:#04x}, which isn't offered"));
+            }
+            out.push((i, h, false));
+        } else if named.is_some() && (ps.redeem_script(i).is_some() || coin.as_ref().is_some_and(|(_, s)| s.first() == Some(&0xa9))) {
+            ps.reveal_check(i, mine)?;
+            if h != arcade_wallet::legacy::ALL || ps.sighash_of(i) != arcade_wallet::legacy::ALL {
+                return Err(format!("input {i} is an inscription reveal: it is signed with ALL only, not {h:#04x}"));
+            }
+            out.push((i, h, true));
+        } else {
             return Err(format!("input {i} isn't this wallet's coin (or doesn't carry its previous transaction)"));
         }
-        if hash_name(*h) == "not offered" {
-            return Err(format!("input {i} asks for hash type {h:#04x}, which isn't offered"));
-        }
     }
-    Ok(list)
+    Ok(out)
 }
 
 fn preview(node: &Node, p: &Value, req: &Value) -> Result<Value, String> {
@@ -392,18 +408,18 @@ fn psbt_preview(node: &Node, p: &Value, req: &Value) -> Result<Value, String> {
     let ps = Psbt::parse(&psbt::decode_text(req["psbt"].as_str().unwrap_or(""))?)?;
     let mine = arcade_ledger::address::p2pkh_script_for_address(&DOGECOIN_MAIN, p["address"].as_str().unwrap_or("")).ok_or("a broken pairing")?;
     let list = plan(&ps, req, &mine)?;
-    let signed: Vec<usize> = list.iter().map(|(i, _)| *i).collect();
+    let signed: Vec<usize> = list.iter().map(|(i, _, _)| *i).collect();
     // Signed coins that carry an inscription (this arcade's ord index, else the mesh's).
     let coins: Vec<arcade_wallet::tx::Utxo> = signed.iter().filter_map(|i| ps.input(*i).coin.map(|(value, script)| arcade_wallet::tx::Utxo { outpoint: ps.input(*i).prevout, value, script })).collect();
     let free: Vec<arcade_chain::OutPoint> = crate::ordsafe::keep_free(node, &DOGECOIN_MAIN, coins.clone()).into_iter().map(|u| u.outpoint).collect();
     let inputs: Vec<Value> = (0..ps.inputs.len())
         .map(|i| {
             let v = ps.input(i);
-            let sign = list.iter().find(|(x, _)| *x == i);
+            let sign = list.iter().find(|(x, _, _)| *x == i);
             json!({"index": i, "coin": format!("{}:{}", v.prevout.txid, v.prevout.vout), "value": v.coin.as_ref().map(|c| c.0),
                    "from": v.coin.as_ref().and_then(|c| arcade_ledger::address::address_of(&c.1, &DOGECOIN_MAIN)),
-                   "mine": v.coin.as_ref().is_some_and(|c| c.1 == mine), "sign": sign.is_some(), "hash_type": sign.map(|(_, h)| hash_name(*h)),
-                   "inscription": sign.is_some() && !free.contains(&v.prevout)})
+                   "mine": v.coin.as_ref().is_some_and(|c| c.1 == mine), "sign": sign.is_some(), "hash_type": sign.map(|(_, h, _)| hash_name(*h)),
+                   "reveal": sign.is_some_and(|(_, _, r)| *r), "inscription": sign.is_some() && !free.contains(&v.prevout)})
         })
         .collect();
     let outputs: Vec<Value> = ps.tx.outputs.iter().enumerate().map(|(n, o)| {
@@ -424,6 +440,7 @@ fn psbt_preview(node: &Node, p: &Value, req: &Value) -> Result<Value, String> {
     v["from_you"] = json!(from_you);
     v["to_you"] = json!(to_you);
     v["inscriptions"] = json!(inputs.iter().filter(|x| x["inscription"] == true).count());
+    v["reveals"] = json!(inputs.iter().filter(|x| x["reveal"] == true).count());
     v["finalize"] = json!(req["finalize"] == true || req["autoFinalize"] == true);
     Ok(v)
 }
@@ -479,8 +496,13 @@ fn sign_one(req: &Value, key: &arcade_wallet::secp256k1::SecretKey, pubkey: &[u8
     let mut ps = Psbt::parse(&psbt::decode_text(req["psbt"].as_str().unwrap_or(""))?)?;
     let mine = psbt::p2pkh(pubkey);
     let finalize = req["finalize"] == true || req["autoFinalize"] == true;
-    for (i, h) in plan(&ps, req, &mine)? {
-        ps.sign_input(i, key, pubkey, h, finalize)?;
+    for (i, h, reveal) in plan(&ps, req, &mine)? {
+        if reveal {
+            // Never finalized: the site builds the reveal's scriptSig (envelope, signature, key, lock).
+            ps.sign_reveal(i, key, pubkey, h)?;
+        } else {
+            ps.sign_input(i, key, pubkey, h, finalize)?;
+        }
     }
     let mut o = json!({"psbtHex": hex::encode(ps.serialize())});
     if let Some(t) = ps.extract() {
@@ -533,5 +555,192 @@ mod tests {
         let c = parse_pair(&code).unwrap();
         assert_eq!((c.host.as_str(), c.base.as_str()), ("dogenames.example", "https://arcade.example"));
         assert!(parse_pair("arcadelink://x/y?k=z").is_err());
+    }
+
+    // ---- an inscription's reveal (D:// style): named, ALL, partial signature over the P2PKH tail ----
+
+    use arcade_chain::encode::write_varint;
+    use arcade_wallet::legacy;
+
+    fn tx_bytes(inputs: &[([u8; 32], u32, &[u8])], outputs: &[(u64, Vec<u8>)]) -> Vec<u8> {
+        let mut t = 1i32.to_le_bytes().to_vec();
+        write_varint(&mut t, inputs.len() as u64);
+        for (txid, vout, script) in inputs {
+            t.extend_from_slice(txid);
+            t.extend_from_slice(&vout.to_le_bytes());
+            write_varint(&mut t, script.len() as u64);
+            t.extend_from_slice(script);
+            t.extend_from_slice(&0xffff_ffffu32.to_le_bytes());
+        }
+        write_varint(&mut t, outputs.len() as u64);
+        for (v, s) in outputs {
+            t.extend_from_slice(&v.to_le_bytes());
+            write_varint(&mut t, s.len() as u64);
+            t.extend_from_slice(s);
+        }
+        t.extend_from_slice(&0u32.to_le_bytes());
+        t
+    }
+
+    fn kv(out: &mut Vec<u8>, k: &[u8], v: &[u8]) {
+        write_varint(out, k.len() as u64);
+        out.extend_from_slice(k);
+        write_varint(out, v.len() as u64);
+        out.extend_from_slice(v);
+    }
+
+    fn me() -> (arcade_wallet::secp256k1::SecretKey, [u8; 33]) {
+        let key = arcade_wallet::secp256k1::SecretKey::from_slice(&[7u8; 32]).unwrap();
+        (key, arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &key).serialize())
+    }
+
+    fn lock(drops: usize, tail: &[u8]) -> Vec<u8> {
+        let mut l = vec![0x6b, 0x6b];
+        l.extend(vec![0x75; drops]);
+        l.extend_from_slice(&[0x6c, 0x6c, 0xab]);
+        l.extend_from_slice(tail);
+        l
+    }
+
+    fn p2sh_of(script: &[u8]) -> Vec<u8> {
+        arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(script))
+    }
+
+    /// A commit tx paying P2SH(`locked_to`) (input 0's coin) and the wallet's P2PKH (input 1's);
+    /// the reveal spends both. Input 0 carries `redeem` (when given) and `sighash` (when given).
+    fn reveal_psbt(locked_to: &[u8], redeem: Option<&[u8]>, sighash: Option<u32>) -> (Vec<u8>, Vec<u8>) {
+        let mine = psbt::p2pkh(&me().1);
+        let commit = tx_bytes(&[([1u8; 32], 0, &[])], &[(100_000_000, p2sh_of(locked_to)), (500_000_000, mine.clone())]);
+        let ctxid = arcade_chain::Tx::parse(&commit).unwrap().txid.0;
+        let unsigned = tx_bytes(&[(ctxid, 0, &[]), (ctxid, 1, &[])], &[(590_000_000, mine)]);
+        let mut b = b"psbt\xff".to_vec();
+        kv(&mut b, &[0x00], &unsigned);
+        b.push(0);
+        kv(&mut b, &[0x00], &commit);
+        if let Some(h) = sighash {
+            kv(&mut b, &[0x03], &h.to_le_bytes());
+        }
+        if let Some(r) = redeem {
+            kv(&mut b, &[0x04], r);
+        }
+        b.push(0);
+        kv(&mut b, &[0x00], &commit);
+        b.push(0);
+        b.push(0);
+        (b, commit)
+    }
+
+    fn req(b: &[u8], named: Option<Value>) -> Value {
+        let mut r = json!({"type": "psbt", "psbt": hex::encode(b), "finalize": true});
+        if let Some(n) = named {
+            r["inputToSign"] = n;
+        }
+        r
+    }
+
+    fn both(h0: u32) -> Value {
+        json!([{"inputIndex": 0, "sighashType": h0}, {"inputIndex": 1, "sighashType": 1}])
+    }
+
+    fn partial(ps: &Psbt, i: usize, pubkey: &[u8]) -> Option<Vec<u8>> {
+        let mut k = vec![0x02];
+        k.extend_from_slice(pubkey);
+        ps.inputs[i].iter().find(|(x, _)| *x == k).map(|(_, v)| v.clone())
+    }
+
+    #[test]
+    fn a_named_reveal_is_signed_over_the_p2pkh_tail_and_left_unfinalized() {
+        let (key, pubkey) = me();
+        let mine = psbt::p2pkh(&pubkey);
+        let l = lock(3, &mine);
+        let (b, commit) = reveal_psbt(&l, Some(&l), None);
+        let ps = Psbt::parse(&b).unwrap();
+        assert_eq!(ps.serialize(), b, "the redeem script is kept, read and written back unchanged");
+        assert_eq!(plan(&ps, &req(&b, Some(both(1))), &mine).unwrap(), vec![(0, 1, true), (1, 1, false)]);
+        let out = sign_one(&req(&b, Some(both(1))), &key, &pubkey).unwrap();
+        assert!(out.get("txHex").is_none(), "the reveal isn't finished by the wallet");
+        let signed = Psbt::parse(&hex::decode(out["psbtHex"].as_str().unwrap()).unwrap()).unwrap();
+        // The reveal: a partial signature, its redeem script still there, never a final scriptSig (finalize was true).
+        assert!(!signed.input(0).finalized);
+        assert_eq!(signed.redeem_script(0), Some(l.as_slice()));
+        let sig = partial(&signed, 0, &pubkey).expect("a partial signature for the reveal");
+        assert_eq!(*sig.last().unwrap(), 0x01);
+        // The legacy sighash, by hand: input 0's script is the P2PKH after OP_CODESEPARATOR only.
+        let ctxid = arcade_chain::Tx::parse(&commit).unwrap().txid.0;
+        let digest_with = |code: &[u8]| -> [u8; 32] {
+            let mut pre = tx_bytes(&[(ctxid, 0, code), (ctxid, 1, &[])], &[(590_000_000, mine.clone())]);
+            pre.extend_from_slice(&1u32.to_le_bytes());
+            arcade_chain::hash::sha256d(&pre).0
+        };
+        assert!(legacy::verify(&pubkey, &sig, &digest_with(&mine), legacy::ALL));
+        assert!(!legacy::verify(&pubkey, &sig, &digest_with(&l), legacy::ALL), "not over the whole lock");
+        assert!(!legacy::verify(&pubkey, &sig, &digest_with(&p2sh_of(&l)), legacy::ALL), "not over the P2SH script");
+        // The wallet's own P2PKH coin beside it is signed and finalized as before.
+        assert!(signed.input(1).finalized && partial(&signed, 1, &pubkey).is_none());
+        // Without finalize the P2PKH coin is a partial signature too, as before.
+        let mut r = req(&b, Some(both(1)));
+        r["finalize"] = json!(false);
+        let o = Psbt::parse(&hex::decode(sign_one(&r, &key, &pubkey).unwrap()["psbtHex"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(partial(&o, 0, &pubkey).is_some() && partial(&o, 1, &pubkey).is_some());
+        // Longest lock allowed.
+        let l200 = lock(psbt::REVEAL_MOST_DROPS, &mine);
+        let (b200, _) = reveal_psbt(&l200, Some(&l200), Some(1));
+        assert!(sign_one(&req(&b200, Some(both(1))), &key, &pubkey).is_ok());
+    }
+
+    #[test]
+    fn a_reveal_is_refused_unless_named_with_all_and_locked_exactly_to_this_key() {
+        let (key, pubkey) = me();
+        let mine = psbt::p2pkh(&pubkey);
+        let good = lock(2, &mine);
+        let refused = |b: &[u8], named: Value| {
+            let ps = Psbt::parse(b).unwrap();
+            assert!(plan(&ps, &req(b, Some(named.clone())), &mine).is_err());
+            assert!(sign_one(&req(b, Some(named)), &key, &pubkey).is_err());
+        };
+        // Another key's hash in the tail.
+        let theirs = lock(2, &psbt::p2pkh(&[2u8; 33]));
+        refused(&reveal_psbt(&theirs, Some(&theirs), None).0, both(1));
+        // The lock's pattern altered.
+        let mut checksig_first = vec![0x6b, 0x6b, 0x75, 0x6c, 0x6c, 0xac, 0xab];
+        checksig_first.extend_from_slice(&mine);
+        let mut extra_op = good.clone();
+        extra_op.insert(3, 0x61);
+        let mut trailing = good.clone();
+        trailing.push(0x75);
+        let mut no_separator = good.clone();
+        no_separator.remove(6);
+        let mut one_toalt = good.clone();
+        one_toalt.remove(0);
+        for bad in [checksig_first, extra_op, trailing, no_separator, one_toalt, lock(0, &mine), lock(psbt::REVEAL_MOST_DROPS + 1, &mine)] {
+            assert_ne!(psbt::reveal_tail(&bad), Some(mine.as_slice()));
+            refused(&reveal_psbt(&bad, Some(&bad), None).0, both(1));
+        }
+        // No redeem script; a redeem script the coin isn't locked to.
+        refused(&reveal_psbt(&good, None, None).0, both(1));
+        refused(&reveal_psbt(&lock(3, &mine), Some(&good), None).0, both(1));
+        // Hash types other than ALL, asked or carried in the PSBT.
+        let (b, _) = reveal_psbt(&good, Some(&good), None);
+        refused(&b, both(0x83));
+        refused(&b, both(0x81));
+        refused(&b, both(0x02));
+        refused(&reveal_psbt(&good, Some(&good), Some(0x81)).0, json!([{"inputIndex": 0}]));
+        // A previous transaction that isn't the one the input spends.
+        let mut ps = Psbt::parse(&b).unwrap();
+        ps.inputs[0][0].1 = tx_bytes(&[([9u8; 32], 0, &[])], &[(100_000_000, p2sh_of(&good))]);
+        refused(&ps.serialize(), both(1));
+        // Not named: never signed, only the wallet's own coin is.
+        let out = sign_one(&req(&b, None), &key, &pubkey).unwrap();
+        let signed = Psbt::parse(&hex::decode(out["psbtHex"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(partial(&signed, 0, &pubkey).is_none() && !signed.input(0).finalized);
+        assert!(signed.input(1).finalized);
+        let only1 = sign_one(&req(&b, Some(json!([{"inputIndex": 1, "sighashType": 1}]))), &key, &pubkey).unwrap();
+        let signed = Psbt::parse(&hex::decode(only1["psbtHex"].as_str().unwrap()).unwrap()).unwrap();
+        assert!(partial(&signed, 0, &pubkey).is_none() && signed.input(1).finalized);
+        // And the psbt-level signer refuses on its own too.
+        let mut ps = Psbt::parse(&b).unwrap();
+        assert!(ps.sign_reveal(0, &key, &pubkey, legacy::SINGLE_ANYONECANPAY).is_err());
+        assert!(ps.sign_reveal(1, &key, &pubkey, legacy::ALL).is_err(), "a plain P2PKH coin isn't a reveal");
+        assert!(ps.sign_reveal(0, &key, &pubkey, legacy::ALL).is_ok());
     }
 }

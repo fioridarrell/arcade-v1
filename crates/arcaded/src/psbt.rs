@@ -6,6 +6,12 @@
 //! wallet signs must carry its whole previous transaction (`non_witness_utxo`), and that
 //! transaction must hash to the input's txid: so the amounts shown and the fee are the real ones,
 //! not what the site says they are.
+//!
+//! One other kind of input is signed, when a site names it: an inscription's reveal (D:// style),
+//! a P2SH coin whose redeem script is OP_TOALTSTACK x2, n x OP_DROP, OP_FROMALTSTACK x2,
+//! OP_CODESEPARATOR and this wallet's P2PKH. The site wrote the inscription and builds the
+//! scriptSig itself; the wallet signs ALL over the P2PKH after the separator and leaves a partial
+//! signature, never a final scriptSig.
 use arcade_chain::encode::write_varint;
 use arcade_chain::{OutPoint, Tx};
 use arcade_wallet::legacy;
@@ -14,9 +20,12 @@ const MAGIC: &[u8] = b"psbt\xff";
 const IN_NON_WITNESS_UTXO: u8 = 0x00;
 const IN_PARTIAL_SIG: u8 = 0x02;
 const IN_SIGHASH: u8 = 0x03;
+const IN_REDEEM_SCRIPT: u8 = 0x04;
 const IN_FINAL_SCRIPTSIG: u8 = 0x07;
 /// Fields a finalizer drops (BIP 174: everything but the utxo and the final scripts).
-const IN_DROPPED_ON_FINAL: [u8; 5] = [IN_PARTIAL_SIG, IN_SIGHASH, 0x04, 0x05, 0x06];
+const IN_DROPPED_ON_FINAL: [u8; 5] = [IN_PARTIAL_SIG, IN_SIGHASH, IN_REDEEM_SCRIPT, 0x05, 0x06];
+/// Most OP_DROPs a reveal lock may have (one per envelope push).
+pub const REVEAL_MOST_DROPS: usize = 200;
 
 pub type Map = Vec<(Vec<u8>, Vec<u8>)>;
 
@@ -169,19 +178,62 @@ impl Psbt {
         }
         let digest = legacy::sighash(&self.shape(), i, &script, hash_type)?;
         let sig = legacy::sign(key, &digest, hash_type);
-        let m = &mut self.inputs[i];
         if finalize {
+            let m = &mut self.inputs[i];
             m.retain(|(k, _)| !IN_DROPPED_ON_FINAL.contains(&k[0]));
             let mut ss = Vec::new();
             push(&mut ss, &sig);
             push(&mut ss, pubkey);
             m.push((vec![IN_FINAL_SCRIPTSIG], ss));
         } else {
-            let mut k = vec![IN_PARTIAL_SIG];
-            k.extend_from_slice(pubkey);
-            m.retain(|(x, _)| x != &k);
-            m.push((k, sig));
+            self.put_partial(i, pubkey, sig);
         }
+        Ok(())
+    }
+
+    fn put_partial(&mut self, i: usize, pubkey: &[u8; 33], sig: Vec<u8>) {
+        let mut k = vec![IN_PARTIAL_SIG];
+        k.extend_from_slice(pubkey);
+        let m = &mut self.inputs[i];
+        m.retain(|(x, _)| x != &k);
+        m.push((k, sig));
+    }
+
+    /// Input `i`'s redeem script, when the PSBT carries one.
+    pub fn redeem_script(&self, i: usize) -> Option<&[u8]> {
+        get(&self.inputs[i], &[IN_REDEEM_SCRIPT])
+    }
+
+    /// Whether input `i` is an inscription reveal locked to `mine` (this wallet's P2PKH): its previous
+    /// transaction is given and matches the txid, its coin is P2SH of the redeem script the PSBT carries,
+    /// and that script is a reveal lock ending in `mine`. Says why not.
+    pub fn reveal_check(&self, i: usize, mine: &[u8]) -> Result<(), String> {
+        let v = self.input(i);
+        let (_, script) = v.coin.ok_or(format!("input {i} doesn't carry its previous transaction (or it doesn't match the txid)"))?;
+        if v.finalized {
+            return Err(format!("input {i} is already signed"));
+        }
+        let lock = self.redeem_script(i).ok_or(format!("input {i} isn't this wallet's coin and carries no redeem script"))?;
+        if script != arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(lock)) {
+            return Err(format!("input {i}'s redeem script isn't the one its coin is locked to"));
+        }
+        if reveal_tail(lock) != Some(mine) {
+            return Err(format!("input {i}'s redeem script isn't an inscription reveal locked to this wallet's key"));
+        }
+        Ok(())
+    }
+
+    /// Sign input `i` as an inscription reveal (see `reveal_check`): ALL over the P2PKH after
+    /// OP_CODESEPARATOR, left as a partial signature for the site to build the scriptSig with.
+    pub fn sign_reveal(&mut self, i: usize, key: &arcade_wallet::secp256k1::SecretKey, pubkey: &[u8; 33], hash_type: u32) -> Result<(), String> {
+        if hash_type != legacy::ALL || self.sighash_of(i) != legacy::ALL {
+            return Err(format!("input {i} is an inscription reveal: it is signed with ALL only"));
+        }
+        let mine = p2pkh(pubkey);
+        self.reveal_check(i, &mine)?;
+        let digest = legacy::sighash(&self.shape(), i, &mine, legacy::ALL)?;
+        let sig = legacy::sign(key, &digest, legacy::ALL);
+        self.put_partial(i, pubkey, sig);
         Ok(())
     }
 
@@ -196,6 +248,17 @@ fn push(out: &mut Vec<u8>, data: &[u8]) {
     // Signatures and keys are under 76 bytes: one length byte.
     out.push(data.len() as u8);
     out.extend_from_slice(data);
+}
+
+/// The P2PKH after OP_CODESEPARATOR in a reveal lock, exactly
+/// 6b 6b, 75 x n (1..=200), 6c 6c, ab, 76 a9 14 <20 bytes> 88 ac; else None.
+pub fn reveal_tail(lock: &[u8]) -> Option<&[u8]> {
+    let n = lock.len().checked_sub(2 + 2 + 1 + 25)?;
+    if !(1..=REVEAL_MOST_DROPS).contains(&n) || lock[..2] != [0x6b, 0x6b] || lock[2..2 + n].iter().any(|b| *b != 0x75) || lock[2 + n..5 + n] != [0x6c, 0x6c, 0xab] {
+        return None;
+    }
+    let tail = &lock[5 + n..];
+    (tail[..3] == [0x76, 0xa9, 0x14] && tail[23..] == [0x88, 0xac]).then_some(tail)
 }
 
 pub fn p2pkh(pubkey: &[u8]) -> Vec<u8> {

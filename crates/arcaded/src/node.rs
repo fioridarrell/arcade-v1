@@ -228,6 +228,17 @@ impl Node {
         crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).unwrap_or(self.params)
     }
 
+    /// Where the ledger is written now: the home (ARCADE), or Pepecoin testnet while ARCADE is stalled
+    /// (crate::arcsvc::stalled; failover to test chains only, Martin 2026-11-17).
+    pub fn write_home(&self) -> &'static arcade_chain::params::ChainParams {
+        let home = self.ledger_home();
+        if crate::arcsvc::runs(home) && crate::arcsvc::stalled() {
+            self.params
+        } else {
+            home
+        }
+    }
+
     /// The chains the ledger is read from, oldest first: the old home (Pepecoin testnet, whose follows, posts and
     /// messages stay readable as history) when ARCADE is home and the old home is kept here, then the home.
     pub fn ledger_chains(&self) -> Vec<&'static arcade_chain::params::ChainParams> {
@@ -235,6 +246,14 @@ impl Node {
         let mut out = Vec::new();
         if home.chain_no != self.params.chain_no && !crate::borrow::is_borrowed(self.params.key) {
             out.push(self.params);
+        }
+        // The mainnet coins kept here with posts and messages indexed (crate::chains::MESSAGE_CHAINS; Martin 2026-11-17,
+        // option C): read beside the home chain.
+        let extra: Vec<&'static arcade_chain::params::ChainParams> = self.extra.lock().unwrap().values().map(|r| r.params).collect();
+        for p in extra {
+            if crate::chains::MESSAGE_CHAINS.contains(&p.key) && self.chain.indexers_for(p.chain_no).contains(&"messages.v1") && !out.iter().any(|o| o.chain_no == p.chain_no) {
+                out.push(p);
+            }
         }
         out.push(home);
         out

@@ -49,7 +49,7 @@
     tipBox.append(amt, " to ", a.tag ? "@" + a.tag : a.address, " ", ts);
     return h("div", { class: "fd-card" + (depth ? " fd-sub" : "") },
       h("div", { class: "fd-head" }, who, a.name && a.name !== a.tag ? h("span", { class: "s" }, " " + a.name) : "",
-        h("span", { class: "s" }, ` · ${p.height ? ago(p.age_hours || 0) : "waiting for a block"}${p.edited ? " · edited" : ""}${p.channel && p.channel !== "main" ? " · #" + p.channel : ""}`)),
+        h("span", { class: "s" }, ` · ${p.height ? ago(p.age_hours || 0) : "waiting for a block"}${p.edited ? " · edited" : ""}${p.channel && p.channel !== "main" ? " · #" + p.channel : ""}${p.chain && SCHEME[p.chain] ? " · " + SCHEME[p.chain] : ""}`)),
       text, ...(p.muted ? [] : contentEmbeds(p.text)), file, acts, replyBox, tipBox,
       ...(p.replies || []).map((r) => card(r, depth + 1)));
   }
@@ -92,11 +92,12 @@
     const text = $("fd-text").value.trim();
     if (!text && !attached) return;
     try {
-      const r = await api("feed.post", { text, channel: $("fd-postch").value.trim(), file: attached || undefined });
+      const r = await api("feed.post", { text, channel: $("fd-postch").value.trim(), file: attached || undefined, chain: $("fd-chain").value || undefined });
       $("fd-text").value = ""; $("fd-file").value = ""; attached = null;
-      note(`Posted (${r.txids.length} transaction${r.txids.length === 1 ? "" : "s"}, fee ${PEP(r.fee)}).`); order = "new"; offset = 0; draw();
+      note(`Posted (${r.txids.length} transaction${r.txids.length === 1 ? "" : "s"}, fee ${chainFee($("fd-chain"), r.fee)}).`); order = "new"; offset = 0; draw();
     } catch (e) { note(e.message, true); }
   };
-  document.querySelector('nav button[data-tab="feed"]').addEventListener("click", () => draw());
+  document.querySelector('nav button[data-tab="feed"]').addEventListener("click", () => { draw(); chainPicker($("fd-chain")); });
+  chainPicker($("fd-chain"));
   setInterval(() => { if (document.querySelector(".tab.on")?.id === "feed") draw(); }, 30000);
 })();

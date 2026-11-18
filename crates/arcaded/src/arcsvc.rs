@@ -2161,7 +2161,7 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
     // Time keepers' frames this peer hasn't had (crate::arckeep).
     crate::arckeep::tick(&link.peer_id.clone(), link)?;
     // Storage items waiting for a block (crate::arcseg).
-    if let Some(blob) = crate::arcseg::due_for(&link.peer_id) {
+    for blob in crate::arcseg::due_for(&link.peer_id) {
         let mut f = frame(svc, "it", json!({}));
         f.blob = blob;
         link.send(&f)?;

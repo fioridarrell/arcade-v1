@@ -113,7 +113,8 @@ pub fn status(node: &Node) -> Value {
             .iter()
             .filter_map(|t| s.get(&(p.chain_no, *t)).map(|h| (t.to_string(), json!({"rows": h.rows.len(), "fresh_s": h.at.map(|a| a.elapsed().as_secs())}))))
             .collect();
-        out.insert(p.key.to_string(), json!({"lent": is_lent, "tables": tables}));
+        let holders = crate::shares::index_holders(node, p.net, index_of(p, "post")).len();
+        out.insert(p.key.to_string(), json!({"lent": is_lent, "holders": holders, "forced": forced(p), "tables": tables}));
     }
     Value::Object(out)
 }
@@ -147,13 +148,18 @@ fn refresh(node: &Node, p: &'static ChainParams, table: &'static str) {
     }
     let t0 = Instant::now();
     let mut got: Vec<(Vec<u8>, Value, u64)> = Vec::new();
-    let mut finished = false;
+    let (mut finished, mut failed) = (false, false);
     while t0.elapsed() < BUDGET {
         let mut req = json!({"chain": p.key, "table": table, "limit": 1000});
         if let Some(a) = &after {
             req["after"] = json!(hex::encode(a));
         }
-        let Ok((v, _)) = crate::shares::ask_explorer(node, p, index_of(p, table), "explorer.msg_rows", &req) else { break };
+        let Ok((v, _)) = crate::shares::ask_explorer(node, p, index_of(p, table), "explorer.msg_rows", &req) else {
+            // No lender answers (none updated yet, or none reachable): not asked again before FRESH is up, so a feed
+            // isn't held up by the mesh on every read.
+            failed = true;
+            break;
+        };
         let rows = v["rows"].as_array().cloned().unwrap_or_default();
         for r in &rows {
             let Some(k) = r["k"].as_str().and_then(|k| hex::decode(k).ok()) else { continue };
@@ -179,7 +185,7 @@ fn refresh(node: &Node, p: &'static ChainParams, table: &'static str) {
         h.rows.pop_first();
     }
     // Fresh only once everything new is in: a read cut short by the budget goes on at the next one.
-    if finished {
+    if finished || failed {
         h.at = Some(Instant::now());
     }
 }

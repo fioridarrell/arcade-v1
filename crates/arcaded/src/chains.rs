@@ -620,7 +620,8 @@ pub fn hide(node: &Node, key: &str, hide: bool) -> Result<Value, String> {
 
 /// chains.plan: the startup chooser's answer. The chosen chains are shown and queued (smallest
 /// reported size for `mode` first, unknown sizes last; no indexes), every other chain is hidden,
-/// and the ARCADE chain is installed when it isn't yet (it syncs first). Chains already
+/// and the ARCADE chain, when it is among them, is installed if it isn't yet (it syncs first);
+/// left out, it stays borrowed (and always shown). Chains already
 /// installed or queued keep their place: nothing is removed. `skip`: only remembers that the
 /// chooser was answered.
 pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result<Value, String> {
@@ -632,8 +633,10 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
         return Err(format!("mode must be one of {}", PLAN_MODES.join(", ")));
     }
     let mut chosen: Vec<&'static ChainParams> = Vec::new();
+    let mut arcade_ticked = false;
     for k in keys {
         if crate::arcsvc::defines(k) {
+            arcade_ticked = true;
             continue;
         }
         let p = by_key(k).ok_or_else(|| format!("unknown chain {k}"))?;
@@ -645,9 +648,10 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
     for p in &chosen {
         check(p, mode, &[])?;
     }
-    // The ARCADE chain first: queued chains wait until it has caught up.
+    // The ARCADE chain, when ticked, first: queued chains wait until it has caught up. Unticked it stays borrowed from
+    // the arcades that keep it (Martin 2026-11-18: every chain is borrowed until someone installs it).
     let mut arcade = Value::Null;
-    if let Some(a) = crate::arcsvc::defined().filter(|a| !crate::arcsvc::runs(a)) {
+    if let Some(a) = crate::arcsvc::defined().filter(|a| arcade_ticked && !crate::arcsvc::runs(a)) {
         crate::arcsvc::install(node)?;
         crate::borrow::manage(node);
         arcade = json!(a.key);

@@ -41,7 +41,7 @@ fn st() -> &'static Mutex<HashMap<(u16, &'static str), Held>> {
 /// The index lenders of chain `p` must keep for `table`. ARCADE keeps its posts, messages and profiles with every
 /// block, whatever its offer lists: any arcade that keeps it will do.
 fn index_of(p: &ChainParams, table: &str) -> &'static str {
-    if crate::arcsvc::runs(p) {
+    if crate::arcborrow::is(p) {
         ""
     } else if table == "profile" {
         "profiles"

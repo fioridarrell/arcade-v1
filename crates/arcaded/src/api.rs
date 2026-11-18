@@ -68,7 +68,7 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
     // Test coins for the first handle come by themselves: asked for now, so they are
     // usually here by the time a handle is picked (a restored wallet may have some).
     // On ARCADE as the home chain (crate::claims::claim_home) the node faucet's ARCADE pays the claim instead.
-    if tag.is_none() && !crate::arcsvc::runs(crate::claims::claim_home(node)) {
+    if tag.is_none() && !crate::arcsvc::usable(crate::claims::claim_home(node)) {
         if let Ok((k, _)) = node.app.tag_key(p, 0) {
             let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
             if crate::claims::coins(node, &script).is_empty() {
@@ -534,7 +534,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "mempool" => {
             // The chain asked for (`--chain`), the home chain by default; the ARCADE chain's pool is its own.
             let p = crate::sitesvc::chain(node, req)?;
-            let pool = if crate::arcsvc::runs(p) {
+            let pool = if crate::arcsvc::borrowed(p) {
+                // Borrowed: what this arcade sent that still waits at the lenders.
+                crate::borrow::pool_txs(p).into_iter().map(|t| (0, t.raw)).collect()
+            } else if crate::arcsvc::runs(p) {
                 crate::arcsvc::waiting(5_000).into_iter().map(|raw| (0, raw)).collect()
             } else {
                 node.chain.mempool(p.chain_no).map_err(|e| e.to_string())?

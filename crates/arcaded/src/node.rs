@@ -223,16 +223,17 @@ impl Node {
     /// The ledger's home chain (docs/HOMECHAIN.md): where @tags, profiles, follows, posts, messages, linked wallets and
     /// the operator's handle proof are written, and read first. `params` is a coin chain (Pepecoin testnet's sync,
     /// miner, mempool and welcome faucet); the two are one chain until HOMECHAIN.md phase 3 moves the ledger to ARCADE.
-    /// Phase 3: the ARCADE chain when it runs here, else `params` (an arcade without ARCADE yet).
+    /// Phase 3: the ARCADE chain when it can be used here, installed or borrowed (Martin 2026-11-18: borrowed until
+    /// installed), else `params` (no arcade lends it yet).
     pub fn ledger_home(&self) -> &'static arcade_chain::params::ChainParams {
-        crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).unwrap_or(self.params)
+        crate::arcsvc::usable_chain().unwrap_or(self.params)
     }
 
     /// Where the ledger is written now: the home (ARCADE), or Pepecoin testnet while ARCADE is stalled
     /// (crate::arcsvc::stalled; failover to test chains only, Martin 2026-11-17).
     pub fn write_home(&self) -> &'static arcade_chain::params::ChainParams {
         let home = self.ledger_home();
-        if crate::arcsvc::runs(home) && crate::arcsvc::stalled() {
+        if crate::arcsvc::usable(home) && crate::arcsvc::stalled() {
             self.params
         } else {
             home

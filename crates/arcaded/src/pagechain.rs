@@ -41,7 +41,8 @@ pub fn of_referer(referer: &str) -> Option<&'static ChainParams> {
 
 /// Whether this arcade keeps chain `p`'s arcade ledger itself (else its reads come from the mesh).
 pub fn keeps_ledger(node: &Node, p: &ChainParams) -> bool {
-    if p.chain_no == node.params.chain_no || crate::arcsvc::runs(p) {
+    // (An installed ARCADE chain borrowed meanwhile, still catching up: from the mesh, as any borrowed chain.)
+    if p.chain_no == node.params.chain_no || crate::arcsvc::own(p) {
         return true;
     }
     node.extra.lock().unwrap().get(p.key).is_some_and(|r| r.indexes.iter().any(|i| i == "ledger")) && !crate::borrow::is_borrowed(p.key)

@@ -62,6 +62,14 @@ pub fn of_address(node: &Node, address: &str) -> Option<String> {
     chains(node).into_iter().find_map(|p| {
         [p.p2pkh_version, node.params.p2pkh_version].into_iter().find_map(|v| tag_of(&node.chain, p.chain_no, &base58check(v, &h)).ok().flatten())
     })
+    .or_else(|| own_on_borrowed(node, &h))
+}
+
+/// ARCADE borrowed here (not installed, or installed and still catching up): its tags aren't in this arcade's own
+/// ledger, so this wallet's own handle is the one its claim confirmed (recorded on the key, crate::claims).
+fn own_on_borrowed(node: &Node, h: &[u8]) -> Option<String> {
+    let arc = crate::arcsvc::usable_chain().filter(|p| crate::arcsvc::borrowed(p))?;
+    node.app.tag_keys(arc.chain_no).ok()?.into_iter().find(|k| k.tag.is_some() && key_hash(&k.address).as_deref() == Some(h)).and_then(|k| k.tag)
 }
 
 /// Does the key of `address` hold `tag` (by [`owner`])?

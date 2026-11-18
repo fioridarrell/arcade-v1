@@ -589,11 +589,11 @@ pub fn send_payloads_with(node: &Node, payloads: &[Vec<u8>], extra: Vec<arcade_w
     // The chain the writer chose (`chain` on the request, crate::api), else the write home. ARCADE chosen and stalled
     // fails over like the default; a mainnet coin chosen is written there or not at all (failover to test chains only).
     let p = match write_on() {
-        Some(p) if crate::arcsvc::runs(p) => node.write_home(),
+        Some(p) if crate::arcsvc::usable(p) => node.write_home(),
         Some(p) => p,
         None => node.write_home(),
     };
-    if crate::arcsvc::runs(p) {
+    if crate::arcsvc::usable(p) {
         return send_payloads_arc(node, p, payloads, extra);
     }
     send_payloads_coin(node, p, payloads, extra)
@@ -611,7 +611,7 @@ fn write_on() -> Option<&'static arcade_chain::params::ChainParams> {
 /// The chains this wallet can write its posts, acts and messages to (Martin 2026-11-17, option C): ARCADE, Pepecoin
 /// testnet, and Pepecoin, Dogecoin and DigiByte where kept here or borrowed. In the order offered.
 pub fn write_chains(node: &Node) -> Vec<&'static arcade_chain::params::ChainParams> {
-    let mut out: Vec<&'static arcade_chain::params::ChainParams> = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).into_iter().collect();
+    let mut out: Vec<&'static arcade_chain::params::ChainParams> = crate::arcsvc::usable_chain().into_iter().collect();
     out.push(node.params);
     for k in crate::chains::MESSAGE_CHAINS {
         if let Some(p) = crate::chains::find(k) {
@@ -642,11 +642,11 @@ pub fn write_chains_status(node: &Node) -> Value {
         let addr = sender_key(node).ok().and_then(|(a, _, _)| crate::hometag::address_on(p, &a));
         // From this arcade's own lists only (its copy, its borrowed copy): never a lender asked while a menu waits.
         let bal = addr.as_ref().and_then(|a| arcade_ledger::address::script_for_address(p, a)).map(|sc| {
-            let coins = if crate::arcsvc::runs(p) { crate::claims::arc_coins(node, p, &sc) } else { coins_on(node, p, &sc) };
+            let coins = if crate::arcsvc::usable(p) { crate::claims::arc_coins(node, p, &sc) } else { coins_on(node, p, &sc) };
             coins.iter().map(|c| c.value).sum::<u64>()
         });
         json!({"key": p.key, "name": p.name, "unit": crate::explorer::unit(p), "default": p.chain_no == def.chain_no,
-               "test": p.key.ends_with("test"), "stalled": crate::arcsvc::runs(p) && crate::arcsvc::stalled(), "address": addr, "balance": bal})
+               "test": p.key.ends_with("test"), "stalled": crate::arcsvc::usable(p) && crate::arcsvc::stalled(), "address": addr, "balance": bal})
     }).collect::<Vec<_>>())
 }
 
@@ -951,7 +951,7 @@ pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
         return Err("make or restore a wallet first".into());
     }
     let home = node.ledger_home();
-    if crate::arcsvc::runs(home) {
+    if crate::arcsvc::usable(home) {
         return Err("your profile is on the ARCADE chain (the home chain): publish it from People (Publish profile), which lists your addresses".into());
     }
     let (address, tag, sk) = sender_key(node)?;

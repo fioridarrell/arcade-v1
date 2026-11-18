@@ -1245,12 +1245,24 @@ pub fn ask_explorer(node: &Node, p: &ChainParams, ix: &str, cmd: &str, req: &Val
     // Linked holders first (their link is up; dialing may not work from the same network).
     let mut holders = index_holders(node, p.net, ix);
     holders.sort_by_key(|(id, _)| !is_linked(node, id));
-    for (id, _) in holders.into_iter().take(4) {
+    // Four tries; an arcade that refuses by the handle gate (a release before a read was opened, such as
+    // explorer.tag for a first handle) doesn't count: the next is asked, up to twelve in all.
+    let (mut tries, mut asked) = (0, 0);
+    for (id, _) in holders.into_iter() {
+        if tries >= 4 || asked >= 12 {
+            break;
+        }
+        asked += 1;
         let Some(r) = ask_holder(node, p, &id, &q) else { continue };
         match r {
             Ok(v) => return Ok((v, id)),
-            Err(e) if is_linked(node, &id) => last = format!("arcade {}: {e}", &id[..id.len().min(8)]),
-            Err(_) => {} // dialing failed: the introduction asked for above makes a link
+            Err(e) if is_linked(node, &id) => {
+                if !e.contains(crate::handlegate::NEED) {
+                    tries += 1;
+                }
+                last = format!("arcade {}: {e}", &id[..id.len().min(8)]);
+            }
+            Err(_) => tries += 1, // dialing failed: the introduction asked for above makes a link
         }
     }
     Err(last)

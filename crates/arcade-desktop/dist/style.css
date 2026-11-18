@@ -623,6 +623,8 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .aid-msgtext { white-space: pre-wrap; word-break: break-all; max-height: 12em; overflow: auto; margin: 0; padding: 8px; border: 1px solid var(--line); border-radius: 8px; }
 .aid-outs { width: 100%; }
 .aid-outs td.mono { font-family: var(--mono); word-break: break-all; }
+.aid-item { margin: 6px 0; padding: 4px 8px; border: 1px solid var(--line, #8884); border-radius: 6px; }
+.aid-item > summary { cursor: pointer; }
 #w-aid-code { flex: 1; min-width: 16em; }
 .aid-sub { color: var(--muted); font-size: .92em; }
 .aid-req .msg:empty, #w-aid-msg:empty { display: none; }

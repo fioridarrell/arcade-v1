@@ -867,6 +867,24 @@ static OWN_PROOF: Mutex<Option<Hash256>> = Mutex::new(None);
 static RACE_PROOF: Mutex<Option<Hash256>> = Mutex::new(None);
 
 /// The ARCADE chain's tip here, if it runs.
+/// No ARCADE block for this long on this arcade's copy: writes fail over to Pepecoin testnet (Martin 2026-11-17, option C:
+/// a stuck ARCADE, or a copy still syncing, must not stop handles, posts, messages or new arcades).
+pub const STALL_SECS: u64 = 20 * 60;
+
+/// Whether the ARCADE chain running here can't take writes now: its newest block (on this arcade's copy) is older than
+/// [`STALL_SECS`], or it doesn't run. Writes go to Pepecoin testnet meanwhile; reads span both.
+pub fn stalled() -> bool {
+    match svc() {
+        Some(s) => {
+            let t = s.st.lock().unwrap().chain.tip().time;
+            // ARCADE_STALL_SECS: a shorter wait for tests (a failover tried without stopping the chain).
+            let limit = std::env::var("ARCADE_STALL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(STALL_SECS);
+            arcade_app::now().saturating_sub(t) > limit
+        }
+        None => true,
+    }
+}
+
 pub fn tip_id() -> Option<Hash256> {
     svc().map(|s| s.st.lock().unwrap().chain.tip().id)
 }

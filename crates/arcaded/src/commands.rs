@@ -132,6 +132,7 @@ cmds! {
     "tag.list" Read "" "Your tag claims and their progress.";
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";
     "faucet.arc" Wallet "address" "The user faucet: ask the mesh to top a website user's ARCADE address up to 0.05 ARCADE, in two coins (once per address a day; a website calls it when a user signs in). This arcade's own wallet gets 1 ARCADE once from the node faucet instead.";
+    "ledger.write_chains" Read "" "Where this wallet can write its posts, acts and messages (ARCADE, Pepecoin testnet, and Pepecoin, Dogecoin, DigiByte where kept or borrowed): each with its balance, which is the default now, and whether ARCADE is stalled (writes then go to Pepecoin testnet). feed.post, feed.act, follow and msg.send take chain to pick one.";
     "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today; node_faucet: node-gift asks, gifts paid today, nodes known paid, and this arcade's own gift.";
     // Messaging
     "msg.me" Read "" "Your messaging key, fingerprint and whether it is published.";

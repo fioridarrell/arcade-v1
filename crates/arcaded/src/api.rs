@@ -88,6 +88,10 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish")) {
         return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
     }
+    // `"chain": key` on a post, act, follow or message: written there (crate::msgsvc::write_chains; option C).
+    if let Some(chain) = req["chain"].as_str().filter(|_| matches!(cmd, "feed.post" | "feed.act" | "follow" | "msg.send")) {
+        return crate::msgsvc::with_write_on(node, Some(chain), || dispatch_inner(node, req));
+    }
     let out = dispatch_inner(node, req);
     // A command that can change a chain or the wallet: chains.list's copy is made again.
     use crate::commands::Perm;
@@ -259,6 +263,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         // Messaging (home chain): the Messages tab and anything else that wants it.
         "msg.me" => crate::msgsvc::me(node),
+        "ledger.write_chains" => Ok(crate::msgsvc::write_chains_status(node)),
         "msg.stats" => Ok(arcade_ledger::messages::counts(&node.chain, node.ledger_home().chain_no)),
         "msg.scan" => Ok(json!({"opened": crate::msgsvc::scan(node)?})),
         "msg.who" => crate::msgsvc::who(node, &s("name").ok_or("name required (@tag or address)")?),

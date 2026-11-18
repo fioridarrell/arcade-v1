@@ -811,6 +811,7 @@ function aidPsbtLines(r) {
   body.push(h("table", { class: "aid-outs" }, h("thead", {}, h("tr", {}, h("th", {}, "#"), h("th", {}, "Pays to"), h("th", { class: "num" }, "Amount"))), h("tbody", {}, rows)));
   const signs = r.inputs.filter((i) => i.sign).map((i) => `#${i.index} ${aidDoge(i.value)} (${i.hash_type})`).join(", ");
   body.push(h("div", { class: "aid-sub" }, `Signs your coin${r.inputs.filter((i) => i.sign).length === 1 ? "" : "s"} ${signs}.${r.finalize ? "" : " The site finishes the transaction."}`));
+  r.inputs.filter((i) => i.reveal).forEach((i) => body.push(h("div", { class: "aid-sub" }, `Input #${i.index} reveals an inscription you committed: its coin is locked to your key (D:// style); the site writes the inscription itself.`)));
   return body;
 }
 function aidCard(r) {

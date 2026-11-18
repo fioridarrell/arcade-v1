@@ -115,7 +115,13 @@ Each phase ships as a release, and each has a pass test like §15.2's.
   - **What moves:** claims, profiles, follows, posts, messages, links and the handle proof are written there.
   - **Keys:** they come from the wallet's existing keys. The BIP44 coin type is the home chain's (§13 q6), so an
     @name's ARCADE address is its existing key hash.
-- **ARCADE is installed by default.** It can't be removed while it is home.
+- **ARCADE is borrowed until it is installed** (Martin, 2026-11-18: "all chains are only borrowed until someone
+  installs them, including arcade"; this replaced "installed by default"). It is home either way: installed,
+  borrowed, or installed and still catching up, when a borrowed copy stands in from 30 blocks behind its lenders
+  until its own copy has caught up (`arcsvc::source`: `Own` or `Borrowed`). Balances, sends, @tag claims (checked
+  with an arcade that keeps the chain), posts and messages work at once. It can be removed like any chain, and is
+  borrowed again. The A:// ledger (`arcledger`: A:// profiles, follows, repos) and blob publishing still need it
+  installed.
 - **New accounts get their first coins from the ARCADE faucet (#175),** not test PEP.
 - **Reads stop falling back to Pepecoin testnet** for tags (the decision above). Profiles and posts made there stay
   readable as history.

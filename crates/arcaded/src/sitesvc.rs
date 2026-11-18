@@ -131,7 +131,7 @@ fn not_final(node: &Node, p: &ChainParams, tx: &Tx) -> Option<String> {
 /// The pool, parsed once: (first seen, tx).
 pub(crate) fn pool(node: &Node, p: &ChainParams) -> Vec<(u64, Tx)> {
     // The ARCADE chain's waiting transactions are its own pool's (crate::arcsvc).
-    if crate::arcsvc::runs(p) {
+    if crate::arcsvc::own(p) {
         return crate::arcsvc::waiting(100_000).into_iter().filter_map(|raw| Tx::parse_with(&raw, &p.format).ok().map(|t| (0, t))).collect();
     }
     node.chain
@@ -443,8 +443,8 @@ fn send_raw(node: &Node, req: &Value, checked: bool) -> R {
         return Err("a coinbase or input-less transaction can't be broadcast".into());
     }
     // An ARCADE transaction goes into the ARCADE chain's own pool, which checks it by that chain's rules and passes it
-    // on to the arcades it is linked to.
-    if crate::arcsvc::runs(p) {
+    // on to the arcades it is linked to. (Installed but borrowed meanwhile: through the lenders, below.)
+    if crate::arcsvc::own(p) {
         let r = crate::arcsvc::submit(&json!({"hex": hex_tx.trim()})).map_err(|e| format!("refused: {e}"))?;
         let _ = node.app.event("wallet", &format!("pooled ARCADE transaction {} for a website user", tx.txid.to_hex()));
         return Ok(json!({"txid": tx.txid.to_hex(), "fee": r["fee"], "size": tx.raw.len(), "pooled": true}));

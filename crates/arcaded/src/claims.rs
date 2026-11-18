@@ -23,15 +23,16 @@ pub fn chain_of(node: &Node, c: u16) -> Option<&'static ChainParams> {
     if c == node.params.chain_no {
         return Some(node.params);
     }
-    crate::arcsvc::defined().filter(|p| p.chain_no == c && crate::arcsvc::runs(p))
+    crate::arcsvc::defined().filter(|p| p.chain_no == c && crate::arcsvc::usable(p))
 }
 
 /// A chain asked for by key (none: the home chain), if claims can be made on it.
 /// Where a new @tag is claimed when no chain is named (docs/HOMECHAIN.md phase 3): the ARCADE chain when it runs
-/// here, else the ledger home.
+/// here (installed or borrowed), else the ledger home.
 pub fn claim_home(node: &Node) -> &'static ChainParams {
-    // ARCADE stalled (or its copy still syncing): claimed on Pepecoin testnet, a handle as good on either chain.
-    crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p) && !crate::arcsvc::stalled()).unwrap_or(node.params)
+    // ARCADE stalled (or its copy still syncing with no borrowed copy standing in): claimed on Pepecoin testnet, a
+    // handle as good on either chain.
+    crate::arcsvc::usable_chain().filter(|_| !crate::arcsvc::stalled()).unwrap_or(node.params)
 }
 
 pub fn chain_for(node: &Node, key: Option<&str>) -> Result<&'static ChainParams, String> {
@@ -40,7 +41,7 @@ pub fn chain_for(node: &Node, key: Option<&str>) -> Result<&'static ChainParams,
     }
     match key.filter(|k| !k.eq_ignore_ascii_case(node.params.key)) {
         None => Ok(node.params),
-        Some(k) => crate::arcsvc::params_for(k).filter(|p| crate::arcsvc::runs(p)).ok_or_else(|| format!("@tags are claimed on {} or on the ARCADE chain (installed here); not on {k}", node.params.name)),
+        Some(k) => crate::arcsvc::params_for(k).filter(|p| crate::arcsvc::usable(p)).ok_or_else(|| format!("@tags are claimed on {} or on the ARCADE chain (installed or borrowed here); not on {k}", node.params.name)),
     }
 }
 
@@ -70,8 +71,21 @@ pub fn check_on(node: &Node, p: &'static ChainParams, tag: &str) -> Check {
     if let Some((on, by)) = crate::hometag::owner(node, &tag).filter(|(on, _)| on.chain_no != p.chain_no) {
         return Check { tag, available: false, reason: Some(format!("taken on {} by {by}", on.name)) };
     }
+    // ARCADE borrowed here (not installed, or installed and still catching up): its tags aren't in this arcade's own
+    // ledger, so an arcade keeping it says (its explorer.tag spans ARCADE and Pepecoin testnet). When none can say,
+    // wait: a claim for a taken tag is paid for and then refused.
+    if let Some(arc) = crate::arcsvc::usable_chain().filter(|a| !crate::arcsvc::own(a)) {
+        match arc_owner_on_mesh(node, arc, &tag) {
+            Ok(Some(by)) => return Check { tag, available: false, reason: Some(format!("taken by {by} (seen by an arcade keeping {})", arc.name)) },
+            Ok(None) => {}
+            Err(why) => {
+                let reason = format!("{} is borrowed here and no arcade keeping it could say whether @{tag} is free ({why}); try again in a minute", arc.name);
+                return Check { tag, available: false, reason: Some(reason) };
+            }
+        }
+    }
     if !is_home(node, p) {
-        // The ARCADE chain: this arcade keeps it whole (no borrowed copy), and its pool's claims are the chain's
+        // The ARCADE chain: kept whole here or borrowed (asked above), and its pool's claims are the chain's
         // business (the first in a block wins).
         let pending = node.app.claims().unwrap_or_default().into_iter().any(|c| {
             c.chain == p.chain_no && c.tag == tag && matches!(c.status, ClaimStatus::Sent | ClaimStatus::Funding | ClaimStatus::Checking)
@@ -165,6 +179,13 @@ pub(crate) fn unconfirmed_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
 
 /// A key's spendable coins on the ARCADE chain: confirmed, mature, and not spent by a transaction in its pool.
 pub(crate) fn arc_coins(node: &Node, p: &ChainParams, script: &[u8]) -> Vec<Utxo> {
+    if crate::arcsvc::borrowed(p) {
+        // Borrowed (not installed, or installed and still catching up): the borrowed copy's coins, less those its
+        // waiting transactions spend; confirmed ones only, as below (waiting change is added where it is wanted).
+        let mut out: Vec<Utxo> = crate::borrow::spendable(node, p, script).into_iter().filter(|u| crate::borrow::unspent_coin(node, p, &u.outpoint).is_some()).collect();
+        out.sort_by(|a, b| b.value.cmp(&a.value));
+        return out;
+    }
     let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
     let mut out = Vec::new();
     for (op, value, _h) in node.chain.coins_for_script(p, script).unwrap_or_default() {
@@ -284,6 +305,23 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                     }
                 }
             }
+            // ... and on a borrowed ARCADE chain (its tags aren't in this arcade's own ledger), an arcade keeping it.
+            if !home && !crate::arcsvc::own(p) {
+                match arc_owner_on_mesh(node, p, &c.tag) {
+                    Ok(Some(by)) if !same_key(&by, &key.address) => {
+                        set(&mut c, ClaimStatus::Failed, "taken by someone else first");
+                        node.app.put_claim(&c).ok();
+                        return Ok(c);
+                    }
+                    Ok(_) => {}
+                    Err(_) => {
+                        c.note = format!("waiting until an arcade keeping {} can say @{} is still free", p.name, c.tag);
+                        c.updated = arcade_app::now();
+                        node.app.put_claim(&c).map_err(|e| e.to_string())?;
+                        return Ok(c);
+                    }
+                }
+            }
             let have = if home { coins(node, &script) } else { arc_coins(node, p, &script) };
             let (fee, dust) = fees_of(node, p);
             // On ARCADE a claim this wallet committed to ahead carries the salt (a released tag's reveal window).
@@ -332,9 +370,14 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
             // This arcade's own tag index still catching up: the mesh's word decides
             // (ThinkPad 2026-11-09: @test14 was claimed on chain, but the local index was at
             // block 54,000, so the card waited for the test coin for good).
-            let lagging = home && local.is_none() && (crate::borrow::is_borrowed(p.key) || crate::borrow::home_lag(node).0 > 10);
-            let mesh = if lagging { mesh_owner(node, &c.tag) } else { None };
-            let confirmed = local.or(mesh.as_ref().map(|a| *a == key.address));
+            // On ARCADE: borrowed here (not installed, or installed and catching up), an arcade keeping it decides.
+            let lagging = local.is_none() && if home { crate::borrow::is_borrowed(p.key) || crate::borrow::home_lag(node).0 > 10 } else { !crate::arcsvc::own(p) };
+            let mesh = match (lagging, home) {
+                (false, _) => None,
+                (true, true) => mesh_owner(node, &c.tag),
+                (true, false) => arc_owner_on_mesh(node, p, &c.tag).ok().flatten(),
+            };
+            let confirmed = local.or(mesh.as_ref().map(|a| same_key(a, &key.address)));
             match confirmed {
                 Some(true) => {
                     set(&mut c, ClaimStatus::Confirmed, if local.is_some() { "confirmed on chain" } else { "confirmed on chain (seen by the mesh; this arcade is still catching up)" });
@@ -351,6 +394,8 @@ fn advance_one(node: &Node, mut c: Claim) -> Result<Claim, String> {
                     let pooled = if home {
                         node.chain.mempool(p.chain_no).unwrap_or_default().iter()
                             .any(|(_, raw)| arcade_chain::Tx::parse_with(raw, &p.format).map(|t| t.txid == txid).unwrap_or(false))
+                    } else if crate::arcsvc::borrowed(p) {
+                        crate::borrow::pooled(p, &txid)
                     } else {
                         crate::arcsvc::pooled(&txid)
                     };
@@ -403,6 +448,24 @@ fn pending_elsewhere(node: &Node, tag: &str) -> Option<String> {
     let p = node.params;
     let (v, _) = crate::shares::ask_explorer(node, p, "", "explorer.mempool", &serde_json::json!({"chain": p.key, "local": true})).ok()?;
     v["pending_tags"].as_array()?.iter().find(|x| x[0] == tag).and_then(|x| x[1].as_str().map(String::from))
+}
+
+/// Who holds `tag` by the word of an arcade keeping the ARCADE chain `arc` (its own explorer.tag answer, which spans
+/// ARCADE and Pepecoin testnet), for an arcade borrowing it: Ok(Some(address)), Ok(None) when it says not claimed,
+/// Err when no arcade could say. Answers are kept 30 s (crate::explorer::mesh_ask).
+fn arc_owner_on_mesh(node: &Node, arc: &'static ChainParams, tag: &str) -> Result<Option<String>, String> {
+    let q = serde_json::json!({"chain": arc.key, "tag": tag, "local": true});
+    match crate::explorer::mesh_ask(node, arc, "ledger", "explorer.tag", &q) {
+        Ok((v, _)) => v["home_address"].as_str().filter(|a| !a.is_empty()).map(|a| Some(a.to_string())).ok_or_else(|| "no owner in the answer".to_string()),
+        Err(e) if e.contains("is not claimed") => Ok(None),
+        Err(e) => Err(e),
+    }
+}
+
+/// Whether two addresses (any chain's p2pkh form) are the same key.
+fn same_key(a: &str, b: &str) -> bool {
+    let h = |x: &str| arcade_ledger::address::decode_base58check(x).filter(|(_, h)| h.len() == 20).map(|(_, h)| h);
+    a == b || h(a).is_some_and(|x| Some(x) == h(b))
 }
 
 /// Who holds `tag` according to an arcade on the mesh (its explorer.tag answer), asked at
@@ -568,7 +631,10 @@ pub fn pending_arcade(node: &Node) -> Vec<(arcade_chain::Tx, arcade_ledger::extr
 pub fn pending_arcade_on(node: &Node, p: &'static ChainParams) -> Vec<(arcade_chain::Tx, arcade_ledger::extract::ArcadeTx)> {
     use arcade_ledger::extract::{class_b_marker, detect_class, extract, Prevout};
     let marker = class_b_marker(p);
-    let raws: Vec<Vec<u8>> = if crate::arcsvc::runs(p) {
+    let raws: Vec<Vec<u8>> = if crate::arcsvc::borrowed(p) {
+        // Borrowed: what this arcade sent that still waits at the lenders.
+        crate::borrow::pool_txs(p).into_iter().map(|t| t.raw).collect()
+    } else if crate::arcsvc::runs(p) {
         crate::arcsvc::waiting(5_000)
     } else {
         node.chain.mempool(p.chain_no).unwrap_or_default().into_iter().map(|(_, raw)| raw).collect()
@@ -671,13 +737,15 @@ pub fn start_status(node: &Node) -> serde_json::Value {
     let balance: u64 = if home { coins(node, &script) } else { arc_coins(node, p, &script) }.iter().map(|u| u.value).sum();
     if !home {
         // ARCADE: its own faucet (#175); the heights are the ARCADE chain's.
-        let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height);
+        // (Borrowed: the borrowed copy's height, which its lenders keep up to date.)
+        let borrowed = crate::arcsvc::borrowed(p);
+        let tip = if borrowed { crate::borrow::tip(node, p.key) } else { node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height) };
         return json!({
             "wallet": true, "tag": tag, "address": key.address, "balance": balance,
             "chain": {"key": p.key, "name": p.name, "unit": crate::explorer::unit(p)},
             "claim": claim.map(|c| json!({"tag": c.tag, "status": format!("{:?}", c.status).to_lowercase(), "note": c.note})),
             "faucet": crate::arcfaucet::of_address(&key.address),
-            "synced": crate::arcsvc::lends().is_some(), "height": tip, "best": tip,
+            "synced": borrowed || crate::arcsvc::lends().is_some(), "borrowed": borrowed, "height": tip, "best": tip,
         });
     }
     let ask = crate::faucet::last_ask(node, &key.address);

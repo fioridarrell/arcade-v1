@@ -103,3 +103,16 @@ every one. MWEB's own rules (kernels, range proofs, the peg-in and peg-out match
 checked by V1.
 
 Run A: 26 match. Run B: 5 match.
+
+## Borrowed until installed (`borrownet.py`)
+
+A closed local ARCADE chain with three arcades: A writes it, C never installs it, and D installs it but takes no
+blocks for 240 s (`ARCADE_ARC_TEST_SYNC_AFTER`). C and D borrow it from A, see their ARCADE, send it, claim a @tag on
+ARCADE and post; D then hands over to its own copy once that has caught up, keeping its balance and handle.
+
+```sh
+cargo build -p arcaded
+unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/borrownet.py target/debug/arcaded /tmp/borrownet'
+```
+
+It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about 10 minutes.

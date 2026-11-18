@@ -1407,6 +1407,17 @@ pub(crate) fn home_lag(node: &Node) -> (u32, bool) {
     (top.saturating_sub(tip), addresses_ready)
 }
 
+/// How far an installed ARCADE chain's own copy is behind its lenders before a borrowed copy stands in for it. Not at
+/// every new block: a borrowed copy follows the headers from block 0, so a copy a block or two behind for a moment
+/// gets its blocks itself.
+const ARC_START_BEHIND: u64 = 30;
+
+/// Whether an installed ARCADE chain is borrowed: started once its own copy is [`ARC_START_BEHIND`] blocks behind,
+/// kept on until the own copy has caught up with the borrowed one (`own`).
+fn arc_borrows(own: bool, running: bool, behind: u64) -> bool {
+    !own && (running || behind >= ARC_START_BEHIND)
+}
+
 /// Start, keep and stop borrowing per chain (called every 20 s and on every switch).
 /// Any chain is borrowed while it is being synced or taken in from copies, the home chain
 /// included (Martin: balances, the test coin and the @handle claim work at once on a fresh
@@ -1422,7 +1433,11 @@ pub fn manage(node: &Node) {
         let own = crate::arcsvc::lends().is_some_and(|l| l.chain_no == p.chain_no)
             && node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64 + 3).unwrap_or(0) >= state(node, p.key).and_then(|s| s["tip"].as_u64()).unwrap_or(0);
         let on = if crate::arcsvc::runs(p) {
-            chain_on(&c, p.key) && !own
+            // Installed, still catching up: borrowed meanwhile once it is ARC_START_BEHIND blocks behind its lenders
+            // (Martin 2026-11-18: an arcade syncing ARCADE spends and claims at once), until its own copy catches up.
+            let top = lender_tips(node, p).values().max().copied().unwrap_or(0);
+            let behind = top.saturating_sub(crate::arcsvc::height().unwrap_or(0));
+            chain_on(&c, p.key) && arc_borrows(own, running.is_some(), behind)
         } else if home {
             // Home: start when 100+ blocks behind, stop once within 10 with addresses built.
             let (lag, addr_ready) = home_lag(node);
@@ -1432,9 +1447,8 @@ pub fn manage(node: &Node) {
         };
         match (on, running) {
             (true, None) => {
-                // Only once an arcade lends it (or we borrowed it before). An installed
-                // ARCADE chain that wasn't borrowed gets its blocks itself.
-                if state(node, p.key).is_none() && (lenders(node, p).is_empty() || crate::arcsvc::runs(p)) {
+                // Only once an arcade lends it (or we borrowed it before).
+                if state(node, p.key).is_none() && lenders(node, p).is_empty() {
                     continue;
                 }
                 let run = Arc::new(Run::default());
@@ -2721,6 +2735,15 @@ pub fn waiting_spent(key: &str) -> HashSet<OutPoint> {
     pool_spent(key)
 }
 
+/// The time of the newest block a borrowed chain is followed to (None while it isn't borrowed, or before its first).
+pub fn tip_time(key: &str) -> Option<u64> {
+    if !is_borrowed(key) {
+        return None;
+    }
+    let node = NODE.get().and_then(|w| w.upgrade())?;
+    state(&node, key).and_then(|s| s["tip_time"].as_u64())
+}
+
 /// The height a borrowed chain is followed to (None before it starts).
 pub fn tip(node: &Node, key: &str) -> Option<u32> {
     state(node, key).and_then(|s| s["tip"].as_u64()).map(|h| h as u32)
@@ -2812,7 +2835,21 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
 
 #[cfg(test)]
 mod tests {
-    use super::{stalled, tips_apart, tips_slack};
+    use super::{arc_borrows, stalled, tips_apart, tips_slack, ARC_START_BEHIND};
+
+    #[test]
+    fn an_installed_arcade_chain_is_borrowed_while_far_behind() {
+        // A fresh install syncing from block 0: borrowed, so coins and claims work at once.
+        assert!(arc_borrows(false, false, 1_800));
+        // A block or two behind for a moment (a new block on the way): it gets its blocks itself.
+        assert!(!arc_borrows(false, false, 2));
+        assert!(!arc_borrows(false, false, ARC_START_BEHIND - 1));
+        assert!(arc_borrows(false, false, ARC_START_BEHIND));
+        // Once borrowing, it stays on, however close, until the own copy has caught up.
+        assert!(arc_borrows(false, true, 0));
+        assert!(!arc_borrows(true, true, 0));
+        assert!(!arc_borrows(true, false, 5_000));
+    }
 
     #[test]
     fn a_lender_stopped_far_behind_is_not_a_disagreement() {

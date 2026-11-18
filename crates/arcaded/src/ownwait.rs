@@ -96,7 +96,21 @@ pub fn note(node: &Node, p: &'static ChainParams, tx: &Tx) {
 }
 
 /// An ARCADE transaction of this arcade's own: into the chain's pool, and remembered.
+/// Borrowed (not installed, or installed and still catching up): to the lenders, which take it into their pools.
 pub fn send_arc(node: &Node, tx: &Tx) -> Result<(Hash256, u64), String> {
+    if let Some(p) = crate::arcsvc::defined().filter(|p| crate::arcsvc::borrowed(p)) {
+        // The fee from the coins it spends, as the borrowed copy knows them (confirmed, or change still waiting).
+        let waiting: Vec<(arcade_chain::OutPoint, u64)> = crate::borrow::pool_txs(p).iter()
+            .flat_map(|t| t.outputs.iter().enumerate().map(move |(i, o)| (arcade_chain::OutPoint { txid: t.txid, vout: i as u32 }, o.value)))
+            .collect();
+        let ins: u64 = tx.inputs.iter().filter_map(|i| {
+            crate::borrow::unspent_coin(node, p, &i.prevout).map(|c| c.1).or_else(|| waiting.iter().find(|w| w.0 == i.prevout).map(|w| w.1))
+        }).sum();
+        let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
+        crate::borrow::broadcast_tx(node, p, tx).map_err(|(why, _)| why)?;
+        note(node, p, tx);
+        return Ok((tx.txid, fee));
+    }
     let r = crate::arcsvc::send_raw(&tx.raw)?;
     if let Some(p) = crate::arcsvc::defined() {
         note(node, p, tx);
@@ -128,7 +142,8 @@ fn where_is(node: &Node, p: &'static ChainParams, tx: &Tx) -> Where {
 /// Into the pool again, and out to the network. None while the chain can't say yet (not caught
 /// up, no lender); Some(taken) otherwise.
 fn put_back(node: &Node, p: &'static ChainParams, tx: &Tx) -> Option<bool> {
-    if crate::arcsvc::runs(p) {
+    // (An installed ARCADE chain still borrowed is sent by its lenders, below.)
+    if crate::arcsvc::own(p) {
         if !crate::arcsvc::ready() {
             return None;
         }

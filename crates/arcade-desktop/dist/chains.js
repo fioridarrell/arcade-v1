@@ -580,7 +580,8 @@
     try { chains = await api("chains.list"); } catch (e) { return; }
     const anyHidden = chains.some((c) => c.hidden);
     // Ticked: what is installed or queued, and, once chains have been hidden, every chain still shown.
-    planTicked = new Set(chains.filter((c) => !c.home && !c.arcade && (c.installed || c.queued || (anyHidden && !c.hidden))).map((c) => c.key));
+    // The ARCADE chain is borrowed until it is installed (Martin 2026-11-18), like any chain: ticked once installed.
+    planTicked = new Set(chains.filter((c) => !c.home && (c.arcade ? c.installed : (c.installed || c.queued || (anyHidden && !c.hidden)))).map((c) => c.key));
     $("cp-skip").textContent = planFirst ? "Skip for now" : "Cancel";
     pmsg("");
     renderPlan();
@@ -611,7 +612,8 @@
     };
     const note = (c) => c.installed ? (c.hidden ? "installed · hidden now" : "installed") : c.queued ? (c.hidden ? `queued #${c.queued} · hidden now` : `queued #${c.queued}`) : c.hidden ? "hidden now" : "";
     $("cp-list").replaceChildren(
-      ...arc.map((c) => row(c, true, `Always on · syncs first${c.installed ? " · installed" : ""}`)),
+      // Installed: stays (Start never removes a chain). Not installed: borrowed from arcades that keep it until ticked.
+      ...arc.map((c) => row(c, !!c.installed, c.installed ? "Installed · always shown" : "Borrowed until ticked · ticked, it syncs first")),
       ...home.map((c) => row(c, true, "This arcade's home chain · always installed")),
       ...rest.map((c) => row(c, false, note(c))));
     $("cp-modes").replaceChildren(...PLAN_MODES.map(([k, t, d]) => {
@@ -637,7 +639,7 @@
       const r = await api("chains.plan", { keys: [...planTicked], mode: planMode });
       closePlan();
       const q = (r.queued || []).map((k) => (chains.find((x) => x.key === k) || {}).name || k);
-      bmsg(q.length ? `Queued, in this order: ${q.join(", ")}. They sync one at a time${r.arcade || chains.some((c) => c.arcade) ? ", after the ARCADE chain" : ""}.` : "Your chains are chosen.", false);
+      bmsg(q.length ? `Queued, in this order: ${q.join(", ")}. They sync one at a time${r.arcade || chains.some((c) => c.arcade && c.installed) ? ", after the ARCADE chain" : ""}.` : "Your chains are chosen.", false);
       refresh();
     } catch (e) { pmsg(e.message, true); }
     $("cp-start").disabled = false;

@@ -871,9 +871,16 @@ static RACE_PROOF: Mutex<Option<Hash256>> = Mutex::new(None);
 /// a stuck ARCADE, or a copy still syncing, must not stop handles, posts, messages or new arcades).
 pub const STALL_SECS: u64 = 20 * 60;
 
-/// Whether the ARCADE chain running here can't take writes now: its newest block (on this arcade's copy) is older than
-/// [`STALL_SECS`], or it doesn't run. Writes go to Pepecoin testnet meanwhile; reads span both.
+/// Whether the ARCADE chain can't take writes now: its newest block (on this arcade's copy, or on the borrowed copy
+/// while one stands in) is older than [`STALL_SECS`], or it is neither installed nor borrowed. Writes go to Pepecoin testnet meanwhile; reads span both.
 pub fn stalled() -> bool {
+    let Some(p) = defined() else { return true };
+    if borrowed(p) {
+        // The borrowed copy's newest block, as its lenders gave it.
+        let t = crate::borrow::tip_time(p.key).unwrap_or(0);
+        let limit = std::env::var("ARCADE_STALL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(STALL_SECS);
+        return arcade_app::now().saturating_sub(t) > limit;
+    }
     match svc() {
         Some(s) => {
             let t = s.st.lock().unwrap().chain.tip().time;
@@ -1300,11 +1307,10 @@ pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
         let _changing = CHANGING.lock().unwrap();
         run(node, def)?;
     } else {
-        // The home chain (HOMECHAIN.md phase 3, Martin 2026-11-17): installed by itself, on a new arcade and on one
-        // updating from a release before, and it stays.
-        install(node)?;
-        eprintln!("arc: the ARCADE test chain {} (block 0 {genesis}) installed: it is the home chain", net.key);
-        let _ = node.app.event("chains", &format!("installed {}: it is the home chain (@tags, profiles, posts and messages live there)", def.params.name));
+        // Not installed: borrowed from the arcades that keep it until the operator installs it (Martin 2026-11-18: "all
+        // chains are only borrowed until someone installs them, including arcade"). It is the home chain either way
+        // (crate::node::Node::ledger_home): @tags, profiles, posts and messages are read and written through lenders.
+        eprintln!("arc: the ARCADE test chain {} (block 0 {genesis}) is not installed here: borrowed from arcades that keep it", net.key);
     }
     Ok(())
 }
@@ -1334,10 +1340,7 @@ pub fn install(node: &Arc<Node>) -> Result<(), String> {
 /// Coins on it are not lost: they are on the chain, and the wallet's keys stay.
 pub fn remove(node: &Arc<Node>) -> Result<(), String> {
     let def = DEF.get().ok_or("this arcade knows no ARCADE chain")?;
-    // The home chain stays (HOMECHAIN.md phase 3): @tags, profiles, posts and messages are read and written there.
-    if !LOCAL.load(Ordering::Relaxed) {
-        return Err(format!("{} is the home chain (your @tag, profile, posts and messages live there), so it can't be removed", def.params.name));
-    }
+    // Optional like any chain (Martin 2026-11-18): removed, it is borrowed again, and stays the home chain.
     let _changing = CHANGING.lock().unwrap();
     let svc = SVC.write().unwrap().take().ok_or_else(|| format!("{} is not installed", def.params.name))?;
     // Under the chain's lock: a block being taken in right now is in before, or never.
@@ -1756,6 +1759,9 @@ fn locator(chain: &LocalChain, reached: Option<Hash256>) -> Vec<Hash256> {
 
 /// Ask `peer` for the branch it named, from where the two chains part (`locator`).
 fn ask(svc: &Svc, link: &mut Link) -> Result<(), LinkError> {
+    if test_holds_sync(svc) {
+        return Ok(());
+    }
     let reached = svc.peers.lock().unwrap().get(&link.peer_id).and_then(|p| p.reached);
     let loc: Vec<String> = {
         let st = svc.st.lock().unwrap();
@@ -1897,6 +1903,12 @@ fn on_answer(node: &Node, svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), L
         ask(svc, link)?;
     }
     Ok(())
+}
+
+/// ARCADE_ARC_TEST_SYNC_AFTER=<seconds> (closed test networks): no blocks are asked of other arcades for that long after
+/// the chain starts here, so an installed copy stays far behind (a borrowed copy then stands in, crate::borrow).
+fn test_holds_sync(svc: &Svc) -> bool {
+    std::env::var("ARCADE_ARC_TEST_SYNC_AFTER").ok().and_then(|v| v.parse::<u64>().ok()).is_some_and(|s| svc.started.elapsed().as_secs() < s)
 }
 
 pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError> {
@@ -2387,9 +2399,58 @@ pub fn block_at(h: u64) -> Option<(Hash256, arcade_arc::merkle::Hash)> {
     svc()?.st.lock().unwrap().chain.storage().block_at(h)
 }
 
-/// Whether `p` is the ARCADE chain installed here.
+/// Whether `p` is the ARCADE chain installed here (its own copy runs, caught up or not). For "can ARCADE be used here"
+/// ask [`usable`]; for "read and spend it from our own copy", [`own`].
 pub fn runs(p: &ChainParams) -> bool {
     svc().is_some_and(|s| s.params.chain_no == p.chain_no)
+}
+
+/// Where this arcade reads and spends the ARCADE chain from (Martin 2026-11-18: every chain is borrowed until it is
+/// installed, and while an installed copy is still catching up).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Source {
+    /// Its own copy (installed, and no borrowed copy stands in for it).
+    Own,
+    /// A borrowed copy (crate::borrow, crate::arcborrow): not installed, or installed and still well behind.
+    Borrowed,
+}
+
+/// The source of the ARCADE chain `p` here, if it can be used at all.
+pub fn source(p: &ChainParams) -> Option<Source> {
+    if !defined().is_some_and(|d| d.chain_no == p.chain_no) {
+        return None;
+    }
+    pick_source(runs(p), crate::borrow::is_borrowed(p.key))
+}
+
+/// [`source`] from whether the own copy runs and whether a borrowed copy is followed: a borrowed copy, while there is
+/// one, answers for an installed copy still catching up (borrowing stops once that has caught up).
+fn pick_source(runs: bool, borrowed: bool) -> Option<Source> {
+    match (runs, borrowed) {
+        (_, true) => Some(Source::Borrowed),
+        (true, false) => Some(Source::Own),
+        (false, false) => None,
+    }
+}
+
+/// Whether the ARCADE chain `p` can be used here: installed, or borrowed.
+pub fn usable(p: &ChainParams) -> bool {
+    source(p).is_some()
+}
+
+/// Whether the ARCADE chain `p` is read and spent from this arcade's own copy (installed and not borrowed meanwhile).
+pub fn own(p: &ChainParams) -> bool {
+    source(p) == Some(Source::Own)
+}
+
+/// Whether the ARCADE chain `p` is read and spent through a borrowed copy now.
+pub fn borrowed(p: &ChainParams) -> bool {
+    source(p) == Some(Source::Borrowed)
+}
+
+/// The ARCADE chain when it can be used here (installed or borrowed).
+pub fn usable_chain() -> Option<&'static ChainParams> {
+    defined().filter(|p| usable(p))
 }
 
 /// The waiting transaction that spends a coin, so a wallet doesn't pick it again.
@@ -3053,6 +3114,10 @@ pub fn submit(req: &Value) -> Result<Value, String> {
 /// Outputs paying `script` of transactions waiting in the pool that no other waiting transaction spends: a wallet's
 /// change from a transaction it just sent, spendable at once (the pool takes chains of waiting transactions).
 pub fn waiting_outputs(script: &[u8]) -> Vec<(OutPoint, u64)> {
+    // Borrowed: the transactions sent from here that still wait at the lenders.
+    if let Some(p) = defined().filter(|p| borrowed(p)) {
+        return crate::borrow::waiting_to(p, script).into_iter().map(|(op, v, _)| (op, v)).collect();
+    }
     let Some(svc) = svc() else { return Vec::new() };
     let st = svc.st.lock().unwrap();
     let mut out = Vec::new();
@@ -3085,6 +3150,17 @@ mod tests {
     use arcade_arc::vrf;
     use arcade_chain::hash::hash160;
     use arcade_chain::{OutPoint, TxIn, TxOut};
+
+    #[test]
+    fn a_borrowed_copy_answers_until_the_chain_is_installed_and_caught_up() {
+        // Not installed: borrowed once an arcade lends it, else not usable here.
+        assert_eq!(pick_source(false, true), Some(Source::Borrowed));
+        assert_eq!(pick_source(false, false), None);
+        // Installed and still catching up, borrowed meanwhile: the borrowed copy answers.
+        assert_eq!(pick_source(true, true), Some(Source::Borrowed));
+        // Installed, no borrowed copy (caught up, or no lender): its own copy.
+        assert_eq!(pick_source(true, false), Some(Source::Own));
+    }
 
     #[test]
     fn a_writer_with_nearly_all_the_weight_goes_on_alone() {

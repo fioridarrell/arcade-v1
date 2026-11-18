@@ -10,6 +10,7 @@ mod webui;
 mod rulecheck;
 mod updater;
 mod handlegate;
+mod lentrows;
 mod hometag;
 mod addrsvc;
 mod collsvc;

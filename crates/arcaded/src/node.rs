@@ -244,7 +244,8 @@ impl Node {
     pub fn ledger_chains(&self) -> Vec<&'static arcade_chain::params::ChainParams> {
         let home = self.ledger_home();
         let mut out = Vec::new();
-        if home.chain_no != self.params.chain_no && !crate::borrow::is_borrowed(self.params.key) {
+        // (Borrowed here, or still catching up: read from arcades that keep it, crate::lentrows.)
+        if home.chain_no != self.params.chain_no && (!crate::borrow::is_borrowed(self.params.key) || crate::lentrows::lent(self, self.params)) {
             out.push(self.params);
         }
         // The mainnet coins kept here with posts and messages indexed (crate::chains::MESSAGE_CHAINS; Martin 2026-11-17,
@@ -253,6 +254,14 @@ impl Node {
         for p in extra {
             if crate::chains::MESSAGE_CHAINS.contains(&p.key) && self.chain.indexers_for(p.chain_no).contains(&"messages.v1") && !out.iter().any(|o| o.chain_no == p.chain_no) {
                 out.push(p);
+            }
+        }
+        // And those borrowed here whose posts and messages an arcade on the mesh keeps.
+        for key in crate::chains::MESSAGE_CHAINS {
+            if let Some(p) = arcade_chain::params::by_key(key).filter(|p| !out.iter().any(|o| o.chain_no == p.chain_no)) {
+                if crate::borrow::is_borrowed(key) && crate::lentrows::lent(self, p) {
+                    out.push(p);
+                }
             }
         }
         out.push(home);

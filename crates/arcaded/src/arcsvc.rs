@@ -2724,14 +2724,14 @@ pub fn light_from(entries: Vec<Entry>) -> Option<Headers<Clock>> {
     Headers::resume(d.net, &d.settings.genesis, d.settings.clock, entries)
 }
 
-/// The draw weight of a writer, as a borrowed copy can tell it: a genesis holder's from the
-/// list; anyone else's is a registered replica's, which a borrowed copy can't check
-/// (`light::UNKNOWN_WEIGHT`: the header's claim is taken).
-pub fn writer_weight(key: &[u8; 32]) -> u64 {
-    match DEF.get().and_then(|d| d.settings.holders.iter().find(|(k, ..)| k == key)) {
-        Some((_, bytes, _)) => *bytes,
-        None => arcade_arc::light::UNKNOWN_WEIGHT,
-    }
+/// The draw weight of a writer, as a borrowed copy can tell it: none. A genesis holder's weight is
+/// the settings' figure only until the registry changes it (rules v4: what it stores counts; the
+/// testnet's holders had other weights from block 1001 on, so a borrowed copy that took the
+/// settings' figure refused every block after 1000, 2026-11-18). A registered replica's owner's
+/// can't be checked either. So the header's claim is taken (`light::UNKNOWN_WEIGHT`), on the
+/// lender's word; the draw, the proofs of time and the difficulty are still checked.
+pub fn writer_weight(_key: &[u8; 32]) -> u64 {
+    arcade_arc::light::UNKNOWN_WEIGHT
 }
 
 /// The defined chain's network, block 0's id and block 0's time.

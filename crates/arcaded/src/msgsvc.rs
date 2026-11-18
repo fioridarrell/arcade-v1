@@ -558,7 +558,7 @@ fn coins_text(p: &arcade_chain::params::ChainParams, sats: u64) -> String {
 }
 
 pub fn send_payloads_with(node: &Node, payloads: &[Vec<u8>], extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
-    let p = node.ledger_home();
+    let p = node.write_home();
     if crate::arcsvc::runs(p) {
         return send_payloads_arc(node, p, payloads, extra);
     }
@@ -616,7 +616,8 @@ fn send_payloads_arc(node: &Node, p: &'static arcade_chain::params::ChainParams,
 
 /// A coin chain as the ledger home (an arcade without the ARCADE chain).
 fn send_payloads_coin(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
-    let p = node.ledger_home();
+    // The coin chain: Pepecoin testnet (an arcade without ARCADE, or ARCADE stalled).
+    let p = node.params;
     let (_, _, sk) = sender_key(node)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
     let script = arcade_wallet::keys::p2pkh_script_for(&pk);

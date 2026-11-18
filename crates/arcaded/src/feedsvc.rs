@@ -211,6 +211,8 @@ pub fn feed(node: &Node, v: &View) -> Result<Value, String> {
                 "txid": txid, "author": author(node, from, cache), "channel": p["channel"], "nick": p["nick"],
                 "text": if is_muted { Value::Null } else { json!(r.text.clone().unwrap_or_else(|| p["text"].as_str().unwrap_or("").to_string())) },
                 "edited": r.text.is_some(), "muted": is_muted, "file": p["file"], "height": p["h"],
+                // The chain it is written on (a:// ARCADE, p:// Pepecoin testnet), for a badge.
+                "chain": p["c"].as_u64().and_then(|c| crate::chains::all().into_iter().chain(crate::arcsvc::defined()).find(|x| x.chain_no as u64 == c)).map(|x| x.key),
                 "likes": r.likes, "dislikes": r.dislikes, "shares": r.shares, "tips": r.tips, "tip_count": r.tip_count,
                 "mine": from == me, "my_opinion": r.mine, "score": score(&r), "replies": replies,
             }))

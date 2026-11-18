@@ -228,6 +228,17 @@ impl Node {
         crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).unwrap_or(self.params)
     }
 
+    /// Where the ledger is written now: the home (ARCADE), or Pepecoin testnet while ARCADE is stalled
+    /// (crate::arcsvc::stalled; failover to test chains only, Martin 2026-11-17).
+    pub fn write_home(&self) -> &'static arcade_chain::params::ChainParams {
+        let home = self.ledger_home();
+        if crate::arcsvc::runs(home) && crate::arcsvc::stalled() {
+            self.params
+        } else {
+            home
+        }
+    }
+
     /// The chains the ledger is read from, oldest first: the old home (Pepecoin testnet, whose follows, posts and
     /// messages stay readable as history) when ARCADE is home and the old home is kept here, then the home.
     pub fn ledger_chains(&self) -> Vec<&'static arcade_chain::params::ChainParams> {

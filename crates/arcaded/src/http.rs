@@ -34,6 +34,8 @@ use std::time::{Duration, Instant};
 const MAX_BODY: usize = 64 << 20;
 /// A body sent with neither (the page API, public commands).
 const MAX_OPEN_BODY: usize = 64 << 10;
+/// A sealed signing request (sitesign's mailboxes): a PSBT with its coins' whole previous transactions.
+const MAX_BOX_BODY: usize = 2 << 20;
 /// A program's room door message (crate::realtime keeps at most 60 KB of one, in base64 here).
 const MAX_DOOR_BODY: usize = 256 << 10;
 /// Connections served at once; more wait for one to close.
@@ -243,6 +245,8 @@ fn body_cap(node: &Node, r: &Req, is_local: bool) -> usize {
         MAX_BODY
     } else if p.starts_with("/realtime/") {
         MAX_DOOR_BODY
+    } else if p == "/api/v1/id/box_put" {
+        MAX_BOX_BODY
     } else {
         MAX_OPEN_BODY
     }

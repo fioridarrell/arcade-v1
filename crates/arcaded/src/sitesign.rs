@@ -15,8 +15,10 @@
 //! {v: 1, apk, n, c} in the pair box: inside, its Dogecoin address and public key. From K both
 //! derive the request box (page → app) and the answer box (app → page).
 //!
-//! **Requests**: the page puts {n, c} in the request box; inside, {id, type: "psbt" | "message",
-//! psbt, inputToSign, finalize, message}. The app takes its paired sites' request boxes every few
+//! **Requests**: the page puts {n, c} in the request box; inside, {id, type: "psbt" | "psbts" | "message",
+//! psbt, inputToSign, finalize, message, label} (for "psbts": {id, type, psbts: [{psbt, inputToSign, finalize,
+//! label}]}, signed together on one yes: a marketplace listing ten names, a cart). `label` is the site's own word
+//! for it ("Buy x.doge"), shown as the site's. The app takes its paired sites' request boxes every few
 //! seconds, shows each one (`id.sign_pending`: for a PSBT the coins it signs, every output, the
 //! fee, and whether a signed coin carries an inscription, checked with this arcade's ord index or
 //! the mesh's), and `id.sign_decide {id, ok}` signs it and answers, or says no.
@@ -33,8 +35,11 @@ type R = Result<Value, String>;
 const BOX_SECONDS: u64 = 600;
 const BOX_MOST_MSGS: usize = 16;
 const BOX_MOST: usize = 20_000;
-/// Largest message a box takes (a PSBT with its coins' transactions, sealed): ~45 KB.
-const MSG_MOST: usize = 60_000;
+/// Largest message a box takes: a PSBT carries each coin's whole previous transaction, and an inscription's is the
+/// inscription itself (an image can be a few hundred KB), so ~550 KB of PSBT, sealed.
+const MSG_MOST: usize = 1_500_000;
+/// All boxes together hold at most this much.
+const ALL_MOST: usize = 64 << 20;
 /// A paired site's request box is read while the site was used within this long.
 const ACTIVE_SECONDS: u64 = 7 * 86_400;
 const PENDING_SECONDS: u64 = 600;
@@ -56,7 +61,7 @@ fn clean_box(b: &str) -> Result<String, String> {
 
 static BOXES: LazyLock<Mutex<HashMap<String, VecDeque<(u64, String)>>>> = LazyLock::new(Default::default);
 
-/// id.box_put: leave a sealed message in a box (most 16 waiting, each up to 60,000 characters, ten minutes).
+/// id.box_put: leave a sealed message in a box (most 16 waiting, each up to 1,500,000 characters, ten minutes).
 pub fn box_put(b: &str, msg: &str) -> R {
     let b = clean_box(b)?;
     if msg.is_empty() || msg.len() > MSG_MOST {
@@ -68,7 +73,8 @@ pub fn box_put(b: &str, msg: &str) -> R {
         q.retain(|(at, _)| at + BOX_SECONDS > t);
         !q.is_empty()
     });
-    if !m.contains_key(&b) && m.len() >= BOX_MOST {
+    let held: usize = m.values().flat_map(|q| q.iter().map(|(_, s)| s.len())).sum();
+    if !m.contains_key(&b) && m.len() >= BOX_MOST || held + msg.len() > ALL_MOST {
         return Err("this arcade is holding as many boxes as it takes: try again in a few minutes".into());
     }
     let q = m.entry(b).or_default();
@@ -346,46 +352,80 @@ fn preview(node: &Node, p: &Value, req: &Value) -> Result<Value, String> {
             let mut v = base;
             v["kind"] = json!("message");
             v["message"] = json!(m);
+            if let Some(l) = req["label"].as_str().map(|l| l.chars().take(120).collect::<String>()).filter(|l| !l.trim().is_empty()) {
+                v["label"] = json!(l);
+            }
             Ok(v)
         }
         "psbt" => {
-            let ps = Psbt::parse(&psbt::decode_text(req["psbt"].as_str().unwrap_or(""))?)?;
-            let mine = arcade_ledger::address::p2pkh_script_for_address(&DOGECOIN_MAIN, p["address"].as_str().unwrap_or("")).ok_or("a broken pairing")?;
-            let list = plan(&ps, req, &mine)?;
-            let signed: Vec<usize> = list.iter().map(|(i, _)| *i).collect();
-            // Signed coins that carry an inscription (this arcade's ord index, else the mesh's).
-            let coins: Vec<arcade_wallet::tx::Utxo> = signed.iter().filter_map(|i| ps.input(*i).coin.map(|(value, script)| arcade_wallet::tx::Utxo { outpoint: ps.input(*i).prevout, value, script })).collect();
-            let free: Vec<arcade_chain::OutPoint> = crate::ordsafe::keep_free(node, &DOGECOIN_MAIN, coins.clone()).into_iter().map(|u| u.outpoint).collect();
-            let inputs: Vec<Value> = (0..ps.inputs.len())
-                .map(|i| {
-                    let v = ps.input(i);
-                    let sign = list.iter().find(|(x, _)| *x == i);
-                    json!({"index": i, "coin": format!("{}:{}", v.prevout.txid, v.prevout.vout), "value": v.coin.as_ref().map(|c| c.0),
-                           "from": v.coin.as_ref().and_then(|c| arcade_ledger::address::address_of(&c.1, &DOGECOIN_MAIN)),
-                           "mine": v.coin.as_ref().is_some_and(|c| c.1 == mine), "sign": sign.is_some(), "hash_type": sign.map(|(_, h)| hash_name(*h)),
-                           "inscription": sign.is_some() && !free.contains(&v.prevout)})
-                })
-                .collect();
-            let outputs: Vec<Value> = ps.tx.outputs.iter().enumerate().map(|(n, o)| {
-                json!({"index": n, "value": o.value, "to": arcade_ledger::address::address_of(&o.script_pubkey, &DOGECOIN_MAIN).unwrap_or_else(|| if o.script_pubkey.first() == Some(&0x6a) { "data (OP_RETURN)".into() } else { format!("script {}", hex::encode(&o.script_pubkey)) }), "mine": o.script_pubkey == mine})
-            }).collect();
-            let known: Option<u64> = (0..ps.inputs.len()).map(|i| ps.input(i).coin.map(|c| c.0)).sum();
-            let out_total: u64 = ps.tx.outputs.iter().map(|o| o.value).sum();
-            let from_you: u64 = coins.iter().map(|c| c.value).sum();
-            let to_you: u64 = ps.tx.outputs.iter().filter(|o| o.script_pubkey == mine).map(|o| o.value).sum();
             let mut v = base;
-            v["kind"] = json!("psbt");
-            v["inputs"] = json!(inputs);
-            v["outputs"] = json!(outputs);
-            v["fee"] = json!(known.and_then(|k| k.checked_sub(out_total)));
-            v["from_you"] = json!(from_you);
-            v["to_you"] = json!(to_you);
-            v["inscriptions"] = json!(inputs.iter().filter(|x| x["inscription"] == true).count());
-            v["finalize"] = json!(req["finalize"] == true || req["autoFinalize"] == true);
+            for (k, x) in psbt_preview(node, p, req)?.as_object().cloned().unwrap_or_default() {
+                v[k] = x;
+            }
             Ok(v)
         }
-        _ => Err("type: psbt or message".into()),
+        "psbts" => {
+            let list = req["psbts"].as_array().filter(|a| !a.is_empty()).ok_or("psbts: [{psbt, inputToSign, finalize}]")?;
+            if list.len() > MOST_IN_BATCH {
+                return Err(format!("psbts: at most {MOST_IN_BATCH} at once"));
+            }
+            let items = list.iter().map(|x| psbt_preview(node, p, x)).collect::<Result<Vec<_>, _>>()?;
+            let sum = |k: &str| items.iter().map(|i| i[k].as_u64().unwrap_or(0)).sum::<u64>();
+            let mut v = base;
+            v["kind"] = json!("psbts");
+            v["from_you"] = json!(sum("from_you"));
+            v["to_you"] = json!(sum("to_you"));
+            v["inscriptions"] = json!(sum("inscriptions"));
+            v["fee"] = json!(items.iter().map(|i| i["fee"].as_u64()).sum::<Option<u64>>());
+            v["items"] = json!(items);
+            Ok(v)
+        }
+        _ => Err("type: psbt, psbts or message".into()),
     }
+}
+
+/// Most PSBTs one request may ask for together.
+const MOST_IN_BATCH: usize = 50;
+
+/// What one PSBT does: the coins this wallet signs (and whether one carries an inscription), every output, the fee.
+fn psbt_preview(node: &Node, p: &Value, req: &Value) -> Result<Value, String> {
+    let ps = Psbt::parse(&psbt::decode_text(req["psbt"].as_str().unwrap_or(""))?)?;
+    let mine = arcade_ledger::address::p2pkh_script_for_address(&DOGECOIN_MAIN, p["address"].as_str().unwrap_or("")).ok_or("a broken pairing")?;
+    let list = plan(&ps, req, &mine)?;
+    let signed: Vec<usize> = list.iter().map(|(i, _)| *i).collect();
+    // Signed coins that carry an inscription (this arcade's ord index, else the mesh's).
+    let coins: Vec<arcade_wallet::tx::Utxo> = signed.iter().filter_map(|i| ps.input(*i).coin.map(|(value, script)| arcade_wallet::tx::Utxo { outpoint: ps.input(*i).prevout, value, script })).collect();
+    let free: Vec<arcade_chain::OutPoint> = crate::ordsafe::keep_free(node, &DOGECOIN_MAIN, coins.clone()).into_iter().map(|u| u.outpoint).collect();
+    let inputs: Vec<Value> = (0..ps.inputs.len())
+        .map(|i| {
+            let v = ps.input(i);
+            let sign = list.iter().find(|(x, _)| *x == i);
+            json!({"index": i, "coin": format!("{}:{}", v.prevout.txid, v.prevout.vout), "value": v.coin.as_ref().map(|c| c.0),
+                   "from": v.coin.as_ref().and_then(|c| arcade_ledger::address::address_of(&c.1, &DOGECOIN_MAIN)),
+                   "mine": v.coin.as_ref().is_some_and(|c| c.1 == mine), "sign": sign.is_some(), "hash_type": sign.map(|(_, h)| hash_name(*h)),
+                   "inscription": sign.is_some() && !free.contains(&v.prevout)})
+        })
+        .collect();
+    let outputs: Vec<Value> = ps.tx.outputs.iter().enumerate().map(|(n, o)| {
+        json!({"index": n, "value": o.value, "to": arcade_ledger::address::address_of(&o.script_pubkey, &DOGECOIN_MAIN).unwrap_or_else(|| if o.script_pubkey.first() == Some(&0x6a) { "data (OP_RETURN)".into() } else { format!("script {}", hex::encode(&o.script_pubkey)) }), "mine": o.script_pubkey == mine})
+    }).collect();
+    let known: Option<u64> = (0..ps.inputs.len()).map(|i| ps.input(i).coin.map(|c| c.0)).sum();
+    let out_total: u64 = ps.tx.outputs.iter().map(|o| o.value).sum();
+    let from_you: u64 = coins.iter().map(|c| c.value).sum();
+    let to_you: u64 = ps.tx.outputs.iter().filter(|o| o.script_pubkey == mine).map(|o| o.value).sum();
+    let mut v = json!({});
+    v["kind"] = json!("psbt");
+    if let Some(l) = req["label"].as_str().map(|l| l.chars().take(120).collect::<String>()).filter(|l| !l.trim().is_empty()) {
+        v["label"] = json!(l);
+    }
+    v["inputs"] = json!(inputs);
+    v["outputs"] = json!(outputs);
+    v["fee"] = json!(known.and_then(|k| k.checked_sub(out_total)));
+    v["from_you"] = json!(from_you);
+    v["to_you"] = json!(to_you);
+    v["inscriptions"] = json!(inputs.iter().filter(|x| x["inscription"] == true).count());
+    v["finalize"] = json!(req["finalize"] == true || req["autoFinalize"] == true);
+    Ok(v)
 }
 
 /// id.sign_pending: what paired websites are asking this app to sign, each with what it does.
@@ -416,17 +456,14 @@ pub fn decide(node: &Node, id: &str, ok: bool) -> R {
     }
     let out = match x.req["type"].as_str().unwrap_or("") {
         "message" => json!({"id": x.asked, "ok": true, "signature": arcade_wallet::keys::signmessage(&key, DOGE_MAGIC, x.req["message"].as_str().unwrap_or(""))}),
+        "psbts" => {
+            let signed = x.req["psbts"].as_array().cloned().unwrap_or_default().iter().map(|r| sign_one(r, &key, &pubkey)).collect::<Result<Vec<_>, _>>()?;
+            json!({"id": x.asked, "ok": true, "results": signed})
+        }
         _ => {
-            let mut ps = Psbt::parse(&psbt::decode_text(x.req["psbt"].as_str().unwrap_or(""))?)?;
-            let mine = psbt::p2pkh(&pubkey);
-            let finalize = x.req["finalize"] == true || x.req["autoFinalize"] == true;
-            for (i, h) in plan(&ps, &x.req, &mine)? {
-                ps.sign_input(i, &key, &pubkey, h, finalize)?;
-            }
-            let mut o = json!({"id": x.asked, "ok": true, "psbtHex": hex::encode(ps.serialize())});
-            if let Some(t) = ps.extract() {
-                o["txHex"] = json!(hex::encode(t));
-            }
+            let mut o = sign_one(&x.req, &key, &pubkey)?;
+            o["id"] = json!(x.asked);
+            o["ok"] = json!(true);
             o
         }
     };
@@ -435,6 +472,21 @@ pub fn decide(node: &Node, id: &str, ok: bool) -> R {
     p2["last"] = json!(now());
     let _ = save(node, &p2);
     Ok(json!({"ok": true, "signed": true, "site": p["host"]}))
+}
+
+/// Sign one PSBT request: {psbtHex, txHex when it is complete}.
+fn sign_one(req: &Value, key: &arcade_wallet::secp256k1::SecretKey, pubkey: &[u8; 33]) -> R {
+    let mut ps = Psbt::parse(&psbt::decode_text(req["psbt"].as_str().unwrap_or(""))?)?;
+    let mine = psbt::p2pkh(pubkey);
+    let finalize = req["finalize"] == true || req["autoFinalize"] == true;
+    for (i, h) in plan(&ps, req, &mine)? {
+        ps.sign_input(i, key, pubkey, h, finalize)?;
+    }
+    let mut o = json!({"psbtHex": hex::encode(ps.serialize())});
+    if let Some(t) = ps.extract() {
+        o["txHex"] = json!(hex::encode(t));
+    }
+    Ok(o)
 }
 
 /// At boot: read paired sites' boxes when any site is paired.

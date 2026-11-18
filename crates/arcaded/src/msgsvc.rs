@@ -558,11 +558,68 @@ fn coins_text(p: &arcade_chain::params::ChainParams, sats: u64) -> String {
 }
 
 pub fn send_payloads_with(node: &Node, payloads: &[Vec<u8>], extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
-    let p = node.write_home();
+    // The chain the writer chose (`chain` on the request, crate::api), else the write home. ARCADE chosen and stalled
+    // fails over like the default; a mainnet coin chosen is written there or not at all (failover to test chains only).
+    let p = match write_on() {
+        Some(p) if crate::arcsvc::runs(p) => node.write_home(),
+        Some(p) => p,
+        None => node.write_home(),
+    };
     if crate::arcsvc::runs(p) {
         return send_payloads_arc(node, p, payloads, extra);
     }
-    send_payloads_coin(node, payloads, extra)
+    send_payloads_coin(node, p, payloads, extra)
+}
+
+thread_local! {
+    /// The chain this request writes its records to (`chain` on feed.post, feed.act, follow, msg.send).
+    static WRITE_ON: std::cell::Cell<Option<&'static arcade_chain::params::ChainParams>> = const { std::cell::Cell::new(None) };
+}
+
+fn write_on() -> Option<&'static arcade_chain::params::ChainParams> {
+    WRITE_ON.with(|w| w.get())
+}
+
+/// The chains this wallet can write its posts, acts and messages to (Martin 2026-11-17, option C): ARCADE, Pepecoin
+/// testnet, and Pepecoin, Dogecoin and DigiByte where kept here or borrowed. In the order offered.
+pub fn write_chains(node: &Node) -> Vec<&'static arcade_chain::params::ChainParams> {
+    let mut out: Vec<&'static arcade_chain::params::ChainParams> = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).into_iter().collect();
+    out.push(node.params);
+    for k in crate::chains::MESSAGE_CHAINS {
+        if let Some(p) = crate::chains::find(k) {
+            if node.extra.lock().unwrap().contains_key(p.key) || crate::borrow::is_borrowed(p.key) {
+                out.push(p);
+            }
+        }
+    }
+    out
+}
+
+/// Run `f` writing to `chain` (a key from [`write_chains`]; None: the write home).
+pub fn with_write_on<T>(node: &Node, chain: Option<&str>, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let chosen = match chain.map(str::trim).filter(|c| !c.is_empty()) {
+        None => None,
+        Some(k) => Some(write_chains(node).into_iter().find(|p| p.key.eq_ignore_ascii_case(k)).ok_or_else(|| format!("posts and messages can't be written to {k} here: pick one of {}", write_chains(node).iter().map(|p| p.key).collect::<Vec<_>>().join(", ")))?),
+    };
+    let before = WRITE_ON.with(|w| w.replace(chosen));
+    let out = f();
+    WRITE_ON.with(|w| w.set(before));
+    out
+}
+
+/// `ledger.write_chains`: where this wallet can write, with its balance there and which is the default now.
+pub fn write_chains_status(node: &Node) -> Value {
+    let def = node.write_home();
+    json!(write_chains(node).iter().map(|p| {
+        let addr = sender_key(node).ok().and_then(|(a, _, _)| crate::hometag::address_on(p, &a));
+        // From this arcade's own lists only (its copy, its borrowed copy): never a lender asked while a menu waits.
+        let bal = addr.as_ref().and_then(|a| arcade_ledger::address::script_for_address(p, a)).map(|sc| {
+            let coins = if crate::arcsvc::runs(p) { crate::claims::arc_coins(node, p, &sc) } else { coins_on(node, p, &sc) };
+            coins.iter().map(|c| c.value).sum::<u64>()
+        });
+        json!({"key": p.key, "name": p.name, "unit": crate::explorer::unit(p), "default": p.chain_no == def.chain_no,
+               "test": p.key.ends_with("test"), "stalled": crate::arcsvc::runs(p) && crate::arcsvc::stalled(), "address": addr, "balance": bal})
+    }).collect::<Vec<_>>())
 }
 
 /// The ARCADE chain as the ledger home (HOMECHAIN.md phase 3): each record a transaction into its own pool, spending
@@ -615,9 +672,30 @@ fn send_payloads_arc(node: &Node, p: &'static arcade_chain::params::ChainParams,
 }
 
 /// A coin chain as the ledger home (an arcade without the ARCADE chain).
-fn send_payloads_coin(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
-    // The coin chain: Pepecoin testnet (an arcade without ARCADE, or ARCADE stalled).
-    let p = node.params;
+/// A coin chain's spendable coins of `script`: Pepecoin testnet as before; another chain kept here (its coins, minus
+/// those its pool spends) or borrowed. Inscribed coins stay out (crate::ordsafe).
+fn coins_on(node: &Node, p: &'static arcade_chain::params::ChainParams, script: &[u8]) -> Vec<arcade_wallet::tx::Utxo> {
+    if p.chain_no == node.params.chain_no {
+        return crate::claims::spendable(node, script);
+    }
+    let coins = if crate::borrow::is_borrowed(p.key) {
+        crate::borrow::spendable(node, p, script)
+    } else {
+        node.chain.coins_for_script(p, script).unwrap_or_default().into_iter()
+            .filter(|(op, _, _)| node.chain.mempool_spender(p.chain_no, op).ok().flatten().is_none() && !node.pending_spent.lock().unwrap().contains(op))
+            .map(|(op, value, _)| arcade_wallet::tx::Utxo { outpoint: op, value, script: script.to_vec() }).collect()
+    };
+    crate::ordsafe::keep_free(node, p, coins)
+}
+
+fn send_payloads_coin(node: &Node, p: &'static arcade_chain::params::ChainParams, payloads: &[Vec<u8>], mut extra: Vec<arcade_wallet::tx::TxOutSpec>) -> Result<(Vec<String>, u64), String> {
+    // A coin chain: Pepecoin testnet (an arcade without ARCADE, or ARCADE stalled), or a mainnet coin chosen.
+    let (fee_kb, dust) = if p.chain_no == node.params.chain_no {
+        (crate::claims::FEE_PER_KB, crate::claims::DUST)
+    } else {
+        let fp = crate::coinsend::fee_policy(p);
+        (fp.fallback_per_kb.max(fp.floor_per_kb), fp.dust)
+    };
     let (_, _, sk) = sender_key(node)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
     let script = arcade_wallet::keys::p2pkh_script_for(&pk);
@@ -626,11 +704,11 @@ fn send_payloads_coin(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_w
     // Check the whole batch can be paid for before sending any of it: running out partway
     // leaves some people with the message and others without (a group invite half sent).
     if payloads.len() > 1 {
-        let coins = crate::claims::spendable(node, &script);
+        let coins = coins_on(node, p, &script);
         let have: u64 = coins.iter().map(|c| c.value).sum();
         let mut need = 0u64;
         for pl in payloads {
-            let tx = arcade_wallet::tx::build_arcade(p, &arcade_wallet::tx::any_data(pl), extra.clone(), &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, arcade_app::now() as u32)
+            let tx = arcade_wallet::tx::build_arcade(p, &arcade_wallet::tx::any_data(pl), extra.clone(), &sk, &coins, fee_kb, dust, arcade_app::now() as u32)
                 .map_err(|e| format!("could not build the message transaction: {e}"))?;
             let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
             let back: u64 = tx.outputs.iter().filter(|o| o.script_pubkey == script).map(|o| o.value).sum();
@@ -644,12 +722,20 @@ fn send_payloads_coin(node: &Node, payloads: &[Vec<u8>], mut extra: Vec<arcade_w
         }
     }
     for pl in payloads {
-        let coins = crate::claims::spendable(node, &script);
-        let tx = arcade_wallet::tx::build_arcade(p, &arcade_wallet::tx::any_data(pl), std::mem::take(&mut extra), &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, arcade_app::now() as u32)
+        let coins = coins_on(node, p, &script);
+        let tx = arcade_wallet::tx::build_arcade(p, &arcade_wallet::tx::any_data(pl), std::mem::take(&mut extra), &sk, &coins, fee_kb, dust, arcade_app::now() as u32)
             .map_err(|e| format!("could not build the message transaction: {e}"))?;
         let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
         let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
         fees += ins.saturating_sub(outs);
+        // A mainnet coin borrowed here: sent by its lenders (Pepecoin testnet keeps its own way, borrowed or not).
+        if p.chain_no != node.params.chain_no && crate::borrow::is_borrowed(p.key) {
+            if let Err((why, _)) = crate::borrow::broadcast_tx(node, p, &tx) {
+                return Err(if txids.is_empty() { format!("the transaction was refused ({why}); nothing was sent") } else { format!("only {} of {} transactions went out ({why})", txids.len(), payloads.len()) });
+            }
+            txids.push(tx.txid.to_hex());
+            continue;
+        }
         // Our own pool must take it (no coin spent twice), or nobody else will.
         if !crate::mempoolshare::add(node, p, &tx) {
             return Err(if txids.is_empty() {

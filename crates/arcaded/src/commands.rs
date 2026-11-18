@@ -202,6 +202,8 @@ cmds! {
     "a.search" Read "q" "Published profiles and @tags matching a name or @tag, for the address book.";
     "a.contact_add" Wallet "tag | address" "Add someone to your address book from their published profile.";
     "a.contact_delete" Wallet "id" "Remove an address book entry.";
+    "a.wallets" Read "tag? | address?" "The wallet addresses someone has proven they hold on the ARCADE chain (every coin; A:// op 7), yours when neither; for yours also what would be proven now.";
+    "a.wallets_publish" Wallet "force?" "Publish proofs of this wallet's addresses on every coin and of each imported wallet (each signs with its own key), when they differ from the chain's; done by itself after a profile is published.";
     "a.post" Wallet "text" "Post to your followers on the ARCADE chain.";
     "a.posts" Read "tag? | address? | following?, limit?" "Posts, newest first.";
     "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";

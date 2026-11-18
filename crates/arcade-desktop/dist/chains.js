@@ -25,7 +25,7 @@
   const RIDERS = ["names", "maps", "tokens"];
   // Indexes that need ord: ticking one ticks ord, unticking ord unticks them.
   const NEEDS_ORD = [...RIDERS, "collections"];
-  let chains = [], open = null, mode = "full", watching = null, poll = null;
+  let chains = [], open = null, mode = "full", watching = null, poll = null, showHidden = false;
 
   const msg = (text, bad) => say("c-msg", text, bad);
 
@@ -91,6 +91,17 @@
       sw.append(cb, document.createTextNode(" Borrow"));
       act.append(sw);
     }
+    // The sync queue: one chain at a time, in order (chains.queue_first, chains.start_now).
+    if (c.queued) act.append(...queueButtons(c));
+    // Paused by chains.start_now: it continues at its turn.
+    if (c.installed && c.queued_resume) d.textContent += ` · continues #${c.queued} in the queue`;
+    // A chain still syncing (the one being installed now), and one paused by hand: the Manage panel's Pause / Resume.
+    const syncing = c.installing || (c.state !== "paused" && Math.floor(c.overall || 0) < 100);
+    if (c.installed && !c.home && !c.arcade && ((syncing && c.state !== "paused") || (c.state === "paused" && !c.queued_resume))) {
+      const paused = c.state === "paused";
+      act.append(smallBtn(paused ? "Resume" : "Pause", paused ? `Resume syncing ${c.name}.` : `Pause ${c.name}: the next chain in the queue starts. Resume it here or from Manage….`,
+        () => pauseChain(c.key, !paused).then(() => msg(paused ? `${c.name} resumes.` : `${c.name} is paused; it stays paused until you resume it.`))));
+    }
     const btn = document.createElement("button");
     if (c.installed) { btn.textContent = c.home ? "Manage indexes…" : "Manage…"; btn.onclick = () => { manage(c.key); reveal(); }; }
     else if (c.queued) {
@@ -100,9 +111,41 @@
     }
     else { btn.textContent = "Install…"; btn.className = "primary"; btn.onclick = () => { choose(c); reveal(); }; }
     act.append(btn);
+    // Hide / Unhide (chains.hide): display only. The home chain and the ARCADE chain are always shown.
+    if (!c.home && !c.arcade) {
+      const hb = document.createElement("button"); hb.className = "linkish";
+      hb.textContent = c.hidden ? "Unhide" : "Hide";
+      hb.title = c.hidden ? `Show ${c.name} in the list again.` : `Hide ${c.name} from this list. Hiding only hides it: an installed chain keeps running, and nothing is removed or paused. "Show hidden chains" below brings it back.`;
+      hb.setAttribute("aria-label", `${c.hidden ? "Unhide" : "Hide"} ${c.name}`);
+      hb.onclick = async () => { try { await api("chains.hide", { key: c.key, hidden: !c.hidden }); msg(""); refresh(); } catch (e) { bmsg(e.message, true); } };
+      act.append(hb);
+    }
+    if (c.hidden) el.classList.add("hid");
     el.append(logoOf(c.key, c.name), info, bal, act);
     return el;
   }
+  function smallBtn(text, title, fn) {
+    const b = document.createElement("button"); b.className = "small"; b.textContent = text; b.title = title;
+    b.onclick = async () => { b.disabled = true; try { await fn(); refresh(); } catch (e) { b.disabled = false; bmsg(e.message, true); } };
+    return b;
+  }
+  // The Manage panel's Pause / Resume (chains.pause, chains.resume): by hand, so the queue never resumes it.
+  const pauseChain = (key, pause) => api(pause ? "chains.pause" : "chains.resume", { key });
+  // A queued row's Sync next (to the front of the queue) and Sync now (the chain installing now is
+  // paused and continues right after it).
+  function queueButtons(c) {
+    const out = [];
+    if (c.queued > 1) out.push(smallBtn("Sync next", `Move ${c.name} to the front of the queue: it starts when the chain syncing now has caught up.`, async () => {
+      await api("chains.queue_first", { key: c.key }); bmsg(`${c.name} is next in the queue.`, false);
+    }));
+    out.push(smallBtn("Sync now", `Start ${c.name} now. The chain syncing now is paused and continues right after it. Not while the home chain or the ARCADE chain is catching up.`, async () => {
+      const r = await api("chains.start_now", { key: c.key });
+      const p = (r.paused || []).map((k) => (chains.find((x) => x.key === k) || {}).name || k);
+      bmsg(`${c.name} starts now${p.length ? `; ${p.join(", ")} paused and continues after it` : ""}.`, false);
+    }));
+    return out;
+  }
+  $("c-show-hidden").onclick = () => { showHidden = !showHidden; refresh(); };
   $("c-borrow-on").onchange = () => setBorrow({ on: $("c-borrow-on").checked }, $("c-borrow-on").checked ? "Borrowing every coin other arcades lend." : "Borrowing is off; borrowed data is removed.");
 
   async function refresh() {
@@ -111,7 +154,12 @@
     try { b = await api("borrow.status"); } catch (e) { /* borrowing unavailable: rows still show */ }
     $("c-borrow-on").checked = !!b.on;
     const by = Object.fromEntries((b.chains || []).map((x) => [x.key, x]));
-    $("c-list").replaceChildren(...chains.map((c) => coinRow(c, by[c.key], b.on)));
+    // Hidden chains (chains.hide) are left out unless "Show hidden chains" is on.
+    const nHidden = chains.filter((c) => c.hidden).length;
+    if (!nHidden) showHidden = false;
+    $("c-show-hidden").hidden = !nHidden;
+    $("c-show-hidden").textContent = showHidden ? `Leave hidden chains out (${nHidden})` : `Show hidden chains (${nHidden})`;
+    $("c-list").replaceChildren(...chains.filter((c) => showHidden || !c.hidden).map((c) => coinRow(c, by[c.key], b.on)));
     if (watching) {
       try { showProgress(await api("chains.status", { key: watching })); } catch (e) { msg(e.message, true); }
     }
@@ -522,6 +570,86 @@
     armed = false;
     try { await api("chains.remove", { key: watching }); msg("Removing the chain and its data…"); watching = null; $("c-progress").hidden = true; refresh(); } catch (e) { msg(e.message, true); }
   };
+  // ---------- which chains to use (chains.plan): on first start, and from "Choose chains…" ----------
+  const PLAN_MODES = MODES.filter(([k]) => ["full", "shared", "chain"].includes(k));
+  let planMode = "full", planTicked = new Set(), planFirst = false;
+  const pmsg = (text, bad) => say("cp-msg", text, bad);
+  async function openPlan(first) {
+    planFirst = !!first;
+    try { chains = await api("chains.list"); } catch (e) { return; }
+    const anyHidden = chains.some((c) => c.hidden);
+    // Ticked: what is installed or queued, and, once chains have been hidden, every chain still shown.
+    planTicked = new Set(chains.filter((c) => !c.home && !c.arcade && (c.installed || c.queued || (anyHidden && !c.hidden))).map((c) => c.key));
+    $("cp-skip").textContent = planFirst ? "Skip for now" : "Cancel";
+    pmsg("");
+    renderPlan();
+    $("cp-modal").hidden = false;
+    $("cp-list").scrollTop = 0;
+    $("cp-start").focus({ preventScroll: true });
+  }
+  function closePlan() { $("cp-modal").hidden = true; }
+  function planSize(c) {
+    const b = c.sizes?.modes?.[planMode];
+    return b == null ? "size not reported yet" : `about ${size(b)}`;
+  }
+  function renderPlan() {
+    const arc = chains.filter((c) => c.arcade), home = chains.filter((c) => c.home), rest = chains.filter((c) => !c.arcade && !c.home);
+    const row = (c, fixed, note) => {
+      const l = document.createElement("label"); l.className = "cp-row" + (fixed ? " fixed" : "");
+      const cb = document.createElement("input"); cb.type = "checkbox";
+      cb.checked = fixed || planTicked.has(c.key); cb.disabled = fixed;
+      cb.onchange = () => { if (cb.checked) planTicked.add(c.key); else planTicked.delete(c.key); planSum(); };
+      const n = document.createElement("div"); n.className = "cp-n";
+      const b = document.createElement("b"); b.textContent = `${c.name} `;
+      const t = document.createElement("span"); t.className = "bt"; t.textContent = TICKERS[c.key] || c.key; b.append(t);
+      const sm = document.createElement("small"); sm.textContent = note;
+      n.append(b, sm);
+      const sz = document.createElement("span"); sz.className = "cp-sz"; sz.textContent = c.installed && !c.arcade ? "" : c.arcade ? "" : planSize(c);
+      l.append(cb, coinLogo(c.key, c.name, "div", "logo"), n, sz);
+      return l;
+    };
+    const note = (c) => c.installed ? (c.hidden ? "installed · hidden now" : "installed") : c.queued ? (c.hidden ? `queued #${c.queued} · hidden now` : `queued #${c.queued}`) : c.hidden ? "hidden now" : "";
+    $("cp-list").replaceChildren(
+      ...arc.map((c) => row(c, true, `Always on · syncs first${c.installed ? " · installed" : ""}`)),
+      ...home.map((c) => row(c, true, "This arcade's home chain · always installed")),
+      ...rest.map((c) => row(c, false, note(c))));
+    $("cp-modes").replaceChildren(...PLAN_MODES.map(([k, t, d]) => {
+      const l = document.createElement("label"); l.className = "mode" + (k === planMode ? " sel" : "");
+      l.innerHTML = `<input type="radio" name="cp-mode" ${k === planMode ? "checked" : ""}><b></b><small></small>`;
+      l.querySelector("b").textContent = t; l.querySelector("small").textContent = d;
+      l.querySelector("input").onchange = () => { planMode = k; renderPlan(); };
+      return l;
+    }));
+    planSum();
+  }
+  function planSum() {
+    const fresh = chains.filter((c) => planTicked.has(c.key) && !c.installed && !c.queued);
+    const known = fresh.map((c) => c.sizes?.modes?.[planMode]).filter((b) => b != null);
+    const total = known.reduce((a, b) => a + b, 0);
+    const unknown = fresh.length - known.length;
+    $("cp-sum").textContent = !fresh.length ? "Nothing new to queue: Start only hides the unticked chains."
+      : `${fresh.length} chain${fresh.length === 1 ? "" : "s"} to queue, smallest first${known.length ? `: about ${size(total)} in all` : ""}${unknown ? ` (${unknown} not reported yet, queued last)` : ""}. Chains grow, so leave room.`;
+  }
+  $("cp-start").onclick = async () => {
+    $("cp-start").disabled = true;
+    try {
+      const r = await api("chains.plan", { keys: [...planTicked], mode: planMode });
+      closePlan();
+      const q = (r.queued || []).map((k) => (chains.find((x) => x.key === k) || {}).name || k);
+      bmsg(q.length ? `Queued, in this order: ${q.join(", ")}. They sync one at a time${r.arcade || chains.some((c) => c.arcade) ? ", after the ARCADE chain" : ""}.` : "Your chains are chosen.", false);
+      refresh();
+    } catch (e) { pmsg(e.message, true); }
+    $("cp-start").disabled = false;
+  };
+  $("cp-skip").onclick = async () => {
+    if (planFirst) { try { await api("chains.plan", { skip: true }); } catch (e) { /* asked again next start */ } }
+    closePlan();
+  };
+  $("cp-modal").addEventListener("keydown", (e) => { if (e.key === "Escape") $("cp-skip").click(); });
+  $("c-plan-open").onclick = () => openPlan(false);
+  // First start: ask which chains to use.
+  api("chains.queue").then((q) => { if (q && !q.plan_done) openPlan(true); }).catch(() => {});
+
   document.querySelector('nav button[data-tab="chains"]').addEventListener("click", refresh);
   clearInterval(poll); poll = setInterval(() => { if (!document.getElementById("chains").hidden && document.getElementById("chains").classList.contains("on")) refresh(); }, 2500);
   // #chains/install/<key> opens that coin's install card.

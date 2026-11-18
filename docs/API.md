@@ -280,13 +280,19 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `chains.peers` | `/api/v1/chains/peers` | read | key | A chain's P2P address book: nodes known, working in the last day, resting after failures; the working ones and the next to try. |
-| `chains.list` | `/api/v1/chains/list` | public | — | Every chain V1.0 knows, installed or not, with sizes reported by arcades. |
+| `chains.list` | `/api/v1/chains/list` | public | — | Every chain V1.0 knows, installed or not, with sizes reported by arcades; per chain: hidden (chains.hide), queued (position), queued_resume and installing (the chain being installed now). |
 | `chains.status` | `/api/v1/chains/status` | public | key | One chain's staged progress. |
 | `chains.offers` | `/api/v1/chains/offers` | public | — | Chains other arcades offer over the mesh. |
 | `chains.sizes` | `/api/v1/chains/sizes` | admin | — | Measure this arcade's disk use per chain now. |
 | `chains.add` | `/api/v1/chains/add` | admin | key, mode?, with? | Install a chain (mode full, shared or chain; with = indexes). |
-| `chains.pause` | `/api/v1/chains/pause` | admin | key | Pause a chain. |
-| `chains.resume` | `/api/v1/chains/resume` | admin | key | Resume a chain. |
+| `chains.queue` | `/api/v1/chains/queue` | public | — | Chains waiting in the queue, next first (position, key, name, mode, with; resume = a chain paused by chains.start_now that continues at its turn), the chain being installed now that they wait behind, the hidden chains, and plan_done (whether the startup chooser was answered). |
+| `chains.unqueue` | `/api/v1/chains/unqueue` | admin | key | Take a chain out of the install queue. |
+| `chains.queue_first` | `/api/v1/chains/queue_first` | admin | key | Move a queued chain to the front of the queue: it is next. |
+| `chains.start_now` | `/api/v1/chains/start_now` | admin | key | Start a queued chain now: the chain being installed is paused and goes back into the queue right after it (a resume entry). Refused while the home chain or the ARCADE chain is catching up. |
+| `chains.hide` | `/api/v1/chains/hide` | admin | key, hidden? | Leave a chain out of the Coins & chains list (hidden: true, the default) or show it again (false). Display only: an installed chain keeps running; nothing is removed or paused. The home chain and the ARCADE chain are always shown. |
+| `chains.plan` | `/api/v1/chains/plan` | admin | keys?, mode?, skip? | The startup chooser: keys = the chains to use. Every other chain is hidden; the chosen ones not installed or queued yet are queued, smallest reported size for mode (full, shared or chain; default full) first, unknown sizes last, with no indexes. The ARCADE chain is installed if it isn't yet and syncs first. Never removes a chain. skip: true only marks the chooser as answered. |
+| `chains.pause` | `/api/v1/chains/pause` | admin | key | Pause a chain (by hand: the queue never resumes it). |
+| `chains.resume` | `/api/v1/chains/resume` | admin | key | Resume a chain (by hand: a resume entry for it leaves the queue). |
 | `chains.index_add` | `/api/v1/chains/index_add` | admin | key, index | Add an index to a chain. |
 | `chains.index_remove` | `/api/v1/chains/index_remove` | admin | key, index | Remove an index from a chain. |
 | `chains.remove` | `/api/v1/chains/remove` | admin | key | Remove a chain and its data. |

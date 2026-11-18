@@ -872,8 +872,16 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "chains.queue" => Ok(crate::chains::queue_list(node)),
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),
-        "chains.pause" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, true),
-        "chains.resume" => crate::chains::set_paused(node, &s("key").ok_or("key required")?, false),
+        "chains.queue_first" => crate::chains::queue_first(node, &s("key").ok_or("key required")?),
+        "chains.start_now" => crate::chains::start_now(&node.self_arc(), &s("key").ok_or("key required")?),
+        "chains.hide" => crate::chains::hide(node, &s("key").ok_or("key required")?, req["hidden"].as_bool().unwrap_or(true)),
+        "chains.plan" => {
+            let keys: Vec<String> = req["keys"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
+            crate::chains::plan(&node.self_arc(), &keys, &s("mode").unwrap_or_else(|| "full".into()), req["skip"] == true)
+        }
+        // By hand: a resume entry in the queue for the chain is dropped (chains::pause_by_hand).
+        "chains.pause" => crate::chains::pause_by_hand(node, &s("key").ok_or("key required")?, true),
+        "chains.resume" => crate::chains::pause_by_hand(node, &s("key").ok_or("key required")?, false),
         "chains.index_add" => crate::chains::add_index(&node.self_arc(), &s("key").ok_or("key required")?, &s("index").ok_or("index required")?),
         "chains.index_remove" => crate::chains::remove_index(&node.self_arc(), &s("key").ok_or("key required")?, &s("index").ok_or("index required")?),
         "chains.remove" => crate::chains::remove(&node.self_arc(), &s("key").ok_or("key required")?),

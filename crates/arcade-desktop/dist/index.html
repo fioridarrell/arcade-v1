@@ -333,9 +333,11 @@
       <div class="borrow-head">
         <h2>Coins</h2>
         <label class="sw"><input type="checkbox" id="c-borrow-on"> Borrow every coin other arcades lend</label>
+        <button class="small" id="c-plan-open" title="Pick the chains you plan to use: the others are hidden, the chosen ones sync one at a time, smallest first.">Choose chains…</button>
       </div>
       <p class="opt">Install a chain to keep it on this arcade; nothing is installed unless you do it here. Coins you haven't installed can be borrowed through other arcades' Core nodes: this arcade keeps only their block headers and your own coins, and checks every block it reads. Installing a chain replaces its borrowed copy.</p>
       <div class="blist" id="c-list"><p class="msg">Loading chains…</p></div>
+      <button class="linkish" id="c-show-hidden" hidden>Show hidden chains</button>
       <p class="msg" id="c-bmsg"></p>
     </div>
 
@@ -477,6 +479,20 @@
     <ul class="events" id="a-list"><li>Loading…</li></ul>
   </section>
 </main>
+<!-- Which chains to use (chains.plan): on first start, and from Chains & Coins' "Choose chains…". -->
+<div id="cp-modal" class="cp-modal" hidden>
+  <div class="cp-sheet" role="dialog" aria-modal="true" aria-labelledby="cp-title">
+    <h2 id="cp-title">Which chains do you plan to use?</h2>
+    <p class="opt">Ticked chains sync one at a time, smallest first, after the ARCADE chain. Chains you leave unticked are hidden from Chains &amp; Coins: installed ones keep running and nothing is removed. Show them again any time.</p>
+    <div class="cp-list" id="cp-list"></div>
+    <h3>How to keep them</h3>
+    <div class="modes" id="cp-modes"></div>
+    <p class="opt">No indexes are added: every index is opt-in. Add the ones you want later from a chain's Manage… panel.</p>
+    <p class="est" id="cp-sum"></p>
+    <div class="row"><button class="primary" id="cp-start">Start</button><button id="cp-skip">Skip for now</button></div>
+    <p class="msg" id="cp-msg"></p>
+  </div>
+</div>
 <script src="common.js"></script>
 <script src="app.js"></script>
 <script src="theme.js"></script>

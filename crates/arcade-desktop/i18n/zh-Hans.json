@@ -1411,5 +1411,6 @@
  "🔑 linked key": "🔑 关联的密钥",
  "🔑 revoked key": "🔑 撤销的密钥",
  "🔓 revealed": "🔓 已揭示",
- "🪙 tipped": "🪙 已打赏"
+ "🪙 tipped": "🪙 已打赏",
+ "Borrowed until ticked · ticked, it syncs here": "勾选前为借用 · 勾选后在此同步"
 }

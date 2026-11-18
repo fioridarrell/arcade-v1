@@ -160,6 +160,7 @@ I18N.add("fr", {
 "Borrow": "Emprunter",
 "Borrowed": "Emprunté",
 "Borrowed until ticked · ticked, it syncs first": "Empruntée tant qu'elle n'est pas cochée · cochée, elle se synchronise en premier",
+"Borrowed until ticked · ticked, it syncs here": "Empruntée tant qu'elle n'est pas cochée · cochée, elle se synchronise ici",
 "Borrowed · at block {0} · from block {1} · {2} coin": "Emprunté · au bloc {0} · depuis le bloc {1} · {2} pièce",
 "Borrowed · at block {0} · from block {1} · {2} coins": "Emprunté · au bloc {0} · depuis le bloc {1} · {2} pièces",
 "Borrowed · waiting for an arcade that lends {0} · from block {1} · {2} coin": "Emprunté · en attente d'une arcade qui prête {0} · depuis le bloc {1} · {2} pièce",

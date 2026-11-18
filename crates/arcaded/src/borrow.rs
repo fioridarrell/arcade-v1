@@ -1418,6 +1418,15 @@ fn arc_borrows(own: bool, running: bool, behind: u64) -> bool {
     !own && (running || behind >= ARC_START_BEHIND)
 }
 
+/// Whether the home chain is borrowed: always while it isn't installed here; installed, while its own copy is far
+/// behind (starts at 100+ blocks, stops within 10 once its address rows are built).
+pub(crate) fn home_borrows(installed: bool, running: bool, lag: u32, addr_ready: bool) -> bool {
+    if !installed {
+        return true;
+    }
+    if running { !(lag <= 10 && addr_ready) } else { lag > 100 }
+}
+
 /// Start, keep and stop borrowing per chain (called every 20 s and on every switch).
 /// Any chain is borrowed while it is being synced or taken in from copies, the home chain
 /// included (Martin: balances, the test coin and the @handle claim work at once on a fresh
@@ -1439,9 +1448,10 @@ pub fn manage(node: &Node) {
             let behind = top.saturating_sub(crate::arcsvc::height().unwrap_or(0));
             chain_on(&c, p.key) && arc_borrows(own, running.is_some(), behind)
         } else if home {
-            // Home: start when 100+ blocks behind, stop once within 10 with addresses built.
+            // Home: not installed here (crate::homeinst), always borrowed. Installed: start when 100+ blocks behind,
+            // stop once within 10 with addresses built.
             let (lag, addr_ready) = home_lag(node);
-            chain_on(&c, p.key) && if running.is_some() { !(lag <= 10 && addr_ready) } else { lag > 100 }
+            chain_on(&c, p.key) && home_borrows(crate::homeinst::installed(), running.is_some(), lag, addr_ready)
         } else {
             chain_on(&c, p.key) && !(installed.contains(p.key) && installed_ready(node, p))
         };
@@ -2835,7 +2845,21 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
 
 #[cfg(test)]
 mod tests {
-    use super::{arc_borrows, stalled, tips_apart, tips_slack, ARC_START_BEHIND};
+    use super::{arc_borrows, home_borrows, stalled, tips_apart, tips_slack, ARC_START_BEHIND};
+
+    #[test]
+    fn the_home_chain_is_borrowed_until_installed_and_while_its_copy_is_far_behind() {
+        // Not installed: borrowed whatever the lag (its own copy never moves).
+        assert!(home_borrows(false, false, 0, false));
+        assert!(home_borrows(false, true, 0, true));
+        // Installed, far behind: starts; a block or two behind: doesn't.
+        assert!(home_borrows(true, false, 500_000, false));
+        assert!(!home_borrows(true, false, 5, true));
+        // Borrowing: goes on until within 10 with its address rows built.
+        assert!(home_borrows(true, true, 50, true));
+        assert!(home_borrows(true, true, 3, false));
+        assert!(!home_borrows(true, true, 3, true));
+    }
 
     #[test]
     fn an_installed_arcade_chain_is_borrowed_while_far_behind() {

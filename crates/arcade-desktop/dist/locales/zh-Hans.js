@@ -160,6 +160,7 @@ I18N.add("zh-Hans", {
 "Borrow": "借用",
 "Borrowed": "借用中",
 "Borrowed until ticked · ticked, it syncs first": "勾选前为借用 · 勾选后最先同步",
+"Borrowed until ticked · ticked, it syncs here": "勾选前为借用 · 勾选后在此同步",
 "Borrowed · at block {0} · from block {1} · {2} coin": "借用中 · 位于区块 {0} · 从区块 {1} 起 · {2} 枚币",
 "Borrowed · at block {0} · from block {1} · {2} coins": "借用中 · 位于区块 {0} · 从区块 {1} 起 · {2} 枚币",
 "Borrowed · waiting for an arcade that lends {0} · from block {1} · {2} coin": "借用中 · 等待出借 {0} 的 arcade · 从区块 {1} 起 · {2} 枚币",

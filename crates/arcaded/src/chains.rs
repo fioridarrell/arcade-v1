@@ -656,6 +656,12 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
         crate::borrow::manage(node);
         arcade = json!(a.key);
     }
+    // The home chain, when ticked and not installed yet (crate::homeinst): installed now, borrowed while it syncs.
+    let mut home = Value::Null;
+    if chosen.iter().any(|p| p.chain_no == node.params.chain_no) && !crate::homeinst::installed() {
+        install_home(node)?;
+        home = json!(node.params.key);
+    }
     let all: Vec<&str> = ALL_CHAINS.iter().map(|p| p.key).collect();
     let chosen_keys: Vec<&str> = chosen.iter().map(|p| p.key).collect();
     let hide = plan_hidden(&all, &chosen_keys, &always_shown(node));
@@ -682,7 +688,7 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
     // The first one starts at once when nothing is being installed (else at its turn).
     let n = node.clone();
     std::thread::spawn(move || queue_step(&n));
-    Ok(json!({"queued": queued, "hidden": hide, "arcade": arcade, "mode": mode}))
+    Ok(json!({"queued": queued, "hidden": hide, "arcade": arcade, "home": home, "mode": mode}))
 }
 
 /// chains.add: install a chain now, or, while another chain is still being installed, put it
@@ -697,13 +703,14 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     }
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
+    // The home chain (crate::homeinst): borrowed until installed; installed, its own copy syncs (borrowing meanwhile).
+    if p.chain_no == node.params.chain_no {
+        return install_home(node);
+    }
     // Headers only is small and quick (§15 step 15): it never waits behind another chain's install.
     if let Some(busy) = installing_now(node).filter(|b| b.key != p.key && mode != "light") {
         if node.extra.lock().unwrap().contains_key(p.key) {
             return Err(format!("{} is already installed", p.name));
-        }
-        if p.chain_no == node.params.chain_no {
-            return Err(format!("{} is this arcade's home chain and is always installed", p.name));
         }
         // The same checks as at its turn, so a typo fails now and not hours later; the queue keeps the checked list.
         let indexes = check(p, mode, &indexes)?;
@@ -720,12 +727,52 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     add_now(node, key, mode, indexes)
 }
 
+/// chains.add for the home chain: keep its blocks here from now on. Its own copy syncs from coin peers and the
+/// mesh; the borrowed copy answers until it has caught up (crate::borrow::home_borrows).
+fn install_home(node: &Arc<Node>) -> Result<Value, String> {
+    let p = node.params;
+    if crate::homeinst::removing() {
+        return Err(format!("{}'s blocks are still being deleted; try again in a minute", p.name));
+    }
+    if crate::homeinst::set(node, true)? {
+        let _ = node.app.event("chains", &format!("installing {}: its own copy syncs, borrowed meanwhile", p.name));
+    }
+    crate::borrow::manage(node);
+    status(node, p.key)
+}
+
+/// chains.remove for the home chain: its blocks and indexes go, and it is borrowed again. Coins on it are not
+/// lost: they are on the chain, and the wallet's keys stay.
+fn remove_home(node: &Arc<Node>) -> Result<Value, String> {
+    let p = node.params;
+    if !crate::homeinst::installed() {
+        return Err(format!("{} is not installed", p.name));
+    }
+    crate::chaindrive::not_moving(p.key)?;
+    if crate::v1import::running(p.key) || crate::coreboot::held(p.key) {
+        return Err(format!("{} is being installed from copies; try again once that is done", p.name));
+    }
+    crate::homeinst::set(node, false)?;
+    crate::homeinst::set_removing(true);
+    crate::borrow::manage(node);
+    let n = node.clone();
+    let (c, name) = (p.chain_no, p.name);
+    std::thread::spawn(move || {
+        // Let the chain thread see it first (it checks every round and every few seconds while listening).
+        std::thread::sleep(std::time::Duration::from_secs(20));
+        while n.chain.remove_chain_batch(c, 20_000).map(|x| x > 0).unwrap_or(false) {}
+        crate::homeinst::set_removing(false);
+        let _ = n.app.event("chains", &format!("removed {name}'s blocks: it is borrowed from other arcades again"));
+    });
+    Ok(json!({"removed": p.key, "borrowed": true}))
+}
+
 fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Result<Value, String> {
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
     let p = by_key(key).ok_or_else(|| format!("unknown chain {key}; see  arcade chain list"))?;
     if p.chain_no == node.params.chain_no {
-        return Err(format!("{} is this arcade's home chain and is always installed", p.name));
+        return install_home(node);
     }
     if node.extra.lock().unwrap().contains_key(key) {
         return Err(format!("{} is already installed", p.name));
@@ -1028,6 +1075,9 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
     }
     // Any capitalisation (DOGE, PEPtest) and the old mesh names map to the chain's key.
     let key = by_key(key).map(|p| p.key).unwrap_or(key);
+    if key == node.params.key {
+        return remove_home(node);
+    }
     crate::chaindrive::not_moving(key)?;
     let r = node.extra.lock().unwrap().remove(key).ok_or_else(|| format!("{key} is not installed"))?;
     r.stop.store(true, Ordering::Relaxed);
@@ -1096,6 +1146,12 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     let c = p.chain_no;
     let home = c == node.params.chain_no;
     let run = node.extra.lock().unwrap().get(key).cloned();
+    if home && !crate::homeinst::installed() {
+        // Not installed here (crate::homeinst): borrowed from arcades that keep it.
+        let mut st = crate::borrow::status(node, key).unwrap_or_else(|| json!({"key": key, "name": p.name, "installed": false}));
+        st["home"] = json!(true);
+        return Ok(st);
+    }
     if !home && run.is_none() {
         // Not installed, but maybe borrowed from arcades on the mesh (crate::borrow).
         return Ok(crate::borrow::status(node, key).unwrap_or_else(|| json!({"key": key, "name": p.name, "installed": false})));
@@ -1305,7 +1361,7 @@ pub fn all() -> impl Iterator<Item = &'static ChainParams> {
 
 /// Whether this arcade keeps `p`'s blocks in its own store.
 pub fn kept(node: &Node, p: &ChainParams) -> bool {
-    p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key) || crate::arcsvc::runs(p)
+    (p.chain_no == node.params.chain_no && crate::homeinst::installed()) || node.extra.lock().unwrap().contains_key(p.key) || crate::arcsvc::runs(p)
 }
 
 /// `chains.list` as the window asks for it: a copy made in the background (one pass at a time),
@@ -1394,7 +1450,7 @@ fn quick_list(node: &Node) -> Value {
     let installed: std::collections::BTreeSet<String> = node.extra.lock().unwrap().keys().cloned().collect();
     let row = |p: &ChainParams, arcade: bool| {
         let home = p.chain_no == node.params.chain_no;
-        json!({"key": p.key, "name": p.name, "installed": home || installed.contains(p.key) || crate::arcsvc::runs(p), "home": home, "arcade": arcade,
+        json!({"key": p.key, "name": p.name, "installed": (home && crate::homeinst::installed()) || installed.contains(p.key) || crate::arcsvc::runs(p), "home": home, "arcade": arcade,
                "borrowed": crate::borrow::is_borrowed(p.key), "state": "loading…", "loading": true, "sizes": null, "offers": node.offers_for(p.key).len(),
                "ord": !arcade && ord_start(p).is_some(), "tokens": if arcade { None } else { arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()) },
                "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "queued": queued_at(node, p.key)})

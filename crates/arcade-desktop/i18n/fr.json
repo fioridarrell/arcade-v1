@@ -1411,5 +1411,6 @@
  "🔑 linked key": "🔑 clé liée",
  "🔑 revoked key": "🔑 clé révoquée",
  "🔓 revealed": "🔓 révélé",
- "🪙 tipped": "🪙 pourboire donné"
+ "🪙 tipped": "🪙 pourboire donné",
+ "Borrowed until ticked · ticked, it syncs here": "Empruntée tant qu'elle n'est pas cochée · cochée, elle se synchronise ici"
 }

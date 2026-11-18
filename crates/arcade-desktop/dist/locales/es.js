@@ -160,6 +160,7 @@ I18N.add("es", {
 "Borrow": "Tomar prestado",
 "Borrowed": "Prestada",
 "Borrowed until ticked · ticked, it syncs first": "Prestada hasta que la marques · marcada, se sincroniza primero",
+"Borrowed until ticked · ticked, it syncs here": "Prestada hasta que la marques · marcada, se sincroniza aquí",
 "Borrowed · at block {0} · from block {1} · {2} coin": "Prestada · en el bloque {0} · desde el bloque {1} · {2} moneda",
 "Borrowed · at block {0} · from block {1} · {2} coins": "Prestada · en el bloque {0} · desde el bloque {1} · {2} monedas",
 "Borrowed · waiting for an arcade that lends {0} · from block {1} · {2} coin": "Prestada · esperando un arcade que preste {0} · desde el bloque {1} · {2} moneda",

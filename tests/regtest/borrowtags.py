@@ -173,6 +173,10 @@ def main():
     print("4. On C: msg.who @alice")
     if not wait("msg.who @alice on C", lambda: same(call("C", "msg.who", name="@alice").get("address")), 120, show=lambda: json.dumps(call("C", "ledger.lent"))[:300]):
         fails.append("msg.who @alice doesn't find alice on C")
+    lent_tags = lambda: ((call("C", "ledger.lent").get("arctest") or {}).get("tables", {}).get("tag") or {}).get("rows", 0)
+    if not wait("C holds A's tag table (lent rows)", lambda: lent_tags() >= 2, 300, show=lambda: f"lent tag rows {lent_tags()}"):
+        fails.append("C's lent tag table stays empty")
+    print("   lent tag rows on C:", lent_tags())
     print("5. On C: explorer.search @alice")
     try:
         sr = call("C", "explorer.search", chain="arctest", q="@alice")

@@ -464,7 +464,10 @@ fn arc_owner_on_mesh(node: &Node, arc: &'static ChainParams, tag: &str) -> Resul
 
 /// [`arc_owner_on_mesh`] for writes on a borrowed ARCADE chain: who holds `tag`, or Err when no arcade keeping it could say.
 pub(crate) fn arc_owner(node: &Node, arc: &'static ChainParams, tag: &str) -> Result<Option<String>, String> {
-    arc_owner_on_mesh(node, arc, tag).map_err(|e| format!("no arcade keeping {} could say who holds @{tag} ({e}); try again in a minute", arc.name))
+    // The one per-chain lookup (own ledger, lent tag rows, a keeper's explorer.tag), crate::hometag.
+    crate::hometag::owner_on_checked(node, arc, tag)
+        .map(|o| o.map(|(a, _)| a))
+        .map_err(|e| format!("no arcade keeping {} could say who holds @{tag} ({e}); try again in a minute", arc.name))
 }
 
 /// The @tag `address` holds on the ARCADE chain `arc`, by the word of an arcade keeping it (for an arcade borrowing it,

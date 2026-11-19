@@ -140,12 +140,6 @@ fn held_tag_of_key(c: u16, h: &[u8]) -> Option<String> {
     })
 }
 
-/// Whether the whole tag table of `p` was read from a lender lately (so a tag missing from it is free, as far as the
-/// mesh knows).
-pub fn tags_whole(p: &ChainParams) -> bool {
-    st().lock().unwrap().get(&(p.chain_no, "tag")).and_then(|h| h.whole_at).is_some_and(|a| a.elapsed() < TAGS_AGAIN * 3)
-}
-
 /// This arcade's own rows and lenders' together, one per txid (its own first, then lenders' it doesn't have).
 pub fn merged(own: Vec<Value>, lent: Vec<Value>) -> Vec<Value> {
     let have: std::collections::HashSet<String> = own.iter().filter_map(|v| v["txid"].as_str().map(String::from)).collect();

@@ -16,14 +16,25 @@ fn arcade(node: &Node) -> Option<&'static ChainParams> {
 /// Who holds `tag` on one chain (`p`'s own namespace), as an address on `p` and the claim's height (0 when unknown):
 /// this arcade's own ledger, else, with `p`'s tag tables borrowed here, lenders' rows, else a keeper asked.
 pub fn owner_on(node: &Node, p: &'static ChainParams, tag: &str) -> Option<(String, u32)> {
+    owner_on_checked(node, p, tag).ok().flatten()
+}
+
+/// [`owner_on`], telling "nobody holds it" (Ok(None)) from "can't tell": Err while `p`'s tags are borrowed here and no
+/// arcade keeping them answered.
+pub fn owner_on_checked(node: &Node, p: &'static ChainParams, tag: &str) -> Result<Option<(String, u32)>, String> {
     let tag = norm(tag);
     if let Some(r) = tag_row(&node.chain, p.chain_no, &tag).ok().flatten() {
-        return Some((r.address, r.block_height));
+        return Ok(Some((r.address, r.block_height)));
     }
-    if !crate::lentrows::tags_lent(node, p) {
-        return None;
+    if !borrowed_tags(node, p) {
+        return Ok(None);
     }
-    crate::lentrows::tag_owner(node, p, &tag).or_else(|| asked(node, p, &tag).ok().flatten())
+    if crate::lentrows::tags_lent(node, p) {
+        if let Some(o) = crate::lentrows::tag_owner(node, p, &tag) {
+            return Ok(Some(o));
+        }
+    }
+    asked(node, p, &tag)
 }
 
 /// The @tag held on chain `p` by the key of `address` (any chain's p2pkh form): this arcade's own ledger (under `p`'s
@@ -32,6 +43,8 @@ pub fn of_address_on(node: &Node, p: &'static ChainParams, address: &str) -> Opt
     let h = key_hash(address)?;
     [p.p2pkh_version, node_home_version(node)].into_iter().find_map(|v| tag_of(&node.chain, p.chain_no, &base58check(v, &h)).ok().flatten())
         .or_else(|| crate::lentrows::tags_lent(node, p).then(|| crate::lentrows::tag_of_key(node, p, &h)).flatten())
+        // A borrowed ARCADE: a keeper's explorer.address (not limited to arcades with a handle, as lent rows are).
+        .or_else(|| (crate::arcborrow::is(p) && crate::arcsvc::borrowed(p)).then(|| crate::claims::arc_tag_on_mesh(node, p, &base58check(p.p2pkh_version, &h))).flatten())
 }
 
 fn node_home_version(node: &Node) -> u8 {
@@ -79,21 +92,19 @@ pub fn owner_checked(node: &Node, tag: &str) -> Result<Option<(&'static ChainPar
     if let Some(o) = owner(node, tag) {
         return Ok(Some(o));
     }
-    let tag = tag.trim().trim_start_matches('@').to_lowercase();
     for p in chains(node) {
-        if crate::lentrows::tags_lent(node, p) && !crate::lentrows::tags_whole(p) {
-            asked(node, p, &tag).map_err(|e| format!("can't tell whether @{tag} is claimed on {}: {e}", p.name))?;
-        } else if !crate::lentrows::tags_lent(node, p) && borrowed_without_keeper(node, p) {
-            return Err(format!("can't tell whether @{tag} is claimed: {} is borrowed here and no arcade that keeps it answers", p.name));
-        }
+        owner_on_checked(node, p, tag).map_err(|e| format!("can't tell whether @{} is claimed on {}: {e}", norm(tag), p.name))?;
     }
     Ok(None)
 }
 
-/// A tag chain borrowed here with no arcade on the mesh keeping its tags.
-fn borrowed_without_keeper(node: &Node, p: &ChainParams) -> bool {
-    let borrowed = if crate::arcborrow::is(p) { crate::arcsvc::borrowed(p) } else { crate::borrow::is_borrowed(p.key) && !node.chain.indexers_for(p.chain_no).contains(&"ledger.v1") };
-    borrowed
+/// Whether chain `p`'s tag tables are borrowed here (ARCADE borrowed; another ledger chain not kept with its ledger).
+fn borrowed_tags(node: &Node, p: &ChainParams) -> bool {
+    if crate::arcborrow::is(p) {
+        crate::arcsvc::borrowed(p)
+    } else {
+        crate::borrow::is_borrowed(p.key) && !node.chain.indexers_for(p.chain_no).contains(&"ledger.v1")
+    }
 }
 
 /// The chains asked, in order: ARCADE, then the ledger home; with ARCADE as the home, Pepecoin testnet too (its tags

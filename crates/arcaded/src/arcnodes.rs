@@ -1,7 +1,8 @@
 //! `explorer.arc_nodes` (the Storage app's Nodes and Coins tabs): per arcade on the mesh, and this one, what it keeps
-//! (each chain's mode, indexes and bytes), how much of it is sealed (earning), how much is ready to seal (blocks of a
-//! listed chain it keeps in full, not sealed yet) and how much can't be sealed yet (unlisted chains, every index,
-//! anything an old "beta" arcade keeps: it has no sealing); per chain, its keepers, its size and how far the ARCADE
+//! (each chain's mode, indexes and bytes), how much of it is sealed (earning), how much is ready to seal now (blocks of a
+//! listed chain it keeps in full that the catalog has cut into segments, not sealed here yet), how much is listed but
+//! not cut yet (the rest of those chains' blocks: sealable once segments are posted for them) and how much can't be
+//! sealed yet (unlisted chains, every index, anything an old "beta" arcade keeps: it has no sealing); per chain, its keepers, its size and how far the ARCADE
 //! chain is in cutting and sealing it; and network totals.
 //!
 //! Where the numbers come from, and how sure they are (each chain's `size`):
@@ -311,13 +312,13 @@ pub(crate) fn assemble(arcades: Vec<ArcadeIn>, est: &BTreeMap<String, Value>, ar
         h: Vec<u64>,
     }
     let mut nets: BTreeMap<String, Net> = BTreeMap::new();
-    let mut t = [0u64; 5]; // kept, sealed, ready, other, estimated
+    let mut t = [0u64; 6]; // kept, sealed, ready, other, estimated, listed and not cut yet
     let (mut beta_n, mut keeping) = (0usize, 0usize);
     for a in &arcades {
         on_mesh.insert(a.node.clone());
         let sealed_of = arc.and_then(|x| x.sealed.get(&a.node));
         let who = a.tag.as_ref().map(|t| format!("@{t}")).or_else(|| a.name.clone()).unwrap_or_else(|| a.node[..a.node.len().min(8)].to_string());
-        let (mut kept, mut ready, mut other, mut estd, mut unknown) = (0u64, 0u64, 0u64, 0u64, false);
+        let (mut kept, mut ready, mut uncut, mut other, mut estd, mut unknown) = (0u64, 0u64, 0u64, 0u64, 0u64, false);
         let mut chains = Vec::new();
         for c in a.chains.iter().take(MAX_CHAINS) {
             let (b, ix, size) = sizes_of(c, est);
@@ -325,9 +326,13 @@ pub(crate) fn assemble(arcades: Vec<ArcadeIn>, est: &BTreeMap<String, Value>, ar
             let bb = b.unwrap_or(0);
             let (sb, sn) = sealed_of.and_then(|s| s.get(&c.key)).copied().unwrap_or((0, 0));
             let sealable = !a.beta && c.mode == "full" && listed(&c.key);
-            let r = if sealable { bb.saturating_sub(sb) } else { 0 };
+            // Ready now: what the catalog has cut of the chain (its segments, every family), not sealed here yet;
+            // the rest of its blocks waits to be cut. (A seal never covers more than was cut.)
+            let cut = arc.and_then(|x| x.segs.get(&c.key)).map_or(0, |s| s[1]).min(bb);
+            let (r, u) = if sealable { (cut.saturating_sub(sb), bb.saturating_sub(cut.max(sb))) } else { (0, 0) };
             kept += bb + ixb;
             ready += r;
+            uncut += u;
             other += ixb + if sealable { 0 } else { bb };
             if size != "measured" {
                 estd += bb + ixb;
@@ -350,7 +355,7 @@ pub(crate) fn assemble(arcades: Vec<ArcadeIn>, est: &BTreeMap<String, Value>, ar
                 "key": c.key, "name": chain_name(&c.key), "mode": c.mode, "h": c.h, "listed": listed(&c.key), "sealable": sealable,
                 "blocks_bytes": b, "index_bytes": ixb,
                 "indexes": ix.iter().map(|(n, b)| json!({"name": n, "bytes": b})).collect::<Vec<_>>(),
-                "size": size, "sealed_bytes": sb, "sealed_copies": sn, "ready_bytes": r,
+                "size": size, "sealed_bytes": sb, "sealed_copies": sn, "ready_bytes": r, "listed_uncut_bytes": u,
             }));
         }
         let sealed: u64 = sealed_of.map(|s| s.values().map(|x| x.0).sum()).unwrap_or(0);
@@ -360,11 +365,12 @@ pub(crate) fn assemble(arcades: Vec<ArcadeIn>, est: &BTreeMap<String, Value>, ar
         t[2] += ready;
         t[3] += other;
         t[4] += estd;
+        t[5] += uncut;
         beta_n += a.beta as usize;
         keeping += (kept > 0) as usize;
         rows.push(json!({
             "node": a.node, "tag": a.tag, "name": a.name, "version": a.version, "me": a.me, "linked": a.linked, "beta": a.beta,
-            "chains": chains, "kept_bytes": kept, "sealed_bytes": sealed, "sealed_copies": copies, "ready_bytes": ready, "other_bytes": other,
+            "chains": chains, "kept_bytes": kept, "sealed_bytes": sealed, "sealed_copies": copies, "ready_bytes": ready, "listed_uncut_bytes": uncut, "other_bytes": other,
             "estimated_bytes": estd, "size": if unknown { "unknown" } else if estd > 0 { "estimated" } else { "measured" },
             "machine": a.machine,
         }));
@@ -424,11 +430,11 @@ pub(crate) fn assemble(arcades: Vec<ArcadeIn>, est: &BTreeMap<String, Value>, ar
         "chains": chains,
         "totals": {
             "arcades": arcades.len(), "keeping": keeping, "beta": beta_n, "linked": arcades.iter().filter(|a| a.linked).count(),
-            "kept_bytes": t[0], "sealed_bytes": t[1], "ready_bytes": t[2], "other_bytes": t[3], "estimated_bytes": t[4],
+            "kept_bytes": t[0], "sealed_bytes": t[1], "ready_bytes": t[2], "listed_uncut_bytes": t[5], "other_bytes": t[3], "estimated_bytes": t[4],
             "offmesh": off_total, "offmesh_sealed_bytes": off_sealed,
         },
         "truncated": truncated || off_total > MAX_OFFMESH,
-        "note": "Kept bytes per arcade: what it measured (size \"measured\"), else the network's figure for that chain and mode, or a rough one (\"estimated\"). Sealed: the ARCADE registry's replicas. Ready: blocks of a listed chain kept in full, not sealed yet. Beta (old) arcades can't seal.",
+        "note": "Kept bytes per arcade: what it measured (size \"measured\"), else the network's figure for that chain and mode, or a rough one (\"estimated\"). Sealed: the ARCADE registry's replicas. Ready: blocks of a listed chain kept in full that are cut into segments, not sealed yet; listed_uncut: the rest of those blocks, not cut yet. Beta (old) arcades can't seal.",
     })
 }
 
@@ -479,15 +485,21 @@ mod tests {
         let a = vec![arcade(1, Some("darrellfiori"), false, vec![chain("pep", "full", &["ledger"], measured(18 * G, &[("ledger", 30 * G)])), chain("doge", "full", &[], measured(252 * G, &[]))])];
         let v = assemble(a, &est(), Some(&arc()), false);
         let r = row(&v, 1);
-        // Sealed counts every chain's replicas (ARCADE's own too); ready only the listed chain kept in full.
+        // Sealed counts every chain's replicas (ARCADE's own too); ready only what is cut of the listed chain kept in
+        // full (4.7 GB of pep's segments, 2 GB of it sealed here), the rest of its blocks listed but not cut yet.
         assert_eq!(r["sealed_bytes"], json!(2 * G + G / 2));
-        assert_eq!(r["ready_bytes"], json!(16 * G));
+        assert_eq!(r["ready_bytes"], json!(4_700_000_000u64 - 2 * G));
+        assert_eq!(r["listed_uncut_bytes"], json!(18 * G - 4_700_000_000));
         // Doge isn't listed here: its blocks and every index can't be sealed yet.
         assert_eq!(r["other_bytes"], json!(252 * G + 30 * G));
         assert_eq!(r["kept_bytes"], json!(18 * G + 30 * G + 252 * G));
         assert_eq!(r["size"], "measured");
         assert_eq!(r["chains"][0]["sealable"], true);
-        assert_eq!(v["totals"]["ready_bytes"], json!(16 * G));
+        assert_eq!(v["totals"]["ready_bytes"], json!(4_700_000_000u64 - 2 * G));
+        assert_eq!(v["totals"]["listed_uncut_bytes"], json!(18 * G - 4_700_000_000));
+        // Every byte is in one part.
+        let sealed_pep = 2 * G;
+        assert_eq!(sealed_pep + r["ready_bytes"].as_u64().unwrap() + r["listed_uncut_bytes"].as_u64().unwrap() + r["other_bytes"].as_u64().unwrap(), r["kept_bytes"].as_u64().unwrap());
     }
 
     #[test]
@@ -497,6 +509,7 @@ mod tests {
         let r = row(&v, 2);
         assert_eq!(r["beta"], true);
         assert_eq!(r["ready_bytes"], json!(0));
+        assert_eq!(r["listed_uncut_bytes"], json!(0));
         assert_eq!(r["other_bytes"], json!(18 * G + 30 * G));
         assert_eq!(r["size"], "estimated");
         assert_eq!(r["estimated_bytes"], r["kept_bytes"]);
@@ -541,8 +554,9 @@ mod tests {
         let btc = r["chains"].as_array().unwrap().iter().find(|c| c["key"] == "btc").unwrap();
         assert_eq!(btc["blocks_bytes"], json!(700 * G));
         assert_eq!(btc["size"], "estimated");
-        // Listed and kept in full: the estimate counts as ready.
-        assert_eq!(btc["ready_bytes"], json!(700 * G));
+        // Listed and kept in full, but nothing cut of it yet: none of it is ready now, all of it waits to be cut.
+        assert_eq!(btc["ready_bytes"], json!(0));
+        assert_eq!(btc["listed_uncut_bytes"], json!(700 * G));
         let wjk = r["chains"].as_array().unwrap().iter().find(|c| c["key"] == "wjk").unwrap();
         assert_eq!(wjk["blocks_bytes"], Value::Null);
         assert_eq!(wjk["size"], "unknown");

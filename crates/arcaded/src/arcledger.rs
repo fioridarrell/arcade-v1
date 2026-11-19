@@ -25,6 +25,120 @@ pub fn write_chain() -> Result<&'static ChainParams, String> {
     crate::arcsvc::usable_chain().ok_or_else(|| "the ARCADE chain isn't installed or borrowed here".to_string())
 }
 
+// ---------------- reads while ARCADE is only borrowed (borrowed = installed, batch 4) ----------------
+//
+// A borrowing arcade has no ledger tables of its own. Each read below asks an arcade that keeps the chain's ledger
+// (`explorer.arc_ledger {chain, op, args}`, forwarded like every ledger read), which runs it on its own tables and
+// answers. The asking arcade first fills in everything that is about *this* wallet (its address, who it follows), so
+// the keeper never answers about itself; keys never leave this arcade (the address book comes back sealed and is
+// opened here).
+
+/// None when this arcade's own copy answers; else the keeper's answer to `op`.
+fn borrowed_read(node: &Node, op: &str, args: Value) -> Result<Option<Value>, String> {
+    if chain().is_ok() {
+        return Ok(None);
+    }
+    let p = write_chain()?;
+    crate::explorer::handle(node, "explorer.arc_ledger", &json!({"chain": p.key, "op": op, "args": args})).map(Some)
+}
+
+/// `req` with this wallet's address filled in when it names no one (`address` or `tag`).
+fn about_me(node: &Node, req: &Value) -> Result<Value, String> {
+    let mut a = if req.is_object() { req.clone() } else { json!({}) };
+    let named = a["address"].as_str().is_some_and(|s| !s.is_empty()) || a["tag"].as_str().is_some_and(|s| !s.is_empty());
+    if !named {
+        a["address"] = json!(sender(node, write_chain()?)?.0);
+    }
+    Ok(a)
+}
+
+/// The keeper's side of `explorer.arc_ledger`: the read `op` on this arcade's own ledger tables. Every read here is
+/// about the address or tag it is given, never about this arcade's own wallet.
+pub fn serve(node: &Node, req: &Value) -> Result<Value, String> {
+    let p = chain()?;
+    let c = p.chain_no;
+    let a = &req["args"];
+    let named = || -> Result<(), String> {
+        let ok = a["address"].as_str().is_some_and(|s| !s.is_empty()) || a["tag"].as_str().is_some_and(|s| !s.is_empty());
+        if ok { Ok(()) } else { Err("address or tag required".into()) }
+    };
+    let s = |k: &str| a[k].as_str().map(String::from);
+    match req["op"].as_str().unwrap_or("") {
+        "profile" => profile(node, a),
+        "a_profile" => {
+            named()?;
+            a_profile_as(node, a, s("me").as_deref())
+        }
+        "a_follows" => {
+            named()?;
+            a_follows(node, a)
+        }
+        "a_posts" => {
+            if a["following_of"].is_null() {
+                named()?;
+            }
+            a_posts_as(node, a, s("following_of").as_deref())
+        }
+        "a_search" => a_search_as(node, &s("q").unwrap_or_default(), s("me").as_deref()),
+        "repo" => repo(node, &s("name").ok_or("name required")?),
+        "repos" => repos(node, s("owner").as_deref()),
+        "items" => items(node, a),
+        "balances" => balances(node, &s("address").ok_or("address required")?),
+        // The sealed address book entries of an address, as stored (only its key opens them).
+        "contact_rows" => {
+            let me = s("address").ok_or("address required")?;
+            let pre = arcade_store::KeyBuf::new().u16(c).bytes(me.as_bytes()).u8(0).done();
+            let rows: Vec<Value> = scan(node, c, arcade_ledger::engine::A_CONTACT, &pre).into_iter()
+                .map(|(k, v)| json!({"id": hex::encode(&k[pre.len()..]), "c": v["c"], "h": v["h"]})).collect();
+            Ok(json!({"rows": rows}))
+        }
+        // Directory cards of key hashes (40 hex), as a.contacts shows them.
+        "cards" => {
+            let keys = a["keys"].as_array().cloned().unwrap_or_default();
+            let cards: serde_json::Map<String, Value> = keys.iter().take(100).filter_map(|k| {
+                let k = k.as_str()?;
+                Some((k.to_string(), directory_card(node, &hex::decode(k).ok()?)?))
+            }).collect();
+            Ok(json!({"cards": cards}))
+        }
+        // A tag's row and its release record, and the tip: what tag_owner and reveal_window decide on.
+        "tag_rel" => {
+            let tag = s("tag").ok_or("tag required")?;
+            let row = arcade_ledger::index::tag_row(&node.chain, c, &tag).map_err(|e| e.to_string())?;
+            let rel = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::TAG_REL, &arcade_store::KeyBuf::new().u16(c).bytes(tag.as_bytes()).done()))
+                .ok().flatten().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+            Ok(json!({"address": row.as_ref().map(|r| r.address.clone()), "block_height": row.as_ref().map(|r| r.block_height),
+                      "rel": rel, "tip": node.chain.tip(c).ok().flatten().map(|t| t.height)}))
+        }
+        // A repository's record and whether a tag maintains it: what pushes and forks check.
+        "repo_row" => {
+            let full = s("full").ok_or("full required")?;
+            let maintains = s("tag").is_some_and(|t| is_maintainer(node, c, &full, &t));
+            Ok(json!({"row": repo_row(node, &full), "maintainer": maintains}))
+        }
+        "holds_blob" => {
+            let id: [u8; 32] = hex::decode(s("id").unwrap_or_default()).ok().and_then(|b| b.try_into().ok()).ok_or("id is 64 hex")?;
+            Ok(json!({"held": crate::arcsvc::holds_blob(&id)}))
+        }
+        // An owner's wallet proofs, its newest set number, and whether it has a published A:// profile.
+        "wallet_state" => {
+            let owner = s("address").ok_or("address required")?;
+            let last = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::A_WALLET, &arcade_store::KeyBuf::new().u16(c).bytes(owner.as_bytes()).u8(1).done()))
+                .ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok()).and_then(|v| v["set"].as_u64()).unwrap_or(0);
+            let has_profile = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::A_PROFILE, &arcade_store::KeyBuf::new().u16(c).bytes(owner.as_bytes()).done()))
+                .ok().flatten().is_some();
+            let proven: Vec<Value> = crate::walletproofs::proven(node, c, &owner).into_iter().map(|(coin, address, h)| json!([coin, address, h])).collect();
+            Ok(json!({"address": owner, "last_set": last, "has_profile": has_profile, "proven": proven, "known_from": crate::walletproofs::known_from(p.net)}))
+        }
+        o => Err(format!("unknown ARCADE ledger read {o}")),
+    }
+}
+
+/// [`serve`]'s `wallet_state` for this wallet's `owner`, from the keeper while ARCADE is borrowed.
+pub fn borrowed_wallet_state(node: &Node, owner: &str) -> Result<Option<Value>, String> {
+    borrowed_read(node, "wallet_state", json!({"address": owner}))
+}
+
 /// The ARCADE chain's height as the copy standing in knows it: the borrowed copy's while it stands in, else this
 /// arcade's own.
 pub fn tip_height(node: &Node, p: &ChainParams) -> u64 {
@@ -176,6 +290,9 @@ pub fn announce(node: &Node) -> Result<Value, String> {
 
 /// `ledger.profile {address | tag}` on ARCADE: the profile and tag the ARCADE chain's index holds.
 pub fn profile(node: &Node, req: &Value) -> Result<Value, String> {
+    if let Some(v) = borrowed_read(node, "profile", req.clone())? {
+        return Ok(v);
+    }
     let p = chain()?;
     let c = p.chain_no;
     let address = match (req["address"].as_str(), req["tag"].as_str()) {
@@ -251,37 +368,46 @@ pub fn tag_checkin(node: &Node) -> Result<Value, String> {
 /// An @tag's owner on the ARCADE chain, and a warning when a released tag changed hands lately (§15 step 8: sends
 /// warn of the owner change).
 pub fn tag_owner(node: &Node, tag: &str) -> Option<(String, Option<String>)> {
-    let p = chain().ok()?;
-    let c = p.chain_no;
-    let row = arcade_ledger::index::tag_row(&node.chain, c, tag).ok().flatten()?;
+    let (c, address, height, rel, _) = tag_state(node, tag)?;
+    let address = address?;
     let warn = arcade_ledger::tags::expiry(c).and_then(|x| {
-        let rel = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::TAG_REL, &arcade_store::KeyBuf::new().u16(c).bytes(tag.as_bytes()).done())).ok().flatten()?;
-        let rel: Value = serde_json::from_slice(&rel).ok()?;
+        let rel = rel?;
         let (rel_h, rel_t) = (rel["h"].as_u64()? as u32, rel["t"].as_u64()?);
-        let changed = row.block_height >= rel_h && rel["a"].as_str() != Some(row.address.as_str());
+        let changed = height >= rel_h && rel["a"].as_str() != Some(address.as_str());
         (changed && arcade_app::now() < rel_t + x.warn).then(|| format!(
-            "@{tag} changed owner: it was released at block {rel_h} (its owner was inactive) and claimed again at block {} by someone else",
-            row.block_height))
+            "@{tag} changed owner: it was released at block {rel_h} (its owner was inactive) and claimed again at block {height} by someone else"))
     });
-    Some((row.address, warn))
+    Some((address, warn))
+}
+
+/// What [`tag_owner`] and [`reveal_window`] decide on: (chain, owner, claim height, release record, tip), from this
+/// arcade's own tables or, while ARCADE is borrowed, from a keeper.
+fn tag_state(node: &Node, tag: &str) -> Option<(u16, Option<String>, u32, Option<Value>, u32)> {
+    let p = write_chain().ok()?;
+    let c = p.chain_no;
+    if let Some(v) = borrowed_read(node, "tag_rel", json!({"tag": tag})).ok()? {
+        let rel = Some(v["rel"].clone()).filter(|r| r.is_object());
+        return Some((c, v["address"].as_str().map(String::from), v["block_height"].as_u64().unwrap_or(0) as u32, rel, v["tip"].as_u64().unwrap_or(0) as u32));
+    }
+    let row = arcade_ledger::index::tag_row(&node.chain, c, tag).ok().flatten();
+    let rel = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::TAG_REL, &arcade_store::KeyBuf::new().u16(c).bytes(tag.as_bytes()).done()))
+        .ok().flatten().and_then(|b| serde_json::from_slice::<Value>(&b).ok());
+    let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
+    Some((c, row.as_ref().map(|r| r.address.clone()), row.map_or(0, |r| r.block_height), rel, tip))
 }
 
 /// A released @tag's reveal window on ARCADE, while it is open: (released at, window ends at).
 pub fn reveal_window(node: &Node, tag: &str) -> Option<(u32, u32)> {
-    let p = chain().ok()?;
-    let c = p.chain_no;
+    let (c, _, _, rel, tip) = tag_state(node, tag)?;
     let x = arcade_ledger::tags::expiry(c)?;
-    let rel = node.chain.store(c).read(|r| r.get(arcade_ledger::engine::TAG_REL, &arcade_store::KeyBuf::new().u16(c).bytes(tag.as_bytes()).done())).ok().flatten()?;
-    let rel: Value = serde_json::from_slice(&rel).ok()?;
-    let h = rel["h"].as_u64()? as u32;
-    let tip = node.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
+    let h = rel?["h"].as_u64()? as u32;
     (tip + 1 < h + x.reveal_blocks).then_some((h, h + x.reveal_blocks))
 }
 
 // ---------------- @tag repositories (§15 step 9) ----------------
 
 fn own_full(node: &Node, name: &str) -> Result<(String, Option<String>), String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let (_, tag, _) = sender(node, p)?;
     let full = arcade_ledger::repos::full_name(name, tag.as_deref()).map_err(|e| format!("{name}: {e}"))?;
     Ok((full, tag))
@@ -295,15 +421,19 @@ pub fn repo_push(node: &Node, name: &str, manifest: &str, base: Option<&str>, fo
     let (full, tag) = own_full(node, name)?;
     let tag = tag.ok_or("claim an @tag on the ARCADE chain first")?;
     let m: [u8; 32] = hex::decode(manifest).ok().and_then(|b| b.try_into().ok()).ok_or("manifest is a blob id (64 hex)")?;
-    if !crate::arcsvc::holds_blob(&m) {
+    let held = match borrowed_read(node, "holds_blob", json!({"id": manifest}))? {
+        Some(v) => v["held"] == true,
+        None => crate::arcsvc::holds_blob(&m),
+    };
+    if !held {
         return Err("that manifest isn't a blob on the ARCADE chain (yet)".into());
     }
     let (owner, _) = full.split_once('/').unwrap_or_default();
-    let c = chain()?.chain_no;
-    if owner != tag && !is_maintainer(node, c, &full, &tag) {
+    let (row, maintains) = repo_state(node, &full, &tag)?;
+    if owner != tag && !maintains {
         return Err(format!("@{tag} isn't the owner or a maintainer of @{full}"));
     }
-    let current = repo_row(node, &full).and_then(|r| hex::decode(r["m"].as_str()?).ok()?.try_into().ok()).unwrap_or(arcade_ledger::repos::NO_BASE);
+    let current = row.and_then(|r| hex::decode(r["m"].as_str()?).ok()?.try_into().ok()).unwrap_or(arcade_ledger::repos::NO_BASE);
     if !push_base_checked(node) {
         let (txid, fee) = send(node, &arcade_ledger::repos::push_payload(&full, &m))?;
         return Ok(json!({"txid": txid, "fee": fee, "repo": format!("@{full}"), "manifest": manifest}));
@@ -326,9 +456,18 @@ pub fn repo_push(node: &Node, name: &str, manifest: &str, base: Option<&str>, fo
 
 /// Whether a push sent now lands where rules version 4 checks its base (the next block's height on).
 pub fn push_base_checked(node: &Node) -> bool {
-    let (Some(net), Ok(p)) = (crate::arcsvc::svc_net(), chain()) else { return false };
-    let next = node.chain.tip(p.chain_no).ok().flatten().map_or(0, |t| t.height as u64 + 1);
-    arcade_arc::params::rules_v4(&net, next)
+    let (Some((net, ..)), Ok(p)) = (crate::arcsvc::defined_net(), write_chain()) else { return false };
+    arcade_arc::params::rules_v4(&net, tip_height(node, p) + 1)
+}
+
+/// A repository's record and whether `tag` maintains it: this arcade's own tables, or a keeper's while ARCADE is
+/// borrowed here.
+fn repo_state(node: &Node, full: &str, tag: &str) -> Result<(Option<Value>, bool), String> {
+    if let Some(v) = borrowed_read(node, "repo_row", json!({"full": full, "tag": tag}))? {
+        return Ok((Some(v["row"].clone()).filter(|r| r.is_object()), v["maintainer"] == true));
+    }
+    let c = chain()?.chain_no;
+    Ok((repo_row(node, full), !tag.is_empty() && is_maintainer(node, c, full, tag)))
 }
 
 /// `ledger.repo_maintainer {name, tag, add}` (the owner only).
@@ -343,7 +482,7 @@ pub fn repo_maintainer(node: &Node, name: &str, tag: &str, add: bool) -> Result<
 pub fn repo_fork(node: &Node, from: &str, name: &str) -> Result<Value, String> {
     let src = arcade_ledger::repos::full_name(from, None).map_err(|e| format!("{from}: {e}"))?;
     let (full, _) = own_full(node, name)?;
-    if repo_row(node, &src).is_none() {
+    if repo_state(node, &src, "")?.0.is_none() {
         return Err(format!("no repository @{src} on the ARCADE chain"));
     }
     let (txid, fee) = send(node, &arcade_ledger::repos::fork_payload(&full, &src))?;
@@ -364,6 +503,9 @@ pub fn repo_row(node: &Node, full: &str) -> Option<Value> {
 
 /// `ledger.repo {name}`: the record, its maintainers and its ref history; `ledger.repos {owner?}`: every repository.
 pub fn repo(node: &Node, name: &str) -> Result<Value, String> {
+    if let Some(v) = borrowed_read(node, "repo", json!({"name": name}))? {
+        return Ok(v);
+    }
     let full = arcade_ledger::repos::full_name(name, None).map_err(|e| format!("{name}: {e}"))?;
     let c = chain()?.chain_no;
     let row = repo_row(node, &full).ok_or_else(|| format!("no repository @{full} on the ARCADE chain"))?;
@@ -380,6 +522,9 @@ pub fn repo(node: &Node, name: &str) -> Result<Value, String> {
 }
 
 pub fn repos(node: &Node, owner: Option<&str>) -> Result<Value, String> {
+    if let Some(v) = borrowed_read(node, "repos", json!({"owner": owner}))? {
+        return Ok(v);
+    }
     let c = chain()?.chain_no;
     let mut pre = arcade_store::KeyBuf::new().u16(c);
     if let Some(o) = owner {
@@ -507,6 +652,9 @@ fn body_of(hash: &str) -> Value {
 
 /// `ledger.items {repo, number?}`: a repository's issues and pull requests with their texts, comments and reviews.
 pub fn items(node: &Node, req: &Value) -> Result<Value, String> {
+    if let Some(v) = borrowed_read(node, "items", req.clone())? {
+        return Ok(v);
+    }
     let full = repo_full(req["repo"].as_str().ok_or("repo required")?)?;
     let c = chain()?.chain_no;
     let pre = arcade_store::KeyBuf::new().u16(c).bytes(full.as_bytes()).u8(0).done();
@@ -538,6 +686,9 @@ pub fn items(node: &Node, req: &Value) -> Result<Value, String> {
 
 /// `ledger.balances {address}`: an address's arcade token balances on ARCADE, each [free, reserved, offered, accepted].
 pub fn balances(node: &Node, address: &str) -> Result<Value, String> {
+    if let Some(v) = borrowed_read(node, "balances", json!({"address": address}))? {
+        return Ok(v);
+    }
     let c = chain()?.chain_no;
     let pre = arcade_store::KeyBuf::new().u16(c).bytes(address.as_bytes()).u8(0).done();
     let rows = node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::BALANCE, &pre)).map_err(|e| e.to_string())?;
@@ -585,11 +736,35 @@ fn card(node: &Node, c: u16, address: &str) -> Value {
 
 /// `a.profile {tag | address}`: a profile card as the ARCADE chain's ledger holds it (this wallet's when neither).
 pub fn a_profile(node: &Node, req: &Value) -> Result<Value, String> {
+    let me = sender(node, write_chain()?)?.0;
+    let mut v = match borrowed_read(node, "a_profile", {
+        let mut a = about_me(node, req)?;
+        a["me"] = json!(me);
+        a
+    })? {
+        Some(v) => v,
+        None => a_profile_as(node, req, Some(&me))?,
+    };
+    if v["mine"] == true {
+        let p = write_chain()?;
+        v["wallet_addresses"] = json!(wallet_addresses(node));
+        // What publishing costs and whether the wallet can pay it (test ARCADE, e.g. from the faucet).
+        let (_, _, sk) = sender(node, p)?;
+        let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+        let have: u64 = crate::claims::arc_coins(node, p, &arcade_wallet::keys::p2pkh_script_for(&pk)).iter().map(|u| u.value).sum();
+        v["spendable"] = json!(have);
+        v["can_publish"] = json!(have >= arcade_arc::params::DUST + 100_000);
+    }
+    Ok(v)
+}
+
+/// [`a_profile`] on this arcade's own tables, `me` being the address whose card counts as its own.
+fn a_profile_as(node: &Node, req: &Value, me: Option<&str>) -> Result<Value, String> {
     let p = chain()?;
     let c = p.chain_no;
     let a = who(node, req)?;
     let mut v = card(node, c, &a);
-    let mine = a == sender(node, p)?.0;
+    let mine = me == Some(a.as_str());
     v["mine"] = json!(mine);
     // No A:// profile yet: the one published on the home chain under the same key (Martin 2026-11-15: keep the name
     // people published; they republish on ARCADE once they have test ARCADE).
@@ -607,15 +782,6 @@ pub fn a_profile(node: &Node, req: &Value) -> Result<Value, String> {
                 v["from_home"] = json!({"chain": node.params.name, "address": home, "height": old["height"], "picture": old["pfp"]});
             }
         }
-    }
-    if mine {
-        v["wallet_addresses"] = json!(wallet_addresses(node));
-        // What publishing costs and whether the wallet can pay it (test ARCADE, e.g. from the faucet).
-        let (_, _, sk) = sender(node, p)?;
-        let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
-        let have: u64 = crate::claims::arc_coins(node, p, &arcade_wallet::keys::p2pkh_script_for(&pk)).iter().map(|u| u.value).sum();
-        v["spendable"] = json!(have);
-        v["can_publish"] = json!(have >= arcade_arc::params::DUST + 100_000);
     }
     Ok(v)
 }
@@ -687,6 +853,9 @@ pub fn a_follow(node: &Node, tag: &str, on: bool) -> Result<Value, String> {
 
 /// `a.follows {tag | address}`: who it follows and who follows it, each with their card.
 pub fn a_follows(node: &Node, req: &Value) -> Result<Value, String> {
+    if let Some(v) = borrowed_read(node, "a_follows", about_me(node, req)?)? {
+        return Ok(v);
+    }
     let c = chain()?.chain_no;
     let a = who(node, req)?;
     let pre = arcade_store::KeyBuf::new().u16(c).bytes(a.as_bytes()).u8(0).done();
@@ -729,20 +898,49 @@ const CONTACT_BOUND: &[u8] = b"arcade A:// contact v1";
 
 /// `a.contacts`: this wallet's address book, opened with its own key.
 pub fn a_contacts(node: &Node) -> Result<Value, String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let me = sender(node, p)?.0;
     let k = crate::msgsvc::keys(node)?;
-    let pre = arcade_store::KeyBuf::new().u16(p.chain_no).bytes(me.as_bytes()).u8(0).done();
-    let mut out: Vec<Value> = scan(node, p.chain_no, arcade_ledger::engine::A_CONTACT, &pre).into_iter().filter_map(|(key, v)| {
+    // The sealed rows: this arcade's own table, or (ARCADE borrowed) the keeper's copy of them, opened here.
+    let rows: Vec<(String, Value)> = match borrowed_read(node, "contact_rows", json!({"address": me}))? {
+        Some(v) => v["rows"].as_array().cloned().unwrap_or_default().into_iter()
+            .filter_map(|r| Some((r["id"].as_str()?.to_string(), json!({"c": r["c"], "h": r["h"]})))).collect(),
+        None => {
+            let pre = arcade_store::KeyBuf::new().u16(p.chain_no).bytes(me.as_bytes()).u8(0).done();
+            scan(node, p.chain_no, arcade_ledger::engine::A_CONTACT, &pre).into_iter().map(|(key, v)| (hex::encode(&key[pre.len()..]), v)).collect()
+        }
+    };
+    let mut opened: Vec<Value> = rows.into_iter().filter_map(|(id, v)| {
         let sealed = hex::decode(v["c"].as_str()?).ok()?;
         let (_, plain) = arcade_msg::envelope::open(&k.secret, CONTACT_BOUND, &sealed).ok()?;
         let mut e: Value = serde_json::from_slice(&plain).ok()?;
-        e["id"] = json!(hex::encode(&key[pre.len()..]));
+        e["id"] = json!(id);
         e["height"] = v["h"].clone();
-        // Someone added from their profile shows it as it is now: a new name, bio or address is seen at once.
-        let addr = e["addresses"]["arcade"].as_str().map(String::from)
-            .or_else(|| e["tag"].as_str().and_then(|t| arcade_ledger::index::tag_row(&node.chain, p.chain_no, t).ok().flatten()).map(|r| r.address));
-        if let Some(live) = addr.as_deref().and_then(h160_of).and_then(|h| directory_card(node, &h)) {
+        Some(e)
+    }).collect();
+    // Someone added from their profile shows it as it is now: a new name, bio or address is seen at once.
+    let borrowed = chain().is_err();
+    let addr_of = |e: &Value| -> Option<String> {
+        e["addresses"]["arcade"].as_str().map(String::from).or_else(|| {
+            let t = e["tag"].as_str()?;
+            if borrowed {
+                crate::hometag::owner_on(node, p, t).map(|(a, ..)| a)
+            } else {
+                arcade_ledger::index::tag_row(&node.chain, p.chain_no, t).ok().flatten().map(|r| r.address)
+            }
+        })
+    };
+    let keys: Vec<String> = opened.iter().filter_map(|e| addr_of(e).as_deref().and_then(h160_of).map(hex::encode)).collect();
+    let remote: serde_json::Map<String, Value> = if borrowed && !keys.is_empty() {
+        borrowed_read(node, "cards", json!({"keys": keys}))?.and_then(|v| v["cards"].as_object().cloned()).unwrap_or_default()
+    } else {
+        Default::default()
+    };
+    let card_of = |h: &[u8]| -> Option<Value> {
+        if borrowed { remote.get(&hex::encode(h)).cloned() } else { directory_card(node, h) }
+    };
+    let mut out: Vec<Value> = opened.drain(..).map(|mut e| {
+        if let Some(live) = addr_of(&e).as_deref().and_then(h160_of).and_then(|h| card_of(&h)) {
             if let Some(n) = live["profile"]["n"].as_str() {
                 e["name"] = json!(n);
             }
@@ -758,7 +956,7 @@ pub fn a_contacts(node: &Node) -> Result<Value, String> {
             e["home"] = live["home"].clone();
             e["profile_picture"] = live["profile"]["p"].clone();
         }
-        Some(e)
+        e
     }).collect();
     out.sort_by(|a, b| a["name"].as_str().unwrap_or("").to_lowercase().cmp(&b["name"].as_str().unwrap_or("").to_lowercase()));
     Ok(json!({"contacts": out}))
@@ -807,9 +1005,22 @@ pub fn a_post(node: &Node, text: &str) -> Result<Value, String> {
 
 /// `a.posts {tag | address | following: true, limit?}`: posts, newest first (`following`: of everyone this wallet follows).
 pub fn a_posts(node: &Node, req: &Value) -> Result<Value, String> {
+    let following_of = if req["following"] == true { Some(sender(node, write_chain()?)?.0) } else { None };
+    let args = match &following_of {
+        Some(me) => json!({"following_of": me, "limit": req["limit"]}),
+        None => about_me(node, req)?,
+    };
+    if let Some(v) = borrowed_read(node, "a_posts", args)? {
+        return Ok(v);
+    }
+    a_posts_as(node, req, following_of.as_deref())
+}
+
+/// [`a_posts`] on this arcade's own tables; `following_of`: the posts of everyone that address follows.
+fn a_posts_as(node: &Node, req: &Value, following_of: Option<&str>) -> Result<Value, String> {
     let c = chain()?.chain_no;
-    let authors: Vec<String> = if req["following"] == true {
-        a_follows(node, &json!({}))?["following"].as_array().map(|v| v.iter().filter_map(|x| x["address"].as_str().map(String::from)).collect()).unwrap_or_default()
+    let authors: Vec<String> = if let Some(me) = following_of {
+        a_follows(node, &json!({"address": me}))?["following"].as_array().map(|v| v.iter().filter_map(|x| x["address"].as_str().map(String::from)).collect()).unwrap_or_default()
     } else {
         vec![who(node, req)?]
     };
@@ -941,6 +1152,15 @@ fn directory_card(node: &Node, h: &[u8]) -> Option<Value> {
 /// `a.search {q}`: everyone whose published name or @tag holds `q`, on ARCADE, on the other chains' arcade ledgers read
 /// here, and on DogeFeed, one card a person (Martin 2026-11-15: "a simple search and click to add someone").
 pub fn a_search(node: &Node, q: &str) -> Result<Value, String> {
+    let me = sender(node, write_chain()?)?.0;
+    if let Some(v) = borrowed_read(node, "a_search", json!({"q": q, "me": me}))? {
+        return Ok(v);
+    }
+    a_search_as(node, q, Some(&me))
+}
+
+/// [`a_search`] on this arcade's own tables, leaving out `me` (the one searching).
+fn a_search_as(node: &Node, q: &str, me: Option<&str>) -> Result<Value, String> {
     let p = chain()?;
     let c = p.chain_no;
     let q = q.trim().trim_start_matches('@').to_lowercase();
@@ -977,7 +1197,7 @@ pub fn a_search(node: &Node, q: &str) -> Result<Value, String> {
     for (a, _) in crate::dproto::handles_matching(&q, 25) {
         add(&a);
     }
-    let me = h160_of(&sender(node, p)?.0);
+    let me = me.and_then(h160_of);
     let out: Vec<Value> = keys.iter().filter(|h| Some(*h) != me.as_ref()).take(25).filter_map(|h| directory_card(node, h)).collect();
     Ok(json!({"results": out}))
 }

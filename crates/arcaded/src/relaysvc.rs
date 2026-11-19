@@ -859,7 +859,14 @@ fn memo_of(id: &str) -> Vec<u8> {
 
 /// A transaction in a block on ARCADE (None while it waits, or if there's no such one).
 pub(crate) fn confirmed_tx(node: &Node, txid: &arcade_chain::hash::Hash256) -> Option<arcade_chain::Tx> {
-    let p = crate::arcledger::chain().ok()?;
+    let p = crate::arcledger::write_chain().ok()?;
+    if crate::arcsvc::borrowed(p) {
+        // Borrowed: a lender's word that it's in a block, checked against the borrowed copy's headers (explorer.tx
+        // fetches the block and finds the transaction in it), then the transaction itself, its txid checked.
+        let v = crate::borrow::explorer(node, "explorer.tx", &serde_json::json!({"txid": txid.to_hex()}), p)?.ok()?;
+        v["height"].as_u64()?;
+        return crate::borrow::raw_tx(node, p, txid).ok();
+    }
     if let Ok(Some((raw, _))) = node.chain.tx_raw(p, txid) {
         return arcade_chain::Tx::parse_with(&raw, &p.format).ok();
     }
@@ -871,7 +878,7 @@ pub(crate) fn confirmed_tx(node: &Node, txid: &arcade_chain::hash::Hash256) -> O
 
 /// Payments said: credited once in a block, to the arcade their memo names, by what they pay this relay's address.
 fn settle_claims(node: &Node, f: &mut Fees) {
-    let Ok(p) = crate::arcledger::chain() else { return };
+    let Ok(p) = crate::arcledger::write_chain() else { return };
     let Some(to) = pay_to(node).and_then(|a| arcade_ledger::address::script_for_address(p, &a)) else { return };
     let now = now_s();
     let claims = std::mem::take(&mut f.claims);

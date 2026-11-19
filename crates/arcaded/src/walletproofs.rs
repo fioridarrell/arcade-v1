@@ -91,7 +91,12 @@ pub fn publish(node: &Node, force: bool) -> Result<Value, String> {
     let owner = crate::arcledger::sender(node, p)?.0;
     let want = signers(node);
     let want_set: BTreeSet<(String, String)> = want.iter().map(|(c, a, ..)| (c.clone(), a.clone())).collect();
-    let have: BTreeSet<(String, String)> = proven(node, p.chain_no, &owner).into_iter().map(|(c, a, _)| (c, a)).collect();
+    // What the chain holds: this arcade's own tables, or a keeper's while ARCADE is borrowed here.
+    let remote = crate::arcledger::borrowed_wallet_state(node, &owner)?;
+    let have: BTreeSet<(String, String)> = match &remote {
+        Some(v) => v["proven"].as_array().into_iter().flatten().filter_map(|x| Some((x[0].as_str()?.to_string(), x[1].as_str()?.to_string()))).collect(),
+        None => proven(node, p.chain_no, &owner).into_iter().map(|(c, a, _)| (c, a)).collect(),
+    };
     if !force && want_set == have {
         return Ok(json!({"sent": false, "why": "the chain already holds these proofs", "proofs": want_set.len()}));
     }
@@ -119,8 +124,11 @@ pub fn publish(node: &Node, force: bool) -> Result<Value, String> {
     let mut txids = Vec::new();
     let mut fees = 0u64;
     let chunks: Vec<&[WalletProof]> = if proofs.is_empty() { vec![&[][..]] } else { proofs.chunks(aproto::MAX_WALLETS).collect() };
-    let last = node.chain.store(p.chain_no).read(|r| r.get(arcade_ledger::engine::A_WALLET, &arcade_store::KeyBuf::new().u16(p.chain_no).bytes(owner.as_bytes()).u8(1).done()))
-        .ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok()).and_then(|v| v["set"].as_u64()).unwrap_or(0);
+    let last = match &remote {
+        Some(v) => v["last_set"].as_u64().unwrap_or(0),
+        None => node.chain.store(p.chain_no).read(|r| r.get(arcade_ledger::engine::A_WALLET, &arcade_store::KeyBuf::new().u16(p.chain_no).bytes(owner.as_bytes()).u8(1).done()))
+            .ok().flatten().and_then(|v| serde_json::from_slice::<Value>(&v).ok()).and_then(|v| v["set"].as_u64()).unwrap_or(0),
+    };
     let set = arcade_app::now().max(last + 1);
     for part in chunks {
         let body = aproto::wallets_body(set, part);
@@ -138,10 +146,16 @@ pub fn publish(node: &Node, force: bool) -> Result<Value, String> {
 pub fn run(node: std::sync::Arc<Node>) {
     let _ = std::thread::Builder::new().name("wallet proofs".into()).spawn(move || loop {
         std::thread::sleep(LOOK_EVERY);
-        let Ok(p) = crate::arcledger::chain() else { continue };
+        let Ok(p) = crate::arcledger::write_chain() else { continue };
         let Ok((owner, ..)) = crate::arcledger::sender(&node, p) else { continue };
-        let key = arcade_store::KeyBuf::new().u16(p.chain_no).bytes(owner.as_bytes()).done();
-        let has_profile = node.chain.store(p.chain_no).read(|r| r.get(arcade_ledger::engine::A_PROFILE, &key)).ok().flatten().is_some();
+        let has_profile = match crate::arcledger::borrowed_wallet_state(&node, &owner) {
+            Ok(Some(v)) => v["has_profile"] == true,
+            Ok(None) => {
+                let key = arcade_store::KeyBuf::new().u16(p.chain_no).bytes(owner.as_bytes()).done();
+                node.chain.store(p.chain_no).read(|r| r.get(arcade_ledger::engine::A_PROFILE, &key)).ok().flatten().is_some()
+            }
+            Err(_) => false,
+        };
         if !has_profile {
             continue;
         }
@@ -181,10 +195,25 @@ pub fn owner_of_proven(node: &Node, c: u16, coin: &str, address: &str) -> Option
 /// `a.wallets {tag | address}`: the addresses the chain holds proofs of for someone (this wallet's when neither),
 /// and for this wallet also what would be proven now.
 pub fn a_wallets(node: &Node, req: &Value) -> Result<Value, String> {
-    let p = crate::arcledger::chain()?;
-    let a = crate::arcledger::who(node, req)?;
-    let mut v = json!({"address": a, "wallets": cards(node, p.chain_no, &a), "known_from": known_from(p.net)});
-    if crate::arcledger::sender(node, p).is_ok_and(|s| s.0 == a) {
+    let p = crate::arcledger::write_chain()?;
+    let mine = crate::arcledger::sender(node, p).map(|s| s.0).ok();
+    let mut v = if crate::arcledger::chain().is_ok() {
+        let a = crate::arcledger::who(node, req)?;
+        json!({"address": a, "wallets": cards(node, p.chain_no, &a), "known_from": known_from(p.net)})
+    } else {
+        // Borrowed: the keeper's copy of the proofs, for the address asked about (this wallet's when none is named).
+        let a = match (req["address"].as_str().filter(|s| !s.is_empty()), req["tag"].as_str().filter(|s| !s.is_empty())) {
+            (Some(a), _) => a.to_string(),
+            (None, Some(t)) => crate::hometag::owner_on(node, p, t).map(|(a, _)| a).ok_or_else(|| format!("@{} isn't claimed on the ARCADE chain", t.trim_start_matches('@')))?,
+            _ => mine.clone().ok_or("this wallet has no ARCADE key yet")?,
+        };
+        let st = crate::arcledger::borrowed_wallet_state(node, &a)?.ok_or("the ARCADE chain isn't usable here")?;
+        let wallets: Vec<Value> = st["proven"].as_array().into_iter().flatten()
+            .map(|x| json!({"coin": x[0], "address": x[1], "height": x[2], "verified": true})).collect();
+        json!({"address": a, "wallets": wallets, "known_from": st["known_from"]})
+    };
+    let a = v["address"].as_str().unwrap_or("").to_string();
+    if mine.as_deref() == Some(a.as_str()) {
         v["here"] = json!(signers(node).into_iter().map(|(c, a, ..)| json!({"coin": c, "address": a})).collect::<Vec<_>>());
     }
     Ok(v)

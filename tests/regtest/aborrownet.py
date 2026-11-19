@@ -154,7 +154,8 @@ def main():
     if installed != [False]:
         fails.append("C has ARCADE installed: the test proves nothing")
     c_arc = call("C", "wallet.keys", chain="arctest")[0]["address"]
-    call("A", "wallet.send", chain="arctest", to=c_arc, amount=300_000_000, send=True)
+    fund = call("A", "wallet.send", chain="arctest", to=c_arc, amount=300_000_000, send=True)
+    fund_txid = (fund.get("broadcast") or {}).get("txid") or fund.get("txid")
     if not wait("C sees 3 ARCADE", lambda: arc_balance("C") >= 300_000_000, 300, show=lambda: f"C balance {arc_balance('C')}"):
         return 1
 
@@ -203,6 +204,34 @@ def main():
     if c_arc not in names:
         fails.append(f"C isn't among @alpha's followers on A: {names[:300]}")
 
+    print("4b. C (borrowing) reads the ledger through A: profiles, follows, posts, search, its address book, repos, svc.paid")
+    def read(label, cmd, check, **p):
+        try:
+            r = call("C", cmd, **p)
+        except RuntimeError as e:
+            fails.append(f"C {label}: {e}")
+            print("  ", label, "REFUSED:", e)
+            return None
+        ok = check(r)
+        print("  ", label, "ok" if ok else "WRONG", json.dumps(r)[:160])
+        if not ok:
+            fails.append(f"C {label} answered wrong: {json.dumps(r)[:300]}")
+        return r
+    read("own a.profile", "a.profile", lambda r: (r.get("profile") or {}).get("n") == "Borrowed C" and r.get("mine") is True and r.get("address") == c_arc)
+    read("a.profile of @alpha", "a.profile", lambda r: r.get("address") == a_arc and r.get("mine") is False, tag="alpha")
+    read("own a.follows", "a.follows", lambda r: any(x.get("address") == a_arc for x in r.get("following", [])))
+    read("a.posts of @alpha", "a.posts", lambda r: any(x.get("txid") == post for x in r.get("posts", [])), tag="alpha")
+    read("a.posts following", "a.posts", lambda r: any(x.get("txid") == post for x in r.get("posts", [])), following=True)
+    read("a.search alpha", "a.search", lambda r: any(x.get("address") == a_arc for x in r.get("results", [])), q="alpha")
+    read("own a.contacts (opened here)", "a.contacts", lambda r: [x.get("name") for x in r.get("contacts", [])] == ["Alpha"])
+    read("ledger.profile of @alpha", "ledger.profile", lambda r: r.get("address") == a_arc, tag="alpha")
+    read("ledger.repos", "ledger.repos", lambda r: isinstance(r.get("repos"), list))
+    read("a.wallets of @alpha", "a.wallets", lambda r: r.get("address") == a_arc and isinstance(r.get("wallets"), list), tag="alpha")
+    if fund_txid:
+        read("svc.paid of A's payment", "svc.paid", lambda r: r.get("in_block") is True and r.get("paid_units") == 300_000_000, txid=fund_txid)
+    else:
+        fails.append(f"no txid from A's payment to C: {fund}")
+
     print("5. A blob (long body) from C is refused, saying why")
     try:
         call("C", "arc.blob_publish", hex=("7b2278223a22" + "79" * 2000 + "227d"), type="application/json", send=True)
@@ -230,6 +259,30 @@ def main():
         fails.append("C didn't keep the blob under its home")
     if os.path.exists(os.path.join(os.getcwd(), "cache", bid)):
         fails.append("the blob went to a cache/ folder in the working directory")
+    print("6b. C claims @charlie and pushes a repository pointing at that blob; A shows it")
+    try:
+        call("C", "tag.claim", tag="charlie", chain="arctest")
+        if not wait("@charlie confirmed on A", lambda: call("A", "explorer.tag", chain="arctest", tag="charlie", local=True).get("home_address"), 600):
+            fails.append("@charlie didn't confirm")
+        # C's own claim record turns confirmed once an arcade keeping the chain says so (its claim loop).
+        if not wait("C's claim of @charlie confirmed", lambda: any(x.get("tag") == "charlie" and x.get("status") == "confirmed" for x in call("C", "tag.list")), 300,
+                    show=lambda: json.dumps(call("C", "tag.list"))[:200]):
+            fails.append("C's claim of @charlie never showed confirmed")
+        push = call("C", "ledger.repo_push", name="hello", manifest=bid)
+        print("   push ->", push.get("txid", "")[:16], push.get("repo"))
+        if not wait("the push in a block on A", lambda: confirmed("A", push["txid"]), 300):
+            fails.append("the push didn't confirm")
+        time.sleep(4)
+        rep = call("A", "ledger.repo", name="@charlie/hello")
+        if rep.get("manifest") != bid:
+            fails.append(f"A's @charlie/hello points elsewhere: {rep}")
+        crep = call("C", "ledger.repo", name="@charlie/hello")
+        if crep.get("manifest") != bid:
+            fails.append(f"C reads another @charlie/hello: {crep}")
+        else:
+            print("   A and C both read @charlie/hello at", bid[:16])
+    except RuntimeError as e:
+        fails.append(f"C's repository push: {e}")
     stop("A")
     start("D", peer="C", settings=sp)
     if not wait("D links to C", lambda: any(x.get("node_id") == call("C", "status")["node_id"] for x in call("D", "peers")), 120):

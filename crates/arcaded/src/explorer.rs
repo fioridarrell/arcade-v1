@@ -128,6 +128,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
     "explorer.msg_rows", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
+    "explorer.arc_ledger",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -263,7 +264,7 @@ fn needed_index(cmd: &str) -> Option<&'static str> {
     if cmd == "explorer.activity" {
         return Some("addresses");
     }
-    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies") || cmd.starts_with("explorer.arc_")).then_some("ledger")
+    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies" | "explorer.arc_ledger") || cmd.starts_with("explorer.arc_")).then_some("ledger")
 }
 
 fn missing_index(e: &str) -> Option<String> {
@@ -790,6 +791,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         // A:// reacts, replies and tips (crate::asocial): the ARCADE chain's ledger.
         "explorer.a_reactions" => { x.need("ledger")?; crate::asocial::ledger_reactions(x.node, x.c(), req) }
         "explorer.a_replies" => { x.need("ledger")?; crate::asocial::ledger_replies(x.node, x.c(), req) }
+        "explorer.arc_ledger" => { x.need("ledger")?; crate::arcledger::serve(x.node, req) }
         "explorer.ledger" => { x.need("ledger")?; ledger_summary(&x) }
         "explorer.ledger_tokens" => {
             x.need("ledger")?;
@@ -1706,9 +1708,11 @@ fn only_public_page_reads_are_answered_for_another_arcade() {
 #[cfg(test)]
 #[test]
 fn ledger_questions_go_to_arcades_keeping_the_ledger() {
-    for c in ["explorer.ledger_bytes", "explorer.page", "explorer.app_cards", "explorer.ledger_inscription"] {
+    for c in ["explorer.ledger_bytes", "explorer.page", "explorer.app_cards", "explorer.ledger_inscription", "explorer.arc_ledger"] {
         assert_eq!(needed_index(c), Some("ledger"), "{c}");
     }
+    // ARCADE ledger reads from arcades that only borrow ARCADE are asked of keepers (borrowed = installed, batch 4).
+    assert!(FORWARDABLE.contains(&"explorer.arc_ledger"));
     assert_eq!(needed_index("explorer.tx"), None);
 }
 

@@ -739,10 +739,12 @@ fn main() {
         let mut heard: Vec<(String, &'static str)> = Vec::new();
         if !no_seeds {
             meshsvc::prune_peers(&node);
+            // By the address each last linked on and by its name too (ARCADE #12: names are looked up on every dial).
             for p in node.app.peers().unwrap_or_default() {
-                let a = if p.host.starts_with("wss://") { p.host.clone() } else if p.host.contains(':') { format!("[{}]:{}", p.host, p.port) } else { format!("{}:{}", p.host, p.port) };
-                if !seeds.contains(&a) && !extra_peers.contains(&a) && !heard.iter().any(|(x, _)| *x == a) {
-                    heard.push((a, if p.source == "chain" { "chain" } else { "gossip" }));
+                for a in meshsvc::peer_dials(&p) {
+                    if !seeds.contains(&a) && !extra_peers.contains(&a) && !heard.iter().any(|(x, _)| *x == a) {
+                        heard.push((a, if p.source == "chain" { "chain" } else { "gossip" }));
+                    }
                 }
             }
         }

@@ -14,7 +14,7 @@ of a Core node, from this computer only.
 | `/r/pending/<addr>` | waiting token transfers in and out |
 | `/r/ledgertx/<txid>` | the arcade ledger's record of one transaction (the original's `arcade_tx` row): `block`, `position`, `class`, `type`, `version`, `sender`, `reference`, `payload_hex`, `valid`; 404 with `state` `pending` (mempool, or a block the ledger hasn't reached), `none` (no arcade record) or `unknown`. No `invalid_reason`: V1.0 keeps only valid or not |
 | `/inscriptions/<id>/full` | redirects to the sandboxed `/app/<home chain>/<id>` |
-| `/realtime/hello`, `join` (certificate signed by the address), `send`, `leave`, `stream` (server-sent events, chunked) | the room door, on V1.0's mesh rooms |
+| `/realtime/hello`, `join` (certificate signed by the address; `fast: true` takes the fast lane too, for `/rpc`'s `realtime.fast`, `realtime.media` and `realtime.lanes` on its token), `send`, `leave`, `stream` (server-sent events, chunked) | the room door, on V1.0's mesh rooms |
 | Core JSON-RPC: `getblockcount`, `getrawtransaction` (verbose, Core's shape), `decoderawtransaction`, `gettxout`, `validateaddress`, `importaddress`, `listunspent`, `listtransactions`, `sendrawtransaction` (checked like a node, then shared over the mesh and sent to coin peers) | `POST /` (home chain) or `POST /chain/<key>`, Basic auth with `<home>/.cookie` |
 
 ## Pointing a program at V1.0

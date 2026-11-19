@@ -940,7 +940,19 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         // A blob from this arcade's wallet: `path` (a file here) or `hex`, its `type`, `class` (0 permanent, 1 release,
         // 2 temporary), `gzip`; `send` to put it in the pool (without: only what it would cost).
+        // A large blob (crate::largeblob, up to 100 MB): parts over several blocks, then its manifest.
+        "arc.blob_publish_large" => crate::largeblob::api_publish(node, req),
+        "arc.blob_publish_status" => crate::largeblob::api_status(req),
         "arc.blob_publish" => {
+            // Over one block's 4 MB: a large blob.
+            let big = match (s("path"), s("hex")) {
+                (Some(path), _) => std::fs::metadata(&path).map(|m| m.len() > arcade_arc::blob::MAX_BLOB_BYTES as u64).unwrap_or(false),
+                (None, Some(h)) => h.trim().len() / 2 > arcade_arc::blob::MAX_BLOB_BYTES,
+                _ => false,
+            };
+            if big {
+                return crate::largeblob::api_publish(node, req);
+            }
             let bytes = match (s("path"), s("hex")) {
                 (Some(path), _) => std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
                 (None, Some(h)) => hex::decode(h.trim()).map_err(|_| "hex is not hex".to_string())?,

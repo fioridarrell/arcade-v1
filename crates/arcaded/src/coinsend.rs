@@ -374,6 +374,12 @@ pub fn publish_blob(node: &Node, bytes: &[u8], kind: &str, class: arcade_arc::bl
 /// the blobs' bytes. At most 4 MB of new blobs (one block's budget) and the transaction under 100 kB. Without `send`,
 /// only what it would be.
 pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool) -> Result<Value, String> {
+    publish_blobs_spending(node, items, send, &[])
+}
+
+/// [`publish_blobs`], spending every coin of `must` that is still spendable here (and more as needed). A large blob's
+/// publisher (crate::largeblob) rebuilds a part's transaction this way, so the old one can never also go in a block.
+pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool, must: &[arcade_chain::OutPoint]) -> Result<Value, String> {
     use arcade_arc::blob::{self, Record};
     use arcade_wallet::tx::{fee_for_size, sign_keyhash, verify_keyhash, TxOutSpec};
     // Blobs travel with their transaction from this arcade's own pool (crate::arcblob holds their bytes until a block
@@ -435,6 +441,8 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
     for (_, sc) in &scripts {
         coins.extend(crate::arcsvc::waiting_outputs(sc).into_iter().map(|(op, value)| Utxo { outpoint: op, value, script: sc.clone() }));
     }
+    // The coins it must spend go first, so all of them are spent.
+    coins.sort_by_key(|c| !must.contains(&c.outpoint));
     let fp = fee_policy(p);
     let change_script = scripts[0].1.clone();
     let mut out_scripts: Vec<usize> = recs.iter().map(|r| r.0.script().len()).collect();
@@ -444,11 +452,12 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
     let fee_of = |n: usize| fee_for_size(p, arcade_wallet::tx::estimate_size(n, &out_scripts) as u64, fp.fallback_per_kb) + blob_fee;
     let (mut chosen, mut have) = (Vec::new(), 0u64);
     for c in coins {
-        have += c.value;
-        chosen.push(c);
-        if have >= fee_of(chosen.len()) + fp.dust {
+        let needed = must.contains(&c.outpoint);
+        if !needed && have >= fee_of(chosen.len()) + fp.dust {
             break;
         }
+        have += c.value;
+        chosen.push(c);
     }
     let fee = fee_of(chosen.len());
     if have < fee + fp.dust {

@@ -857,7 +857,11 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             // manifest.
             if r.query != "raw" {
                 if let Some(f) = crate::arcblob::file_manifest(&bid) {
-                    serve_file(&mut s, &r, id, &f, ord_csp(node));
+                    // A large blob whose parts (all here) don't make the root it names is no file.
+                    if crate::largeblob::whole_ok(&bid, &f) == Some(false) {
+                        return respond(&mut s, "502 Bad Gateway", "text/plain", &[], b"that large blob's parts don't make the root its manifest names\n");
+                    }
+                    serve_file(&mut s, &r, &bid, id, &f, ord_csp(node));
                     return;
                 }
             }
@@ -997,7 +1001,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
 /// How an ord inscription is served: sandboxed (opaque origin, scripts only), loading only
 /// from this arcade, so recursive inscriptions can ask /content/<id> for their parts.
 /// A blob file, streamed part by part (whole, or one `Range: bytes=a-b`).
-fn serve_file(s: &mut TcpStream, r: &Req, id: &str, f: &crate::arcblob::FileManifest, csp: String) {
+fn serve_file(s: &mut TcpStream, r: &Req, bid: &[u8; 32], id: &str, f: &crate::arcblob::FileManifest, csp: String) {
     let range = r.headers.get("range").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("bytes=")).and_then(|v| {
         let (a, b) = v.split_once('-')?;
         let (a, b) = match (a.trim().parse::<u64>().ok(), b.trim().parse::<u64>().ok()) {
@@ -1019,9 +1023,26 @@ fn serve_file(s: &mut TcpStream, r: &Req, id: &str, f: &crate::arcblob::FileMani
     if range.is_some() {
         h.push_str(&format!("Content-Range: bytes {from}-{to}/{}\r\n", f.size));
     }
+    // A large blob stored gzipped (its manifest says so): the browser undoes it.
+    if f.gzip() {
+        h.push_str("Content-Encoding: gzip\r\n");
+    }
     h.push_str("\r\n");
     use std::io::Write;
     if s.write_all(h.as_bytes()).is_err() || r.method == "HEAD" {
+        return;
+    }
+    // The whole, read through: checked against the large blob's root on the way (each part is checked against its id
+    // as it is read).
+    if let (Some(root), true) = (f.root, from == 0 && to + 1 == f.size) {
+        let mut rs = crate::largeblob::RootStream::default();
+        let ok = crate::arcblob::file_range(f, from, to, |b| {
+            rs.push(b);
+            s.write_all(b).is_ok()
+        });
+        if ok {
+            crate::largeblob::remember(bid, rs.finish() == (root, f.size));
+        }
         return;
     }
     crate::arcblob::file_range(f, from, to, |b| s.write_all(b).is_ok());

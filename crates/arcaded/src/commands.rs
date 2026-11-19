@@ -195,6 +195,8 @@ cmds! {
     "arc.fog" Read "" "Fog storage here: what it holds (own, kept, viewed), the segments it keeps, those short of copies on the network, warnings.";
     "arc.blob" Read "id" "A blob of the ARCADE chain (hex), fetched from linked arcades when it isn't here.";
     "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?" "Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Without send, only the quote (blob_fee, fee).";
+    "arc.blob_publish_large" Wallet "path | hex, type, class?, gzip?, name?, send?" "Put a file of up to 100 MB on the ARCADE chain as one large blob: parts of 4 MB over successive blocks, then a manifest naming them and the overall root; its id is the manifest's. Without send, the quote (parts, fee, blocks, seconds). Resumes after a restart without paying twice. arc.blob_publish switches to it above 4 MB.";
+    "arc.blob_publish_status" Read "id?" "Publishing of large blobs from here: parts in blocks and waiting, the manifest, what was paid, resends.";
     "a.profile" Read "tag? | address?" "A profile card on the ARCADE chain (yours when neither), with follower counts.";
     "a.profile_set" Wallet "name?, bio?, url?, picture?, addresses?" "Publish your profile on the ARCADE chain (A://).";
     "a.follow" Wallet "tag" "Follow an @tag on the ARCADE chain.";

@@ -147,6 +147,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn", "explorer.a_reactions", "explorer.a_replies",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
     "explorer.arc_machines",
+    "explorer.msg_rows", "explorer.msg_file",
 ];
 
 /// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
@@ -387,13 +388,106 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> R {
 /// images as links (`content.src`) the UI loads one by one, so the list comes back at once.
 /// Answers from other arcades keep the bytes (their links would point at them).
 pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    // A height given as a number is taken as its text (ARCADE #25: {"id": 2483} failed).
+    let fixed;
+    let req = if req["id"].is_u64() && cmd == "explorer.block" {
+        let mut q = req.clone();
+        q["id"] = json!(req["id"].as_u64().unwrap().to_string());
+        fixed = q;
+        &fixed
+    } else {
+        req
+    };
+    // explorer.blocks with the documented offset / limit: a page object (before / n keep the plain list).
+    if cmd == "explorer.blocks" && (req.get("offset").is_some() || req.get("limit").is_some()) {
+        return blocks_page(node, req, img_links);
+    }
     let mut out = answer(node, cmd, req, img_links);
     if img_links {
         if let Ok(v) = out.as_mut() {
             link_previews(v);
         }
     }
+    if let Ok(v) = out.as_mut() {
+        pin(node, cmd, req, v);
+    }
     out
+}
+
+/// The tip an answer on `p` was counted against, and where it came from (ARCADE #25): this arcade's own copy
+/// ("local"), its borrowed copy ("borrowed"), or another arcade ("mesh", when the answer says so).
+fn pin_of(node: &Node, p: &'static ChainParams) -> (Value, &'static str) {
+    if crate::borrow::is_borrowed(p.key) {
+        let (h, hash) = crate::borrow::tip_pin(node, p);
+        return (json!({"height": h, "hash": hash}), "borrowed");
+    }
+    match node.chain.tip(p.chain_no).ok().flatten() {
+        Some(t) => (json!({"height": t.height, "hash": t.hash.to_hex()}), "local"),
+        None => (Value::Null, "local"),
+    }
+}
+
+/// Every tx, block, address, summary and mempool answer says its chain, the tip it was counted against (`as_of`),
+/// where it came from (`source`), and the amounts' scale (`decimals`; amounts are in base units).
+fn pin(node: &Node, cmd: &str, req: &Value, v: &mut Value) {
+    if !matches!(cmd, "explorer.tx" | "explorer.block" | "explorer.address" | "explorer.summary" | "explorer.mempool") || !v.is_object() {
+        return;
+    }
+    let Some(p) = (match req["chain"].as_str() { Some(k) => crate::chains::find(k), None => Some(node.params) }) else { return };
+    let (as_of, source) = pin_of(node, p);
+    if v["chain"].is_null() {
+        v["chain"] = json!(p.key);
+    }
+    if v["as_of"].is_null() {
+        v["as_of"] = as_of;
+    }
+    if v["source"].is_null() {
+        v["source"] = json!(if v.get("_mesh").is_some() || v.get("mesh_parts").is_some() { "mesh" } else { source });
+    }
+    if v["decimals"].is_null() {
+        v["decimals"] = json!(8);
+    }
+    if v["unit"].is_null() {
+        v["unit"] = json!(unit(p));
+    }
+    if req["chain"].is_null() {
+        v["chain_note"] = json!(format!("no chain given: answered on the home chain, {} (give chain, e.g. arctest)", p.name));
+    }
+}
+
+/// Most blocks one page of explorer.blocks gives.
+const BLOCKS_MAX: u64 = 100;
+
+/// `explorer.blocks {chain?, offset?, limit?}`: blocks newest first, `offset` back from the tip, at most
+/// BLOCKS_MAX: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the
+/// next page, null at block 0), chain, as_of}.
+fn blocks_page(node: &Node, req: &Value, img_links: bool) -> R {
+    let num = |k: &str| req[k].as_u64().or_else(|| req[k].as_str().and_then(|x| x.parse().ok()));
+    let p = match req["chain"].as_str() {
+        Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
+        None => node.params,
+    };
+    let (as_of, source) = pin_of(node, p);
+    let tip = as_of["height"].as_u64().unwrap_or(0);
+    let offset = num("offset").unwrap_or(0);
+    let asked = num("limit").unwrap_or(20).max(1);
+    let limit = asked.min(BLOCKS_MAX);
+    let before = (tip + 1).saturating_sub(offset);
+    let mut q = req.clone();
+    if let Some(o) = q.as_object_mut() {
+        o.remove("offset");
+        o.remove("limit");
+    }
+    q["before"] = json!(before);
+    q["n"] = json!(limit);
+    let items = if before == 0 { json!([]) } else { answer(node, "explorer.blocks", &q, img_links)? };
+    let lowest = items.as_array().and_then(|a| a.last()).and_then(|b| b["height"].as_u64());
+    let next = match lowest {
+        Some(h) if h > 0 => Some(tip + 1 - h),
+        _ => None,
+    };
+    Ok(json!({"items": items, "offset": offset, "limit": limit, "limit_applied": (asked > limit).then_some(limit),
+              "next": next, "chain": p.key, "as_of": as_of, "source": source}))
 }
 
 /// Previews another arcade made (a borrowed chain, or an index asked on the mesh) carry an
@@ -1424,8 +1518,37 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
     } else {
         vec![]
     };
-    json!({"vout": vout, "value": value, "address": a, "tag": a.as_deref().and_then(|a| tag_of(x, a)),
-           "op_return": script.first() == Some(&0x6a), "spent_by": spent, "inscriptions": ins})
+    let mut o = json!({"vout": vout, "value": value, "address": a, "tag": a.as_deref().and_then(|a| tag_of(x, a)),
+           "op_return": script.first() == Some(&0x6a), "spent_by": spent, "inscriptions": ins});
+    if script.first() == Some(&0x6a) {
+        let (data, decoded) = op_return_view(script);
+        o["data"] = json!(data);
+        o["decoded"] = decoded;
+    }
+    o
+}
+
+/// An OP_RETURN output's data (hex) and, when it is an arcade record, what it says (ARCADE #25): the record kind
+/// (repository, A://, or another arcade record by its type number) and the op as this arcade reads it.
+pub fn op_return_view(script: &[u8]) -> (Option<String>, Value) {
+    let Some(d) = arcade_ledger::script::op_return_data(script) else { return (None, Value::Null) };
+    let data = Some(hex::encode(d));
+    let Some(payload) = d.strip_prefix(arcade_ledger::extract::MARKER.as_slice()) else { return (data, Value::Null) };
+    let ty = (payload.len() >= 4).then(|| u16::from_be_bytes([payload[2], payload[3]]));
+    let decoded = if let Some(r) = arcade_ledger::repos::parse(payload) {
+        match r {
+            Ok(op) => json!({"record": "repository", "op": format!("{op:?}")}),
+            Err(e) => json!({"record": "repository", "error": e}),
+        }
+    } else if let Some(r) = arcade_ledger::aproto::parse(payload) {
+        match r {
+            Ok(op) => json!({"record": "A://", "op": format!("{op:?}")}),
+            Err(e) => json!({"record": "A://", "error": e}),
+        }
+    } else {
+        json!({"record": "arcade", "type": ty})
+    };
+    (data, decoded)
 }
 
 fn tx(x: &Ctx, id: &str) -> R {
@@ -1454,7 +1577,8 @@ fn tx(x: &Ctx, id: &str) -> R {
     let outputs: Vec<Value> = t.outputs.iter().enumerate().map(|(k, o)| out_json(x, &txid, k as u32, o.value, &o.script_pubkey)).collect();
     let out: u64 = t.outputs.iter().map(|o| o.value).sum();
     let born = if x.has("ord") && !t.is_coinbase() { ord::genesis_ctype(&t.inputs[0].script_sig, ord::dialect(x.p)).map(|ct| String::from_utf8_lossy(&ct).into_owned()) } else { None };
-    Ok(json!({"txid": txid.to_hex(), "height": height, "time": time, "seen": seen, "confirmations": height.map(|h| tip(x).saturating_sub(h) + 1).unwrap_or(0),
+    let block = height.and_then(|h| x.node.chain.hash_at(x.c(), h).ok().flatten()).map(|b| b.to_hex());
+    Ok(json!({"txid": txid.to_hex(), "height": height, "block": block, "time": time, "seen": seen, "confirmations": height.map(|h| tip(x).saturating_sub(h) + 1).unwrap_or(0),
               "coinbase": t.is_coinbase(), "size": t.raw.len(), "rbf": t.inputs.iter().any(|i| i.sequence < 0xffff_fffe),
               "fee": if t.is_coinbase() { None } else { Some(total_in.saturating_sub(out)) }, "in": total_in, "out": out,
               "inputs": inputs, "outputs": outputs, "genesis": born, "unit": unit(x.p)}))
@@ -1505,7 +1629,19 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
         // Asked without its history (a wallet reading token balances).
     } else if x.has("addresses") {
         let hist = x.node.chain.history_for_script(c, &script).map_err(e)?;
-        let rows: Vec<Value> = hist.iter().rev().take(50).map(|(h, t12, recv, sent)| {
+        // A page of it, newest first (ARCADE #25: it stopped at 50): history_offset / history_limit, or offset /
+        // limit; history_next is the offset of the next page (null after the oldest).
+        let num = |k: &str| req[k].as_u64().or_else(|| req[k].as_str().and_then(|x| x.parse().ok()));
+        let h_off = num("history_offset").or_else(|| num("offset")).unwrap_or(0) as usize;
+        let h_asked = num("history_limit").or_else(|| num("limit")).unwrap_or(50).max(1) as usize;
+        let h_lim = h_asked.min(500);
+        v["history_offset"] = json!(h_off);
+        v["history_limit"] = json!(h_lim);
+        v["history_next"] = json!((h_off + h_lim < hist.len()).then_some(h_off + h_lim));
+        if h_asked > h_lim {
+            v["history_limit_applied"] = json!(h_lim);
+        }
+        let rows: Vec<Value> = hist.iter().rev().skip(h_off).take(h_lim).map(|(h, t12, recv, sent)| {
             let txid = x.node.chain.txids_by_t12(x.p, t12).ok().and_then(|v| v.first().copied());
             json!({"height": h, "time": block_time(x, u64::from(*h)), "txid": txid.map(|t| t.to_hex()), "received": recv, "sent": sent})
         }).collect();
@@ -2130,4 +2266,36 @@ fn search_hits_from_elsewhere() {
     assert_eq!(search_hits("tokens", &json!({"kind": "token", "id": "pepe"})), vec![json!({"kind": "token", "id": "pepe"})], "one hit");
     assert!(search_hits("maps", &json!({"kind": "name", "id": "1.pepemap"})).is_empty(), "a dotted word is a name unless the maps keeper finds it");
     assert!(search_hits("ord", &list).is_empty());
+}
+
+#[cfg(test)]
+mod op_return_tests {
+    use super::op_return_view;
+
+    fn script(data: &[u8]) -> Vec<u8> {
+        let mut s = vec![0x6a, 0x4c, data.len() as u8];
+        s.extend_from_slice(data);
+        s
+    }
+
+    #[test]
+    fn op_return_outputs_show_their_data_and_what_it_says() {
+        // Plain data: its hex, nothing decoded.
+        let (d, v) = op_return_view(&script(b"hello"));
+        assert_eq!(d.as_deref(), Some("68656c6c6f"));
+        assert!(v.is_null());
+        // A repository comment record: named as such, with its op.
+        let mut rec = arcade_ledger::extract::MARKER.to_vec();
+        rec.extend(arcade_ledger::repos::comment_payload("arcade-v1", 25, 0, &[7u8; 32]));
+        let (d, v) = op_return_view(&script(&rec));
+        assert_eq!(d, Some(hex::encode(&rec)));
+        assert_eq!(v["record"], "repository");
+        assert!(v["op"].as_str().unwrap().contains("25"), "{v}");
+        // Another arcade record: its type.
+        let mut other = arcade_ledger::extract::MARKER.to_vec();
+        other.extend([0, 0, 0, 9, 1, 2]);
+        assert_eq!(op_return_view(&script(&other)).1["record"], "arcade");
+        // Not an OP_RETURN script at all.
+        assert_eq!(op_return_view(&[0x76, 0xa9]).0, None);
+    }
 }

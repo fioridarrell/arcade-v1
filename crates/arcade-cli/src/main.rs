@@ -572,7 +572,10 @@ fn main() {
                 };
                 println!("  {:<34} {:<20} {:>5.1}% {:>13}  {}", st["name"].as_str().unwrap_or(""), format!("{bar:░<20}"), p, rate, st["detail"].as_str().unwrap_or(""));
             }
-            println!("  overall {:.1}%", r["overall"].as_f64().unwrap_or(0.0));
+            match r["overall"].as_f64() {
+                Some(o) => println!("  overall {o:.1}%"),
+                None => println!("  overall unknown (no peer has told its height yet)"),
+            }
             return;
         }
         if a.first() == Some(&"chain") && a.get(1) == Some(&"list") || a.first() == Some(&"chains") {

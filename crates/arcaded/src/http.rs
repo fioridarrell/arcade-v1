@@ -302,9 +302,22 @@ fn json_out(s: &mut TcpStream, code: u16, v: &Value) {
         401 => "401 Unauthorized",
         403 => "403 Forbidden",
         404 => "404 Not Found",
+        503 => "503 Service Unavailable",
         _ => "500 Internal Server Error",
     };
     respond(s, status, "application/json", &[], v.to_string().as_bytes());
+}
+
+/// While arcaded starts or stops, every request is answered at once with 503 and {"state": "starting" |
+/// "stopping"} (ARCADE #25: calls timed out and looked like a crash). The web port opens before the chains do.
+fn not_ready(s: &mut TcpStream) -> bool {
+    let (body, wait) = match crate::api::phase() {
+        "starting" => (crate::api::starting_reply(), "5"),
+        "stopping" => (crate::api::stopping_reply(), "10"),
+        _ => return false,
+    };
+    respond(s, status_line(503), "application/json", &[("Retry-After", wait.into())], body.to_string().as_bytes());
+    true
 }
 
 fn port(node: &Node) -> u16 {
@@ -520,6 +533,9 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     let Ok(rs) = s.try_clone() else { return };
     let mut rd = BufReader::new(Timed { s: rs, until: Instant::now() + HEAD_TIME });
     let Some(mut r) = read_head(&mut rd) else { return };
+    if not_ready(&mut s) {
+        return;
+    }
     // A mesh link over WebSocket (wss://<host>/mesh; a proxy in front holds the TLS): handed to the mesh, which treats
     // it as an inbound link from the client's address (the proxy's X-Forwarded-For, believed only from this computer).
     if r.method == "GET" && r.path == "/mesh" && r.headers.get("upgrade").and_then(|v| v.as_str()).is_some_and(|u| u.eq_ignore_ascii_case("websocket")) {
@@ -1103,22 +1119,33 @@ fn web_api(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
         return json_out(s, 200, &json!({"ok": true, "result": routes}));
     }
     let cmd = rest.trim_matches('/').replace('/', ".");
+    if crate::commands::find(&cmd).is_none() {
+        let e = format!("unknown route /api/v1/{}: GET /api/v1/routes lists them", rest.trim_matches('/'));
+        return json_out(s, 404, &crate::api::error_reply(&e));
+    }
     let mut req = query_fields(&r.query);
     if r.method == "POST" && !r.body.is_empty() {
         match serde_json::from_slice::<Value>(&r.body) {
             Ok(Value::Object(o)) => req.extend(o),
-            _ => return json_out(s, 400, &json!({"ok": false, "error": "the body must be a JSON object"})),
+            _ => return json_out(s, 400, &crate::api::error_reply("bad request: the body must be a JSON object")),
         }
     }
     req.insert("cmd".into(), json!(cmd));
     let req = Value::Object(req);
     let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(|v| v.trim().to_string());
     if let Err((code, e)) = crate::apikeys::allow(node, key.as_deref(), &req) {
-        return json_out(s, code, &json!({"ok": false, "error": e}));
+        let mut v = crate::api::error_reply(&e);
+        if code == 401 || code == 403 {
+            v["code"] = json!("forbidden");
+        }
+        return json_out(s, code, &v);
     }
     match crate::api::dispatch(node, &req) {
         Ok(v) => json_out(s, 200, &json!({"ok": true, "result": v})),
-        Err(e) => json_out(s, 400, &json!({"ok": false, "error": e})),
+        Err(e) => {
+            let v = crate::api::error_reply(&e);
+            json_out(s, if v["code"] == "not_found" { 404 } else { 400 }, &v)
+        }
     }
 }
 
@@ -1304,7 +1331,7 @@ fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
         let id = id?; // a notification gets no answer
         Some(match out {
             Ok(v) => json!({"jsonrpc": "2.0", "id": id, "result": v}),
-            Err((code, msg)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}}),
+            Err((code, msg)) => json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg, "data": {"code": crate::api::error_code(&msg)}}}),
         })
     };
     let body: Value = match serde_json::from_slice(&r.body) {
@@ -1371,6 +1398,7 @@ pub(crate) mod tests {
             String::from_utf8_lossy(&out).into_owned()
         });
         let (s, _) = l.accept().unwrap();
+        crate::api::set_ready();
         handle(node, s, conf);
         client.join().unwrap()
     }

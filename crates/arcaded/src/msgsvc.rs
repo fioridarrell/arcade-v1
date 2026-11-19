@@ -646,7 +646,8 @@ pub fn write_chains_status(node: &Node) -> Value {
             coins.iter().map(|c| c.value).sum::<u64>()
         });
         json!({"key": p.key, "name": p.name, "unit": crate::explorer::unit(p), "default": p.chain_no == def.chain_no,
-               "test": p.key.ends_with("test"), "stalled": crate::arcsvc::usable(p) && crate::arcsvc::stalled(), "address": addr, "balance": bal})
+               "test": p.key.ends_with("test"), "stalled": crate::arcsvc::usable(p) && crate::arcsvc::stalled(), "address": addr, "balance": bal, "decimals": 8,
+               "balance_counts": "confirmed, mature coins less those waiting (mempool) transactions spend; waiting change not counted"})
     }).collect::<Vec<_>>())
 }
 

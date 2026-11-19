@@ -131,7 +131,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
     "explorer.msg_rows", "explorer.msg_file", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
-    "explorer.arc_ledger", "explorer.token_note", "explorer.prize_rows",
+    "explorer.arc_ledger", "explorer.token_note", "explorer.prize_rows", "explorer.arc_blobs", "explorer.arc_fog_nodes",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -146,7 +146,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.search", "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription",
     "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn", "explorer.a_reactions", "explorer.a_replies",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
-    "explorer.arc_machines",
+    "explorer.arc_machines", "explorer.arc_blobs", "explorer.arc_fog_nodes",
     "explorer.msg_rows", "explorer.msg_file",
 ];
 
@@ -647,6 +647,9 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         "explorer.arc_segments" => return crate::arcstats::segments(node, req),
         "explorer.arc_holders" => return crate::arcstats::holders(node, req),
         "explorer.arc_payouts" => return crate::arcstats::payouts(node, req),
+        // Every blob as fog storage sees it from here (crate::fogmap), for the Storage app's fog map.
+        "explorer.arc_blobs" => return crate::fogmap::blobs(node, req),
+        "explorer.arc_fog_nodes" => return crate::fogmap::nodes(node, req),
         _ => {}
     }
     let mut x = ctx(node, req)?;

@@ -56,8 +56,14 @@ fn units_of(text: &str, places: u32) -> Result<u64, String> {
     u64::try_from(n).ok().filter(|n| *n > 0).ok_or_else(|| format!("{t} is not an amount above nothing"))
 }
 
+/// A token's record: the home chain's ledger here, or, while the home chain is borrowed, an arcade keeping it.
 fn property(node: &Node, pid: u32) -> Option<Value> {
-    arcade_ledger::engine::property(&node.chain, node.params.chain_no, pid).ok().flatten()
+    crate::lentledger::property(node, node.params, pid)
+}
+
+/// An arcade inscription's row on the home chain, as [`property`] reads.
+fn inscription(node: &Node, id: &str) -> Option<Value> {
+    crate::lentledger::inscription(node, node.params, id)
 }
 
 fn divisible(p: &Value) -> bool {
@@ -68,7 +74,7 @@ fn divisible(p: &Value) -> bool {
 pub fn side_of(node: &Node, v: &Value) -> Result<Side, String> {
     if let Some(id) = v.get("inscription").filter(|x| !x.is_null()) {
         let key = id.as_str().map(String::from).or_else(|| id.as_u64().map(|n| n.to_string())).unwrap_or_default();
-        let row = arcade_ledger::content::inscription(&node.chain, node.params.chain_no, key.trim_start_matches('#')).ok_or("there is no such inscription")?;
+        let row = inscription(node, key.trim_start_matches('#')).ok_or("there is no such inscription")?;
         let t: [u8; 32] = hex::decode(row["txid"].as_str().unwrap_or("")).ok().and_then(|b| b.try_into().ok()).ok_or("bad inscription id")?;
         return Ok(Side::Inscription(t));
     }
@@ -90,7 +96,7 @@ pub fn side_json(node: &Node, s: &Side) -> Value {
     match s {
         Side::Inscription(t) => {
             let id = hex::encode(t);
-            let row = arcade_ledger::content::inscription(&node.chain, node.params.chain_no, &id).unwrap_or(Value::Null);
+            let row = inscription(node, &id).unwrap_or(Value::Null);
             json!({"kind": "inscription", "txid": id, "number": row["number"], "collection": Value::Null, "edition": Value::Null})
         }
         Side::Token { pid, units } => {
@@ -106,7 +112,7 @@ fn holds(node: &Node, address: &str, side: &Side) -> Result<(), String> {
     let c = node.params.chain_no;
     match side {
         Side::Inscription(t) => {
-            let row = arcade_ledger::content::inscription(&node.chain, c, &hex::encode(t)).ok_or("there is no such inscription")?;
+            let row = inscription(node, &hex::encode(t)).ok_or("there is no such inscription")?;
             if row["owner"].as_str() != Some(address) {
                 return Err(format!("#{} is not held by {address}", row["number"]));
             }
@@ -117,7 +123,12 @@ fn holds(node: &Node, address: &str, side: &Side) -> Result<(), String> {
             Ok(())
         }
         Side::Token { pid, units } => {
-            let have = arcade_ledger::tokens::balances(&node.chain, c, address).into_iter().find(|b| b.0 == pid.to_string()).and_then(|b| b.2.parse::<u64>().ok()).unwrap_or(0);
+            // (Borrowed home: what an arcade keeping its ledger says the address holds.)
+            let have = if crate::borrow::is_borrowed(node.params.key) {
+                crate::walletsvc::send_holdings(node, node.params, address).into_iter().find(|(x, _)| x == pid).map(|(_, u)| u).unwrap_or(0)
+            } else {
+                arcade_ledger::tokens::balances(&node.chain, c, address).into_iter().find(|b| b.0 == pid.to_string()).and_then(|b| b.2.parse::<u64>().ok()).unwrap_or(0)
+            };
             let (_, leaving) = crate::walletsvc::pending_moves(node, address);
             let out: u64 = leaving.iter().filter(|m| m["kind"] == "token" && m["property_id"].as_u64() == Some(*pid as u64)).filter_map(|m| m["units"].as_u64()).sum();
             if have.saturating_sub(out) < *units {
@@ -152,7 +163,7 @@ fn hold(node: &Node, ops: &[OutPoint]) {
 
 /// The seller's coins for a leg: its two smallest of at least the dust line.
 fn leg_coins(node: &Node, script: &[u8]) -> Vec<Coin> {
-    let mut cs: Vec<Coin> = crate::claims::spendable(node, script).into_iter().filter(|u| u.value >= crate::claims::DUST).map(|u| Coin { outpoint: u.outpoint, value: u.value }).collect();
+    let mut cs: Vec<Coin> = crate::claims::send_coins(node, script).into_iter().filter(|u| u.value >= crate::claims::DUST).map(|u| Coin { outpoint: u.outpoint, value: u.value }).collect();
     cs.sort_by_key(|c| c.value);
     cs
 }
@@ -256,6 +267,10 @@ fn shape_of(tx: &Tx) -> Shape {
 /// A coin's value: confirmed and unspent, or the output of a waiting transaction, unspent.
 fn coin_value(node: &Node, op: &OutPoint, script: &[u8]) -> Option<u64> {
     let p = node.params;
+    // Borrowed home: read from a lender and checked (its transaction by txid, its block against our headers), unspent.
+    if crate::borrow::is_borrowed(p.key) {
+        return crate::borrow::checked_coin(node, p, op).filter(|(s, _, _)| s == script).map(|(_, v, _)| v);
+    }
     if node.chain.mempool_spender(p.chain_no, op).ok().flatten().is_some() {
         return None;
     }
@@ -329,7 +344,7 @@ pub fn fill(node: &Node, leg: &Value, expect: &Value, peer: &str, send: bool) ->
     let pk = PublicKey::from_secret_key(SECP256K1, &sk);
     let script = arcade_wallet::keys::p2pkh_script_for(&pk);
     let leg_ins: Vec<OutPoint> = c.shape.inputs.iter().map(|i| i.prevout).collect();
-    let coins: Vec<Coin> = crate::claims::spendable(node, &script).into_iter().filter(|u| !leg_ins.contains(&u.outpoint)).map(|u| Coin { outpoint: u.outpoint, value: u.value }).collect();
+    let coins: Vec<Coin> = crate::claims::send_coins(node, &script).into_iter().filter(|u| !leg_ins.contains(&u.outpoint)).map(|u| Coin { outpoint: u.outpoint, value: u.value }).collect();
     let done = legs::complete(&fees(), &c.shape, c.reserve, c.take.coins(), &coins, &script)?;
     let what = json!({"give": side_json(node, &c.take), "get": side_json(node, &c.give), "fee": done.fee, "fee_text": arcade_ledger::amount::fixed8(done.fee), "price": c.take.coins()});
     if !send {
@@ -344,6 +359,20 @@ pub fn fill(node: &Node, leg: &Value, expect: &Value, peer: &str, send: bool) ->
 /// by `owner` there); "failed" when it can no longer confirm or the block did not move the piece;
 /// else "waiting" (the original's tradeWatch).
 pub fn watch(node: &Node, txid: &str, inscription: Option<&str>, owner: Option<&str>) -> Value {
+    // Borrowed home: in a block a lender names, checked against our headers (borrowed = installed, batch 6).
+    if crate::borrow::is_borrowed(node.params.key) {
+        let Ok(h) = Hash256::from_hex(txid) else { return json!({"state": "waiting", "why": "not a txid"}) };
+        if crate::borrow::depth(node, node.params, &h) == 0 {
+            return json!({"state": "waiting"});
+        }
+        if let (Some(i), Some(o)) = (inscription.filter(|i| !i.is_empty()), owner.filter(|o| !o.is_empty())) {
+            let row = self::inscription(node, i).unwrap_or(Value::Null);
+            if row["owner"].as_str().is_some_and(|now| now != o) {
+                return json!({"state": "failed", "why": "the block refused the trade; nothing moved"});
+            }
+        }
+        return json!({"state": "settled", "txid": txid});
+    }
     let Some(st) = crate::walletsvc::tx_status(node, txid) else {
         return json!({"state": "waiting", "why": "not seen here yet"});
     };

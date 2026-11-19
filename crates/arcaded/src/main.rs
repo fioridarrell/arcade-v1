@@ -11,6 +11,7 @@ mod webui;
 mod rulecheck;
 mod updater;
 mod handlegate;
+mod lentledger;
 mod lentrows;
 mod hometag;
 mod homeinst;

@@ -83,7 +83,10 @@ fn here_at(node: &Node, p: &ChainParams, start: u32, read_to: Option<u32>, op: &
     if depth > DEPTH {
         return Held::Unknown;
     }
-    let Some(tx) = node.chain.mempool_tx(p.chain_no, &op.txid).ok().flatten().and_then(|raw| Tx::parse_with(&raw, &p.format).ok()) else {
+    // (Or one this arcade sent through the lenders of a chain it borrows.)
+    let waiting = node.chain.mempool_tx(p.chain_no, &op.txid).ok().flatten().and_then(|raw| Tx::parse_with(&raw, &p.format).ok())
+        .or_else(|| crate::borrow::is_borrowed(p.key).then(|| crate::borrow::pool_txs(p).into_iter().find(|t| t.txid == op.txid)).flatten());
+    let Some(tx) = waiting else {
         return Held::Unknown;
     };
     pooled(node, p, start, read_to, &tx, depth)
@@ -206,15 +209,24 @@ pub fn answer(node: &Node, p: &ChainParams, req: &Value) -> Result<Value, String
     let Some(start) = ord::ord_start(p) else { return Ok(json!({"held": [], "free": req["outpoints"]})) };
     let Some(read_to) = local_ord(node, p) else { return Err(format!("the ord index is not on {}; add it in Chains & Coins", p.name)) };
     let (mut held, mut free) = (Vec::new(), Vec::new());
+    // And, for each confirmed coin that carries some, which ones and where in the coin they sit: what an arcade that
+    // only borrows the chain sends an inscription by (crate::ordsend, borrowed = installed, batch 6).
+    let mut on = serde_json::Map::new();
     for s in req["outpoints"].as_array().ok_or("give outpoints: [\"txid:vout\"]")?.iter().take(500).filter_map(|x| x.as_str()) {
         let Some(op) = parse_op(s) else { continue };
         match here_at(node, p, start, Some(read_to), &op, 0) {
-            Held::Yes => held.push(s),
+            Held::Yes => {
+                held.push(s);
+                let list = ord::on_coin_at(&node.chain, p, &op);
+                if !list.is_empty() {
+                    on.insert(s.to_string(), json!(list.into_iter().map(|(id, offset, n)| json!({"id": id, "offset": offset, "number": n})).collect::<Vec<_>>()));
+                }
+            }
             Held::No => free.push(s),
             Held::Unknown => {}
         }
     }
-    Ok(json!({"held": held, "free": free}))
+    Ok(json!({"held": held, "free": free, "on": on}))
 }
 
 // ---------------- the guard ----------------
@@ -393,6 +405,8 @@ mod tests {
         let v = answer(&t.node, p, &json!({"outpoints": [format!("{}:1", t.spend.txid.to_hex()), format!("{}:0", t.spend.txid.to_hex()), "junk"]})).unwrap();
         assert_eq!(v["held"], json!([format!("{}:1", t.spend.txid.to_hex())]));
         assert_eq!(v["free"], json!([format!("{}:0", t.spend.txid.to_hex())]));
+        // And which inscriptions sit on the held coin, where: what a borrowing arcade sends one by (crate::ordsend).
+        assert_eq!(v["on"], json!({format!("{}:1", t.spend.txid.to_hex()): [{"id": ord::iid_str(&[7u8; 36]), "offset": 0, "number": null}]}));
     }
 
     #[test]

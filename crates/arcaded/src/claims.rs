@@ -171,6 +171,19 @@ pub fn spendable(node: &Node, script: &[u8]) -> Vec<Utxo> {
     crate::ordsafe::keep_free(node, node.params, coins(node, script))
 }
 
+/// The home chain coins a send this wallet builds may spend (a page's request, a trade, a prize claim): [`spendable`];
+/// while the home chain is borrowed (borrowed = installed, batch 6), also the coins a lender's address index names,
+/// each checked against its block, so a coin from before the borrow floor counts too. Coins carrying an inscription
+/// stay out either way.
+pub fn send_coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
+    if !crate::borrow::is_borrowed(node.params.key) {
+        return spendable(node, script);
+    }
+    let mut out = crate::borrow::own_coins(node, node.params, script);
+    out.retain(|u| !node.pending_spent.lock().unwrap().contains(&u.outpoint));
+    crate::ordsafe::keep_free(node, node.params, out)
+}
+
 pub(crate) fn coins(node: &Node, script: &[u8]) -> Vec<Utxo> {
     // The home chain still catching up: its borrowed copy knows the coins (incl. waiting ones).
     if crate::borrow::is_borrowed(node.params.key) {

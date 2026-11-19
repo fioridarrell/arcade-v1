@@ -33,13 +33,25 @@ fn all(node: &Node) -> Vec<Value> {
     v
 }
 
-/// An arcade token: `units` of property `pid` to `to`. Built, and sent when `send`.
-pub fn ledger_send(node: &Node, pid: u32, units: u64, to: &str, send: bool) -> Result<Value, String> {
+/// An arcade token: `units` of property `pid` to `to`, on the home chain's ledger, or on the ARCADE chain's when `chain`
+/// names it (installed or borrowed). Built, and sent when `send`.
+pub fn ledger_send(node: &Node, pid: u32, units: u64, to: &str, send: bool, chain: Option<&str>) -> Result<Value, String> {
     if units == 0 {
         return Err("send at least one unit".into());
     }
-    let (txid, fee, outputs) = crate::walletsvc::token_send(node, pid, units, to, send)?;
-    Ok(json!({"propertyid": pid, "units": units, "to": to, "fee": fee, "outputs": outputs, "txid": if send { json!(txid) } else { Value::Null }, "sent": send}))
+    let p = match chain.filter(|c| !c.is_empty()) {
+        None => node.params,
+        Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
+    };
+    let arcade = crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no);
+    let (txid, fee, outputs) = if arcade {
+        crate::walletsvc::arc_token_send(node, p, pid, units, to, send)?
+    } else if p.chain_no == node.params.chain_no {
+        crate::walletsvc::token_send(node, pid, units, to, send)?
+    } else {
+        return Err(format!("arcade tokens are sent on the home chain or the ARCADE chain, not {}", p.name));
+    };
+    Ok(json!({"chain": p.key, "propertyid": pid, "units": units, "to": to, "fee": fee, "outputs": outputs, "txid": if send { json!(txid) } else { Value::Null }, "sent": send}))
 }
 
 /// What a PRC-20 / DRC-20 send needs: the chain, its protocol, the wallet's key and address, the tick's decimals and
@@ -68,8 +80,10 @@ fn key_or_wallet(node: &Node, p: &ChainParams, key: Option<&str>) -> Result<(arc
 fn t20(node: &Node, chain: &str, tick: &str, amount: &str, to: &str, key: Option<&str>) -> Result<T20, String> {
     let p = crate::chains::find(chain).ok_or_else(|| format!("unknown chain {chain}"))?;
     let proto = arcade_ledger::tokens::protocol(p).ok_or_else(|| format!("no PRC-20 / DRC-20 on {}", p.name))?.0;
-    if crate::borrow::is_borrowed(p.key) || !crate::chains::kept(node, p) {
-        return Err(format!("{} is not installed here: a token send spends this arcade's own coins of it", p.name));
+    // Installed, or borrowed (borrowed = installed, batch 6: the coins from a lender, each checked against its block;
+    // the transactions built and signed here, sent through the lenders).
+    if !crate::borrow::is_borrowed(p.key) && !crate::chains::kept(node, p) {
+        return Err(format!("{} is neither installed nor borrowed here: a token send spends this arcade's own coins of it", p.name));
     }
     // The tick and the balance: from this arcade's tokens index, else from an arcade on the mesh that keeps it
     // (explorer.token / explorer.address answer either way).
@@ -178,8 +192,9 @@ fn step(node: &Node, j: &mut Value) -> Result<(), String> {
             }
             // Sent only once the tokens index has read the note: this arcade's own, when it keeps one; else the
             // mesh's, given a block more (and the note shown as transferable there).
-            let kept = if p.chain_no == node.params.chain_no { crate::chains::home_indexes(node) } else { node.extra.lock().unwrap().get(p.key).map(|r| r.indexes.clone()).unwrap_or_default() }
-                .iter().any(|i| i == "tokens");
+            // (Borrowed: our own copy's index, if any, is behind; the mesh's counts.)
+            let indexes = if p.chain_no == node.params.chain_no { crate::chains::home_indexes(node) } else { node.extra.lock().unwrap().get(p.key).map(|r| r.indexes.clone()).unwrap_or_default() };
+            let kept = !crate::borrow::is_borrowed(p.key) && indexes.iter().any(|i| i == "tokens");
             if kept {
                 let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
                 let read = node.chain.indexed_to(p.chain_no, crate::chains::indexer_name("tokens")).ok().flatten().unwrap_or(0);

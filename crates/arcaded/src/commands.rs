@@ -183,9 +183,9 @@ cmds! {
     "ledger" Public "" "The arcade ledger's fingerprints next to what other arcades report.";
     "profile" Public "who" "A published profile (who = @tag or address).";
     "ord" Public "id?, chain?" "An inscription, or ord index counts.";
-    "ord.send" Local "inscription, to, chain?, send?" "Send one inscription (id or number) from this wallet's address on a chain kept here with its ord index: its coin whole to `to` first, clean coins pay the fee. Only one alone at the start of its coin. send: true broadcasts, otherwise it is built and shown with its fee.";
-    "token.send" Local "propertyid, units, to, send?" "Send arcade tokens (base units) from this wallet in one transaction; without send: true, only what it would do.";
-    "token20.send" Local "chain, tick, amount, to, send?" "Send PRC-20 / DRC-20 tokens from this wallet (a job: inscribe the transfer, then send it).";
+    "ord.send" Local "inscription, to, chain?, send?" "Send one inscription (id or number) from this wallet's address on a chain kept here with its ord index, or borrowed (where it sits from the arcades keeping the ord index, which must agree; coins from a lender, checked against their blocks; sent through the lenders): its coin whole to `to` first, clean coins pay the fee. Only one alone at the start of its coin. send: true broadcasts, otherwise it is built and shown with its fee.";
+    "token.send" Local "propertyid, units, to, chain?, send?" "Send arcade tokens (base units) from this wallet in one transaction, on the home chain's ledger or the ARCADE chain's (chain: arc / arctest), installed or borrowed; without send: true, only what it would do.";
+    "token20.send" Local "chain, tick, amount, to, send?" "Send PRC-20 / DRC-20 tokens from this wallet (a job: inscribe the transfer, then send it), on a chain installed or borrowed here.";
     "token20.sends" Read "" "This wallet's PRC-20 / DRC-20 send jobs and where each stands.";
     "arc.cache" Admin "mb?, clear?" "The viewer cache of ARCADE blobs: its size limit (MB), what it holds, or clear it.";
     "ledger.announce" Wallet "" "Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain.";

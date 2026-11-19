@@ -1412,5 +1412,6 @@
  "🔑 revoked key": "🔑 clé révoquée",
  "🔓 revealed": "🔓 révélé",
  "🪙 tipped": "🪙 pourboire donné",
- "Borrowed until ticked · ticked, it syncs here": "Empruntée tant qu'elle n'est pas cochée · cochée, elle se synchronise ici"
+ "Borrowed until ticked · ticked, it syncs here": "Empruntée tant qu'elle n'est pas cochée · cochée, elle se synchronise ici",
+ "Arcade V1.0 is in beta: testing is happening now, and things can change or break. Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com": "Arcade V1.0 est en bêta : les tests sont en cours, et des choses peuvent changer ou casser. Merci de l'essayer ! Questions, problèmes ou idées : team@arcade-nodes.com"
 }

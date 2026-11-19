@@ -46,7 +46,7 @@ ShowUninstDetails show
 !define MUI_FINISHPAGE_RUN
 !define MUI_FINISHPAGE_RUN_TEXT "Open Arcade V1.0"
 !define MUI_FINISHPAGE_RUN_FUNCTION OpenArcade
-!define MUI_FINISHPAGE_TEXT "Arcade V1.0 is installed, and its service is running: it starts by itself every time you log in.$\r$\n$\r$\nOpen it from the Start menu or the desktop. The first time, make a wallet (write its 12 words down) or restore one."
+!define MUI_FINISHPAGE_TEXT "Arcade V1.0 is installed, and its service is running: it starts by itself every time you log in.$\r$\n$\r$\nOpen it from the Start menu or the desktop. The first time, make a wallet (write its 12 words down) or restore one.$\r$\n$\r$\nArcade V1.0 is in beta: testing is happening now, and things can change or break (test coins have no value).$\r$\nThank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com"
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM

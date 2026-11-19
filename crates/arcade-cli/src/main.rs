@@ -194,6 +194,8 @@ fn wait_status(sock: &std::path::Path, what: &str, done: impl Fn(&Value) -> bool
 /// First-run setup: the whiteboard steps, in order, on the command line.
 fn setup(sock: &std::path::Path) {
     println!("Arcade V1.0 setup — Pepecoin testnet");
+    println!("Arcade V1.0 is in beta: testing is happening now, and things can change or break (test coins have no value).");
+    println!("Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com\n");
 
     step(1, "Install arcade");
     match call(sock, json!({"cmd": "status"})) {

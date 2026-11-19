@@ -229,6 +229,10 @@ sh "$START"
 fi
 
 say "Arcade V1.0 is installed and running."
+echo
+say "Arcade V1.0 is in beta: testing is happening now, and things can change or break (test coins have no value)."
+say "Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com"
+echo
 echo "  data:     $HOME_DIR"
 echo "  ports:    http $HTTP_PORT, mesh $MESH_PORT, STUN $([ "$STUN_PORT" = 0 ] && echo off || echo "$STUN_PORT")"
 if [ "$SYSTEMD" = 1 ]; then

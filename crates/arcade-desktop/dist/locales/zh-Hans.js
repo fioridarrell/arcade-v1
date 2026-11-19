@@ -106,6 +106,7 @@ I18N.add("zh-Hans", {
 "Arcade Git (by @strawberry) isn't installed here. Install it from the App Store to read the code?": "此处未安装 Arcade Git（由 @strawberry 发布）。要从应用商店安装它来阅读代码吗？",
 "Arcade Git isn't in the App Store on this arcade yet: the code is also at /git/@arcade/arcade-v1 for git clone": "此 arcade 的应用商店中还没有 Arcade Git：代码也可在 /git/@arcade/arcade-v1 通过 git clone 获取",
 "Arcade V1.0": "Arcade V1.0",
+"Arcade V1.0 is in beta: testing is happening now, and things can change or break. Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com": "Arcade V1.0 目前是测试版：正在测试中，功能可能会变化或出错。感谢你的试用！有问题、故障或想法，请联系 team@arcade-nodes.com",
 "Arcade inscription #{0}": "Arcade 铭文 #{0}",
 "Arcade inscriptions": "Arcade 铭文",
 "Arcade inscriptions ({0})": "Arcade 铭文（{0}）",

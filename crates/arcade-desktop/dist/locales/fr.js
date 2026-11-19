@@ -106,6 +106,7 @@ I18N.add("fr", {
 "Arcade Git (by @strawberry) isn't installed here. Install it from the App Store to read the code?": "Arcade Git (par @strawberry) n'est pas installé ici. L'installer depuis l'App Store pour lire le code ?",
 "Arcade Git isn't in the App Store on this arcade yet: the code is also at /git/@arcade/arcade-v1 for git clone": "Arcade Git n'est pas encore dans l'App Store de cette arcade : le code est aussi à /git/@arcade/arcade-v1 pour git clone",
 "Arcade V1.0": "Arcade V1.0",
+"Arcade V1.0 is in beta: testing is happening now, and things can change or break. Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com": "Arcade V1.0 est en bêta : les tests sont en cours, et des choses peuvent changer ou casser. Merci de l'essayer ! Questions, problèmes ou idées : team@arcade-nodes.com",
 "Arcade inscription #{0}": "Inscription Arcade n°{0}",
 "Arcade inscriptions": "Inscriptions Arcade",
 "Arcade inscriptions ({0})": "Inscriptions Arcade ({0})",

@@ -532,6 +532,10 @@ sh.Run "$deskRun", 1, False
 
     $stunText = if ($StunPort -eq 0) { 'off' } else { "$StunPort" }
     Say "Arcade V1.0 is installed and running."
+    Write-Host ""
+    Say "Arcade V1.0 is in beta: testing is happening now, and things can change or break (test coins have no value)."
+    Say "Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com"
+    Write-Host ""
     Write-Host "  programs: $bin"
     Write-Host "  data:     $DataDir"
     Write-Host "  ports:    http $HttpPort, mesh $MeshPort, STUN $stunText"

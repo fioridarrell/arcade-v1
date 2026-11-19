@@ -172,6 +172,10 @@ fi
 
 stun_text="$STUN_PORT"; [ "$STUN_PORT" = 0 ] && stun_text=off
 say "Arcade V1.0 is installed and running."
+echo
+say "Arcade V1.0 is in beta: testing is happening now, and things can change or break (test coins have no value)."
+say "Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com"
+echo
 echo "  programs: $BIN"
 echo "  data:     $HOME_DIR"
 echo "  ports:    http $HTTP_PORT, mesh $MESH_PORT, STUN $stun_text"

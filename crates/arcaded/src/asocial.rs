@@ -25,8 +25,8 @@ pub fn known_from(net: &str) -> Option<u64> {
     }
 }
 
-/// ARCADE testnet's height for ops 8 to 10: set at release time.
-const ARCTEST_FROM: Option<u64> = None;
+/// ARCADE testnet's height for ops 8 to 10 (Martin 2026-11-18: "sooner if possible"; arcades update within ~40 min).
+const ARCTEST_FROM: Option<u64> = Some(2120);
 
 const MAX_TARGETS: usize = 100;
 

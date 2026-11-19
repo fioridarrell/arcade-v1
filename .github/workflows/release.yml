@@ -49,9 +49,12 @@ jobs:
             # Core 26's pubkey.cpp also calls the ElligatorSwift module, which the crate leaves out (GNU ld
             # drops the unused call on Linux; MSVC must resolve it): compile it in too.
             cl: /DSECP256K1_STATIC /DENABLE_MODULE_ELLSWIFT=1
+            # libclang (bindgen) is older than the runner's newest MSVC STL wants: let bindgen read the headers anyway.
+            bindgen: -D_ALLOW_COMPILER_AND_STL_VERSION_MISMATCH
     runs-on: ${{ matrix.runner }}
     env:
       CL: ${{ matrix.cl }}
+      BINDGEN_EXTRA_CLANG_ARGS: ${{ matrix.bindgen }}
       ARCADE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4

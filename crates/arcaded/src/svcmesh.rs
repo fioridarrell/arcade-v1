@@ -701,6 +701,12 @@ pub fn run(node: Arc<Node>) {
 
 /// A request's asker's link went down: its helper is told, so it can stop (called from a link's end).
 pub fn link_down(peer: &str) {
+    // Only when the last link to the asker went: arcades often hold two links to each other for a moment (both
+    // dialed, or one by address and one by name), and closing the spare one must not cancel requests whose answers
+    // still reach the asker over the other (crvia sends by peer, over any link up).
+    if crate::crvia::linked(peer) {
+        return;
+    }
     let mut gone: Vec<(Sender<Value>, u64)> = Vec::new();
     {
         let mut s = st().lock().unwrap();
@@ -762,5 +768,29 @@ mod tests {
         assert_eq!(seen, vec![(json!({"n": 1}), 0), (Value::Null, 3)]);
         tx.send(Frame::new(json!({"op": "a", "end": true, "err": "nope"}))).unwrap();
         assert_eq!(answers(&mut |u| rx.recv_timeout(u.saturating_duration_since(Instant::now())).map_err(|e| e.to_string()), Duration::from_secs(5), false, &mut |_, _| Ok(())).unwrap_err(), "nope");
+    }
+
+    #[test]
+    fn a_spare_link_ending_keeps_the_askers_requests() {
+        let peer = "ab".repeat(32);
+        let (tx, rx) = std::sync::mpsc::channel();
+        st().lock().unwrap().helpers.insert(
+            "linkdowntest".into(),
+            Helper { gen: 1, tx, open: HashMap::from([(7, Open { target: Target::Mesh { peer: peer.clone(), rid: 1, seq: 0 }, at: Instant::now() })]), offer: None, said: None },
+        );
+        let open = || st().lock().unwrap().helpers["linkdowntest"].open.contains_key(&7);
+        // Two links to the asker; one ends: the request stays and the helper hears nothing.
+        crate::crvia::up(&peer);
+        crate::crvia::up(&peer);
+        crate::crvia::down(&peer);
+        link_down(&peer);
+        assert!(open(), "a spare link ending must not cancel");
+        assert!(rx.try_recv().is_err());
+        // The last link ends: cancelled, and the helper is told.
+        crate::crvia::down(&peer);
+        link_down(&peer);
+        assert!(!open());
+        assert_eq!(rx.try_recv().unwrap()["cancel"]["id"], 7);
+        st().lock().unwrap().helpers.remove("linkdowntest");
     }
 }

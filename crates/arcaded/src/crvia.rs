@@ -78,8 +78,17 @@ pub fn tick(peer: &str, link: &mut Link) -> Result<(), LinkError> {
         Some(p) if !p.out.is_empty() => p.out.drain(..).collect(),
         _ => return Ok(()),
     };
-    for f in &out {
-        link.send(f)?;
+    for (i, f) in out.iter().enumerate() {
+        if let Err(e) = link.send(f) {
+            // This link is ending: what it didn't send goes back to the front of the queue, for the peer's other link
+            // (two links to one arcade are common for a moment) or for the next one.
+            if let Some(p) = PEERS.lock().unwrap().get_mut(peer) {
+                for g in out[i..].iter().rev() {
+                    p.out.push_front(g.clone());
+                }
+            }
+            return Err(e);
+        }
     }
     Ok(())
 }

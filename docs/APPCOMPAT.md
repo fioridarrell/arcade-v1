@@ -273,6 +273,18 @@ system notification, and rings to or from an original arcade.
 - Pictures need `WEBKIT_DISABLE_DMABUF_RENDERER=1`, which the installed launcher already sets: without
   it a `<video>` never plays a camera stream on this machine, so nothing can be encoded.
 
+**A website's viewer in the same room.** A browser on a website in front of a V1.0 arcade (the room door
+on this computer) has WebRTC, but a window has none, so a viewer and a window meet on the window's pieces:
+- the website joins its viewer's seat through the door with `fast: true` (`/realtime/join`); its stream
+  then carries `fast` and `mchunk` events like a window's poll;
+- the website sends the viewer's fast data and pieces with `/rpc`'s `realtime.fast` and `realtime.media`
+  on the door's token (a JSON-RPC batch per viewer request), and asks `realtime.lanes` for which pairs
+  the fast lane reaches;
+- the window answers a viewer's WebRTC offer or "please offer" with the signal `p` ("my pictures go as
+  pieces"), and sends `p` itself to a player it would offer to. The viewer then stops waiting for WebRTC
+  for that pair, puts it on the fast lane, and decodes and encodes the same pieces (VP8, Opus) with
+  WebCodecs. Viewers with each other stay on WebRTC.
+
 Findings:
 - **Room frames were lost across a relaying arcade (on main too).** An arcade that borrows blocks or
   fetches shares from a neighbour holds more connections to it under the same id. Room frames for that

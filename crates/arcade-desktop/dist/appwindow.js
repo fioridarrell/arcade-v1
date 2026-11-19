@@ -491,12 +491,15 @@
   //  - {f: 1, d, r?, b?, t?}: fast data carried by the room. r: sent reliable; b: d is base64 of
   //    bytes; t: only for these player ids.
   //  - {to, k, i, n, d}: piece i of n of signal k for one player. The signal is JSON {t}: 'o' and 'a'
-  //    (the two halves of a direct link), 'h' (please offer) and 'n' (I don't link with you).
+  //    (the two halves of a direct link), 'h' (please offer), 'n' (I don't link with you) and 'p'
+  //    (no WebRTC here: my pictures and sound go as the arcades' media pieces, realtime.media).
   // This window makes no WebRTC links (it has none). A pair whose arcades are both V1.0 goes over the
   // arcades' own fast lane instead (realtime.fast / realtime.lanes): state 'direct'. Every other pair
   // is carried by the room: at most three hidden messages a second, signals first, then the reliable
   // sends in order, and of the rest only the latest. An original arcade that offers a WebRTC link gets
-  // no answer and carries the pair over the room after its own wait.
+  // no answer and carries the pair over the room after its own wait. A website's viewer that knows the
+  // pieces (the room door with fast) is told 'p' instead: it stops waiting for a WebRTC link, takes the
+  // arcades' fast lane for this pair, and sends and plays the same pieces as this window.
   const RTC = "\u001farcade-rtc:", TRADE = "\u001farcade-trade:";
   const FAST_MAX = 16384, FAST_PEERS = 19, FAST_PEERS_MAX = 60, FAST_TO_MAX = 64, RTC_PIECE = 300, FAST_LANE_WAIT = 5000, LANES_EVERY = 1000;
   const fastLinkList = (link) => (Array.isArray(link) ? link.slice(0, FAST_PEERS_MAX).map(String) : null);
@@ -545,12 +548,21 @@
     if (Object.keys(s.fast.peers).length >= s.fastMax) return;
     const fast = s.fast, peer = (fast.peers[p.id] = { p, state: "" });
     fastSay(name, s, p, "connecting");
+    // A viewer with a higher id waits for this side's WebRTC offer, which never comes: say so at once.
+    if (s.me.id < p.id) piecesHint(name, s, peer);
     // No lane by then: the room carries the pair (and it goes 'direct' if a lane comes up later).
     peer.timer = setTimeout(() => {
       if (s.fast !== fast || fast.peers[p.id] !== peer || peer.state === "direct") return;
       fastSay(name, s, peer.p, "room");
       fastPump(name, s);
     }, FAST_LANE_WAIT);
+  }
+  // 'p' to a player, at most once a second (a viewer asks again after each rejoin).
+  function piecesHint(name, s, peer) {
+    const now = Date.now();
+    if (now - (peer.hinted || 0) < 1000) return;
+    peer.hinted = now;
+    fastSignal(name, s, peer.p.id, { t: "p" });
   }
   function fastDrop(s, id) {
     const peer = s.fast && s.fast.peers[id];
@@ -629,10 +641,11 @@
     if (o.t === "n") {                              // they do not link with us: let them go
       if (s.fast.peers[p.id]) { fastDrop(s, p.id); fastSay(name, s, p, "gone"); }
     } else if (o.t === "o" || o.t === "h") {
-      // They want a direct link. One the page does not link with is told so; the rest get no
-      // answer, and the pair stays on the room.
+      // They want a direct link. One the page does not link with is told so; the rest are told 'p'
+      // (an original arcade's viewer ignores it, and the pair stays on the room).
       if (!s.fast.peers[p.id]) fastMeet(name, s, p);
       if (!s.fast.peers[p.id] && !fastLinks(s, p.id)) fastSignal(name, s, p.id, { t: "n" });
+      else if (s.fast.peers[p.id]) piecesHint(name, s, s.fast.peers[p.id]);
     }
   }
   // The page's fast.send: through the room to the players it is for.

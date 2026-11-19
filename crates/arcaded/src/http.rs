@@ -1192,7 +1192,16 @@ fn realtime_door(node: &Node, s: &mut TcpStream, r: &Req, what: &str) {
             let cred = json!({"a": address, "x": body["expires"].as_u64().unwrap_or(0), "s": st("sig")});
             let who = if address.is_empty() { None } else { Some((address.clone(), Some(cred))) };
             let who = who.or_else(|| Some((format!("guest-{}", &hex::encode(rand_bytes())[..8]), None)));
-            done(s, crate::realtime::join_as(node, &game, &game, &room, who))
+            let mut j = crate::realtime::join_as(node, &game, &game, &room, who);
+            // fast: true takes the fast lane too, as realtime.join does for a window: a website's viewer
+            // then sends and hears fast data and media pieces with /rpc's realtime.fast, realtime.media
+            // and realtime.lanes on the same token, and its stream carries fast and mchunk events.
+            if let (Ok(j), true) = (&mut j, body["fast"] == true) {
+                crate::realtime::fast::want_fast(j["token"].as_str().unwrap_or(""));
+                j["fast"] = json!(true);
+                j["media"] = json!(true);
+            }
+            done(s, j)
         }
         "send" => done(s, crate::realtime::send(node, &st("token"), body["data"].as_str(), body["b64"].as_str())),
         "leave" => done(s, crate::realtime::leave(node, &st("token"))),
@@ -1399,6 +1408,73 @@ pub(crate) mod tests {
         // The link names the key.
         let l = crate::webui::link(&t.node, 8420).unwrap();
         assert_eq!(l["url"], format!("http://127.0.0.1:8420/ui/#k={key}"));
+    }
+
+    /// A website's viewers join through the room door with fast: true and carry media pieces (and fast data) with
+    /// /rpc's realtime.media and realtime.fast on the door's token, in one JSON-RPC batch, as the website does;
+    /// they hear them as mchunk and fast events. A seat that did not ask for the fast lane can't send them.
+    #[test]
+    fn the_room_door_takes_the_fast_lane_for_a_websites_media() {
+        use base64::Engine;
+        let (_one, t) = crate::http::tests::node();
+        let post = |path: &str, body: &str, extra: &str| {
+            format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).into_bytes()
+        };
+        let body_of = |a: &str| -> Value { serde_json::from_str(a.split("\r\n\r\n").nth(1).unwrap_or("")).unwrap_or(Value::Null) };
+        let join = |fast: Option<bool>| {
+            let mut b = json!({"game": "doortest", "room": "media-bridge"});
+            if let Some(f) = fast {
+                b["fast"] = json!(f);
+            }
+            body_of(&ask(&t.node, &conf(), &post("/realtime/join", &b.to_string(), "")))
+        };
+        let (a, b, c) = (join(Some(true)), join(Some(true)), join(None));
+        assert!(a["ok"] == true && a["fast"] == true && a["media"] == true, "{a}");
+        assert!(c["ok"] == true && c["fast"] == false, "{c}");
+        let tok = |j: &Value| j["token"].as_str().unwrap().to_string();
+        let id = |j: &Value| j["me"]["id"].as_str().unwrap().to_string();
+        let _ = crate::realtime::poll(&tok(&b), 0);
+        let _ = crate::realtime::poll(&tok(&c), 0);
+
+        // Two pieces (a camera picture in two parts, as media.js splits one) in one batch, with the cookie.
+        let key = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210";
+        let _ = t.node.rpc_cookie.set(format!("__cookie__:{key}"));
+        let basic = format!("Authorization: Basic {}\r\n", base64::engine::general_purpose::STANDARD.encode(format!("__cookie__:{key}")));
+        let piece = |part: u8| {
+            let mut p = vec![0xa1, 1, 1, 0, 0, 0, 7, 0, 0, 0, 40, part, 2, 0, 64, 0, 48];
+            p.extend((0..100u8).map(|i| i ^ part));
+            base64::engine::general_purpose::STANDARD.encode(p)
+        };
+        let (p0, p1) = (piece(0), piece(1));
+        let batch = json!([
+            {"jsonrpc": "2.0", "id": 1, "method": "realtime.media", "params": {"token": tok(&a), "to": [id(&b), id(&c)], "b64": p0}},
+            {"jsonrpc": "2.0", "id": 2, "method": "realtime.media", "params": {"token": tok(&a), "to": [id(&b)], "b64": p1}},
+            {"jsonrpc": "2.0", "id": 3, "method": "realtime.fast", "params": {"token": tok(&a), "to": [id(&b)], "data": "hi"}},
+        ]);
+        let got = body_of(&ask(&t.node, &conf(), &post("/rpc", &batch.to_string(), &basic)));
+        let got = got.as_array().cloned().unwrap_or_default();
+        assert_eq!(got.len(), 3, "{got:?}");
+        assert_eq!(got[0]["result"]["sent"], 1, "only the fast seat is reached: {got:?}");
+        assert_eq!(got[1]["result"]["sent"], 1, "{got:?}");
+        assert_eq!(got[2]["result"]["sent"], 1, "{got:?}");
+        let evs = crate::realtime::poll(&tok(&b), 0).unwrap()["events"].as_array().cloned().unwrap_or_default();
+        let chunks: Vec<&Value> = evs.iter().filter(|e| e["type"] == "mchunk").collect();
+        assert_eq!(chunks.len(), 2, "{evs:?}");
+        assert_eq!(chunks[0]["b64"], p0);
+        assert_eq!(chunks[1]["b64"], p1);
+        assert_eq!(chunks[0]["member"]["id"], id(&a).as_str());
+        assert!(evs.iter().any(|e| e["type"] == "fast" && e["data"] == "hi"), "{evs:?}");
+        // The seat without the fast lane hears none of it, and may send none.
+        let evs = crate::realtime::poll(&tok(&c), 0).unwrap()["events"].as_array().cloned().unwrap_or_default();
+        assert!(!evs.iter().any(|e| e["type"] == "mchunk" || e["type"] == "fast"), "{evs:?}");
+        let refused = crate::api::dispatch(&t.node, &json!({"cmd": "realtime.media", "token": tok(&c), "to": [id(&a)], "b64": p0}));
+        assert!(refused.is_err_and(|e| e.contains("fast lane")));
+        // Which players the fast lane reaches, for the website's viewer: those here with the fast lane.
+        let lanes = crate::api::dispatch(&t.node, &json!({"cmd": "realtime.lanes", "token": tok(&a)})).unwrap();
+        assert_eq!(lanes["up"], json!([id(&b)]), "{lanes}");
+        for j in [&a, &b, &c] {
+            let _ = crate::realtime::leave(&t.node, &tok(j));
+        }
     }
 
     #[test]

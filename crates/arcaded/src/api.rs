@@ -765,7 +765,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 }
             };
             use arcade_ledger::{maps, names, ord, tokens};
-            match req["cmd"].as_str().unwrap() {
+            let cmd = req["cmd"].as_str().unwrap();
+            let local = (|| match cmd {
                 "ord" => {
                     need("ord")?;
                     match s("id") {
@@ -810,6 +811,15 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                     let a = s("owner").ok_or("give an address")?;
                     Ok(json!(tokens::balances(&node.chain, cc, &a).into_iter().map(|(t, o, tr)| json!({"tick": t, "overall": o, "transferable": tr})).collect::<Vec<_>>()))
                 }
+            })();
+            // Borrowed = installed (batch 5): the index not added here, or the chain only borrowed here (where a claim
+            // newer than our copy isn't found yet): read from an arcade keeping the index. (ord.chunks are this
+            // arcade's own fingerprints, never asked elsewhere.)
+            match local {
+                Err(e) if cmd != "ord.chunks" && (crate::explorer::names_missing_index(&e) || crate::borrow::is_borrowed(cp.key)) => {
+                    crate::explorer::index_read_elsewhere(node, cmd, cp, &req).map_err(|why| format!("{e} (asked the mesh too: {why})"))
+                }
+                r => r,
             }
         }
         // This arcade's ARCADE pay and Earn progress, read only (arc.earn without the switch).

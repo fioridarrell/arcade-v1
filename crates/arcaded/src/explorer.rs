@@ -127,6 +127,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
     "explorer.msg_rows", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
+    "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -140,6 +141,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.ledger_token", "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag",
     "explorer.search", "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription",
     "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn", "explorer.a_reactions", "explorer.a_replies",
+    "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
 ];
 
 /// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
@@ -261,7 +263,7 @@ fn needed_index(cmd: &str) -> Option<&'static str> {
     if cmd == "explorer.activity" {
         return Some("addresses");
     }
-    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies")).then_some("ledger")
+    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies") || cmd.starts_with("explorer.arc_")).then_some("ledger")
 }
 
 fn missing_index(e: &str) -> Option<String> {
@@ -322,6 +324,16 @@ fn link_previews(v: &mut Value) {
 }
 
 fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    // The storage analytics are of the ARCADE chain only: asked of it whatever chain the question names.
+    let arc_req;
+    let req = if cmd.starts_with("explorer.arc_") {
+        let mut q = req.clone();
+        q["chain"] = json!(crate::arcsvc::defined().map(|p| p.key).ok_or("this arcade knows no ARCADE chain")?);
+        arc_req = q;
+        &arc_req
+    } else {
+        req
+    };
     let local = handle_here(node, cmd, req, img_links);
     if req["local"] == true || !FORWARDABLE.contains(&cmd) {
         return local;
@@ -433,6 +445,14 @@ fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
 }
 
 fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    // The ARCADE chain's own state (crate::arcstats): no chain context or index, only the running chain.
+    match cmd {
+        "explorer.arc_storage_summary" => return crate::arcstats::summary(node, req),
+        "explorer.arc_segments" => return crate::arcstats::segments(node, req),
+        "explorer.arc_holders" => return crate::arcstats::holders(node, req),
+        "explorer.arc_payouts" => return crate::arcstats::payouts(node, req),
+        _ => {}
+    }
     let mut x = ctx(node, req)?;
     x.img_links = img_links;
     // Not kept here, or kept but still catching up (borrowed meanwhile, the home chain

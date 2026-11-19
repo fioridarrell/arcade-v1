@@ -2501,6 +2501,13 @@ pub fn linked_peers() -> Vec<String> {
 }
 
 /// The running ARCADE chain's network.
+/// Read-only access to the running ARCADE chain (crate::arcstats): its net and the chain, under its lock.
+pub(crate) fn with_chain<R>(f: impl FnOnce(&Net, &LocalChain) -> R) -> Option<R> {
+    let svc = svc()?;
+    let st = svc.st.lock().unwrap();
+    Some(f(&svc.net, &st.chain))
+}
+
 pub fn svc_net() -> Option<Net> {
     svc().map(|s| s.net)
 }

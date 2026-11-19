@@ -193,6 +193,9 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             }))
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
+        "mesh.sysinfo" => Ok(crate::sysinfo::read(node)),
+        "sysinfo.status" => Ok(crate::sysinfo::status(node)),
+        "sysinfo.set" => crate::sysinfo::set(node, &req),
         "mesh.relay" => Ok(crate::relaysvc::status(node)),
         "svc.offers" => crate::svcmesh::list_offers(node, req),
         "svc.services" => Ok(crate::svcmesh::services()),

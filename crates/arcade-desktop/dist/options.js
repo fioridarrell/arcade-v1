@@ -94,9 +94,46 @@ $("o-pay-set").addEventListener("click", async () => {
   refreshRelay();
 });
 
+// Share system info (sysinfo.status / sysinfo.set): the switch, and the exact record it sends, field by field.
+const SI_FIELDS = [["cpu", "CPU"], ["cores", "Cores"], ["ram_gb", "RAM"], ["gpus", "GPUs"], ["disk_gb", "Disk (this arcade's data)"],
+  ["os", "System"], ["arch", "Architecture"], ["version", "Arcade version"], ["seal", "Seal speed"]];
+function siValue(k, v, st) {
+  if (k === "cores") return [v.physical != null ? `${v.physical} physical` : null, v.logical != null ? `${v.logical} logical` : null].filter(Boolean).join(", ");
+  if (k === "ram_gb") return `${v} GB`;
+  if (k === "gpus") return v.map((g) => g.unified ? `${g.name}: memory shared with the RAM` : g.vram_gb != null ? `${g.name}: ${g.vram_gb} GB` : g.name).join("; ");
+  if (k === "disk_gb") return `${v.total} GB, ${v.free} GB free`;
+  if (k === "seal") return `${v} core-seconds per GiB, measured`;
+  return String(v);
+}
+async function refreshSysinfo() {
+  let st;
+  try { st = await api("sysinfo.status"); } catch (e) { say("o-si-msg", e.message, true); return; }
+  if (document.activeElement !== $("o-si-on")) $("o-si-on").checked = !!st.on;
+  const r = st.record || {};
+  const rows = SI_FIELDS.map(([k, label]) => {
+    let val = r[k] != null ? siValue(k, r[k], st) : null;
+    if (k === "seal" && val == null) val = `not measured yet: ${(st.seal.sealed_bytes / 1048576).toFixed(0)} of ${(st.seal.needs_bytes / 1048576).toFixed(0)} MiB sealed here`;
+    if (val == null) val = "can't be read here: left out";
+    return h("tr", {}, h("td", {}, label), h("td", { translate: ["cpu", "version", "os", "arch"].includes(k) ? "no" : null }, val),
+      h("td", { class: "muted" }, k === "seal" ? "measured" : "reported"));
+  });
+  $("o-si-rows").replaceChildren(...rows);
+  const sig = JSON.stringify(st.record);
+  if ($("o-si-json").dataset.sig !== sig) { $("o-si-json").dataset.sig = sig; $("o-si-json").textContent = JSON.stringify(st.record, null, 1); }
+  if (!$("o-si-msg").textContent) say("o-si-msg", st.on ? (st.sent_at ? `Shared: last sent ${agoText(st.sent_at)}.` : "Shared.") : `Not shared. This is what would go out (${st.bytes} bytes, plus its signature).`);
+}
+$("o-si-on").addEventListener("change", async (e) => {
+  try {
+    await api("sysinfo.set", { on: e.target.checked });
+    say("o-si-msg", e.target.checked ? "Sharing this arcade's system info with the mesh." : "Not shared any more: every arcade was told to drop it.");
+  } catch (err) { say("o-si-msg", err.message, true); }
+  refreshSysinfo();
+});
+
 async function refreshOptions() {
   refreshCache();
   refreshRelay();
+  refreshSysinfo();
   const u = await api("update.status");
   $("o-ver").textContent = u.version || "local build";
   $("o-new").textContent = u.newest ? (u.newer ? `${u.newest} (newer)` : `${u.newest} (this one)`) : "—";

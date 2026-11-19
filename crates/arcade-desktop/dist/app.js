@@ -182,6 +182,37 @@ function chainChips(c) {
   return out;
 }
 const IX_NAMES = { addresses: "addresses", ord: "inscriptions", tokens: "tokens", names: "names", maps: "maps", ledger: "arcade ledger", profiles: "profiles", messages: "messages" };
+// An arcade's round trip (mesh.overview ping_ms, the least of its link's last pings): "—" when not linked or not
+// timed yet; marked when the link goes through a relay.
+function pingPill(a) {
+  const tip = "Round trip over the mesh link: the fastest of its last pings";
+  if (!a.linked || a.ping_ms == null) return h("span", { class: "pill ping", title: tip }, "—");
+  const ms = a.ping_ms < 10 ? a.ping_ms.toFixed(1) : Math.round(a.ping_ms);
+  return h("span", { class: "pill ping", title: tip }, a.ping_via === "relay" ? `${ms} ms relayed` : `${ms} ms`);
+}
+// What an arcade runs on, when its operator shares it (mesh.overview machine, from its signed record): one short
+// line, each figure as reported by it; the seal speed is measured from its own seals.
+const sig2 = (x) => Number(x.toPrecision(2)).toString();
+function machineLine(m) {
+  if (!m) return null;
+  const parts = [];
+  if (m.cores) parts.push(`${m.cores} cores`);
+  if (m.ram_gb) parts.push(`${m.ram_gb} GB`);
+  const names = new Map();
+  for (const g of m.gpus || []) {
+    const n = String(g.name || "").replace(/^NVIDIA\s+/, "").replace(/^GeForce\s+/, "") + (g.unified ? " (unified)" : "");
+    names.set(n, (names.get(n) || 0) + 1);
+  }
+  for (const [n, c] of names) parts.push(h("span", { translate: "no" }, c > 1 ? `${c}× ${n}` : n));
+  if (m.disk_free_gb != null) parts.push(m.disk_free_gb >= 1000 ? `${(m.disk_free_gb / 1000).toFixed(1)} TB free` : `${m.disk_free_gb} GB free`);
+  parts.push("reported");
+  if (m.seal) parts.push(`seals ${sig2(m.seal / 3600)} core-h/GiB, measured`);
+  const tip = [m.cpu, m.threads ? `${m.threads} threads` : null, m.os && m.arch ? `${m.os} ${m.arch}` : null].filter(Boolean).join(" · ");
+  const kids = [];
+  parts.forEach((p, i) => { if (i) kids.push(" · "); kids.push(typeof p === "string" ? h("span", {}, p) : p); });
+  return h("div", { class: "meta machine", title: tip || null }, ...kids);
+}
+
 function drawMesh(ov) {
   const all = ov.arcades || [];
   const linked = all.filter((a) => a.linked).length;
@@ -226,8 +257,10 @@ function drawMesh(ov) {
       h("div", { class: "top" },
         h("span", { class: "who" }, who),
         a.version ? h("span", { class: "pill" }, a.version) : null,
-        h("span", { class: "pill " + (a.linked ? "ok" : "") }, a.linked ? `linked ${ago(a.since)}` : "heard, not linked")),
+        h("span", { class: "pill " + (a.linked ? "ok" : "") }, a.linked ? `linked ${ago(a.since)}` : "heard, not linked"),
+        pingPill(a)),
       h("div", { class: "meta" }, `node ${short(a.node, 16)}${a.addr ? " · " + a.addr : ""}`),
+      machineLine(a.machine),
       chains.length
         ? h("div", { class: "lines" }, ...chains.map((c) => h("div", { class: "line" },
             coinLogo(c.key, c.name, "span", "logo"), h("span", { class: "cn" }, c.name), h("span", { class: "chips" }, ...chainChips(c)))))

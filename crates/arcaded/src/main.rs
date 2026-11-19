@@ -111,6 +111,8 @@ mod ringsvc;
 mod rtcsvc;
 mod rpc;
 mod sizes;
+mod sysinfo;
+mod linkrtt;
 mod udpsvc;
 mod relaysvc;
 mod svcmesh;
@@ -562,6 +564,7 @@ fn main() {
     // A home chain far behind (a fresh install): installed from copies when the mesh has them.
     v1import::auto_home(node.clone());
     sizes::load(&node);
+    sysinfo::load(&node);
     if node.home_mode == "shared" {
         // Shared home chain (test setups): keep our share of its blocks right.
         let n = node.clone();
@@ -632,6 +635,11 @@ fn main() {
     {
         let n = node.clone();
         std::thread::Builder::new().name("sizes".into()).spawn(move || sizes::run(n)).unwrap();
+    }
+    {
+        // This machine, told to the mesh when the operator shares it (off by default).
+        let n = node.clone();
+        std::thread::Builder::new().name("sysinfo".into()).spawn(move || sysinfo::run(n)).unwrap();
     }
     {
         // This arcade's own waiting transactions: put back after a restart, dropped ones shown (ownwait.rs).

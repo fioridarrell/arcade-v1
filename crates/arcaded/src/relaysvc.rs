@@ -325,7 +325,7 @@ fn rl(head: Value) -> Frame {
 }
 
 /// A link that is itself relayed: nothing is relayed over it (one hop only).
-fn is_relayed(link: &Link) -> bool {
+pub(crate) fn is_relayed(link: &Link) -> bool {
     link.describe().starts_with("relay:")
 }
 

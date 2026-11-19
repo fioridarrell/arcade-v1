@@ -282,7 +282,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `chains.peers` | `/api/v1/chains/peers` | read | key | A chain's P2P address book: nodes known, working in the last day, resting after failures; the working ones and the next to try. |
 | `chains.list` | `/api/v1/chains/list` | public | — | Every chain V1.0 knows, installed or not, with sizes reported by arcades; per chain: hidden (chains.hide), queued (position), queued_resume and installing (the chain being installed now). |
-| `chains.status` | `/api/v1/chains/status` | public | key | One chain's staged progress. |
+| `chains.status` | `/api/v1/chains/status` | public | key | One chain's staged progress. `recovered_at_start` is `{from, to}` when this start wound the tip back (the last stop left without writing the coin caches, exit code 3), else null. |
 | `chains.offers` | `/api/v1/chains/offers` | public | — | Chains other arcades offer over the mesh. |
 | `chains.sizes` | `/api/v1/chains/sizes` | admin | — | Measure this arcade's disk use per chain now. |
 | `chains.add` | `/api/v1/chains/add` | admin | key, mode?, with? | Install a chain (mode full, shared or chain; with = indexes). |

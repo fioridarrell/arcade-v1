@@ -202,12 +202,23 @@ pub fn request_restart() {
     STOP_ASKED.store(true, std::sync::atomic::Ordering::SeqCst);
 }
 
+/// Exit codes: 0 a clean stop (the coin caches written), 1 the arcade couldn't start (the
+/// reason is logged), 3 a second stop signal left without writing the coin caches, 75 an update
+/// couldn't start the new arcaded (the service manager starts it), 101 a crash (Rust panic).
+pub const EXIT_SECOND_STOP: i32 = 3;
+const SECOND_STOP_LINE: &str =
+    "arcaded: second stop signal: leaving without writing the coin caches (the next start connects that stretch again)\n";
+
 #[cfg(unix)]
 extern "C" fn on_stop_signal(_: libc::c_int) {
     // A second SIGTERM / Ctrl-C while the caches are being written: leave at once (the next
-    // start winds the tip back, as before this flush existed). _exit is async-signal-safe.
+    // start winds the tip back, as before this flush existed). write and _exit are
+    // async-signal-safe (eprintln! isn't: it takes a lock).
     if STOP_ASKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-        unsafe { libc::_exit(1) };
+        unsafe {
+            libc::write(2, SECOND_STOP_LINE.as_ptr() as *const libc::c_void, SECOND_STOP_LINE.len());
+            libc::_exit(EXIT_SECOND_STOP)
+        };
     }
 }
 
@@ -217,7 +228,9 @@ unsafe extern "system" fn on_console_ctrl(ctrl: u32) -> i32 {
     match ctrl {
         0 | 1 | 2 | 5 | 6 => {
             if STOP_ASKED.swap(true, std::sync::atomic::Ordering::SeqCst) {
-                unsafe { libc::_exit(1) };
+                // A console handler runs on a thread of its own, not in a signal: printing is safe here.
+                eprint!("{SECOND_STOP_LINE}");
+                unsafe { libc::_exit(EXIT_SECOND_STOP) };
             }
             // CLOSE / LOGOFF / SHUTDOWN end the process as soon as this returns. Hold it here
             // while the stop thread writes the caches and exits (Windows allows ~5 s for a
@@ -334,6 +347,15 @@ usage: arcaded [options]
   --import-node-key FILE  take this node identity (an original arcade's mesh.key: 64 hex digits), so the
                         arcade keeps its node id; only into a new home (or one with the same key)
   --help, --version     print this or the version and exit
+
+exit codes:
+  0    stopped cleanly (\"arcaded: stopped\"): the coin caches were written
+  1    couldn't start: the line before says why (another arcaded in this folder, a bad option, ...)
+  3    a second stop signal during the stop: left without writing the coin caches; the next
+       start winds each chain's tip back to its last complete cache (logged, and shown as
+       \"recovered_at_start\" in chains.status) and connects that stretch again from stored blocks
+  75   an update couldn't start the new arcaded: the service manager starts it
+  101  a crash: the panic message is logged just before
 ";
 
 /// Hold an exclusive lock on DIR/arcaded.lock for the life of the process (released by the
@@ -406,6 +428,12 @@ fn open_files_limit(cur: u64, hard: u64, want: u64) -> u64 {
     want.min(hard).max(cur)
 }
 
+/// Leave with exit code 1 because the arcade can't start, saying why (exit codes: USAGE).
+fn fail_start(why: &str) -> ! {
+    eprintln!("arcaded: couldn't start: {why}");
+    std::process::exit(1)
+}
+
 fn main() {
     tame_malloc();
     more_open_files();
@@ -429,7 +457,7 @@ fn main() {
         .unwrap_or_else(arcade_local::default_home);
     let mesh = !args.iter().any(|a| a == "--no-mesh");
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
-    let mesh_port: Option<u16> = match opt("--mesh-port").map(|v| v.parse::<u16>().expect("--mesh-port N")) {
+    let mesh_port: Option<u16> = match opt("--mesh-port").map(|v| v.parse::<u16>().unwrap_or_else(|_| fail_start(&format!("--mesh-port {v}: give a port number")))) {
         Some(0) => None,
         Some(p) => Some(p),
         None => Some(8421),
@@ -438,7 +466,7 @@ fn main() {
         args.iter().enumerate().filter(|(_, a)| *a == "--mesh-peer").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
     let no_seeds = args.iter().any(|a| a == "--no-seeds");
     let fresh = !home.exists();
-    std::fs::create_dir_all(&home).expect("create home");
+    std::fs::create_dir_all(&home).unwrap_or_else(|e| fail_start(&format!("{}: {e}", home.display())));
     // A home made here holds the wallet and its key file: this user only. One made by the package (StateDirectory,
     // shared with the arcade group) keeps its mode.
     #[cfg(unix)]
@@ -465,8 +493,8 @@ fn main() {
         }
     };
 
-    let app = arcade_app::AppDb::open(&home).expect("open arcade.mdbx");
-    let chain = arcade_chaindb::ChainDb::open(home.join("chain.mdbx")).expect("open chain.mdbx");
+    let app = arcade_app::AppDb::open(&home).unwrap_or_else(|e| fail_start(&format!("opening arcade.mdbx: {e}")));
+    let chain = arcade_chaindb::ChainDb::open(home.join("chain.mdbx")).unwrap_or_else(|e| fail_start(&format!("opening chain.mdbx: {e}")));
     // An original arcade moving to V1.0 keeps its node id: its mesh.key seed becomes the node identity.
     if let Some(i) = args.iter().position(|a| a == "--import-node-key") {
         let path = args.get(i + 1).map(std::path::PathBuf::from).unwrap_or_default();
@@ -483,7 +511,7 @@ fn main() {
             }
         }
     }
-    let identity = app.node_identity().expect("node identity");
+    let identity = app.node_identity().unwrap_or_else(|e| fail_start(&format!("the node identity: {e}")));
     let node = Arc::new(Node {
         home: home.clone(),
         rpc_cookie: Default::default(),
@@ -530,7 +558,7 @@ fn main() {
         let n = node.clone();
         std::thread::Builder::new().name("api".into()).spawn(move || api::serve_on(n, listener)).unwrap();
     }
-    chains::start_home(&node).expect("home indexes");
+    chains::start_home(&node).unwrap_or_else(|e| fail_start(&format!("the home chain's indexes: {e}")));
     // A local ARCADE test chain (stand-in rules; closed test networks only), which this
     // arcade can then install in Chains & Coins: crate::arcsvc.
     if let Some(settings) = opt("--arc-local") {
@@ -729,7 +757,7 @@ fn main() {
             }).unwrap();
         }
         // STUN server (--stun-port, default 3478, 0 = none) and UDP paths beside mesh links.
-        let stun_flag: Option<u16> = opt("--stun-port").map(|v| v.parse().expect("--stun-port N"));
+        let stun_flag: Option<u16> = opt("--stun-port").map(|v| v.parse().unwrap_or_else(|_| fail_start(&format!("--stun-port {v}: give a port number"))));
         udpsvc::start(node.clone(), stun_flag);
         if let Some(port) = mesh_port {
             let n = node.clone();

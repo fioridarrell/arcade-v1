@@ -672,6 +672,7 @@ fn coin_cache_matches_direct_and_survives_a_crash() {
     }
     let db = ChainDb::open(&path).unwrap();
     assert_eq!(db.tip(c).unwrap().unwrap().height, 10, "wound back to the coins' last good point");
+    assert_eq!(db.recovered_at_start(c), Some((30, 10)), "the wind-back is readable after the start");
     db.connect_blocks(direct.p, &blocks[10..]).unwrap();
     assert_eq!(coin_tables(&db)[..2], coin_tables(&direct.db)[..2], "crash, recovery, reconnect = direct");
 }

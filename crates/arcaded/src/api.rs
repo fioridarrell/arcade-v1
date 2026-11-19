@@ -921,6 +921,17 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 st["place"] = crate::chaindrive::place(node, p.chain_no);
                 st["move"] = crate::chaindrive::status(p.key);
             }
+            // A tip wound back when this arcade started (the last stop left without writing the coin
+            // caches): the stretch between is connected again from the stored blocks.
+            if st.is_object() {
+                let no = crate::chains::find(&key)
+                    .map(|p| p.chain_no)
+                    .or_else(|| arcade_chain::params::ARCADE_CHAINS.iter().find(|a| a.1 == key).map(|a| a.0));
+                st["recovered_at_start"] = match no.and_then(|c| node.chain.recovered_at_start(c)) {
+                    Some((from, to)) => json!({"from": from, "to": to}),
+                    None => Value::Null,
+                };
+            }
             Ok(st)
         }
         "chains.drives" => Ok(crate::chaindrive::drives(node)),

@@ -427,7 +427,13 @@ pub fn short_of_copies() -> Vec<Value> {
 
 /// `arc.fog`: what fog storage does here (the last round's view).
 pub fn status() -> Value {
-    STATUS.lock().unwrap().clone().unwrap_or_else(|| json!({"on": false, "grace_secs": grace_secs(), "idle_secs": idle_secs(), "held_ids": crate::arcblob::held_ids().iter().take(200).map(hex::encode).collect::<Vec<_>>()}))
+    let mut v = STATUS.lock().unwrap().clone().unwrap_or_else(|| json!({"on": false, "grace_secs": grace_secs(), "idle_secs": idle_secs()}));
+    // What's held is read now, not as of the last round.
+    let held = crate::arcblob::held_ids();
+    v["held"] = json!(held.len());
+    v["mine"] = json!(held.iter().filter(|id| crate::arcblob::is_mine(id)).count());
+    v["held_ids"] = json!(held.iter().take(200).map(hex::encode).collect::<Vec<_>>());
+    v
 }
 
 #[cfg(test)]

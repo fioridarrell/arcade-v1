@@ -13,11 +13,16 @@
    Nothing is sent until the page names a player (share), and nobody's sound plays until the page
    names them (hear). While anything is open the window shows so, with a Stop the page cannot cover.
 
-   A piece on the wire: 0xA1, kind (1 camera, 2 microphone, 3 screen, 4 screen sound, 9 a note),
-   flags (1: key frame), seq (u32), time (u32, ms), part, parts, width (u16), height (u16), bytes. */
+   A piece on the wire: 0xA1, kind (1 camera, 2 microphone, 3 screen, 4 screen sound, 5 the camera's mask,
+   9 a note), flags (1: key frame), seq (u32), time (u32, ms), part, parts, width (u16), height (u16), bytes.
+
+   The cutout (start({video, cutout}), cutout.js): the camera's picture goes through the cutter before it is
+   encoded, so every viewer sees the blurred or composited picture. In 'transparent' the blurred picture goes, and
+   with it a mask (kind 5, the time of the picture it belongs to): a window that knows masks draws the person
+   alone over whatever the page put behind the tile; an older one ignores kind 5 and shows the blurred picture. */
 (function () {
   "use strict";
-  const KIND = { cam: 1, mic: 2, scr: 3, snd: 4, note: 9 };
+  const KIND = { cam: 1, mic: 2, scr: 3, snd: 4, mask: 5, note: 9 };
   const HEAD = 17, PIECE = 48000, LOUDEST = 4, TILES = 16;
   const CAM = { most: 640, fps: 20, bitrate: 600000 }, SCR = { most: 1280, fps: 10, bitrate: 1500000 };
   const KEY_EVERY = 2000, GONE_AFTER = 3000, SPEAK_ON = 0.04, SPEAK_HOLD = 600, OUT_MOST = 80;
@@ -84,7 +89,7 @@
       if (!s.media) {
         s.media = { stream: null, xstream: null, video: false, audio: false, screen: false, share: {}, hear: {}, volume: {},
                     place: {}, muted: { video: false, audio: false, sound: false }, tiles: {}, enc: {}, rx: {}, out: [], busy: false,
-                    frames: {}, levels: null, spatial: null, speaking: {}, kfAsked: {} };
+                    frames: {}, levels: null, spatial: null, speaking: {}, kfAsked: {}, cut: null };
         seats.add(s);
         s.media.watch = setInterval(() => watch(s), 150);
       }
@@ -164,17 +169,26 @@
         e.w = w; e.h = h; e.wantKey = true;
       };
       e.timer = setInterval(() => {
-        if (md.enc[slot] !== e || v.readyState < 2 || !v.videoWidth) return;
+        // The camera through the cutter: its canvas is the picture (already at most CAM.most).
+        // While a cutout is asked for and has drawn nothing yet, nothing goes (never the background it hides).
+        if (slot === "cam" && md.cutMode && !(md.cut && md.cut.drawnAt)) return;
+        const cut = slot === "cam" && md.cut && md.cut.drawnAt ? md.cut : null, src = cut ? cut.canvas : v;
+        const sw = cut ? src.width : v.videoWidth, sh = cut ? src.height : v.videoHeight;
+        if (md.enc[slot] !== e || (!cut && v.readyState < 2) || !sw) return;
         if (slot === "cam" && md.muted.video) return;
-        if (!targets(s, kind).length) { e.wantKey = true; return; }          // nobody to send to: nothing encoded
-        const scale = Math.min(1, opt.most / Math.max(v.videoWidth, v.videoHeight));
-        const w = Math.max(2, Math.round(v.videoWidth * scale / 2) * 2), h = Math.max(2, Math.round(v.videoHeight * scale / 2) * 2);
+        const to = targets(s, kind);
+        if (!to.length) { e.wantKey = true; return; }                         // nobody to send to: nothing encoded
+        const scale = Math.min(1, opt.most / Math.max(sw, sh));
+        const w = Math.max(2, Math.round(sw * scale / 2) * 2), h = Math.max(2, Math.round(sh * scale / 2) * 2);
         if (!e.enc || e.enc.state === "closed" || w !== e.w || h !== e.h) make(w, h);
         if (e.enc.encodeQueueSize > 4) return;                                // the encoder is behind: skip a frame
         if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
-        g.drawImage(v, 0, 0, w, h);
-        const now = performance.now(), key = e.wantKey || now - e.lastKey > KEY_EVERY;
-        const frame = new VideoFrame(c, { timestamp: Math.round(now * 1000) });
+        g.drawImage(src, 0, 0, w, h);
+        const now = Math.round(performance.now()), key = e.wantKey || now - e.lastKey > KEY_EVERY;
+        // Transparent: the mask of this picture goes first (a new one, or again with each key frame).
+        const mask = cut && cut.mask();
+        if (mask && (key || mask.seq !== e.maskSeq)) { e.maskSeq = mask.seq; sendPiece(s, KIND.mask, false, mask.seq, now, mask.bytes, mask.w, mask.h, to); }
+        const frame = new VideoFrame(c, { timestamp: now * 1000 });
         try { e.enc.encode(frame, { keyFrame: key }); if (key) { e.wantKey = false; e.lastKey = now; } } catch (err) { e.wantKey = true; }
         frame.close();
       }, Math.round(1000 / opt.fps));
@@ -229,7 +243,7 @@
     // ---------------- receiving ----------------
     function rxOf(s, id) {
       const md = s.media;
-      return md.rx[id] || (md.rx[id] = { parts: {}, dec: {}, last: {}, said: "", level: {} });
+      return md.rx[id] || (md.rx[id] = { parts: {}, dec: {}, last: {}, said: "", level: {}, masks: [] });
     }
     function heard(s, ev) {
       const p = ev.member;
@@ -251,8 +265,20 @@
         for (const k2 in rx.parts) if (+k2.split("/")[1] < seq - 30) delete rx.parts[k2];
       }
       if (kind === KIND.note) { heardNote(s, p, body); return; }
+      if (kind === KIND.mask) { heardMask(s, p, t, body, w, h); return; }
       if (kind === KIND.cam || kind === KIND.scr) heardVideo(s, p, kind, key, t, body, w, h);
       else if (kind === KIND.mic || kind === KIND.snd) heardAudio(s, p, kind, t, body);
+    }
+    // A mask for their camera's picture of time t: kept with the last few, and their pictures drawn through it.
+    function heardMask(s, p, t, body, w, h) {
+      const C = window.ArcadeCutout, rx = rxOf(s, p.id);
+      const data = C && C.decodeMask(body, w, h);
+      if (!data) return;
+      const m = { t, w, h, data };
+      m.canvas = C.maskCanvas(document.createElement("canvas"), m);
+      C.keepMask(rx.masks, m);
+      rx.last.mask = Date.now();
+      said(s, p.id);
     }
     function heardNote(s, p, body) {
       let o; try { o = JSON.parse(new TextDecoder().decode(body)); } catch (err) { return; }
@@ -276,7 +302,11 @@
         try { if (d) d.dec.close(); } catch (err) {}
         d = rx.dec[slot] = { w, h, broken: false, dec: null };
         d.dec = new VideoDecoder({
-          output: (frame) => { paint(s, tileKey, frame); frame.close(); },
+          output: (frame) => {
+            const masked = slot === "cam" && rx.masks.length && Date.now() - (rx.last.mask || 0) < GONE_AFTER;
+            paint(s, tileKey, frame, masked ? window.ArcadeCutout.maskFor(rx.masks, Math.round(frame.timestamp / 1000)) : null);
+            frame.close();
+          },
           error: () => { d.broken = true; askKey(s, p.id); },
         });
         d.dec.configure({ codec: "vp8", codedWidth: w, codedHeight: h, optimizeForLatency: true });
@@ -324,8 +354,8 @@
       const md = s.media, rx = md && md.rx[id], peer = peerOf(s, id);
       if (!rx || !peer) return;
       const now = Date.now(), live = (k) => rx.last[k] && now - rx.last[k] < GONE_AFTER;
-      const video = live("cam") || live("scr"), audioOn = live("mic");
-      const was = rx.said, is = video || audioOn ? (video ? "v" : "") + (audioOn ? "a" : "") : "";
+      const video = live("cam") || live("scr"), audioOn = live("mic"), clear = !!(live("cam") && live("mask"));
+      const was = rx.said, is = video || audioOn ? (video ? "v" : "") + (audioOn ? "a" : "") + (clear ? "t" : "") : "";
       if (was === is) return;
       // A player who starts sending: their sound often comes a moment before their first key
       // frame. Wait for the other kind a little, so the page hears both at once (as on the original).
@@ -335,7 +365,7 @@
       }
       if (!is) rx.first = 0;
       rx.said = is;
-      if (is) say(s, { type: "media", member: peer.p, video, audio: audioOn });
+      if (is) say(s, clear ? { type: "media", member: peer.p, video, audio: audioOn, transparent: true } : { type: "media", member: peer.p, video, audio: audioOn });
       else say(s, { type: "media-off", member: peer.p });
       drawAll(s);
     }
@@ -354,19 +384,37 @@
       }
       return el;
     }
-    function paint(s, key, frame) {
+    // A picture into its tile; through a mask (the person alone, nothing behind) when one came with it.
+    function paint(s, key, frame, mask) {
       const md = s.media;
       if (!md) return;
       const c = tile(s, key, false);
-      if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) { c.width = frame.displayWidth; c.height = frame.displayHeight; }
-      c.getContext("2d").drawImage(frame, 0, 0);
+      if (mask) window.ArcadeCutout.paintMasked(c, frame, mask, frame.displayWidth, frame.displayHeight);
+      else {
+        if (c.width !== frame.displayWidth || c.height !== frame.displayHeight) { c.width = frame.displayWidth; c.height = frame.displayHeight; }
+        c.getContext("2d").drawImage(frame, 0, 0);
+      }
+      c.style.background = mask ? "transparent" : "#000";
+      c.style.zIndex = mask ? "1" : "";                   // a cut picture is drawn over the others (their screen, say)
       c._at = Date.now();
+    }
+    // Your own picture as it goes out, from the cutter (the person alone in 'transparent').
+    function paintMe(s) {
+      const md = s.media, cut = md && md.cut, c = md && md.tiles.me;
+      if (!cut || !c || c.tagName !== "CANVAS") return;
+      const src = cut.mode === "transparent" ? cut.alpha : cut.canvas;
+      if (!src.width || src.width < 4) return;
+      if (c.width !== src.width || c.height !== src.height) { c.width = src.width; c.height = src.height; }
+      const g = c.getContext("2d");
+      g.globalCompositeOperation = "copy"; g.drawImage(src, 0, 0); g.globalCompositeOperation = "source-over";
+      c.style.background = cut.mode === "transparent" ? "transparent" : "#000";
+      c.style.zIndex = cut.mode === "transparent" ? "1" : "";
     }
     function drawAll(s) {
       const md = s.media;
       if (!md) return;
       const keep = {};
-      if (md.stream && md.video) keep.me = md.stream;
+      if (md.stream && md.video) keep.me = md.cut ? true : md.stream;
       if (md.xstream) keep["me#screen"] = md.xstream;
       const now = Date.now();
       for (const id in md.rx) {
@@ -504,6 +552,7 @@
     function stopStream(s) {
       const md = s.media;
       stopSlot(s, "cam"); stopSlot(s, "mic");
+      cutOff(s);
       if (md.stream) md.stream.getTracks().forEach((t) => t.stop());
       md.stream = null; md.video = md.audio = md.screen = false;
     }
@@ -513,6 +562,7 @@
       stopSlot(s, "scr"); stopSlot(s, "snd");
       md.xstream.getTracks().forEach((t) => t.stop());
       md.xstream = null;
+      if (md.cut) md.cut.setScreen(null);
       note(s, Object.keys(md.share).filter((id) => direct(s, id)), { screenOff: 1 });
       drawAll(s);
       if (told) say(s, { type: "media-state", state: "screen-off" });
@@ -530,12 +580,53 @@
       if (had && !quiet) say(s, { type: "media-state", state: "off" });
     }
 
+    // ---------------- the cutout ----------------
+    const CUTS = ["blur", "composite", "transparent"];
+    function cutOff(s) {
+      const md = s.media;
+      if (md && md.cut) { md.cut.stop(); md.cut = null; }
+    }
+    // The cutter on the camera's track, or its mode changed; mode "" ends it. The answer once it is running:
+    // {cutout, cutoutWhy?}: what runs, and why it is not what was asked (no screen yet, too slow, no model).
+    async function cutOn(s, mode) {
+      const md = s.media, cam = md.stream && md.video && !md.screen ? md.stream.getVideoTracks()[0] : null;
+      md.cutMode = mode;
+      if (!mode) { cutOff(s); drawAll(s); return {}; }
+      if (!cam) throw new Error("no camera: start({video: true}) first");
+      if (!window.ArcadeCutout) throw new Error("no cutout in this window");
+      if (md.cut && md.cut.track0 !== cam) cutOff(s);
+      if (!md.cut) {
+        let ready;
+        const wait = new Promise((ok) => { ready = ok; });
+        const cut = window.ArcadeCutout.start({
+          track: cam, mode, base: "", fps: CAM.fps, most: CAM.most,
+          screen: md.xstream ? md.xstream.getVideoTracks()[0] || null : null,
+          onstate: (st) => {
+            if (st.why !== "getting ready") ready();
+            if (md.cut === cut) say(s, { type: "media-cutout", mode: st.mode, want: st.want, why: st.why });
+          },
+          onframe: () => { if (md.cut === cut) paintMe(s); },
+        });
+        cut.track0 = cam;
+        md.cut = cut;
+        if (md.enc.cam) md.enc.cam.wantKey = true;
+        drawAll(s);
+        await Promise.race([wait, new Promise((ok) => setTimeout(ok, 10000))]);
+        if (md.cut !== cut) return {};
+      } else md.cut.setMode(mode);
+      const cut = md.cut;
+      return cut.mode === mode ? { cutout: cut.mode } : { cutout: cut.mode, cutoutWhy: cut.why };
+    }
+
     async function door(s, m) {
       if (!s.fast) throw new Error("media needs a room joined with {fast: true}");
       const md = mediaOf(s);
       switch (m.do) {
         case "start": {
           const want = { video: !!m.video, audio: !!m.audio, screen: !!m.screen, sound: !!(m.sound && m.screen) };
+          // No cutout said: as before (a second start keeps it); null or "" ends it.
+          const cutout = m.cutout === undefined ? md.cutMode || "" : m.cutout ? String(m.cutout) : "";
+          if (cutout && CUTS.indexOf(cutout) < 0) throw new Error("a cutout is " + CUTS.join(", ") + " or none");
           if (want.screen) want.video = false;
           if (!want.video && !want.audio && !want.screen) throw new Error("ask for video, audio, screen or a pair");
           const md0 = navigator.mediaDevices;
@@ -568,7 +659,11 @@
           }));
           drawAll(s);
           say(s, { type: "media-state", state: "on" });
-          return { video: md.video, audio: md.audio, screen: md.screen };
+          const out = { video: md.video, audio: md.audio, screen: md.screen };
+          if (cutout && md.video && !md.screen) Object.assign(out, await cutOn(s, cutout));
+          else if (cutout) Object.assign(out, { cutout: "off", cutoutWhy: md.screen ? "the cutout is for a camera, not a screen" : "no camera" });
+          else md.cutMode = "";
+          return out;
         }
         case "stop": stopAll(s); return {};
         case "screen": {
@@ -581,6 +676,7 @@
           catch (err) { throw new Error(err && err.name === "NotAllowedError" ? "cancelled" : String(err && (err.name || err.message) || err)); }
           stopScreen(s, false);
           md.xstream = x; md.muted.sound = false;
+          if (md.cut) md.cut.setScreen(x.getVideoTracks()[0] || null);
           startVideo(s, "scr", KIND.scr, new MediaStream(x.getVideoTracks()), SCR);
           if (x.getAudioTracks().length) startAudio(s, "snd", KIND.snd, new MediaStream(x.getAudioTracks()));
           x.getVideoTracks().forEach((t) => t.addEventListener("ended", () => { if (md.xstream === x) stopScreen(s, true); }));
@@ -645,8 +741,13 @@
           drawPill(); return {};
         }
         case "spatial": md.spatial = spatialClean(m.scene); sound(s); return {};
+        case "cutout": {
+          const mode = m.mode ? String(m.mode) : "";
+          if (mode && CUTS.indexOf(mode) < 0) throw new Error("a cutout is " + CUTS.join(", ") + " or none");
+          return await cutOn(s, mode);
+        }
         case "shown": return {};
-        default: throw new Error("media ops are start, stop, screen, share, hear, volume, place, mute, frames, spatial and levels");
+        default: throw new Error("media ops are start, stop, screen, share, hear, volume, place, mute, frames, spatial, levels and cutout");
       }
     }
 

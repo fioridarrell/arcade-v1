@@ -8,7 +8,7 @@
      room.fast (a room joined with {fast: true}): on('message' | 'peer'), send(value, {reliable, to}),
        routes(), link(ids, {max}), peers()
      room.media (on a fast room): start, stop, showScreen, hideScreen, share, frames, levels, spatial,
-       hear, volume, place, mute; on('media' | 'media-off' | 'state' | 'speaking' | 'frame' | 'levels')
+       hear, volume, place, mute, cutout; on('media' | 'media-off' | 'state' | 'speaking' | 'frame' | 'levels' | 'cutout')
      arcade.realtime.area('world', {cell, view, x, y})  -> Area: on, move(x, y), send, members, leave
      arcade.realtime.ring(address, {line, link})  arcade.realtime.ringed()
 
@@ -77,10 +77,10 @@
   function Media(room, screen) {
     this.room = room;
     this.screen = screen;                           // this window can share its screen
-    this._on = { media: [], 'media-off': [], state: [], speaking: [], frame: [], levels: [] };
+    this._on = { media: [], 'media-off': [], state: [], speaking: [], frame: [], levels: [], cutout: [] };
   }
   Media.prototype.on = function (type, fn) {
-    if (!this._on[type]) throw new Error('media events are: media, media-off, state, speaking, frame, levels');
+    if (!this._on[type]) throw new Error('media events are: media, media-off, state, speaking, frame, levels, cutout');
     this._on[type].push(fn);
     return this;
   };
@@ -92,11 +92,26 @@
   function okOrError(promise) {
     return promise.then(function () { return { ok: true }; }, function (err) { return { ok: false, error: err.message }; });
   }
+  // cutout ('blur', 'composite', 'transparent', or null for none): the camera's picture with the person cut out. Left
+  // out, a second start keeps what the first said.
+  function withCutout(said, r) {
+    if (said.cutout) r.cutout = String(said.cutout);
+    if (said.cutoutWhy) r.cutoutWhy = String(said.cutoutWhy);
+    return r;
+  }
   Media.prototype.start = function (options) {
     options = options || { video: true, audio: true };
-    return this._ask('start', { video: !!options.video, audio: !!options.audio, screen: !!options.screen, sound: !!options.sound,
-                                facing: options.facing === 'environment' ? 'environment' : options.facing === 'user' ? 'user' : '' }, 600000)
-      .then(function (said) { var r = { ok: true, video: !!said.video, audio: !!said.audio, screen: !!said.screen }; if (said.sound) r.sound = true; return r; },
+    var m = { video: !!options.video, audio: !!options.audio, screen: !!options.screen, sound: !!options.sound,
+              facing: options.facing === 'environment' ? 'environment' : options.facing === 'user' ? 'user' : '' };
+    if (options.cutout !== undefined) m.cutout = options.cutout ? String(options.cutout) : '';
+    return this._ask('start', m, 600000)
+      .then(function (said) { var r = { ok: true, video: !!said.video, audio: !!said.audio, screen: !!said.screen }; if (said.sound) r.sound = true; return withCutout(said, r); },
+            function (err) { return { ok: false, error: err.message }; });
+  };
+  // The cutout on the camera now on, changed, or (null) off: {ok, cutout, cutoutWhy?}.
+  Media.prototype.cutout = function (mode) {
+    return this._ask('cutout', { mode: mode ? String(mode) : '' }, 600000)
+      .then(function (said) { return withCutout(said, { ok: true, cutout: said.cutout ? String(said.cutout) : 'off' }); },
             function (err) { return { ok: false, error: err.message }; });
   };
   Media.prototype.stop = function () { return this._ask('stop'); };
@@ -217,7 +232,7 @@
       if (typeof said === 'string') { try { said = JSON.parse(said); } catch (err) {} }
       this.fast._emit('message', said, p);
     }
-    else if (ev.type === 'media' && this.media) this.media._emit('media', p, { video: !!ev.video, audio: !!ev.audio });
+    else if (ev.type === 'media' && this.media) this.media._emit('media', p, ev.transparent ? { video: !!ev.video, audio: !!ev.audio, transparent: true } : { video: !!ev.video, audio: !!ev.audio });
     else if (ev.type === 'media-off' && this.media) this.media._emit('media-off', p);
     else if (ev.type === 'media-speaking' && this.media) this.media._emit('speaking', p, !!ev.on);
     else if (ev.type === 'media-frame' && this.media) {
@@ -228,6 +243,7 @@
     }
     else if (ev.type === 'media-levels' && this.media) this.media._emit('levels', ev.levels || {});
     else if (ev.type === 'media-state' && this.media) this.media._emit('state', ev.state);
+    else if (ev.type === 'media-cutout' && this.media) this.media._emit('cutout', { mode: String(ev.mode || 'off'), want: String(ev.want || ''), why: String(ev.why || '') });
     else if (ev.type === 'peer' && this.fast) {
       if (ev.state === 'gone') delete this.fast._peers[p.id]; else this.fast._peers[p.id] = ev.state;
       this.fast._emit('peer', p, ev.state);

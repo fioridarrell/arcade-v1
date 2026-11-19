@@ -465,23 +465,34 @@ pub fn decide(node: &Node, id: &str, ok: bool) -> R {
         answer(&p, &json!({"id": x.asked, "ok": false, "error": "declined in the ARCADE app"}))?;
         return Ok(json!({"ok": true, "declined": true}));
     }
-    let (key, pubkey, address, _) = doge_key(node)?;
+    // No key to sign with (the wallet is locked, say): the request stays waiting, to approve again once it's open.
+    let (key, pubkey, address, _) = match doge_key(node) {
+        Ok(k) => k,
+        Err(e) => {
+            PENDING.lock().unwrap().push(x);
+            return Err(e);
+        }
+    };
     if address != p["address"].as_str().unwrap_or("") {
         let e = format!("{} is paired with another account ({}): switch to it in the ARCADE app", p["host"].as_str().unwrap_or("this site"), p["address"].as_str().unwrap_or(""));
         PENDING.lock().unwrap().push(x);
         return Err(e);
     }
-    let out = match x.req["type"].as_str().unwrap_or("") {
-        "message" => json!({"id": x.asked, "ok": true, "signature": arcade_wallet::keys::signmessage(&key, DOGE_MAGIC, x.req["message"].as_str().unwrap_or(""))}),
-        "psbts" => {
-            let signed = x.req["psbts"].as_array().cloned().unwrap_or_default().iter().map(|r| sign_one(r, &key, &pubkey)).collect::<Result<Vec<_>, _>>()?;
-            json!({"id": x.asked, "ok": true, "results": signed})
-        }
-        _ => {
-            let mut o = sign_one(&x.req, &key, &pubkey)?;
+    let signed: R = match x.req["type"].as_str().unwrap_or("") {
+        "message" => Ok(json!({"id": x.asked, "ok": true, "signature": arcade_wallet::keys::signmessage(&key, DOGE_MAGIC, x.req["message"].as_str().unwrap_or(""))})),
+        "psbts" => x.req["psbts"].as_array().cloned().unwrap_or_default().iter().map(|r| sign_one(r, &key, &pubkey)).collect::<Result<Vec<_>, _>>().map(|s| json!({"id": x.asked, "ok": true, "results": s})),
+        _ => sign_one(&x.req, &key, &pubkey).map(|mut o| {
             o["id"] = json!(x.asked);
             o["ok"] = json!(true);
             o
+        }),
+    };
+    // A yes that can't be signed (a check refused it at signing): the site hears why now, instead of waiting until it gives up.
+    let out = match signed {
+        Ok(o) => o,
+        Err(e) => {
+            let _ = answer(&p, &json!({"id": x.asked, "ok": false, "error": format!("the ARCADE app couldn't sign this: {e}")}));
+            return Err(e);
         }
     };
     answer(&p, &out)?;

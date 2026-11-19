@@ -161,6 +161,46 @@ pub fn fee_for(bytes: u64) -> u64 {
     bytes.div_ceil(1_000).saturating_mul(BLOB_FEE_PER_KB)
 }
 
+// ---------------- rules version 5: copies by class (docs/FOGSTORE.md) ----------------
+
+/// What one copy of 1,000 bytes costs for a month (rules version 5): 47 ARCADE a GB a copy a month (Martin 2026-11-18:
+/// at a cent an ARCADE, an arcade's VPS paid for twice over a month; the first figures, to settle with the real bills).
+pub const COPY_MONTH_PER_KB: u64 = 47 * COIN / 1_000_000;
+
+/// The least number of copies the network keeps of a blob of `class` (Martin 2026-11-18: "a min of three copies for
+/// lower level blobs and more copies for higher cost blobs"): Temporary 3, Release 5, Permanent 7; a boost adds 2.
+pub fn floor(class: Class) -> usize {
+    match class {
+        Class::Temporary => 3,
+        Class::Release => 5,
+        Class::Permanent => 7,
+        Class::Boost => 2,
+    }
+}
+
+/// Months a blob's fee prepays its copies (rules version 5): Temporary and a boost 3 (90 days); Release and Permanent 12.
+pub fn months(class: Class) -> u64 {
+    match class {
+        Class::Temporary | Class::Boost => 3,
+        Class::Release | Class::Permanent => 12,
+    }
+}
+
+/// A blob's rate per started 1,000 bytes from rules version 5: its copies, for its months, at [`COPY_MONTH_PER_KB`].
+pub fn class_fee_per_kb(class: Class) -> u64 {
+    COPY_MONTH_PER_KB * floor(class) as u64 * months(class)
+}
+
+/// The least fee for the blobs a transaction pays for, each `(class, length)`, in the block at `height`: the flat rate
+/// ([`fee_for`] over their bytes) before rules version 5, each by its class from then on.
+pub fn fee_at(net: &crate::params::Net, height: u64, paid: &[(Class, u64)]) -> u64 {
+    if crate::params::rules_v5(net, height) {
+        paid.iter().map(|(c, len)| len.div_ceil(1_000).saturating_mul(class_fee_per_kb(*c))).fold(0u64, u64::saturating_add)
+    } else {
+        fee_for(paid.iter().map(|p| p.1).sum())
+    }
+}
+
 /// The header's root over a block's blob ids, in order; zeros when it carries none.
 pub fn ids_root(ids: &[Hash]) -> Hash {
     let mut b = merkle::RootBuilder::new();

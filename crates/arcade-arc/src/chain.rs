@@ -641,7 +641,8 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         block.check(&self.net)?;
         // A blob may come without its bytes only in a block older than the window: when it was new, the network had
         // them and checked them; full nodes may have dropped them since (§15 step 3).
-        if !block.blobs_whole() && block.header.time.saturating_add(self.net.blob_window) > now {
+        // From rules version 5 any block may: no arcade has to keep every blob's bytes (docs/FOGSTORE.md).
+        if !block.blobs_whole() && !params::rules_v5(&self.net, block.header.height) && block.header.time.saturating_add(self.net.blob_window) > now {
             return Err(ChainError::Block(BlockError::Blobs("a recent block came without a blob's bytes")));
         }
         let entry = self.enter(&block.header, now)?;
@@ -790,7 +791,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         let mut want = Vec::new();
         let mut here: HashSet<Hash> = HashSet::new();
         for (i, tx) in block.txs.iter().enumerate().skip(1) {
-            let mut bytes = 0u64;
+            let mut paid: Vec<(crate::blob::Class, u64)> = Vec::new();
             for r in crate::blob::records(tx) {
                 let id = r.id(&self.net);
                 let brings = !self.blobs.contains(&id) && here.insert(id);
@@ -799,11 +800,11 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
                 }
                 // A boost pays the full blob fee whether it brings the bytes or not (§15 step 4).
                 if brings || r.class == crate::blob::Class::Boost {
-                    bytes += r.len;
+                    paid.push((r.class, r.len));
                 }
             }
             let fee = changes.fees_by_tx.get(i - 1).copied().unwrap_or(0);
-            if fee < crate::blob::fee_for(bytes) {
+            if fee < crate::blob::fee_at(&self.net, block.header.height, &paid) {
                 return Err(ChainError::Block(BlockError::Blobs("a transaction doesn't pay the blob fee for the blobs it brings")));
             }
         }

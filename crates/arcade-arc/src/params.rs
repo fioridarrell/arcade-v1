@@ -123,7 +123,7 @@ pub const BLOB_WINDOW: u64 = 30 * 24 * 3600;
 /// The newest rules version this arcade knows. Version 2 (time keepers, §6.2): a block's proof of time may come in
 /// up to [`MAX_POT_RUNS`] runs one after another. Version 3 (blobs, §15 step 1): blob records and a block's blob section.
 /// Version 4 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20): see [`rules_v4`].
-pub const RULES_KNOWN: u32 = 4;
+pub const RULES_KNOWN: u32 = 5;
 
 /// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
 /// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the
@@ -132,6 +132,14 @@ pub const RULES_KNOWN: u32 = 4;
 /// seed's proof of time in up to [`MAX_POT_RUNS`] runs (#20).
 pub fn rules_v4(net: &Net, height: u64) -> bool {
     net.rules_at(height) >= 4
+}
+
+/// Whether rules version 5 applies to the block at `height` (Martin 2026-11-18, docs/FOGSTORE.md: data spreads by demand,
+/// "fog of war"): a block is valid with its blobs' records only, whatever its age, since no arcade has to keep every blob's
+/// bytes; and a blob pays for the copies its class keeps (crate::blob::class_fee_per_kb) instead of the flat rate. Not
+/// scheduled on the testnet until a release names its height.
+pub fn rules_v5(net: &Net, height: u64) -> bool {
+    net.rules_at(height) >= 5
 }
 
 /// The first height where [`rules_v4`] holds, if any (a network's rules versions rise with height).

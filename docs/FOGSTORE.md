@@ -83,6 +83,8 @@ who steps in, never as a copy count for a listed segment.
   segments it keeps, the network's segments short of copies (with how they were counted), and warnings.
 - `arc.keep`: the share kept by choice and its segments.
 - For other reads: `fogstore::blob_floor(class)` and `fogstore::short_of_copies()`.
+- `explorer.arc_storage_summary` (what the ARCADE Storage app reads) carries them as `floors` (per class), `short`
+  (segments and blobs below their floor) and `fog` (this arcade's settings, keep share and blobs held).
 
 ## Switching it on
 

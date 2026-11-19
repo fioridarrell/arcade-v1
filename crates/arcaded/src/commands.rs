@@ -47,16 +47,29 @@ pub const PERMS: &[Perm] = &[Perm::Read, Perm::Message, Perm::Post, Perm::Tip, P
 pub struct Cmd {
     pub name: &'static str,
     pub perm: Perm,
-    /// Parameters: "name" required, "name?" optional.
+    /// Parameters: "name" required, "name?" optional, "a | b" one of them, "(...)" a note. Their types, defaults and
+    /// allowed values come from [`PARAM_TYPES`] and [`PARAM_RULES`] ([`params_of`]).
     pub params: &'static str,
     pub summary: &'static str,
+    /// The answer's shape, when the row gives one (`=> "{txid, fee}"`); [`result_of`] otherwise says what it can.
+    pub result: Option<&'static str>,
 }
 
 macro_rules! cmds {
-    ($($name:literal $perm:ident $params:literal $summary:literal;)*) => {
-        pub static COMMANDS: &[Cmd] = &[$(Cmd { name: $name, perm: Perm::$perm, params: $params, summary: $summary },)*];
+    ($($name:literal $perm:ident $params:literal $summary:literal $(=> $result:literal)?;)*) => {
+        pub static COMMANDS: &[Cmd] = &[$(Cmd { name: $name, perm: Perm::$perm, params: $params, summary: $summary, result: cmds!(@r $($result)?) },)*];
     };
+    (@r $r:literal) => { Some($r) };
+    (@r) => { None };
 }
+
+/// The few commands kept off the network surfaces on purpose: answered on the unix socket alone, never by /api/v1
+/// or JSON-RPC, and so not in [`COMMANDS`] (rpc.help, /api/v1/routes, openapi.json). Every other command is on every
+/// surface with one name, one set of arguments, one answer shape and one set of error codes; a command's permission
+/// (Local: the socket and the cookie RPC only) still decides who may call it. `surfaces_match` (tests) holds this.
+pub const PRIVATE: &[(&str, &str)] = &[
+    ("service.stop", "stops arcaded (arcade stop): the socket's own line, acted on by the stop watcher"),
+];
 
 cmds! {
     "status" Public "chain?" "Home chain, sync state, tip, best_known (the best height anyone tells us of), tags, profiles, mesh links, node id, phase (starting, ready, stopping) and rules.update_needed. With chain (a key, e.g. arctest): that chain alone: tip {height, hash}, best_known (from linked peers, null when none told), best_known_from, behind, sync (synced, syncing, unknown, not_kept), mode and source (own or borrowed), and for the ARCADE chain its rules.";
@@ -75,9 +88,9 @@ cmds! {
     "svc.offers" Read "service?" "Services offered over the mesh: each arcade's offer, its @tag, public name, pay_to and link state.";
     "svc.services" Read "" "The service helpers attached to this arcade, with their offers and open requests.";
     "svc.ask" Local "to, service, body, timeout?, stream?" "Ask a service at an arcade (node id, or \"self\" for this one) over the mesh; answers collected (bytes as base64), or streamed line by line on the socket.";
-    "svc.pay" Wallet "to, amount, memo" "Pay ARCADE to an address with a memo of up to 80 bytes (a service's credit).";
+    "svc.pay" Wallet "to, amount, memo, client_ref?" "Pay ARCADE to an address with a memo of up to 80 bytes (a service's credit).";
     "svc.paid" Read "txid, memo?" "Whether a payment is in a block, what it paid this arcade's address, and whether the memo is in it.";
-    "events" Read "n?, kind?" "Recent activity (newest first), optionally of one kind.";
+    "events" Read "n?, kind?" "Recent activity (newest first), optionally of one kind. events.since follows the log with a cursor.";
     "mempool" Public "" "Home chain transactions waiting for a block.";
     // For a website server in front of this arcade (its users hold their own keys)
     "id.start" Public "host, path?, http?" "ARCADE ID sign-in (no password; built on Digi-ID, created by the DigiByte community): a code for a website to show as a QR code, digiid://host/path?x=nonce (path default /digiid/callback; http: true for a plain-http test address). Digi-ID wallets answer it (Coinomi is the one digi-id.io names); an ARCADE wallet may answer with a key on any chain it holds. Lasts 5 minutes, works once.";
@@ -120,7 +133,7 @@ cmds! {
     "wallet.addr_kind" Wallet "chain, kind?" "The address type the Wallet shows on a chain (legacy, p2sh-p2wpkh, p2wpkh, p2tr; remembered per chain) and the types it offers; kind: remember that one.";
     "dd.wallet" Read "chain?" "Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen).";
     "dd.coins" Read "chain?, pubkey" "The DigiDollar address and coins (txid, vout, cents, height) of any DigiByte key (33-byte hex), as dd.wallet shows this wallet's: for a website whose accounts sign in their browsers.";
-    "dd.send" Local "chain?, to, cents, send?" "Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown.";
+    "dd.send" Local "chain?, to, cents, send?, client_ref?" "Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown.";
     "wallet.send" Local "chain?, to, amount, from?, kind?, all_kinds?, send?, client_ref?" "client_ref (with send): as for ledger.item_open. Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
     "wallet.link" Wallet "chain, wif, tag" "Link another wallet to your @tag (signed by both keys).";
     "wallet.unlink" Wallet "chain, address, tag" "Remove a linked wallet.";
@@ -134,7 +147,7 @@ cmds! {
     "wallet.imports" Local "" "Imported wallets, with balances on chains this arcade keeps addresses for.";
     "wallet.import_remove" Local "chain, address" "Forget an imported wallet and its key.";
     "tag.check" Public "tag, chain?" "Whether a @tag is free and valid on one chain (every chain has its own @tags): tag may name it (alice.doge), or chain does; else where new tags go. Answers full (alice.doge) and label (@alice · DOGE).";
-    "tag.claim" Wallet "tag, chain?" "Claim a @tag on one chain: ARCADE, Pepecoin testnet (test coins asked for by themselves), or a mainnet chain tags live on here (pep, doge, dgb: kept with their ledger or borrowed; paid in that coin). tag may name the chain (alice.doge).";
+    "tag.claim" Wallet "tag, chain?, client_ref?" "Claim a @tag on one chain: ARCADE, Pepecoin testnet (test coins asked for by themselves), or a mainnet chain tags live on here (pep, doge, dgb: kept with their ledger or borrowed; paid in that coin). tag may name the chain (alice.doge).";
     "tag.resolve" Public "tag" "What an @tag names: found one (its chain, address, label) or many (different people on several chains: each, to pick from) or none. alice.doge names Dogecoin's.";
     "start.status" Read "" "Getting started: wallet made, handle (claimed or being claimed), test coins asked for or here, synced.";
     "tag.list" Read "" "Your tag claims and their progress.";
@@ -154,10 +167,10 @@ cmds! {
     "msg.read" Message "peer" "Mark a conversation read.";
     "msg.unread" Read "" "Unread counts: messages, requests, group lines.";
     "msg.file" Read "id" "A message's file (base64).";
-    "msg.send" Message "to, text?, file?" "Send a private message to a @tag, address or key; file = {name, type, data (base64)}.";
+    "msg.send" Message "to, text?, file?, client_ref?" "Send a private message to a @tag, address or key; file = {name, type, data (base64)}.";
     "msg.delete" Message "id" "Stop showing a message here (the chain keeps it).";
-    "msg.announce" Wallet "" "Publish your messaging key now if it isn't on chain.";
-    "profile.publish_addresses" Wallet "send?" "List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee and total cost.";
+    "msg.announce" Wallet "client_ref?" "Publish your messaging key now if it isn't on chain.";
+    "profile.publish_addresses" Wallet "send?, client_ref?" "List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee and total cost.";
     "contacts.list" Read "" "Your contacts.";
     "contacts.save" Message "key, name?, address?, notes?" "Add or change a contact (by messaging key).";
     "contacts.delete" Message "key" "Remove a contact.";
@@ -182,60 +195,60 @@ cmds! {
     "feed" Public "order?, channel?, tag?, author?, txid?, limit?, offset?" "Public posts (popular, new, friends or following) with replies, counts and tips.";
     "feed.channels" Public "" "Channels and how many posts each has.";
     "feed.settings" Read "set?" "Feed settings (hide muted, contacts only); set = {hide_muted, contacts_only} needs post.";
-    "feed.post" Post "text?, channel?, file?" "Post publicly (needs a @tag).";
-    "feed.act" Post "kind, target, text?, amount?" "Like, unlike, dislike, undislike, reply, share, edit, delete; tip (needs tip; amount in satoshis).";
+    "feed.post" Post "text?, channel?, file?, client_ref?" "Post publicly (needs a @tag).";
+    "feed.act" Post "kind, target, text?, amount?, client_ref?" "Like, unlike, dislike, undislike, reply, share, edit, delete; tip (needs tip; amount in satoshis).";
     "follows" Public "who" "An account's followers and the accounts it follows (who = @tag or address), with @tags and counts.";
-    "follow" Post "who, on?" "Follow an account (on: false unfollows): a feed act on the home chain from this wallet; the newest between two accounts counts.";
+    "follow" Post "who, on?, client_ref?" "Follow an account (on: false unfollows): a feed act on the home chain from this wallet; the newest between two accounts counts.";
     "feed.file" Public "txid" "A post's file (base64).";
     // Protocol indexes
     "ledger" Public "" "The arcade ledger's fingerprints next to what other arcades report.";
     "profile" Public "who" "A published profile (who = @tag or address).";
     "ord" Public "id?, chain?" "An inscription, or ord index counts.";
-    "ord.send" Local "inscription, to, chain?, send?" "Send one inscription (id or number) from this wallet's address on a chain kept here with its ord index, or borrowed (where it sits from the arcades keeping the ord index, which must agree; coins from a lender, checked against their blocks; sent through the lenders): its coin whole to `to` first, clean coins pay the fee. Only one alone at the start of its coin. send: true broadcasts, otherwise it is built and shown with its fee.";
-    "token.send" Local "propertyid, units, to, chain?, send?" "Send arcade tokens (base units) from this wallet in one transaction, on the home chain's ledger or the ARCADE chain's (chain: arc / arctest), installed or borrowed; without send: true, only what it would do.";
+    "ord.send" Local "inscription, to, chain?, send?, client_ref?" "Send one inscription (id or number) from this wallet's address on a chain kept here with its ord index, or borrowed (where it sits from the arcades keeping the ord index, which must agree; coins from a lender, checked against their blocks; sent through the lenders): its coin whole to `to` first, clean coins pay the fee. Only one alone at the start of its coin. send: true broadcasts, otherwise it is built and shown with its fee.";
+    "token.send" Local "propertyid, units, to, chain?, send?, client_ref?" "Send arcade tokens (base units) from this wallet in one transaction, on the home chain's ledger or the ARCADE chain's (chain: arc / arctest), installed or borrowed; without send: true, only what it would do.";
     "token20.send" Local "chain, tick, amount, to, send?" "Send PRC-20 / DRC-20 tokens from this wallet (a job: inscribe the transfer, then send it), on a chain installed or borrowed here.";
     "token20.sends" Read "" "This wallet's PRC-20 / DRC-20 send jobs and where each stands.";
     "arc.cache" Admin "mb?, clear?" "The viewer cache of ARCADE blobs: its size limit (MB), what it holds, or clear it.";
-    "ledger.announce" Wallet "" "Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain.";
+    "ledger.announce" Wallet "client_ref?" "Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain.";
     "ledger.profile" Read "address | tag" "A profile and @tag as the ARCADE chain's ledger holds them.";
     "ledger.send" Wallet "hex, client_ref?" "Send one arcade record (the whole payload after the marker) on the ARCADE chain. client_ref as for ledger.item_open.";
     "arc.keep" Admin "mb?" "Keep a share of the ARCADE chain's blobs by choice (rules version 5): whole segments, sealed and paid; segments short of copies first. mb: the share in MB (0 or \"off\": none).";
     "arc.fog" Read "" "Fog storage here: what it holds (own, kept, viewed), the segments it keeps, those short of copies on the network, warnings.";
     "arc.blob" Read "id" "A blob of the ARCADE chain (hex), fetched from linked arcades when it isn't here.";
-    "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?" "Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Without send, only the quote (blob_fee, fee).";
-    "arc.blob_publish_large" Wallet "path | hex, type, class?, gzip?, name?, send?" "Put a file of up to 100 MB on the ARCADE chain as one large blob: parts of 4 MB over successive blocks, then a manifest naming them and the overall root; its id is the manifest's. Without send, the quote (parts, fee, blocks, seconds). Resumes after a restart without paying twice. arc.blob_publish switches to it above 4 MB.";
+    "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?, client_ref?" "Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Without send, only the quote (blob_fee, fee).";
+    "arc.blob_publish_large" Wallet "path | hex, type, class?, gzip?, name?, send?, client_ref?" "Put a file of up to 100 MB on the ARCADE chain as one large blob: parts of 4 MB over successive blocks, then a manifest naming them and the overall root; its id is the manifest's. Without send, the quote (parts, fee, blocks, seconds). Resumes after a restart without paying twice. arc.blob_publish switches to it above 4 MB.";
     "arc.blob_publish_status" Read "id?" "Publishing of large blobs from here: parts in blocks and waiting, the manifest, what was paid, resends.";
     "a.profile" Read "tag? | address?" "A profile card on the ARCADE chain (yours when neither), with follower counts.";
-    "a.profile_set" Wallet "name?, bio?, url?, picture?, addresses?" "Publish your profile on the ARCADE chain (A://).";
-    "a.follow" Wallet "tag" "Follow an @tag on the ARCADE chain.";
-    "a.unfollow" Wallet "tag" "Stop following an @tag.";
+    "a.profile_set" Wallet "name?, bio?, url?, picture?, addresses?, client_ref?" "Publish your profile on the ARCADE chain (A://).";
+    "a.follow" Wallet "tag, client_ref?" "Follow an @tag on the ARCADE chain.";
+    "a.unfollow" Wallet "tag, client_ref?" "Stop following an @tag.";
     "a.follows" Read "tag? | address?" "Who it follows and who follows it (yours when neither).";
     "a.contacts" Wallet "" "Your address book, opened with your key.";
-    "a.contact_save" Wallet "id?, name, tag?, addresses, note?" "Save an address book entry (encrypted to your own key).";
+    "a.contact_save" Wallet "id?, name, tag?, addresses, note?, client_ref?" "Save an address book entry (encrypted to your own key).";
     "a.search" Read "q" "Published profiles and @tags matching a name or @tag, for the address book.";
-    "a.contact_add" Wallet "tag | address" "Add someone to your address book from their published profile.";
-    "a.contact_delete" Wallet "id" "Remove an address book entry.";
+    "a.contact_add" Wallet "tag | address, client_ref?" "Add someone to your address book from their published profile.";
+    "a.contact_delete" Wallet "id, client_ref?" "Remove an address book entry.";
     "a.wallets" Read "tag? | address?" "The wallet addresses someone has proven they hold on the ARCADE chain (every coin; A:// op 7), yours when neither; for yours also what would be proven now.";
-    "a.wallets_publish" Wallet "force?" "Publish proofs of this wallet's addresses on every coin and of each imported wallet (each signs with its own key), when they differ from the chain's; done by itself after a profile is published.";
-    "a.post" Wallet "text" "Post to your followers on the ARCADE chain.";
+    "a.wallets_publish" Wallet "force?, client_ref?" "Publish proofs of this wallet's addresses on every coin and of each imported wallet (each signs with its own key), when they differ from the chain's; done by itself after a profile is published.";
+    "a.post" Wallet "text, client_ref?" "Post to your followers on the ARCADE chain.";
     "a.posts" Read "tag? | address? | following?, limit?" "Posts, newest first.";
     "a.reactions" Public "targets, me?" "Reacts, replies and tips on up to 100 targets (any chain's transactions: {chain, txid}) from the ARCADE chain's ledger (A:// ops 8 to 10, docs/APROTO.md): likes, dislikes, replies, tips (total, count, per recipient, author marked where known); me (true or an ARCADE address): its react and tips.";
     "a.replies" Public "chain, txid, offset?, limit?" "Replies to a target (any chain's transaction), oldest first, with their authors.";
-    "a.react" Wallet "chain, txid, kind" "Like, unlike, dislike or undislike any chain's transaction, on the ARCADE chain (A:// op 8).";
-    "a.reply" Wallet "chain, txid, text" "Reply to any chain's transaction (1 to 500 bytes), on the ARCADE chain (A:// op 9).";
-    "a.tip" Wallet "chain, txid, amount, to?, memo?" "Tip on any chain's transaction: pay amount (sats of ARCADE) to `to` (an ARCADE address; default the transaction's author where one is found) with the tip record (A:// op 10, memo up to 100 bytes) in the same transaction.";
+    "a.react" Wallet "chain, txid, kind, client_ref?" "Like, unlike, dislike or undislike any chain's transaction, on the ARCADE chain (A:// op 8).";
+    "a.reply" Wallet "chain, txid, text, client_ref?" "Reply to any chain's transaction (1 to 500 bytes), on the ARCADE chain (A:// op 9).";
+    "a.tip" Wallet "chain, txid, amount, to?, memo?, client_ref?" "Tip on any chain's transaction: pay amount (sats of ARCADE) to `to` (an ARCADE address; default the transaction's author where one is found) with the tip record (A:// op 10, memo up to 100 bytes) in the same transaction.";
     "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";
-    "ledger.tag_commit" Wallet "tag" "Commit ahead to claiming a released @tag on the ARCADE chain.";
-    "ledger.tag_checkin" Wallet "" "Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot).";
-    "ledger.repo_push" Wallet "name, manifest, base?, force?" "Point @owner/name at a git manifest blob (owner or maintainer). From rules v4 the push names base (the manifest it was built on, \"\" for a new repo; default: the current one) and is refused if the repo moved on, unless force.";
-    "ledger.repo_maintainer" Wallet "name, tag, add?" "Add or remove a maintainer of your repository.";
-    "ledger.repo_fork" Wallet "from, name" "Fork @owner/name under your @tag.";
+    "ledger.tag_commit" Wallet "tag, client_ref?" "Commit ahead to claiming a released @tag on the ARCADE chain.";
+    "ledger.tag_checkin" Wallet "client_ref?" "Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot).";
+    "ledger.repo_push" Wallet "name, manifest, base?, force?, client_ref?" "Point @owner/name at a git manifest blob (owner or maintainer). From rules v4 the push names base (the manifest it was built on, \"\" for a new repo; default: the current one) and is refused if the repo moved on, unless force.";
+    "ledger.repo_maintainer" Wallet "name, tag, add?, client_ref?" "Add or remove a maintainer of your repository.";
+    "ledger.repo_fork" Wallet "from, name, client_ref?" "Fork @owner/name under your @tag.";
     "ledger.repo" Read "name" "A repository under an @tag: its manifest, maintainers and push history.";
     "ledger.repos" Read "owner?" "Repositories on the ARCADE chain.";
     "ledger.item_open" Wallet "repo, kind, title, body, from?, manifest?, head?, client_ref?" "Open an issue or a pull request on a repository. client_ref: a key of yours; sent again with the same key, the first answer comes back (replayed: true) and nothing is signed twice. The answer's receipt names what tx.status follows.";
     "ledger.item_comment" Wallet "repo, number, body, review?, client_ref?" "Comment on, or review (approve | changes), an issue or pull request. client_ref as for ledger.item_open.";
-    "ledger.item_state" Wallet "repo, number, state, manifest?" "Close, reopen or merge an issue or pull request.";
-    "ledger.items" Read "repo, number?, state?, kind?, since?, summary?" "A repository's issues and pull requests with their comments and reviews. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items or comments at or after it); summary: true leaves out the events and keeps the title. count: how many.";
+    "ledger.item_state" Wallet "repo, number, state, manifest?, client_ref?" "Close, reopen or merge an issue or pull request.";
+    "ledger.items" Read "repo, number?, state?, kind?, since?, summary?, pending?, cursor?, limit?" "A repository's issues and pull requests with their comments and reviews, by number. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items or comments at or after it); summary: true leaves out the events and keeps the title. Items, comments, reviews and state changes still waiting in the pool come too, marked pending: true (a pending item has no number yet; pending: false leaves them out). Paged: limit (default 50, at most 500) and cursor (the next of the page before; opaque); next is null on the last page, which also carries the pending items. count: how many on this page." => "{repo, items: [{number, kind, by, state, height, txid, text, events, comments, pending}], count, next, limit}";
     "arc.earn" Admin "chain, on?" "The Earn ARCADE switch for a chain kept here in full (docs/EARN.md), and where it stands: sealing, the catalog, replicas waiting to register, this arcade's turn and next payout.";
     "arc.earning" Read "" "Whether this arcade earns ARCADE: a light (green, yellow, grey, red) and why, pay built up, audits, the next payout turn, and the account paid.";
     "ord.chunks" Public "from?, chain?" "Ord fingerprint chunks (as other arcades compare them).";
@@ -246,7 +259,7 @@ cmds! {
     // Explorer
     "explorer.summary" Public "chain?" "Chain summary for the explorer's front page.";
     "explorer.earn" Public "chain?" "This arcade's ARCADE pay, read only (docs/EARN.md): its turn, next payout, accrued pay, pay and draw weight, why pay waits, and its sealed replicas waiting to register; with a chain, that coin's Earn ARCADE progress too.";
-    "explorer.blocks" Public "chain?, offset?, limit?, before?, n?" "Recent blocks, newest first. offset (back from the tip) and limit (at most 100) answer a page: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the next page; null at block 0), chain, as_of, source}. before and n (at most 100) answer the plain list, as before.";
+    "explorer.blocks" Public "chain?, offset?, limit?, before?, n?, order?, from?" "Recent blocks, newest first. offset (back from the tip) and limit (at most 100) answer a page: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the next page; null at block 0), chain, as_of, source}. before and n (at most 100) answer the plain list, as before. order asc with from (a height, default 0): a feed oldest first, {items, from, limit, next_from (the height to ask from next; the tip + 1 at the end: chains.wait waits for it), tip, chain, as_of, source}." => "{items: [{height, hash, time, txs}], next | next_from, chain, as_of, source}";
     "explorer.block" Public "chain?, id" "One block (id: a height, as a number or text, or a hash). Carries chain, as_of {height, hash} (the tip its confirmations count against), source (local, borrowed or mesh), unit and decimals.";
     "explorer.tx" Public "chain?, txid" "One transaction: height, block (its hash), confirmations, fee, inputs and outputs in base units (decimals: 8); an OP_RETURN output carries data (hex) and decoded (an arcade record: repository or A:// with its op). Carries chain, as_of, source; without chain it answers on the home chain and says so (chain_note).";
     "explorer.address" Public "chain?, address, history?, inscriptions?, content?, history_offset?, history_limit?" "An address: balance, history (newest first, a page at a time: history_offset (or offset) and history_limit (or limit; default 50, at most 500); history_next is the next page's offset, null after the oldest; tx_count the total), inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address).";
@@ -340,7 +353,7 @@ cmds! {
     "borrow.status" Read "" "Borrowed coins: the switches, and per chain its lenders, tip, floor, tip mismatch and your balance.";
     "borrow.set" Admin "on, chain?" "Turn borrowing on or off: for every coin (no chain) or for one chain (off removes its borrowed data).";
     "borrow.coins" Read "chain" "Your coins on a borrowed chain (from blocks read since the floor, and the lender's coin scan).";
-    "borrow.send" Local "chain, to, amount, from?, kind?, all_kinds?, send?" "Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown.";
+    "borrow.send" Local "chain, to, amount, from?, kind?, all_kinds?, send?, client_ref?" "Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown.";
     // Mining
     "mine.start" Admin "threads?" "Mine the home chain: only at the tip (synced with a coin peer, no higher height known); until then it waits and mine.status says why.";
     "mine.stop" Admin "" "Stop mining.";
@@ -348,6 +361,45 @@ cmds! {
     "stake.status" Read "" "KOT staking: on or off, coins, self-check, blocks staked.";
     "stake.set" Admin "on" "Turn KOT staking on or off.";
     "stake.check" Read "" "Check our KOT stake rules against the newest blocks.";
+    // Once on the socket only (ARCADE #25 part 2: every surface answers the same commands; commands::PRIVATE lists
+    // the few that stay off the network on purpose).
+    "arc.block" Public "height? | id?, raw?" "One block of the ARCADE chain run here: by height (the branch it is on) or by id (any branch it holds): id, prev, height, time, difficulty, writer, score, steps, best, txs (txids), raw (with raw: true, the transactions' hex), bytes, pot_runs." => "{id, prev, height, time, difficulty, writer, score, steps, best, txs, raw, bytes, pot_runs}";
+    "arc.submit" Post "hex, blobs?" "A signed ARCADE transaction (hex) into this arcade's pool, from where it goes to the other arcades and into a block; blobs: the hex of blobs it brings. As tx.broadcast for the ARCADE chain." => "{id, fee}";
+    "arc.pool" Public "" "The ARCADE transactions waiting in this arcade's pool, in order of arrival (at most 1,000 listed)." => "{count, bytes, txs: [{id, fee, bytes}]}";
+    "arc.catalog" Public "" "The segments the ARCADE chain lists, the entries that wait (and who stands behind each), and this arcade's side of it.";
+    "arc.genesis" Public "" "Where the ARCADE chain's genesis list stands here.";
+    "arc.segment_root" Read "chain, first, last" "The storage root this arcade makes for heights first..last of a chain it keeps.";
+    "arc.replicas" Read "" "The sealed copies (replicas) this arcade holds, and a sealing under way.";
+    "arc.sealing" Read "chain" "The segments of a chain as this arcade holds them for the ARCADE chain: waiting, queued, sealing, registering, earning; this arcade's weight and the chain's total; why sealing waits.";
+    "arc.open" Read "segment, leaves" "Leaves of one of this arcade's replicas, opened (segment: its id; leaves: indexes).";
+    "arc.seal" Admin "segment?" "Seal a confirmed segment (its id; else the first listed one of a chain kept here not sealed yet) under this arcade's key, in the background.";
+    "arc.reveal" Admin "segment, first?, count?" "A reveal demand by hand: the holders of a listed segment must show these leaves on the ARCADE chain.";
+    "arc.serve_check" Admin "owner, chain, first? | hashes?, count?" "A serving check by hand, no verdict posted: does the arcade `owner` (64 hex) hand out these blocks of chain?";
+    "arc.keeper" Admin "on?" "This arcade's time keeper: on: true or false turns it on or off (it starts or stops within a block); its state.";
+    "arc.archive" Admin "on?" "Keep every blob's plain copy (an archive node; on: true) or let the classes drop them.";
+    "arc.blob_publish_many" Wallet "files, send?, client_ref?" "Several blobs in one ARCADE transaction: files [{hex | path, type, class?, gzip?}] (path: this computer's socket or cookie RPC only); without send, only what it would cost.";
+    "code.status" Public "" "The releases known here and which of their files are held.";
+    "code.add" Local "record, sig, files" "A release made here (scripts/code-publish.py), with its files ({name: path} on this computer).";
+    "code.export" Local "id, dir" "A release's held files written into dir (a folder on this computer) under their names.";
+    "swap.list" Read "" "This arcade's own swaps (as maker or taker) and the step each is at.";
+    "swap.take" Local "node, order, give?, get?" "Take an order whole (node: the maker's arcade): the secret is made here and this wallet's leg locked; with the legs shown ({give, get}), only on exactly those terms.";
+    "ledger.book" Public "network?, base?, quote?" "The market's open orders on the arcade ledger (docs/MARKET.md).";
+    "ledger.trades" Public "network?, base?, quote?, before?" "The market's recent trades on the arcade ledger.";
+    "ledger.pairs" Public "q?" "The market's pairs on the arcade ledger.";
+    "explorer.site" Public "chain?, name" "A name's site as this arcade's names index holds it: {name, claim, holder, page, scanning}.";
+    "explorer.sites" Public "chain?, all?" "Sites by name, newest first: {names: [{name, page, number, height, title}], scanning}.";
+    "explorer.ledger_bytes" Public "chain?, id" "An arcade inscription's whole bytes (base64, up to 16 MB), for an arcade that does not keep this chain's ledger: {txid, number, content_type, sha256, b64}.";
+    "explorer.page" Public "chain?, path, query?" "A public page read (GET /r/...) answered on this chain, for an app opened at an arcade that does not keep its ledger.";
+    "explorer.app_cards" Public "chain?" "The rows of a chain that may be app cards, for an arcade's App Store that borrows it: {rows}.";
+    "explorer.ord_outpoints" Public "chain?, outpoints" "Which of these outpoints carry ord inscriptions (outpoints: [\"txid:vout\", ...]).";
+    "explorer.token_note" Public "chain?, id" "The token note an inscription carries (PRC-20 / DRC-20): {id, note}.";
+    "explorer.prize_rows" Public "chain?" "The prize pool rows of a chain's ledger: {rows}.";
+    "explorer.activity" Public "chain?, addresses, since?" "tx.activity read from this arcade's own copy (never borrowed): history rows and waiting transactions of up to 500 addresses.";
+    // Agents never poll (ARCADE #25 part 2).
+    "events.since" Read "cursor?, kinds?, limit?, wait?" "The arcade's event log, oldest first, after cursor (from events.since's next; none: from now, \"0\": from the oldest kept), of kinds (comma list or array) only; limit (default 100, at most 1,000); wait: seconds (at most 60) to wait for the first new event. {events: [{cursor, at, kind, text}], next, waited}." => "{events: [{cursor, at, kind, text}], next, waited, timed_out}";
+    "chains.wait" Public "chain, height, timeout?" "Answered once chain's tip (as this arcade reads it: own copy or borrowed) reaches height, or after timeout seconds (default 60, at most 600): {chain, height, tip: {height, hash}, source, reached, timed_out}." => "{chain, height, tip: {height, hash}, source, reached, timed_out}";
+    "rpc.openapi" Public "" "The OpenAPI 3.1 document of the web API (also GET /api/v1/openapi.json): every command, its typed parameters and result shape." => "OpenAPI 3.1 document (object)";
+    "rpc.guide" Public "" "The short guide for AI agents and scripts (also GET /api/v1/agents.md), as Markdown text." => "string (Markdown)";
     // Apps (app cards)
     "apps.store" Public "sort?, q?, flagged?, category?" "The App Store: app cards from every chain with the arcade ledger (popular or new; starred first), in categories (counts in \"categories\"; category = one of them).";
     "apps.categories" Public "" "The App Store's known categories (games, apps, social, node modules); a card may name any other.";
@@ -379,8 +431,8 @@ cmds! {
     "collections.known_get" Read "" "Whether this arcade asks Nintondo for its known collections: {known}.";
     "dogefeed.stamp" Post "record" "This arcade's registrar stamp (att) for a D:// record its author signed in their browser: checked as DogeFeed's guide checks it, then attested with this arcade's kid. Answers the stamped record, the fee address and the 0.1 DOGE fee its reveal must pay.";
     "dogefeed.sign_action" Post "op, target, inputs, recipient?, fee" "This arcade's registrar signature for a paid D:// action a browser builds (like, branch, follow, tip, reveal, delete, keyrevoke): the 80-byte OP_RETURN data, its fee output paying this arcade's fee address.";
-    "dogefeed.post" Wallet "type?, text?, media?, reply?, quote?, pay?, ref?, tags?, mentions?, send?" "Post, comment, quote or edit on D:// from this arcade's own Dogecoin wallet: signed, stamped by this arcade and inscribed as DogeFeed writes them. Without send: the record and its cost.";
-    "dogefeed.act" Wallet "op, target, amount?, send?" "Like, branch, follow, tip, reveal, delete or keyrevoke on D:// from this arcade's own Dogecoin wallet (1 DOGE in all for likes, branches and follows; amount in DOGE for tips, 90/10). Without send: what it would send.";
+    "dogefeed.post" Wallet "type?, text?, media?, reply?, quote?, pay?, ref?, tags?, mentions?, send?, client_ref?" "Post, comment, quote or edit on D:// from this arcade's own Dogecoin wallet: signed, stamped by this arcade and inscribed as DogeFeed writes them. Without send: the record and its cost.";
+    "dogefeed.act" Wallet "op, target, amount?, send?, client_ref?" "Like, branch, follow, tip, reveal, delete or keyrevoke on D:// from this arcade's own Dogecoin wallet (1 DOGE in all for likes, branches and follows; amount in DOGE for tips, 90/10). Without send: what it would send.";
     "dogefeed.registrar" Admin "fee_address?" "This arcade's D:// registrar (kid, key, address, fee address); fee_address sets where its 0.1 DOGE fees go.";
     "dogefeed.registrars_add" Admin "kid, pubkey, address, fee_address, name?" "Count another registrar's stamps (another arcade's) on this arcade.";
     "dogefeed.registrars_remove" Admin "kid" "Stop counting a registrar added with dogefeed.registrars_add.";
@@ -397,7 +449,7 @@ cmds! {
     "ring.send" Local "page, to, line?, link?" "Ring an address from this arcade's player, for the app whose page asks (arcade.realtime.ring): rung, and why not. It reaches them only if they have Notifications on for that app and the caller in their address book.";
     "ring.waiting" Local "" "What is ringing this arcade's player now; asking also says the app is open, so it can be rung here.";
     "ring.get" Local "id, page" "The ring an app was opened from (arcade.realtime.ringed), for that app only: from, tag, link, line, at.";
-    "inscribe" Wallet "data, encoding?, contenttype?, json?" "Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64).";
+    "inscribe" Wallet "data, encoding?, contenttype?, json?, client_ref?" "Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64).";
     "inscribe.estimate" Public "data, encoding?, contenttype?, json?" "What inscribing that would cost: transactions, fee, value kept in its data outputs.";
     "wallet.requests" Read "page?" "Requests from pages to send, waiting for your answer.";
     "wallet.preview" Read "id" "A request's transaction as it would be built now: outputs and fee.";
@@ -413,8 +465,8 @@ cmds! {
     "apikey.revoke" Local "id" "Revoke an API key.";
     "rpc.help" Public "" "Every command, its parameters and what it needs.";
     "arc.status" Public "" "The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here.";
-    "tx.status" Read "chain, txid | client_ref" "Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding}), signed (signed here moments ago, in no pool or block), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, and code not_found when this arcade never signed it.";
-    "tx.wait" Read "chain, txid | client_ref, until?, timeout?" "tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped, or after timeout seconds (default 60, at most 600) with timed_out: true.";
+    "tx.status" Read "chain, txid | client_ref" "Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding, peers_acked, peers_refused}), broadcast_failed (refused here or by every peer that answered: broadcast.refusals [{peer, code, error}], code fee_too_low, conflict, missing_coin, dust, not_yet_valid, blob_missing, pool_full, invalid, rules or unreachable), signed (signed here: the receipt is written the moment it is signed, before any network step; in no pool or block yet), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, error (what the send answered, when it failed after signing), and code not_found when this arcade never signed it." => "{chain, txid, state, ever_signed_here, signed_at, client_ref, cmd, confirmed?, broadcast?, error?, as_of?}";
+    "tx.wait" Read "chain, txid | client_ref, until?, timeout?" "tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped or broadcast_failed, or after timeout seconds (default 60, at most 600) with timed_out: true." => "tx.status's answer + {timed_out}";
     "rpc.info" Local "" "Where the RPC and the web API are, and the cookie file.";
 }
 
@@ -422,6 +474,499 @@ pub fn find(name: &str) -> Option<&'static Cmd> {
     COMMANDS.iter().find(|c| c.name == name)
 }
 
+
+// ---------------- typed parameters and answers (ARCADE #25 part 2) ----------------
+//
+// One source for rpc.help, /api/v1/routes and /api/v1/openapi.json: the rows above name each command's parameters;
+// PARAM_TYPES gives every parameter name its JSON type and meaning; PARAM_RULES adds what one command alone says of
+// one of its parameters (allowed values, a default, a limit). `every_param_is_typed` (tests) keeps the two in step.
+
+/// Every parameter name a command takes: (name, JSON type, what it is). A type "a|b" takes either.
+pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
+    ("activity", "boolean", "Also list the record's activity."),
+    ("add", "boolean", "true adds, false removes."),
+    ("addr_kind", "string", "Address type: legacy, p2sh-p2wpkh or p2wpkh."),
+    ("address", "string", "An address on the chain in question."),
+    ("addresses", "array|string", "Addresses (an array, or a comma list)."),
+    ("after", "integer|string", "Start after this key or position (exclusive)."),
+    ("all", "boolean", "All of them, not only the newest or own."),
+    ("all_kinds", "boolean", "Also spend the wallet's other address types' coins."),
+    ("amount", "integer|string", "An amount in the chain's smallest unit (satoshis; 8 decimals unless the answer says otherwise)."),
+    ("args", "object", "The read's own arguments."),
+    ("author", "string", "An author's @tag or address."),
+    ("b64", "string", "Bytes as base64."),
+    ("base", "string", "A base: a manifest blob id (64 hex) for a push, or a market's base asset."),
+    ("before", "integer", "Only below this height or position (exclusive)."),
+    ("bio", "string", "Profile text."),
+    ("blob", "object", "A sealed record: {kdf, iterations, salt, nonce, sealed}."),
+    ("blobs", "array", "The hex of blobs a transaction brings."),
+    ("blocks", "integer", "How many blocks back."),
+    ("body", "string|object", "The body: text, or a JSON object where the command says."),
+    ("box", "string", "A box id: 32 hex characters."),
+    ("buyer", "string", "The other player's address."),
+    ("category", "string", "An App Store category."),
+    ("cents", "integer", "DigiDollar cents."),
+    ("chain", "string", "A chain key (arctest, arc, peptest, pep, doge, dgb, ...). Absent: the home chain (the answer's chain says which)."),
+    ("changes", "object", "The changes to make."),
+    ("channel", "string", "A feed channel."),
+    ("class", "integer", "Blob class: 0 permanent, 1 release, 2 temporary, 3 boost."),
+    ("clear", "boolean", "Empty it."),
+    ("client_ref", "string", "Your idempotency key for a send (1 to 128 printable characters): a retry with the same one never signs again; it answers the first send's result (replayed: true). tx.status and tx.wait take it in place of a txid."),
+    ("code", "string", "A code from an earlier answer."),
+    ("content", "boolean", "Include inscription content previews."),
+    ("contenttype", "string", "A MIME type."),
+    ("count", "integer", "How many."),
+    ("counts", "boolean", "Include counts."),
+    ("cover", "string", "A cover inscription id."),
+    ("cred", "string", "A signed credential."),
+    ("cursor", "string", "Opaque: the next from the page before. Absent: the first page."),
+    ("data", "string", "Data: text, or base64 with encoding base64."),
+    ("description", "string", "Free text."),
+    ("dir", "string", "A folder on this computer."),
+    ("direction", "string", "in, out or both."),
+    ("drive", "string", "A drive from chains.drives (home = this arcade's own)."),
+    ("drop", "string", "A peer id prefix."),
+    ("encoding", "string", "text or base64."),
+    ("expect", "object", "The terms agreed: {give, take}."),
+    ("fam", "string", "A chain part: blocks, coins, ord, tokens, names, maps, ledger, profiles, messages."),
+    ("family", "string", "A segment family."),
+    ("fast", "boolean", "Use the fast lane."),
+    ("fee", "integer", "A fee in the smallest unit."),
+    ("fee_address", "string", "Where fees go."),
+    ("file", "object", "A file: {name, type, data (base64)}."),
+    ("files", "array|object", "Files: [{hex | path, type, class?, gzip?}] for blobs; {name: path} for a release."),
+    ("first", "integer", "The first height or leaf."),
+    ("flagged", "boolean", "Only flagged ones."),
+    ("following", "boolean", "Only accounts you follow."),
+    ("force", "boolean", "Do it even when it would otherwise refuse."),
+    ("free_mb", "integer", "Free MB a month per arcade."),
+    ("from", "integer|string", "Where to start: a height, an address or a name, as the command says."),
+    ("game", "string", "A game id."),
+    ("get", "object", "A leg to get: {chain, amount} or an asset."),
+    ("give", "object", "A leg to give: {chain, amount} or an asset."),
+    ("gzip", "boolean", "Store gzip-compressed."),
+    ("hash", "string", "A hash (64 hex)."),
+    ("hashes", "array", "Block hashes (64 hex each)."),
+    ("head", "string", "A head manifest (64 hex)."),
+    ("height", "integer", "A block height."),
+    ("here", "boolean", "Only what this arcade holds (never ask other arcades)."),
+    ("hex", "string", "Bytes as hex."),
+    ("hidden", "boolean", "Hide (true) or show (false)."),
+    ("history", "boolean", "Include history rows."),
+    ("history_limit", "integer", "History rows per page."),
+    ("history_offset", "integer", "History rows to skip."),
+    ("host", "string", "A host name."),
+    ("http", "boolean", "Plain http (a test address)."),
+    ("id", "integer|string", "An id: a height, hash, txid, inscription id or number, record id, as the command says."),
+    ("ids", "array", "Ids (up to 500)."),
+    ("include_invalid", "boolean", "Also list records that fail their checks."),
+    ("index", "integer|string", "An index: a key index (faucet.ask) or an index name (ledger, ord, addresses, ...)."),
+    ("inputs", "array", "The inputs a browser built."),
+    ("inscription", "string", "An inscription id or number."),
+    ("inscriptions", "boolean", "Include inscriptions held."),
+    ("json", "object", "JSON content."),
+    ("judge", "string", "A judge's address."),
+    ("key", "string", "A key: a chain key (chains.*, share.*), a messaging key, or hex key material, as the command says."),
+    ("keys", "array", "Chain keys."),
+    ("kid", "string", "A registrar key id."),
+    ("kind", "string", "A kind: what it is depends on the command (see its allowed values)."),
+    ("kinds", "array|string", "Kinds to keep (an array, or a comma list)."),
+    ("lan", "boolean", "Offer LAN candidates."),
+    ("lan_dial", "boolean", "Offer LAN addresses to every peer."),
+    ("last", "integer", "The last height."),
+    ("leaves", "array", "Leaf indexes."),
+    ("leg", "object", "A built trade leg."),
+    ("limit", "integer", "Most rows in one answer."),
+    ("limit_gb", "integer", "A month's traffic limit in GB."),
+    ("line", "string", "A line of text."),
+    ("link", "string", "A link."),
+    ("lot", "integer", "A lot number."),
+    ("maker_fee", "object", "{bps (<= 500), to: {chain: address}}."),
+    ("manifest", "string", "A manifest blob id (64 hex)."),
+    ("map", "string", "A map name."),
+    ("max_links", "integer", "Most links at once."),
+    ("mb", "integer|string", "Size in MB (0 or \"off\": none)."),
+    ("me", "boolean", "Also say what this wallet did."),
+    ("media", "array", "Media inscriptions."),
+    ("member", "string", "A member id."),
+    ("members", "array|string", "@tags or addresses."),
+    ("memo", "string", "A memo (up to 80 bytes)."),
+    ("mentions", "array", "@tags mentioned."),
+    ("message", "string", "The signed message."),
+    ("mode", "string", "How a chain is kept: full, shared or chain."),
+    ("msg", "string", "A sealed message."),
+    ("n", "integer", "How many."),
+    ("name", "string", "A name."),
+    ("network", "string", "A chain key for a market."),
+    ("node", "string", "An arcade's node id (hex)."),
+    ("nonce", "string", "A sign-in nonce."),
+    ("note", "string", "A note."),
+    ("notes", "string", "Notes."),
+    ("number", "integer", "An issue or pull request number."),
+    ("offset", "integer", "Rows to skip (from the newest unless the command says)."),
+    ("ok", "boolean", "Yes (true) or no (false)."),
+    ("on", "boolean", "Switch on (true) or off (false)."),
+    ("op", "string", "An operation: the command lists them."),
+    ("open", "boolean", "Only open ones."),
+    ("order", "string", "An order: a sort order (asc, desc, popular, new, ...) or an order id, as the command says."),
+    ("outpoints", "array", "Outpoints \"txid:vout\"."),
+    ("owner", "string", "An owner: @tag, address or node id."),
+    ("page", "string", "An app page (chain:txid)."),
+    ("password", "string", "The account's password."),
+    ("path", "string", "A path: a file on this computer (socket and cookie RPC only), or a URL path, as the command says."),
+    ("pay", "integer", "An amount to pay."),
+    ("pay_cap", "number", "Most ARCADE paid a month."),
+    ("pay_on", "boolean", "Pay relays that charge."),
+    ("pay_to", "string", "An ARCADE address to be paid at."),
+    ("payout", "object", "{chain: address}."),
+    ("peer", "string", "A peer: messaging key or node id."),
+    ("pending", "boolean", "Include what still waits in the pool (default true)."),
+    ("perms", "array|string", "Permissions: read, message, post, tip, wallet, admin."),
+    ("phrase", "string", "12 words."),
+    ("picture", "string", "A picture inscription id or URL."),
+    ("pool", "string", "A prize pool id."),
+    ("prefix", "string", "A signed-message prefix."),
+    ("price_per_gb", "number", "ARCADE per GB."),
+    ("propertyid", "integer", "An arcade token's property id."),
+    ("psbt", "string", "A PSBT (base64 or hex)."),
+    ("pubkey", "string", "A public key (33-byte hex)."),
+    ("q", "string", "Search text."),
+    ("qr", "string", "The QR code's text."),
+    ("query", "object", "Query fields."),
+    ("quote", "string", "A quote: a market's quote asset, or a D:// record quoted."),
+    ("raw", "boolean", "Include the raw transactions."),
+    ("recipient", "string", "A recipient address."),
+    ("record", "object|string", "A record."),
+    ("ref", "string", "A D:// reference."),
+    ("referee", "string", "A referee's address."),
+    ("reliable", "boolean", "Resend until acknowledged."),
+    ("replay", "object", "A run's replay."),
+    ("reply", "string", "A D:// record replied to."),
+    ("repo", "string", "A repository: @owner/name."),
+    ("request", "object", "A send request."),
+    ("requests", "boolean", "Only message requests."),
+    ("review", "string", "A review verdict."),
+    ("room", "string", "A room name."),
+    ("scripts", "string", "\"assume\": skip script checks."),
+    ("sealed", "string", "A sealed message."),
+    ("secret", "string", "A WIF key or 12 words (local only)."),
+    ("segment", "string", "A segment id (64 hex)."),
+    ("send", "boolean", "true signs and broadcasts; absent or false only builds and shows it (nothing signed)."),
+    ("service", "string", "A service name."),
+    ("session", "string", "A session id."),
+    ("set", "object", "Settings to set."),
+    ("sig", "string", "A signature."),
+    ("signal", "object", "A WebRTC signal."),
+    ("signature", "string", "A Core signmessage signature (base64)."),
+    ("since", "integer", "A height: only what is at or after it."),
+    ("skip", "boolean", "Skip the chooser."),
+    ("slug", "string", "A collection's slug."),
+    ("sort", "string", "A sort order."),
+    ("source", "string", "Where from: own, mesh, known, ..."),
+    ("sources", "integer", "Most sources at once."),
+    ("state", "string", "A state."),
+    ("status", "string", "A status filter."),
+    ("stream", "boolean", "Stream the answer line by line (socket)."),
+    ("stun_port", "integer", "STUN port for the next start (0: none)."),
+    ("summary", "boolean", "Short form: no events, the title only."),
+    ("supply", "integer", "A collection's supply."),
+    ("table", "string", "post, act, cand or profile."),
+    ("tag", "string", "An @tag (the @ may be left out; alice.doge names Dogecoin's)."),
+    ("tags", "array", "Tags."),
+    ("take", "object", "What to take."),
+    ("taker", "string", "The taker's reference."),
+    ("taker_height", "integer", "The taker's lock height."),
+    ("taker_keys", "object", "The taker's keys."),
+    ("taker_lock", "string", "The taker's lock."),
+    ("taker_time", "integer", "The taker's lock time."),
+    ("target", "string|object", "A target: a txid, or {chain, txid}."),
+    ("targets", "array", "Targets: [{chain, txid}] (up to 100)."),
+    ("text", "string", "Text."),
+    ("threads", "integer", "Threads to use."),
+    ("tick", "string", "A token tick."),
+    ("timeout", "integer", "Seconds to wait at most."),
+    ("tip_limit", "integer", "A key's daily tip limit (smallest units)."),
+    ("title", "string", "A title."),
+    ("to", "string|array", "Where to: an address or @tag (svc.ask: a node id or \"self\"; realtime: player ids)."),
+    ("token", "string", "A seat token from realtime.join."),
+    ("txid", "string", "A transaction id (64 hex)."),
+    ("type", "string", "A type: a MIME type for blobs, a record type for D://."),
+    ("units", "integer|string", "Token base units."),
+    ("until", "string", "The state to wait for."),
+    ("uri", "string", "A digiid:// URI."),
+    ("url", "string", "A URL."),
+    ("value", "string", "A value."),
+    ("verdict", "string", "A verdict."),
+    ("via", "string", "This arcade's https address."),
+    ("wait", "integer", "Milliseconds (realtime.poll) or seconds (events.since) to wait for news."),
+    ("what", "string", "What to fetch: coins or blocks."),
+    ("who", "string", "An @tag or address."),
+    ("wif", "string", "A WIF private key."),
+    ("with", "array", "Indexes to keep with a chain."),
+];
+
+/// What one command says of one parameter: (command, parameter, allowed values (comma list, "" none), default (JSON,
+/// "" none), most (a number's limit, 0 none)).
+pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
+    ("tx.wait", "until", "accepted_local,broadcast_ok,seen_in_peer_mempool,confirmed", "\"confirmed\"", 0),
+    ("tx.wait", "timeout", "", "60", 600),
+    ("chains.wait", "timeout", "", "60", 600),
+    ("events.since", "limit", "", "100", 1000),
+    ("events.since", "wait", "", "0", 60),
+    ("events", "n", "", "30", 2000),
+    ("ledger.items", "state", "open,closed,merged", "", 0),
+    ("ledger.items", "kind", "issue,pull", "", 0),
+    ("ledger.items", "limit", "", "50", 500),
+    ("ledger.items", "pending", "", "true", 0),
+    ("ledger.item_open", "kind", "issue,pull", "\"issue\"", 0),
+    ("ledger.item_comment", "review", "approve,changes", "", 0),
+    ("ledger.item_state", "state", "open,closed,merged", "", 0),
+    ("explorer.blocks", "order", "desc,asc", "\"desc\"", 0),
+    ("explorer.blocks", "limit", "", "20", 100),
+    ("explorer.blocks", "n", "", "", 100),
+    ("explorer.blocks", "from", "", "0", 0),
+    ("feed", "order", "popular,new,friends,following", "\"popular\"", 0),
+    ("feed.act", "kind", "like,unlike,dislike,undislike,reply,share,edit,delete,tip", "", 0),
+    ("psbt.feed_act", "kind", "like,unlike,dislike,undislike,reply,share,edit,delete,tip", "", 0),
+    ("a.react", "kind", "like,unlike,dislike,undislike", "", 0),
+    ("wallet.send", "kind", "legacy,p2sh-p2wpkh,p2wpkh,p2tr", "", 0),
+    ("borrow.send", "kind", "legacy,p2sh-p2wpkh,p2wpkh,p2tr", "", 0),
+    ("wallet.addr_kind", "kind", "legacy,p2sh-p2wpkh,p2wpkh,p2tr", "", 0),
+    ("wallet.import", "addr_kind", "legacy,p2sh-p2wpkh,p2wpkh", "\"legacy\"", 0),
+    ("chains.add", "mode", "full,shared,chain", "\"full\"", 0),
+    ("chains.plan", "mode", "full,shared,chain", "\"full\"", 0),
+    ("chains.copy_start", "what", "coins,blocks", "\"coins\"", 0),
+    ("chains.index_copy_start", "index", "ledger,ord", "", 0),
+    ("chains.index_copy_cancel", "index", "ledger,ord", "", 0),
+    ("arc.blob_publish", "class", "0,1,2,3", "0", 0),
+    ("arc.blob_publish_large", "class", "0,1,2,3", "0", 0),
+    ("explorer.msg_rows", "table", "post,act,cand,profile", "", 0),
+    ("explorer.dogefeed_address", "direction", "in,out,both", "", 0),
+    ("apps.node", "op", "identity,send,sent,replies", "", 0),
+    ("inscribe", "encoding", "text,base64", "\"text\"", 0),
+    ("inscribe.estimate", "encoding", "text,base64", "\"text\"", 0),
+    ("explorer.arc_segments", "limit", "", "", 500),
+    ("explorer.arc_holders", "limit", "", "", 500),
+    ("explorer.arc_payouts", "blocks", "", "300", 1152),
+    ("explorer.token", "n", "", "25", 100),
+];
+
+/// A row's parameter list split at its top-level commas (a note in parentheses keeps its commas).
+fn split_params(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut depth) = (Vec::new(), String::new(), 0i32);
+    for ch in s.chars() {
+        match ch {
+            '(' => depth += 1,
+            ')' => depth -= 1,
+            _ => {}
+        }
+        if ch == ',' && depth == 0 {
+            out.push(std::mem::take(&mut cur));
+        } else {
+            cur.push(ch);
+        }
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out.into_iter().map(|p| p.trim().to_string()).filter(|p| !p.is_empty()).collect()
+}
+
+/// A parameter's type and meaning from [`PARAM_TYPES`].
+pub fn param_type(name: &str) -> Option<(&'static str, &'static str)> {
+    PARAM_TYPES.iter().find(|p| p.0 == name).map(|p| (p.1, p.2))
+}
+
+/// One command's parameters, typed: [{name, type, required, default?, enum?, maximum?, one_of?, note?, description}].
+/// "a | b": either one (one_of names the group; required when the group isn't marked optional).
+pub fn params_of(c: &Cmd) -> Vec<serde_json::Value> {
+    use serde_json::json;
+    let mut out = Vec::new();
+    for part in split_params(c.params) {
+        let (body, note) = match part.find('(') {
+            Some(i) => (part[..i].trim().to_string(), Some(part[i + 1..].trim_end_matches(')').trim().to_string())),
+            None => (part.clone(), None),
+        };
+        let alts: Vec<String> = body.split('|').map(|a| a.trim().to_string()).filter(|a| !a.is_empty()).collect();
+        let group_opt = alts.iter().all(|a| a.ends_with('?'));
+        let one_of: Option<Vec<String>> = (alts.len() > 1).then(|| alts.iter().map(|a| a.trim_end_matches('?').to_string()).collect());
+        for a in &alts {
+            let name = a.trim_end_matches('?').to_string();
+            let (ty, desc) = param_type(&name).unwrap_or(("string", ""));
+            let mut v = json!({"name": name, "type": ty, "required": one_of.is_none() && !a.ends_with('?'), "description": desc});
+            if let Some(g) = &one_of {
+                v["one_of"] = json!(g);
+                v["one_of_required"] = json!(!group_opt);
+            }
+            if let Some(n) = &note {
+                v["note"] = json!(n);
+                // "(<= 500)", "(<= 1152, default 300)"
+                for bit in n.split(',').map(str::trim) {
+                    if let Some(m) = bit.strip_prefix("<=").and_then(|x| x.trim().parse::<u64>().ok()) {
+                        v["maximum"] = json!(m);
+                    }
+                    if let Some(d) = bit.strip_prefix("default").and_then(|x| x.trim().parse::<u64>().ok()) {
+                        v["default"] = json!(d);
+                    }
+                }
+            }
+            if let Some(r) = PARAM_RULES.iter().find(|r| r.0 == c.name && r.1 == name) {
+                if !r.2.is_empty() {
+                    v["enum"] = json!(r.2.split(',').collect::<Vec<_>>());
+                }
+                if let Ok(d) = serde_json::from_str::<serde_json::Value>(r.3) {
+                    v["default"] = d;
+                }
+                if r.4 > 0 {
+                    v["maximum"] = json!(r.4);
+                }
+            }
+            if name == "send" && v["default"].is_null() {
+                v["default"] = json!(false);
+            }
+            out.push(v);
+        }
+    }
+    out
+}
+
+/// What a command answers: the row's own shape, else what its kind of command answers.
+pub fn result_of(c: &Cmd) -> serde_json::Value {
+    use serde_json::json;
+    if let Some(r) = c.result {
+        return json!({"shape": r});
+    }
+    let p = c.params;
+    let shape = if p.contains("client_ref?") {
+        if p.contains("send?") {
+            "{txid, fee, ..., receipt: {chain, txids, client_ref, state}} with send: true; without, the transaction built and shown (nothing signed)"
+        } else {
+            "{txid, fee, ..., receipt: {chain, txids, client_ref, state}}"
+        }
+    } else if c.name.starts_with("explorer.") {
+        "object, or a list; reads of one chain carry chain, as_of {height, hash}, source and decimals"
+    } else {
+        "object (see summary)"
+    };
+    json!({"shape": shape})
+}
+
+/// Whether a command is a send that signs (it takes client_ref and leaves a receipt: crate::receipts).
+pub fn is_send(c: &Cmd) -> bool {
+    split_params(c.params).iter().any(|p| p.trim_end_matches('?') == "client_ref")
+}
+
+/// Whether a send only signs with send: true (it takes send).
+pub fn signs_only_with_send(c: &Cmd) -> bool {
+    split_params(c.params).iter().any(|p| p.trim_end_matches('?') == "send")
+}
+
+/// The web API route of a command.
+pub fn route_of(name: &str) -> String {
+    format!("/api/v1/{}", name.replace('.', "/"))
+}
+
 pub fn help() -> serde_json::Value {
-    serde_json::json!(COMMANDS.iter().map(|c| serde_json::json!({"method": c.name, "needs": c.perm.name(), "params": c.params, "summary": c.summary})).collect::<Vec<_>>())
+    serde_json::json!(COMMANDS
+        .iter()
+        .map(|c| serde_json::json!({"method": c.name, "route": route_of(c.name), "needs": c.perm.name(), "params": c.params,
+                                    "summary": c.summary, "schema": params_of(c), "result": result_of(c), "sends": is_send(c)}))
+        .collect::<Vec<_>>())
+}
+
+/// GET /api/v1/routes: every command as a route, with the same typed schema as rpc.help.
+pub fn routes() -> serde_json::Value {
+    serde_json::json!(COMMANDS
+        .iter()
+        .map(|c| serde_json::json!({"route": route_of(c.name), "method": c.name, "needs": c.perm.name(), "params": c.params,
+                                    "summary": c.summary, "schema": params_of(c), "result": result_of(c), "sends": is_send(c)}))
+        .collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The names a match in `src` answers ("name" => or "a" | "b" =>), between the line holding `from` and the end.
+    fn arms(src: &str, from: &str) -> std::collections::BTreeSet<String> {
+        let body = &src[src.find(from).expect("the dispatch function")..];
+        let mut out = std::collections::BTreeSet::new();
+        for line in body.lines() {
+            // The match's own arms (8 spaces in); a nested match (apps.node's ops) is further in.
+            if line.starts_with("    }") {
+                break;
+            }
+            let Some(t) = line.strip_prefix("        ").filter(|t| !t.starts_with(' ')) else { continue };
+            let t = t.strip_prefix("c @ (").unwrap_or(t);
+            if !t.starts_with('"') {
+                continue;
+            }
+            let Some(head) = t.split(" =>").next().filter(|_| t.contains(" =>")) else { continue };
+            let head = head.split(" if ").next().unwrap_or(head).trim_end_matches(')');
+            let names: Vec<&str> = head.split('|').map(|x| x.trim().trim_matches('"')).collect();
+            if names.iter().all(|n| !n.is_empty() && n.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '.' || c == '_')) {
+                out.extend(names.into_iter().map(String::from));
+            }
+        }
+        out
+    }
+
+    /// Every command the socket answers is in the one table (so /api/v1 and JSON-RPC answer it under the same name,
+    /// and rpc.help, routes and openapi.json list it), unless PRIVATE keeps it off the network; and every row has a
+    /// handler. ARCADE #25 part 2: before, 32 commands answered on the socket alone.
+    #[test]
+    fn surfaces_match() {
+        let api = include_str!("api.rs");
+        let mut socket = arms(api, "fn dispatch_cmd(");
+        // The explorer's own reads (crate::explorer::answer), reached on the socket by their prefix.
+        let ex = include_str!("explorer.rs");
+        // (and a read answered before the match: `if cmd == "explorer.arc_machines"`)
+        socket.extend(ex.match_indices("cmd == \"explorer.").filter_map(|(i, _)| ex[i + 8..].split('"').next().map(String::from)));
+        for line in ex.lines().filter(|l| l.contains(" =>") && l.trim_start().starts_with("\"explorer.")) {
+            let head = line.split(" =>").next().unwrap_or("");
+            socket.extend(head.split('|').map(|x| x.trim().trim_matches('"').to_string()).filter(|n| n.starts_with("explorer.") && !n.ends_with('_')));
+        }
+        let private: Vec<&str> = PRIVATE.iter().map(|p| p.0).collect();
+        let missing: Vec<&String> = socket.iter().filter(|n| find(n).is_none() && !private.contains(&n.as_str())).collect();
+        assert!(missing.is_empty(), "answered on the socket but not in the command table (so not on /api/v1, JSON-RPC, rpc.help, routes or openapi.json): {missing:?}");
+        let unhandled: Vec<&str> = COMMANDS.iter().map(|c| c.name).filter(|n| !socket.contains(*n)).collect();
+        assert!(unhandled.is_empty(), "in the table with no handler: {unhandled:?}");
+        for (name, why) in PRIVATE {
+            assert!(find(name).is_none() && !why.is_empty(), "{name} is private: it must stay out of the table");
+            assert!(api.contains(&format!("\"{name}\"")), "{name} is listed private but the socket doesn't answer it");
+        }
+        // One name per command, and the web route maps back to it.
+        let mut seen = std::collections::BTreeSet::new();
+        for c in COMMANDS {
+            assert!(seen.insert(c.name), "{} twice in the table", c.name);
+            assert_eq!(route_of(c.name).strip_prefix("/api/v1/").unwrap().replace('/', "."), c.name);
+        }
+    }
+
+    #[test]
+    fn every_param_is_typed() {
+        for c in COMMANDS {
+            for p in params_of(c) {
+                let n = p["name"].as_str().unwrap();
+                assert!(param_type(n).is_some(), "{}: parameter {n} has no type in PARAM_TYPES", c.name);
+            }
+        }
+        for r in PARAM_RULES {
+            let c = find(r.0).unwrap_or_else(|| panic!("PARAM_RULES names {}, no command", r.0));
+            assert!(params_of(c).iter().any(|p| p["name"] == r.1), "PARAM_RULES: {} takes no {}", r.0, r.1);
+        }
+        let t = |c: &str, p: &str| params_of(find(c).unwrap()).into_iter().find(|x| x["name"] == p).unwrap();
+        assert_eq!(t("tx.wait", "until")["enum"][0], "accepted_local");
+        assert_eq!(t("tx.wait", "timeout")["maximum"], 600);
+        assert_eq!(t("tx.status", "txid")["one_of"], serde_json::json!(["txid", "client_ref"]));
+        assert_eq!(t("tx.status", "chain")["required"], true);
+        assert_eq!(t("explorer.arc_payouts", "blocks")["default"], 300);
+        assert_eq!(t("wallet.send", "send")["default"], false);
+        assert_eq!(t("ledger.items", "cursor")["type"], "string");
+        assert!(is_send(find("ledger.item_open").unwrap()) && !is_send(find("ledger.items").unwrap()));
+        assert!(signs_only_with_send(find("wallet.send").unwrap()) && !signs_only_with_send(find("ledger.item_open").unwrap()));
+        let h = help();
+        assert_eq!(h.as_array().unwrap().len(), COMMANDS.len());
+        assert!(h[0]["schema"].is_array() && h[0]["result"]["shape"].is_string());
+    }
 }

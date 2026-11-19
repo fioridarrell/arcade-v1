@@ -69,7 +69,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `status` | `/api/v1/status` | public | chain? | Home chain, sync state, tip, best_known (the best height anyone tells us of), tags, profiles, mesh links, node id, phase (starting, ready, stopping) and rules.update_needed. With chain (a key, e.g. arctest): that chain alone: tip {height, hash}, best_known (from linked peers, null when none told), best_known_from, behind, sync (synced, syncing, unknown, not_kept), mode and source (own or borrowed), and for the ARCADE chain its rules. |
 | `peers` | `/api/v1/peers` | read | — | Arcades linked over the mesh right now. |
-| `events` | `/api/v1/events` | read | n?, kind? | Recent activity (newest first), optionally of one kind. |
+| `events` | `/api/v1/events` | read | n?, kind? | Recent activity (newest first), optionally of one kind. events.since follows the log with a cursor. |
 | `mempool` | `/api/v1/mempool` | public | — | Home chain transactions waiting for a block. |
 | `feed` | `/api/v1/feed` | public | order?, channel?, tag?, author?, txid?, limit?, offset? | Public posts (popular, new or friends) with replies, counts and tips. |
 | `ledger` | `/api/v1/ledger` | public | — | The arcade ledger's fingerprints next to what other arcades report. |
@@ -79,7 +79,8 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `map` | `/api/v1/map` | public | map?, chain? | A map claim, or counts. |
 | `token` | `/api/v1/token` | public | tick?, chain? | A token, or how many there are. |
 | `tokens` | `/api/v1/tokens` | public | owner, chain? | Token balances of an address. |
-| `inscribe` | `/api/v1/inscribe` | wallet | data, encoding?, contenttype?, json? | Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64). |
+| `inscribe` | `/api/v1/inscribe` | wallet | data, encoding?, contenttype?, json?, client_ref? | Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64). |
+| `follow` | `/api/v1/follow` | post | who, on?, client_ref? | Follow an account (on: false unfollows): a feed act on the home chain from this wallet; the newest between two accounts counts. |
 
 ### Mesh
 
@@ -101,8 +102,8 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `tx.activity` | `/api/v1/tx/activity` | public | addresses, since?, chain? | What changed for up to 500 addresses: history rows above height since, and waiting transactions paying or spending them; height to pass as since next time. |
 | `tx.fee` | `/api/v1/tx/fee` | public | chain? | The fee rate (per 1000 bytes) and dust limit this arcade's wallet builds transactions with on that chain (kept or borrowed). |
 | `tx.broadcast` | `/api/v1/tx/broadcast` | post | hex, chain? | Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network. On a borrowed chain it goes to the lenders' nodes, which check it; refused by all, it is not sent. |
-| `tx.status` | `/api/v1/tx/status` | read | chain, txid \| client_ref | Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding}), signed (signed here moments ago, in no pool or block), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, and code not_found when this arcade never signed it. |
-| `tx.wait` | `/api/v1/tx/wait` | read | chain, txid \| client_ref, until?, timeout? | tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped, or after timeout seconds (default 60, at most 600) with timed_out: true. |
+| `tx.status` | `/api/v1/tx/status` | read | chain, txid \| client_ref | Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding, peers_acked, peers_refused}), broadcast_failed (refused here or by every peer that answered: broadcast.refusals [{peer, code, error}], code fee_too_low, conflict, missing_coin, dust, not_yet_valid, blob_missing, pool_full, invalid, rules or unreachable), signed (signed here: the receipt is written the moment it is signed, before any network step; in no pool or block yet), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, error (what the send answered, when it failed after signing), and code not_found when this arcade never signed it. |
+| `tx.wait` | `/api/v1/tx/wait` | read | chain, txid \| client_ref, until?, timeout? | tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped or broadcast_failed, or after timeout seconds (default 60, at most 600) with timed_out: true. |
 
 ### Psbt
 
@@ -180,7 +181,7 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `dd.wallet` | `/api/v1/dd/wallet` | read | chain? | Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen). |
-| `dd.send` | `/api/v1/dd/send` | local | chain?, to, cents, send? | Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown. |
+| `dd.send` | `/api/v1/dd/send` | local | chain?, to, cents, send?, client_ref? | Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown. |
 
 ### Account
 
@@ -196,7 +197,7 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `tag.check` | `/api/v1/tag/check` | public | tag, chain? | Whether a @tag is free and valid on one chain (every chain has its own @tags; see "@tags per chain" below). tag may name the chain (`alice.doge`), or chain does; else where new tags go. Answers chain, full (`alice.doge`) and label (`@alice · DOGE`). |
-| `tag.claim` | `/api/v1/tag/claim` | wallet | tag, chain? | Claim a @tag on one chain: ARCADE, Pepecoin testnet (test coins asked for by themselves), or a mainnet chain tags live on here (pep, doge, dgb: kept with their ledger index or borrowed; the fee is paid in that coin from the claim's key). |
+| `tag.claim` | `/api/v1/tag/claim` | wallet | tag, chain?, client_ref? | Claim a @tag on one chain: ARCADE, Pepecoin testnet (test coins asked for by themselves), or a mainnet chain tags live on here (pep, doge, dgb: kept with their ledger or borrowed; paid in that coin). tag may name the chain (alice.doge). |
 | `tag.resolve` | `/api/v1/tag/resolve` | public | tag | What an @tag names: {found: one / many / none, choices: [{tag, chain, label, address, name}]}. many = different people hold the name on several chains: show them and let the person pick. |
 | `tag.list` | `/api/v1/tag/list` | read | — | Your tag claims and their progress. |
 
@@ -222,10 +223,10 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | `msg.read` | `/api/v1/msg/read` | message | peer | Mark a conversation read. |
 | `msg.unread` | `/api/v1/msg/unread` | read | — | Unread counts: messages, requests, group lines. |
 | `msg.file` | `/api/v1/msg/file` | read | id | A message's file (base64). |
-| `msg.send` | `/api/v1/msg/send` | message | to, text?, file? | Send a private message to a @tag, address or key; file = {name, type, data (base64)}. |
+| `msg.send` | `/api/v1/msg/send` | message | to, text?, file?, client_ref? | Send a private message to a @tag, address or key; file = {name, type, data (base64)}. |
 | `msg.delete` | `/api/v1/msg/delete` | message | id | Stop showing a message here (the chain keeps it). |
-| `msg.announce` | `/api/v1/msg/announce` | wallet | — | Publish your messaging key now if it isn't on chain. |
-| `profile.publish_addresses` | `/api/v1/profile/publish_addresses` | wallet | send? | List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee and total cost. |
+| `msg.announce` | `/api/v1/msg/announce` | wallet | client_ref? | Publish your messaging key now if it isn't on chain. |
+| `profile.publish_addresses` | `/api/v1/profile/publish_addresses` | wallet | send?, client_ref? | List this wallet's own addresses (Pepecoin mainnet, Dogecoin, each other coin installed here) on your @tag's profile, keeping the rest of it; no private key is pasted. send: true broadcasts, otherwise it's only built and shown with its fee and total cost. |
 
 ### Contacts
 
@@ -267,8 +268,8 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 |---|---|---|---|---|
 | `feed.channels` | `/api/v1/feed/channels` | public | — | Channels and how many posts each has. |
 | `feed.settings` | `/api/v1/feed/settings` | read | set? | Feed settings (hide muted, contacts only); set = {hide_muted, contacts_only} needs post. |
-| `feed.post` | `/api/v1/feed/post` | post | text?, channel?, file? | Post publicly (needs a @tag). |
-| `feed.act` | `/api/v1/feed/act` | post | kind, target, text?, amount? | Like, unlike, dislike, undislike, reply, share, edit, delete; tip (needs tip; amount in satoshis). |
+| `feed.post` | `/api/v1/feed/post` | post | text?, channel?, file?, client_ref? | Post publicly (needs a @tag). |
+| `feed.act` | `/api/v1/feed/act` | post | kind, target, text?, amount?, client_ref? | Like, unlike, dislike, undislike, reply, share, edit, delete; tip (needs tip; amount in satoshis). |
 | `feed.file` | `/api/v1/feed/file` | public | txid | A post's file (base64). |
 
 ### Ord
@@ -276,6 +277,7 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `ord.chunks` | `/api/v1/ord/chunks` | public | from?, chain? | Ord fingerprint chunks (as other arcades compare them). |
+| `ord.send` | `/api/v1/ord/send` | local | inscription, to, chain?, send?, client_ref? | Send one inscription (id or number) from this wallet's address on a chain kept here with its ord index, or borrowed (where it sits from the arcades keeping the ord index, which must agree; coins from a lender, checked against their blocks; sent through the lenders): its coin whole to `to` first, clean coins pay the fee. Only one alone at the start of its coin. send: true broadcasts, otherwise it is built and shown with its fee. |
 
 ### Explorer
 
@@ -283,7 +285,7 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 |---|---|---|---|---|
 | `explorer.summary` | `/api/v1/explorer/summary` | public | chain? | Chain summary for the explorer's front page. |
 | `explorer.earn` | `/api/v1/explorer/earn` | public | chain? | This arcade's ARCADE pay, read only (docs/EARN.md): its turn, next payout, accrued pay, pay and draw weight, why pay waits, and its sealed replicas waiting to register; with a chain, that coin's Earn ARCADE progress too. App pages read it at `/r/explorer/earn`. |
-| `explorer.blocks` | `/api/v1/explorer/blocks` | public | chain?, offset?, limit?, before?, n? | Recent blocks, newest first. offset (back from the tip) and limit (at most 100) answer a page: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the next page; null at block 0), chain, as_of, source}. before and n (at most 100) answer the plain list, as before. |
+| `explorer.blocks` | `/api/v1/explorer/blocks` | public | chain?, offset?, limit?, before?, n?, order?, from? | Recent blocks, newest first. offset (back from the tip) and limit (at most 100) answer a page: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the next page; null at block 0), chain, as_of, source}. before and n (at most 100) answer the plain list, as before. order asc with from (a height, default 0): a feed oldest first, {items, from, limit, next_from (the height to ask from next; the tip + 1 at the end: chains.wait waits for it), tip, chain, as_of, source}. |
 | `explorer.block` | `/api/v1/explorer/block` | public | chain?, id | One block (id: a height, as a number or text, or a hash). Carries chain, as_of {height, hash} (the tip its confirmations count against), source (local, borrowed or mesh), unit and decimals. |
 | `explorer.tx` | `/api/v1/explorer/tx` | public | chain?, txid | One transaction: height, block (its hash), confirmations, fee, inputs and outputs in base units (decimals: 8); an OP_RETURN output carries data (hex) and decoded (an arcade record: repository or A:// with its op). Carries chain, as_of, source; without chain it answers on the home chain and says so (chain_note). |
 | `explorer.address` | `/api/v1/explorer/address` | public | chain?, address, history?, inscriptions?, content?, history_offset?, history_limit? | An address: balance, history (newest first, a page at a time: history_offset (or offset) and history_limit (or limit; default 50, at most 500); history_next is the next page's offset, null after the oldest; tx_count the total), inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address). |
@@ -304,6 +306,15 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | `explorer.tag` | `/api/v1/explorer/tag` | public | chain?, tag | A @tag's page: addresses (with linked and imported wallets) and balances. |
 | `explorer.search` | `/api/v1/explorer/search` | public | chain?, q | Search: block, tx, address, @tag, inscription, token, name. |
 | `explorer.inscription_types` | `/api/v1/explorer/inscription_types` | public | chain? | How many ord inscriptions of each kind (images, text, HTML, ...) a chain holds. |
+| `explorer.site` | `/api/v1/explorer/site` | public | chain?, name | A name's site as this arcade's names index holds it: {name, claim, holder, page, scanning}. |
+| `explorer.sites` | `/api/v1/explorer/sites` | public | chain?, all? | Sites by name, newest first: {names: [{name, page, number, height, title}], scanning}. |
+| `explorer.ledger_bytes` | `/api/v1/explorer/ledger_bytes` | public | chain?, id | An arcade inscription's whole bytes (base64, up to 16 MB), for an arcade that does not keep this chain's ledger: {txid, number, content_type, sha256, b64}. |
+| `explorer.page` | `/api/v1/explorer/page` | public | chain?, path, query? | A public page read (GET /r/...) answered on this chain, for an app opened at an arcade that does not keep its ledger. |
+| `explorer.app_cards` | `/api/v1/explorer/app_cards` | public | chain? | The rows of a chain that may be app cards, for an arcade's App Store that borrows it: {rows}. |
+| `explorer.ord_outpoints` | `/api/v1/explorer/ord_outpoints` | public | chain?, outpoints | Which of these outpoints carry ord inscriptions (outpoints: ["txid:vout", ...]). |
+| `explorer.token_note` | `/api/v1/explorer/token_note` | public | chain?, id | The token note an inscription carries (PRC-20 / DRC-20): {id, note}. |
+| `explorer.prize_rows` | `/api/v1/explorer/prize_rows` | public | chain? | The prize pool rows of a chain's ledger: {rows}. |
+| `explorer.activity` | `/api/v1/explorer/activity` | public | chain?, addresses, since? | tx.activity read from this arcade's own copy (never borrowed): history rows and waiting transactions of up to 500 addresses. |
 
 ### Chains
 
@@ -337,6 +348,7 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | `chains.index_copy_status` | `/api/v1/chains/index_copy_status` | public | key? | Index copies (docs/INDEXBOOT.md): what old arcades offer per chain, the fetch, its votes, and whether an index here came from a copy. |
 | `chains.index_copy_start` | `/api/v1/chains/index_copy_start` | admin | key, index, from? | Fetch an index copy now from the best offer (index = ledger or ord; from = one arcade's node id): it is taken in only if 2 or more other arcades agree with it. |
 | `chains.index_copy_cancel` | `/api/v1/chains/index_copy_cancel` | admin | key, index | Stop fetching an index copy (its pieces are deleted). |
+| `chains.wait` | `/api/v1/chains/wait` | public | chain, height, timeout? | Answered once chain's tip (as this arcade reads it: own copy or borrowed) reaches height, or after timeout seconds (default 60, at most 600): {chain, height, tip: {height, hash}, source, reached, timed_out}. |
 
 ### Share
 
@@ -358,7 +370,7 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | `borrow.status` | `/api/v1/borrow/status` | read | — | Borrowed coins: the switches, and per chain its lenders, tip, floor, tip mismatch and your balance. |
 | `borrow.set` | `/api/v1/borrow/set` | admin | on, chain? | Turn borrowing on or off: for every coin (no chain) or for one chain (off removes its borrowed data). |
 | `borrow.coins` | `/api/v1/borrow/coins` | read | chain | Your coins on a borrowed chain (from blocks read since the floor, and the lender's coin scan). |
-| `borrow.send` | `/api/v1/borrow/send` | local | chain, to, amount, from?, kind?, all_kinds?, send? | Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown. |
+| `borrow.send` | `/api/v1/borrow/send` | local | chain, to, amount, from?, kind?, all_kinds?, send?, client_ref? | Pay amount (satoshis) on a borrowed chain, signed here (kind, all_kinds: as wallet.send); send: true broadcasts to every lender, otherwise only built and shown. |
 
 ### Mining
 
@@ -433,6 +445,102 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | `rpc.help` | `/api/v1/rpc/help` | public | — | Every command, its parameters and what it needs. |
 | `arc.status` | `/api/v1/arc/status` | public | — | The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here. |
 | `rpc.info` | `/api/v1/rpc/info` | local | — | Where the RPC and the web API are, and the cookie file. |
+| `rpc.openapi` | `/api/v1/rpc/openapi` | public | — | The OpenAPI 3.1 document of the web API (also GET /api/v1/openapi.json): every command, its typed parameters and result shape. |
+| `rpc.guide` | `/api/v1/rpc/guide` | public | — | The short guide for AI agents and scripts (also GET /api/v1/agents.md), as Markdown text. |
+
+### Svc
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `svc.pay` | `/api/v1/svc/pay` | wallet | to, amount, memo, client_ref? | Pay ARCADE to an address with a memo of up to 80 bytes (a service's credit). |
+
+### Token
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `token.send` | `/api/v1/token/send` | local | propertyid, units, to, chain?, send?, client_ref? | Send arcade tokens (base units) from this wallet in one transaction, on the home chain's ledger or the ARCADE chain's (chain: arc / arctest), installed or borrowed; without send: true, only what it would do. |
+
+### Ledger
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `ledger.announce` | `/api/v1/ledger/announce` | wallet | client_ref? | Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain. |
+| `ledger.tag_commit` | `/api/v1/ledger/tag_commit` | wallet | tag, client_ref? | Commit ahead to claiming a released @tag on the ARCADE chain. |
+| `ledger.tag_checkin` | `/api/v1/ledger/tag_checkin` | wallet | client_ref? | Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot). |
+| `ledger.repo_push` | `/api/v1/ledger/repo_push` | wallet | name, manifest, base?, force?, client_ref? | Point @owner/name at a git manifest blob (owner or maintainer). From rules v4 the push names base (the manifest it was built on, "" for a new repo; default: the current one) and is refused if the repo moved on, unless force. |
+| `ledger.repo_maintainer` | `/api/v1/ledger/repo_maintainer` | wallet | name, tag, add?, client_ref? | Add or remove a maintainer of your repository. |
+| `ledger.repo_fork` | `/api/v1/ledger/repo_fork` | wallet | from, name, client_ref? | Fork @owner/name under your @tag. |
+| `ledger.item_state` | `/api/v1/ledger/item_state` | wallet | repo, number, state, manifest?, client_ref? | Close, reopen or merge an issue or pull request. |
+| `ledger.items` | `/api/v1/ledger/items` | read | repo, number?, state?, kind?, since?, summary?, pending?, cursor?, limit? | A repository's issues and pull requests with their comments and reviews, by number. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items or comments at or after it); summary: true leaves out the events and keeps the title. Items, comments, reviews and state changes still waiting in the pool come too, marked pending: true (a pending item has no number yet; pending: false leaves them out). Paged: limit (default 50, at most 500) and cursor (the next of the page before; opaque); next is null on the last page, which also carries the pending items. count: how many on this page. |
+| `ledger.book` | `/api/v1/ledger/book` | public | network?, base?, quote? | The market's open orders on the arcade ledger (docs/MARKET.md). |
+| `ledger.trades` | `/api/v1/ledger/trades` | public | network?, base?, quote?, before? | The market's recent trades on the arcade ledger. |
+| `ledger.pairs` | `/api/v1/ledger/pairs` | public | q? | The market's pairs on the arcade ledger. |
+
+### Arc
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `arc.blob_publish` | `/api/v1/arc/blob_publish` | wallet | path \| hex, type, class?, gzip?, send?, client_ref? | Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Without send, only the quote (blob_fee, fee). |
+| `arc.blob_publish_large` | `/api/v1/arc/blob_publish_large` | wallet | path \| hex, type, class?, gzip?, name?, send?, client_ref? | Put a file of up to 100 MB on the ARCADE chain as one large blob: parts of 4 MB over successive blocks, then a manifest naming them and the overall root; its id is the manifest's. Without send, the quote (parts, fee, blocks, seconds). Resumes after a restart without paying twice. arc.blob_publish switches to it above 4 MB. |
+| `arc.block` | `/api/v1/arc/block` | public | height? \| id?, raw? | One block of the ARCADE chain run here: by height (the branch it is on) or by id (any branch it holds): id, prev, height, time, difficulty, writer, score, steps, best, txs (txids), raw (with raw: true, the transactions' hex), bytes, pot_runs. |
+| `arc.submit` | `/api/v1/arc/submit` | post | hex, blobs? | A signed ARCADE transaction (hex) into this arcade's pool, from where it goes to the other arcades and into a block; blobs: the hex of blobs it brings. As tx.broadcast for the ARCADE chain. |
+| `arc.pool` | `/api/v1/arc/pool` | public | — | The ARCADE transactions waiting in this arcade's pool, in order of arrival (at most 1,000 listed). |
+| `arc.catalog` | `/api/v1/arc/catalog` | public | — | The segments the ARCADE chain lists, the entries that wait (and who stands behind each), and this arcade's side of it. |
+| `arc.genesis` | `/api/v1/arc/genesis` | public | — | Where the ARCADE chain's genesis list stands here. |
+| `arc.segment_root` | `/api/v1/arc/segment_root` | read | chain, first, last | The storage root this arcade makes for heights first..last of a chain it keeps. |
+| `arc.replicas` | `/api/v1/arc/replicas` | read | — | The sealed copies (replicas) this arcade holds, and a sealing under way. |
+| `arc.sealing` | `/api/v1/arc/sealing` | read | chain | The segments of a chain as this arcade holds them for the ARCADE chain: waiting, queued, sealing, registering, earning; this arcade's weight and the chain's total; why sealing waits. |
+| `arc.open` | `/api/v1/arc/open` | read | segment, leaves | Leaves of one of this arcade's replicas, opened (segment: its id; leaves: indexes). |
+| `arc.seal` | `/api/v1/arc/seal` | admin | segment? | Seal a confirmed segment (its id; else the first listed one of a chain kept here not sealed yet) under this arcade's key, in the background. |
+| `arc.reveal` | `/api/v1/arc/reveal` | admin | segment, first?, count? | A reveal demand by hand: the holders of a listed segment must show these leaves on the ARCADE chain. |
+| `arc.serve_check` | `/api/v1/arc/serve_check` | admin | owner, chain, first? \| hashes?, count? | A serving check by hand, no verdict posted: does the arcade `owner` (64 hex) hand out these blocks of chain? |
+| `arc.keeper` | `/api/v1/arc/keeper` | admin | on? | This arcade's time keeper: on: true or false turns it on or off (it starts or stops within a block); its state. |
+| `arc.archive` | `/api/v1/arc/archive` | admin | on? | Keep every blob's plain copy (an archive node; on: true) or let the classes drop them. |
+| `arc.blob_publish_many` | `/api/v1/arc/blob_publish_many` | wallet | files, send?, client_ref? | Several blobs in one ARCADE transaction: files [{hex | path, type, class?, gzip?}] (path: this computer's socket or cookie RPC only); without send, only what it would cost. |
+
+### A
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `a.profile_set` | `/api/v1/a/profile_set` | wallet | name?, bio?, url?, picture?, addresses?, client_ref? | Publish your profile on the ARCADE chain (A://). |
+| `a.follow` | `/api/v1/a/follow` | wallet | tag, client_ref? | Follow an @tag on the ARCADE chain. |
+| `a.unfollow` | `/api/v1/a/unfollow` | wallet | tag, client_ref? | Stop following an @tag. |
+| `a.contact_save` | `/api/v1/a/contact_save` | wallet | id?, name, tag?, addresses, note?, client_ref? | Save an address book entry (encrypted to your own key). |
+| `a.contact_add` | `/api/v1/a/contact_add` | wallet | tag \| address, client_ref? | Add someone to your address book from their published profile. |
+| `a.contact_delete` | `/api/v1/a/contact_delete` | wallet | id, client_ref? | Remove an address book entry. |
+| `a.wallets_publish` | `/api/v1/a/wallets_publish` | wallet | force?, client_ref? | Publish proofs of this wallet's addresses on every coin and of each imported wallet (each signs with its own key), when they differ from the chain's; done by itself after a profile is published. |
+| `a.post` | `/api/v1/a/post` | wallet | text, client_ref? | Post to your followers on the ARCADE chain. |
+| `a.react` | `/api/v1/a/react` | wallet | chain, txid, kind, client_ref? | Like, unlike, dislike or undislike any chain's transaction, on the ARCADE chain (A:// op 8). |
+| `a.reply` | `/api/v1/a/reply` | wallet | chain, txid, text, client_ref? | Reply to any chain's transaction (1 to 500 bytes), on the ARCADE chain (A:// op 9). |
+| `a.tip` | `/api/v1/a/tip` | wallet | chain, txid, amount, to?, memo?, client_ref? | Tip on any chain's transaction: pay amount (sats of ARCADE) to `to` (an ARCADE address; default the transaction's author where one is found) with the tip record (A:// op 10, memo up to 100 bytes) in the same transaction. |
+
+### Code
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `code.status` | `/api/v1/code/status` | public | — | The releases known here and which of their files are held. |
+| `code.add` | `/api/v1/code/add` | local | record, sig, files | A release made here (scripts/code-publish.py), with its files ({name: path} on this computer). |
+| `code.export` | `/api/v1/code/export` | local | id, dir | A release's held files written into dir (a folder on this computer) under their names. |
+
+### Swap
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `swap.list` | `/api/v1/swap/list` | read | — | This arcade's own swaps (as maker or taker) and the step each is at. |
+| `swap.take` | `/api/v1/swap/take` | local | node, order, give?, get? | Take an order whole (node: the maker's arcade): the secret is made here and this wallet's leg locked; with the legs shown ({give, get}), only on exactly those terms. |
+
+### Events
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `events.since` | `/api/v1/events/since` | read | cursor?, kinds?, limit?, wait? | The arcade's event log, oldest first, after cursor (from events.since's next; none: from now, "0": from the oldest kept), of kinds (comma list or array) only; limit (default 100, at most 1,000); wait: seconds (at most 60) to wait for the first new event. {events: [{cursor, at, kind, text}], next, waited}. |
+
+### Dogefeed
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `dogefeed.post` | `/api/v1/dogefeed/post` | wallet | type?, text?, media?, reply?, quote?, pay?, ref?, tags?, mentions?, send?, client_ref? | Post, comment, quote or edit on D:// from this arcade's own Dogecoin wallet: signed, stamped by this arcade and inscribed as DogeFeed writes them. Without send: the record and its cost. |
+| `dogefeed.act` | `/api/v1/dogefeed/act` | wallet | op, target, amount?, send?, client_ref? | Like, branch, follow, tip, reveal, delete or keyrevoke on D:// from this arcade's own Dogecoin wallet (1 DOGE in all for likes, branches and follows; amount in DOGE for tips, 90/10). Without send: what it would send. |
 
 ## For agents and scripts
 
@@ -465,7 +573,48 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 
   `tx.wait chain txid until timeout` answers once that state is reached.
 - **Explorer answers** for tx, block, address, summary and mempool carry `chain`, `as_of {height, hash}` (the tip
-  they were counted against), `source` (local, borrowed or mesh) and `decimals`.
+  they were counted against), `source` and `decimals`. Every other object answer of the Explorer, and
+  `status chain=`, carry `source` too:
+  - `local`: this arcade's own copy;
+  - `borrowed:<node>`: a lender or another arcade, with its node id when known;
+  - `copy`: its own copy, still being imported from a shared copy;
+  - `none`: not kept here.
+
+  `status chain=` keeps the older own/borrowed word in `source_detail`.
+
+Part 2 (ARCADE Git #25):
+
+- **One surface.** Every command is in one table. The socket, JSON-RPC and `/api/v1` answer the same names, with
+  the same arguments, answer shapes and error codes. `rpc.help`, `GET /api/v1/routes` and
+  `GET /api/v1/openapi.json` (OpenAPI 3.1, also `rpc.openapi`) list them all, with typed parameters (`schema`:
+  name, type, required, default, enum, maximum, one_of) and result shapes. Permissions are unchanged: a `local`
+  command over an API key is `403 forbidden`. Only `service.stop` stays socket-only. 32 commands that once
+  answered on the socket alone are now on every surface: `arc.block`, `arc.pool`, `arc.submit`, `ledger.book`,
+  `swap.list`, `explorer.site` and the rest. A test fails when a command is on one surface but not the others.
+- **The guide.** `GET /api/v1/agents.md` (also `rpc.guide`) is a short guide for agents. It covers keys, chains,
+  units, error codes, retries with `client_ref`, waiting and paging.
+- **Receipts at signing.** Every command that signs takes `client_ref`. This covers ledger.*, a.*, wallet.send,
+  borrow.send, token.send, ord.send, msg.send, feed.post, feed.act, follow, tag.claim, arc.blob_publish*,
+  dogefeed.post, dogefeed.act, inscribe and svc.pay (`sends: true` in rpc.help).
+  - The receipt is written the moment a transaction is signed, before any network step. `tx.status` answers
+    `signed` even if the call timed out.
+  - A retry with the same `client_ref` never signs again. It gets the first answer (`replayed: true`); while the
+    first is still running, `in_progress: true` and its txids; after a failure that followed signing, code
+    `client_ref_used`.
+- **Per-peer broadcast results.** ARCADE pool gossip has a new reply, `txr`. An arcade that fetched transactions
+  says which it took and which it refused, with a code. Older arcades don't send it and ignore it. No block rule
+  changes.
+  - `tx.status` gives `broadcast.peers_acked`, `peers_refused` and `refusals [{peer, code, error}]`. Lenders of a
+    borrowed chain are counted too.
+  - `broadcast_failed` means refused here, or by every peer that answered while none holds it.
+  - Codes: `fee_too_low`, `conflict`, `missing_coin`, `dust`, `not_yet_valid`, `blob_missing`, `pool_full`,
+    `rules`, `invalid`, `refused_recently`, `unreachable`.
+- **`ledger.items`** includes items, comments and state changes still in the pool (`pending: true`; pending
+  items come on the last page). It pages with `limit` and `cursor`/`next`.
+- **No polling.**
+  - `explorer.blocks order=asc from=` is a block feed, oldest first (`next_from`).
+  - `chains.wait {chain, height, timeout}` waits for a height.
+  - `events.since {cursor, kinds?, limit?, wait?}` follows the event log with a cursor.
 
 ## Sign-in for websites
 

@@ -98,6 +98,10 @@ pub fn note(node: &Node, p: &'static ChainParams, tx: &Tx) {
 /// An ARCADE transaction of this arcade's own: into the chain's pool, and remembered.
 /// Borrowed (not installed, or installed and still catching up): to the lenders, which take it into their pools.
 pub fn send_arc(node: &Node, tx: &Tx) -> Result<(Hash256, u64), String> {
+    // Signed: its receipt is written before any network step (crate::receipts, ARCADE #25 part 2).
+    if let Some(p) = crate::arcsvc::defined() {
+        crate::receipts::signed(node, p.key, &tx.txid);
+    }
     if let Some(p) = crate::arcsvc::defined().filter(|p| crate::arcsvc::borrowed(p)) {
         // The fee from the coins it spends, as the borrowed copy knows them (confirmed, or change still waiting).
         let waiting: Vec<(arcade_chain::OutPoint, u64)> = crate::borrow::pool_txs(p).iter()
@@ -111,7 +115,9 @@ pub fn send_arc(node: &Node, tx: &Tx) -> Result<(Hash256, u64), String> {
         note(node, p, tx);
         return Ok((tx.txid, fee));
     }
-    let r = crate::arcsvc::send_raw(&tx.raw)?;
+    // This arcade's own pool is the first peer that answers (tx.status: a refusal here is broadcast_failed).
+    let r = crate::arcsvc::send_raw(&tx.raw).inspect_err(|e| crate::receipts::outcome(&tx.txid.to_hex(), "local", false, e))?;
+    crate::receipts::outcome(&tx.txid.to_hex(), "local", true, "");
     if let Some(p) = crate::arcsvc::defined() {
         note(node, p, tx);
     }
@@ -148,6 +154,8 @@ fn way(arcade: bool, borrowed: bool, home: bool) -> Way {
 /// place a send leaves (a home chain only borrowed sent nothing before: its outbox is drained by a sync loop that
 /// doesn't run then). Err when it was refused (spent coins, no lender took it).
 pub fn send_own(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<(), String> {
+    // Signed: its receipt is written before any network step (crate::receipts, ARCADE #25 part 2).
+    crate::receipts::signed(node, p.key, &tx.txid);
     let home = p.chain_no == node.params.chain_no;
     match way(crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no), crate::borrow::is_borrowed(p.key), home) {
         Way::Arcade => send_arc(node, tx).map(|_| ()),

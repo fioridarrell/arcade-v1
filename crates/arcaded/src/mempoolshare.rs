@@ -108,6 +108,21 @@ fn passed_tx(node: &Node, p: &ChainParams, txid: &arcade_chain::Hash256) -> Opti
     Tx::parse_with(&raw, &p.format).ok().filter(|t| t.txid == *txid)
 }
 
+/// Every passed-on transaction of a chain still waiting (not in a block): (seen, raw), oldest first.
+/// The /chain/<key> RPC lists them with the pool (getrawtransaction, getrawmempool, gettxout).
+pub fn passed_pool(node: &Node, p: &ChainParams) -> Vec<(u64, Vec<u8>)> {
+    let mut all: Vec<(arcade_chain::Hash256, u64, Vec<u8>)> =
+        passed(|m| m.txs.iter().filter(|(k, _)| k.0 == p.chain_no).map(|(k, v)| (k.1, v.0, v.1.clone())).collect());
+    all.retain(|(id, ..)| node.chain.tx_raw(p, id).ok().flatten().is_none());
+    all.sort_by_key(|x| x.1);
+    all.into_iter().map(|(_, seen, raw)| (seen, raw)).collect()
+}
+
+/// The passed-on transaction spending this coin, if any.
+pub fn passed_spender_of(p: &ChainParams, op: &OutPoint) -> Option<arcade_chain::Hash256> {
+    passed(|m| m.spent.get(&(p.chain_no, *op)).copied())
+}
+
 /// Whether a passed-on transaction other than `me` already spends this coin.
 fn passed_spender(p: &ChainParams, op: &OutPoint, me: &arcade_chain::Hash256) -> bool {
     passed(|m| m.spent.get(&(p.chain_no, *op)).is_some_and(|t| t != me))

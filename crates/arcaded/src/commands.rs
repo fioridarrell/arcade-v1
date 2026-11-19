@@ -194,7 +194,7 @@ cmds! {
     "arc.keep" Admin "mb?" "Keep a share of the ARCADE chain's blobs by choice (rules version 5): whole segments, sealed and paid; segments short of copies first. mb: the share in MB (0 or \"off\": none).";
     "arc.fog" Read "" "Fog storage here: what it holds (own, kept, viewed), the segments it keeps, those short of copies on the network, warnings.";
     "arc.blob" Read "id" "A blob of the ARCADE chain (hex), fetched from linked arcades when it isn't here.";
-    "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?" "Put a file on the ARCADE chain as a blob (0.01 ARCADE a kB).";
+    "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?" "Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Without send, only the quote (blob_fee, fee).";
     "a.profile" Read "tag? | address?" "A profile card on the ARCADE chain (yours when neither), with follower counts.";
     "a.profile_set" Wallet "name?, bio?, url?, picture?, addresses?" "Publish your profile on the ARCADE chain (A://).";
     "a.follow" Wallet "tag" "Follow an @tag on the ARCADE chain.";

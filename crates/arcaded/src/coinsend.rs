@@ -369,7 +369,8 @@ pub fn publish_blob(node: &Node, bytes: &[u8], kind: &str, class: arcade_arc::bl
 }
 
 /// `arc.blob_publish_many`: blobs in one transaction from this arcade's wallet: a record each, change back, paying
-/// the wallet's rate for its own bytes and 0.01 ARCADE a kB of every blob the chain doesn't hold yet; into the pool with
+/// the wallet's rate for its own bytes and the blob fee for every blob the chain doesn't hold yet (and every boost), at
+/// the rate the next block takes (blob::fee_at: 0.01 ARCADE a kB before rules version 5, each class's rate since); into the pool with
 /// the blobs' bytes. At most 4 MB of new blobs (one block's budget) and the transaction under 100 kB. Without `send`,
 /// only what it would be.
 pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool) -> Result<Value, String> {
@@ -386,7 +387,8 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
         return Err("no blobs".into());
     }
     let mut recs = Vec::new();
-    let (mut new_bytes, mut seen) = (0u64, std::collections::HashSet::new());
+    // What the blobs pay for, as the pool counts it (arcade_arc::pool): each new blob once, and every boost.
+    let (mut paid, mut seen) = (Vec::new(), std::collections::HashSet::new());
     for (bytes, kind, class, encoding) in items {
         if bytes.is_empty() || bytes.len() > blob::MAX_BLOB_BYTES || kind.len() > blob::MAX_TYPE {
             return Err(format!("a blob is 1 to {} bytes, its type at most {} characters", blob::MAX_BLOB_BYTES, blob::MAX_TYPE));
@@ -395,7 +397,7 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
         let id = rec.id(&net);
         let new = !crate::arcsvc::holds_blob(&id) && seen.insert(id);
         if new || *class == blob::Class::Boost {
-            new_bytes += bytes.len() as u64;
+            paid.push((*class, bytes.len() as u64));
         }
         recs.push((rec, id, new));
     }
@@ -437,7 +439,8 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
     let change_script = scripts[0].1.clone();
     let mut out_scripts: Vec<usize> = recs.iter().map(|r| r.0.script().len()).collect();
     out_scripts.push(change_script.len());
-    let blob_fee = blob::fee_for(new_bytes);
+    // Priced as the next block will judge it.
+    let blob_fee = blob::fee_at(&net, tip as u64 + 1, &paid);
     let fee_of = |n: usize| fee_for_size(p, arcade_wallet::tx::estimate_size(n, &out_scripts) as u64, fp.fallback_per_kb) + blob_fee;
     let (mut chosen, mut have) = (Vec::new(), 0u64);
     for c in coins {

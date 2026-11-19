@@ -131,7 +131,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
     "explorer.msg_rows", "explorer.msg_file", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
-    "explorer.arc_ledger", "explorer.token_note", "explorer.prize_rows",
+    "explorer.arc_ledger", "explorer.token_note", "explorer.prize_rows", "explorer.arc_blobs", "explorer.arc_fog_nodes",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -146,7 +146,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.search", "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription",
     "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn", "explorer.a_reactions", "explorer.a_replies",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
-    "explorer.arc_machines",
+    "explorer.arc_machines", "explorer.arc_nodes", "explorer.arc_blobs", "explorer.arc_fog_nodes",
     "explorer.msg_rows", "explorer.msg_file",
 ];
 
@@ -398,6 +398,13 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     } else {
         req
     };
+    // explorer.blocks oldest first, from a height (ARCADE #25 part 2): a feed an agent follows with chains.wait.
+    if cmd == "explorer.blocks" && req["order"] == "asc" {
+        return blocks_asc(node, req, img_links);
+    }
+    if let Some(o) = req["order"].as_str().filter(|o| *o != "desc" && *o != "asc") {
+        return Err(format!("bad request: order is asc or desc, not {o}"));
+    }
     // explorer.blocks with the documented offset / limit: a page object (before / n keep the plain list).
     if cmd == "explorer.blocks" && (req.get("offset").is_some() || req.get("limit").is_some()) {
         return blocks_page(node, req, img_links);
@@ -416,24 +423,111 @@ pub fn handle_with(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
 
 /// The tip an answer on `p` was counted against, and where it came from (ARCADE #25): this arcade's own copy
 /// ("local"), its borrowed copy ("borrowed"), or another arcade ("mesh", when the answer says so).
-fn pin_of(node: &Node, p: &'static ChainParams) -> (Value, &'static str) {
+fn pin_of(node: &Node, p: &'static ChainParams) -> (Value, String) {
+    let source = source_of(node, p);
     if crate::borrow::is_borrowed(p.key) {
         let (h, hash) = crate::borrow::tip_pin(node, p);
-        return (json!({"height": h, "hash": hash}), "borrowed");
+        return (json!({"height": h, "hash": hash}), source);
     }
     match node.chain.tip(p.chain_no).ok().flatten() {
-        Some(t) => (json!({"height": t.height, "hash": t.hash.to_hex()}), "local"),
-        None => (Value::Null, "local"),
+        Some(t) => (json!({"height": t.height, "hash": t.hash.to_hex()}), source),
+        None => (Value::Null, source),
     }
+}
+
+/// Where this arcade reads chain `p` from (ARCADE #25 part 2): "local" (its own copy), "borrowed:<node>" (a lender's,
+/// the first one's node id when known), "copy" (its own copy, still being imported from a shared copy), or "none" (not
+/// kept here at all).
+pub fn source_of(node: &Node, p: &'static ChainParams) -> String {
+    if crate::borrow::is_borrowed(p.key) {
+        return match crate::borrow::lenders(node, p).first() {
+            Some(l) => format!("borrowed:{}", &l[..l.len().min(16)]),
+            None => "borrowed".into(),
+        };
+    }
+    if crate::coreboot::job_info(p.key).is_some() {
+        return "copy".into();
+    }
+    if p.chain_no != node.params.chain_no && !crate::arcsvc::runs(p) && !crate::chains::kept(node, p) {
+        return "none".into();
+    }
+    "local".into()
+}
+
+/// `chains.wait {chain, height, timeout?}`: answered once the chain's tip (as this arcade reads it) reaches height, or
+/// after timeout seconds (default 60, at most 600). Agents wait here instead of asking again and again.
+pub fn chain_wait(node: &Node, req: &Value) -> R {
+    let key = req["chain"].as_str().ok_or("chain required (a chain key such as arctest)")?;
+    let p = crate::chains::find(key).ok_or_else(|| format!("unknown chain {key}"))?;
+    let want = req["height"].as_u64().or_else(|| req["height"].as_str().and_then(|h| h.parse().ok())).ok_or("height required (a block height)")?;
+    let timeout = req["timeout"].as_u64().or_else(|| req["timeout"].as_str().and_then(|t| t.parse().ok())).unwrap_or(60).min(600);
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
+    loop {
+        let (tip, source) = pin_of(node, p);
+        let reached = tip["height"].as_u64().is_some_and(|h| h >= want);
+        let over = std::time::Instant::now() >= end || crate::STOP_ASKED.load(std::sync::atomic::Ordering::Relaxed);
+        if reached || over {
+            return Ok(json!({"chain": p.key, "height": want, "tip": tip, "source": source, "reached": reached, "timed_out": !reached}));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
+}
+
+/// `explorer.blocks {chain?, order: "asc", from?, limit?}`: blocks oldest first from height `from` (default 0), at most
+/// BLOCKS_MAX: {items, from, limit, next_from (ask from it next; the tip + 1 once the feed reached the tip), tip, chain,
+/// as_of, source}.
+fn blocks_asc(node: &Node, req: &Value, img_links: bool) -> R {
+    let num = |k: &str| req[k].as_u64().or_else(|| req[k].as_str().and_then(|x| x.parse().ok()));
+    let p = match req["chain"].as_str() {
+        Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
+        None => node.params,
+    };
+    let (as_of, source) = pin_of(node, p);
+    let tip = as_of["height"].as_u64();
+    let from = num("from").unwrap_or(0);
+    let limit = num("limit").or_else(|| num("n")).unwrap_or(20).clamp(1, BLOCKS_MAX);
+    let items = match tip {
+        Some(t) if from <= t => {
+            let last = (from + limit - 1).min(t);
+            let mut q = req.clone();
+            if let Some(o) = q.as_object_mut() {
+                for k in ["order", "from", "limit", "offset"] {
+                    o.remove(k);
+                }
+            }
+            q["before"] = json!(last + 1);
+            q["n"] = json!(last + 1 - from);
+            let got = answer(node, "explorer.blocks", &q, img_links)?;
+            let mut list: Vec<Value> = got.as_array().cloned().unwrap_or_default();
+            list.retain(|b| b["height"].as_u64().is_some_and(|h| h >= from && h <= last));
+            list.sort_by_key(|b| b["height"].as_u64().unwrap_or(0));
+            list
+        }
+        _ => Vec::new(),
+    };
+    let next_from = items.last().and_then(|b| b["height"].as_u64()).map(|h| h + 1).unwrap_or(from);
+    Ok(json!({"items": items, "order": "asc", "from": from, "limit": limit, "next_from": next_from, "tip": tip,
+              "at_tip": tip.is_some_and(|t| next_from > t), "chain": p.key, "as_of": as_of, "source": source}))
 }
 
 /// Every tx, block, address, summary and mempool answer says its chain, the tip it was counted against (`as_of`),
 /// where it came from (`source`), and the amounts' scale (`decimals`; amounts are in base units).
 fn pin(node: &Node, cmd: &str, req: &Value, v: &mut Value) {
-    if !matches!(cmd, "explorer.tx" | "explorer.block" | "explorer.address" | "explorer.summary" | "explorer.mempool") || !v.is_object() {
+    if !v.is_object() {
         return;
     }
     let Some(p) = (match req["chain"].as_str() { Some(k) => crate::chains::find(k), None => Some(node.params) }) else { return };
+    // Every object answer says where it came from (ARCADE #25 part 2); the five reads of one chain's data also say
+    // the tip they were counted against, the chain and its units.
+    if !matches!(cmd, "explorer.tx" | "explorer.block" | "explorer.address" | "explorer.summary" | "explorer.mempool") {
+        if v["source"].is_null() {
+            v["source"] = json!(match v["_mesh"]["node"].as_str() {
+                Some(n) => format!("borrowed:{n}"),
+                None => source_of(node, p),
+            });
+        }
+        return;
+    }
     let (as_of, source) = pin_of(node, p);
     if v["chain"].is_null() {
         v["chain"] = json!(p.key);
@@ -442,7 +536,11 @@ fn pin(node: &Node, cmd: &str, req: &Value, v: &mut Value) {
         v["as_of"] = as_of;
     }
     if v["source"].is_null() {
-        v["source"] = json!(if v.get("_mesh").is_some() || v.get("mesh_parts").is_some() { "mesh" } else { source });
+        v["source"] = json!(match v["_mesh"]["node"].as_str() {
+            Some(n) => format!("borrowed:{n}"),
+            None if v.get("mesh_parts").is_some() => "borrowed:mesh".to_string(),
+            None => source,
+        });
     }
     if v["decimals"].is_null() {
         v["decimals"] = json!(8);
@@ -524,6 +622,11 @@ fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     // The machines this arcade heard of (crate::sysinfo): mesh gossip, the same on any chain, never asked on.
     if cmd == "explorer.arc_machines" {
         return Ok(crate::sysinfo::read(node));
+    }
+    // Per arcade on the mesh, what it keeps and how much of it is sealed (crate::arcnodes): gossip and this arcade's
+    // ARCADE registry, never asked on.
+    if cmd == "explorer.arc_nodes" {
+        return Ok(crate::arcnodes::read(node));
     }
     // The storage analytics are of the ARCADE chain only: asked of it whatever chain the question names.
     let arc_req;
@@ -647,6 +750,9 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         "explorer.arc_segments" => return crate::arcstats::segments(node, req),
         "explorer.arc_holders" => return crate::arcstats::holders(node, req),
         "explorer.arc_payouts" => return crate::arcstats::payouts(node, req),
+        // Every blob as fog storage sees it from here (crate::fogmap), for the Storage app's fog map.
+        "explorer.arc_blobs" => return crate::fogmap::blobs(node, req),
+        "explorer.arc_fog_nodes" => return crate::fogmap::nodes(node, req),
         _ => {}
     }
     let mut x = ctx(node, req)?;

@@ -1990,6 +1990,20 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             }
         }
         "txs" => on_txs(svc, link, f)?,
+        // What a peer did with transactions it fetched from us: taken (the blob's ids) or refused (r: [txid, code,
+        // words]). For tx.status (crate::receipts); never a reason to take or drop anything.
+        "txr" => {
+            let peer = &link.peer_id[..link.peer_id.len().min(16)];
+            for id in ids_of(&f.blob, ASK_TXS) {
+                crate::receipts::outcome(&id.to_hex(), peer, true, "");
+            }
+            for r in f.head["r"].as_array().into_iter().flatten().take(ASK_TXS) {
+                if let (Some(id), Some(code)) = (r[0].as_str().filter(|t| t.len() == 64), r[1].as_str()) {
+                    let words = r[2].as_str().unwrap_or("");
+                    crate::receipts::outcome(id, peer, code == "known", &format!("{code}: {}", words.chars().take(200).collect::<String>()));
+                }
+            }
+        }
         // A waiting blob ahead of the transactions that bring it (crate::arcblob).
         "bl" => crate::arcblob::on_piece(&svc.net, &link.peer_id, &f.head, &f.blob),
         // A blob piece asked of this arcade (a viewer's arcade fetching it, crate::arcblob::view).
@@ -2185,8 +2199,22 @@ fn on_txs(svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), LinkError> {
         }
         data
     };
+    // What became of each one, told back to the arcade that served them ("txr", ARCADE #25 part 2): taken, or refused
+    // and why. An older arcade ignores the frame (it drops ops it doesn't know); nothing a block holds depends on it.
+    let mut took = Vec::new();
+    let mut refused = Vec::new();
     for raw in split_blocks(&data).unwrap_or_default().into_iter().take(ASK_TXS) {
-        let _ = take_tx(svc, &raw);
+        let id = Tx::parse_with(&raw, &TX_FORMAT).ok().map(|t| t.txid);
+        match (take_tx(svc, &raw), id) {
+            (Ok(_), Some(id)) | (Err(PoolError::Known), Some(id)) => took.push(id),
+            (Err(e), Some(id)) => refused.push(json!([id.to_hex(), e.code(), e.to_string()])),
+            _ => {}
+        }
+    }
+    if !took.is_empty() || !refused.is_empty() {
+        let mut f = frame(svc, "txr", json!({"r": refused}));
+        f.blob = blob_of(&took);
+        link.send(&f)?;
     }
     ask_txs(svc, link)
 }
@@ -2716,14 +2744,25 @@ fn blob_copies(node: &Node, svc: &Svc, h: u64) -> (u64, bool) {
     (copies, here)
 }
 
-/// The audited replicas the registry counts of the ARCADE blob-family segment of `family` covering height `h`: None
-/// while no listed segment covers it (crate::fogstore).
-pub fn segment_replicas(family: u8, h: u64) -> Option<u64> {
+/// The registered replicas of the listed ARCADE blob-family segment of `family` covering height `h`, each as (owner key
+/// hex, audited): audited = it passed an audit and hasn't missed one since (the whitepaper's "copies count only when
+/// audited"). None while no listed segment covers it (crate::fogstore). A read of the chain's state only: what the
+/// registry counts for pay (`Registry::holders_of`, consensus) is untouched.
+pub fn segment_holders(family: u8, h: u64) -> Option<Vec<(String, bool)>> {
     let svc = svc()?;
     let st = svc.st.lock().unwrap();
     let reg = st.chain.storage();
-    let n = reg.catalog().spans(svc.net.key, family).filter(|(first, last, _)| *first <= h && h <= *last).find_map(|(_, _, listed)| listed.map(|l| reg.holders_of(&l.id)));
-    n
+    let listed = reg.catalog().spans(svc.net.key, family).filter(|(first, last, _)| *first <= h && h <= *last).find_map(|(_, _, listed)| listed.map(|l| l.id))?;
+    Some(replicas_audited(reg, &listed))
+}
+
+/// A segment's registered replicas: (owner key hex, audited).
+pub(crate) fn replicas_audited(reg: &arcade_arc::registry::Registry, segment: &arcade_arc::merkle::Hash) -> Vec<(String, bool)> {
+    reg.all_replicas()
+        .into_iter()
+        .filter(|(_, seg, _, _)| seg == segment)
+        .map(|(id, _, owner, _)| (hex::encode(owner), reg.replica_audit(&id).is_some_and(|a| a.1 == 0) && reg.draw_from(&id).is_some()))
+        .collect()
 }
 
 /// Whether this arcade keeps every blob's plain copy (`arc.archive`).
@@ -3148,6 +3187,24 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
 /// Whether a coin's data can earn on the ARCADE network this arcade knows: one of its listed chains for the next block
 /// (params.rs `Net::listed_at`; adding one is a rules version, so it flips at that version's height). Before block 0
 /// (a defined network not running yet) block 0's list. Never call with the chain's state locked.
+/// Whether Earn ARCADE is on here for any coin (the per-coin switch, a coin kept here in full, not borrowed, and
+/// paid), with the ARCADE chain running: what the app's keep-share suggestion asks (crate::fogstore::api_keep).
+pub fn earning_any(node: &Node) -> bool {
+    let Some(arc) = defined() else { return false };
+    if let Some(on) = crate::diskbudget::test_earn() {
+        return on && svc().is_some();
+    }
+    svc().is_some()
+        && crate::chains::all().any(|p| {
+            p.key != arc.key
+                && node.mode_of(p.key).as_deref() == Some("full")
+                && crate::chains::kept(node, p)
+                && !crate::borrow::is_borrowed(p.key)
+                && crate::arcseg::earn_on(node, p.key)
+                && paid_here(p)
+        })
+}
+
 fn paid_here(p: &ChainParams) -> bool {
     let at = svc().map(|s| (s.net, s.next_height())).or_else(|| defined_net().map(|d| (d.0, 0)));
     at.is_none_or(|(n, h)| n.is_listed_at(p.key, h))
@@ -3291,6 +3348,15 @@ pub fn waiting_outputs(script: &[u8]) -> Vec<(OutPoint, u64)> {
         }
     }
     out
+}
+
+/// The ARCADE chain's waiting transactions as this arcade sees them: its own pool, or (borrowed) the ones sent from here
+/// that still wait at the lenders.
+pub fn pool_txs() -> Vec<Tx> {
+    if let Some(p) = defined().filter(|p| borrowed(p)) {
+        return crate::borrow::pool_txs(p);
+    }
+    svc().map(|s| s.st.lock().unwrap().pool.iter().map(|w| w.tx.clone()).collect()).unwrap_or_default()
 }
 
 pub fn waiting(max: usize) -> Vec<Vec<u8>> {

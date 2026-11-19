@@ -2137,6 +2137,8 @@ pub fn send(node: &Node, key: &str, to: &str, amount: u64, from: Option<&str>, k
 /// coin's P2P peers we know; kept as waiting here once a lender takes it. Ok(lender answers),
 /// or Err(why, lender answers) when no lender took it.
 pub fn broadcast_tx(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<Value, (String, Value)> {
+    // Signed here (a send of this arcade's own): its receipt before any network step (crate::receipts).
+    crate::receipts::signed(node, p.key, &tx.txid);
     let hx = hex::encode(&tx.raw);
     let mut answers = Vec::new();
     let mut ok = false;
@@ -2163,11 +2165,20 @@ pub fn broadcast_tx(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<Val
             Ok(v) => match r(&v[0]) {
                 Ok(t) => {
                     ok |= t.as_str() == Some(tx.txid.to_hex().as_str());
+                    crate::receipts::outcome(&tx.txid.to_hex(), a, true, "");
                     answers.push(json!({"lender": a, "ok": true}));
                 }
-                Err(x) => answers.push(json!({"lender": a, "error": x})),
+                Err(x) => {
+                    // Already in that node's pool or chain: it holds it.
+                    let held = x.to_string().to_ascii_lowercase().contains("already");
+                    crate::receipts::outcome(&tx.txid.to_hex(), a, held, &x.to_string());
+                    answers.push(json!({"lender": a, "error": x, "code": crate::receipts::refusal_code(&x.to_string())}));
+                }
             },
-            Err(x) => answers.push(json!({"lender": a, "error": x})),
+            Err(x) => {
+                crate::receipts::outcome(&tx.txid.to_hex(), a, false, &format!("unreachable: {x}"));
+                answers.push(json!({"lender": a, "error": x, "code": "unreachable"}));
+            }
         }
     }
     // The coin's own P2P peers, when other arcades told us some.

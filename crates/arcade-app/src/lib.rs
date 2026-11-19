@@ -543,6 +543,18 @@ impl AppDb {
         Ok(())
     }
 
+    /// Events after `after` (an event's key, exclusive; None: from the oldest kept), oldest first, at most `n`, with
+    /// their keys: a cursor over the log (`events.since`).
+    pub fn events_after(&self, after: Option<&[u8]>, n: usize) -> Result<Vec<(Vec<u8>, Event)>> {
+        let rows = self.store.read(|r| r.scan_after(EVENTS, b"", after, n))?;
+        rows.into_iter().map(|(k, v)| Ok((k, dec(EVENTS, &v)?))).collect()
+    }
+
+    /// The newest event's key (None: no event yet).
+    pub fn last_event_key(&self) -> Result<Option<Vec<u8>>> {
+        Ok(self.store.read(|r| r.last_with_prefix(EVENTS, b""))?.map(|(k, _)| k))
+    }
+
     pub fn recent_events(&self, n: usize) -> Result<Vec<Event>> {
         let all = self.store.read(|r| r.scan_prefix(EVENTS, b""))?;
         all.iter().rev().take(n).map(|(_, v)| dec(EVENTS, v)).collect()

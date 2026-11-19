@@ -86,7 +86,7 @@ fn replicas_by_segment(reg: &Registry) -> HashMap<Hash, Vec<(Hash, Key, u32, Opt
 }
 
 /// Every confirmed segment of every chain and family the catalog may list (the chains V1 knows and ARCADE itself).
-fn all_listed(reg: &Registry) -> Vec<&arcade_arc::catalog::Listed> {
+pub(crate) fn all_listed(reg: &Registry) -> Vec<&arcade_arc::catalog::Listed> {
     let cat = reg.catalog();
     let mut keys: Vec<&str> = crate::chains::all().map(|p| p.key).chain(cat.net().listed.iter().copied()).chain(cat.net().listed_v4.iter().copied()).collect();
     if let Some(p) = crate::arcsvc::defined() {

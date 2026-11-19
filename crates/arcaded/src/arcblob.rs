@@ -84,6 +84,25 @@ pub struct Meta {
     /// The blob's length, as its record says (0 in a meta written before it was kept).
     #[serde(default)]
     pub len: u64,
+    /// Who published it: the address its transaction pays back to (its first spendable output, as `line` takes it);
+    /// empty in a meta written before it was kept (crate::fogmap reads it from the block then).
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub publisher: String,
+}
+
+/// The address a script pays (pay to a key hash or a script hash on `net`), None for any other script.
+pub fn address_of_script(net: &Net, script: &[u8]) -> Option<String> {
+    let (ver, hash) = match script {
+        [0x76, 0xa9, 20, h @ .., 0x88, 0xac] if h.len() == 20 => (net.p2pkh_version, h),
+        [0xa9, 20, h @ .., 0x87] if h.len() == 20 => (net.p2sh_version, h),
+        _ => return None,
+    };
+    Some(arcade_ledger::address::base58check(ver, hash))
+}
+
+/// Write a blob's meta again (crate::fogmap fills in a publisher read from the block).
+pub fn put_meta(id: &Hash, m: &Meta) {
+    let _ = std::fs::write(meta_path(id), serde_json::to_vec(m).unwrap_or_default());
 }
 
 /// How long a boost keeps a blob plain (the Temporary time: 90 days; local test chains less).
@@ -439,7 +458,8 @@ pub fn keep_block(net: &Net, block: &Block) {
             use sha2::Digest;
             let line = hex::encode(&sha2::Sha256::digest([r.kind.as_bytes(), b"\0", publisher].concat())[..16]);
             let boosted_until = if r.class == arcade_arc::blob::Class::Boost { boost_until } else { 0 };
-            let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until, len: r.len };
+            let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until, len: r.len,
+                           publisher: address_of_script(net, publisher).unwrap_or_default() };
             let _ = std::fs::write(meta_path(id), serde_json::to_vec(&m).unwrap_or_default());
         }
     }
@@ -602,6 +622,12 @@ fn mtime(p: &std::path::Path) -> Option<u64> {
 /// When the blob was last viewed or served here (its plain copy's time; one fetched to keep a segment says 0).
 pub fn last_use(id: &Hash) -> Option<u64> {
     mtime(&path(id))
+}
+
+/// When the blob was last viewed or served here, as fog storage records it (its plain or cached copy's time, the newer;
+/// a copy's arrival counts; one fetched only to keep a segment says nothing). None: never here, or only kept.
+pub fn last_view(id: &Hash) -> Option<u64> {
+    [mtime(&path(id)), mtime(&cache_dir().join(hex::encode(id)))].into_iter().flatten().filter(|t| *t > 1).max()
 }
 
 /// The ids whose bytes are here: plain copies and the cache.

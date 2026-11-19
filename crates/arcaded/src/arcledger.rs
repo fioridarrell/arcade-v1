@@ -688,6 +688,75 @@ pub fn items(node: &Node, req: &Value) -> Result<Value, String> {
     Ok(json!({"repo": format!("@{full}"), "items": out}))
 }
 
+/// The @tag (else the address) that signed a waiting transaction: its first input's key (a P2PKH spend), as the
+/// ledger names an item's author once a block has it.
+fn pending_by(node: &Node, p: &'static ChainParams, tx: &arcade_chain::Tx) -> Value {
+    let sig = tx.inputs.first().map(|i| i.script_sig.as_slice()).unwrap_or(&[]);
+    // <push sig> <push pubkey>: the pubkey is the last push, 33 (or 65) bytes.
+    let pk = sig.first().map(|n| *n as usize).and_then(|n| sig.get(1 + n..)).and_then(|rest| {
+        let m = *rest.first()? as usize;
+        rest.get(1..1 + m).filter(|_| m == 33 || m == 65)
+    });
+    let Some(pk) = pk.and_then(|k| arcade_wallet::secp256k1::PublicKey::from_slice(k).ok()) else { return Value::Null };
+    let Some(address) = arcade_ledger::address::address_of(&arcade_wallet::keys::p2pkh_script_for(&pk), p) else { return Value::Null };
+    match arcade_ledger::index::tag_of(&node.chain, p.chain_no, &address).ok().flatten() {
+        Some(t) => json!(t),
+        None => json!(address),
+    }
+}
+
+/// Add to a `ledger.items` answer what still waits in the pool for its repository (ARCADE #25 part 2): new items
+/// (no number yet), comments, reviews and state changes, each marked pending: true.
+pub fn add_pending(node: &Node, v: &mut Value) {
+    use arcade_ledger::repos::RepoOp;
+    let Some(full) = v["repo"].as_str().map(|r| r.trim_start_matches('@').to_string()) else { return };
+    let Some(p) = crate::arcsvc::defined() else { return };
+    let known: std::collections::HashSet<String> = v["items"].as_array().into_iter().flatten()
+        .flat_map(|it| std::iter::once(it["txid"].clone()).chain(it["events"].as_array().into_iter().flatten().map(|e| e["txid"].clone())))
+        .filter_map(|t| t.as_str().map(String::from)).collect();
+    for tx in crate::arcsvc::pool_txs() {
+        let txid = tx.txid.to_hex();
+        if known.contains(&txid) {
+            continue;
+        }
+        let payload = arcade_ledger::extract::class_c_payload(&tx);
+        let Some(Ok(op)) = arcade_ledger::repos::parse(&payload) else { continue };
+        let by = pending_by(node, p, &tx);
+        match op {
+            RepoOp::Open { name, kind, body } if name == full => {
+                let b = hex::encode(body);
+                let text = body_of(&b);
+                if let Some(items) = v["items"].as_array_mut() {
+                    items.push(json!({"number": null, "kind": if kind == arcade_ledger::repos::KIND_PULL { "pull" } else { "issue" }, "by": by,
+                                      "state": "open", "height": null, "txid": txid, "text": text,
+                                      "events": [{"by": by, "w": "open", "v": 0, "b": b, "txid": txid, "height": null, "pending": true}], "pending": true}));
+                }
+            }
+            RepoOp::Comment { name, number, verdict, body } if name == full => {
+                let b = hex::encode(body);
+                let e = json!({"by": by, "w": if verdict == 0 { "comment" } else { "review" }, "v": verdict, "b": b, "txid": txid, "height": null,
+                               "text": body_of(&b), "pending": true});
+                if let Some(it) = v["items"].as_array_mut().and_then(|a| a.iter_mut().find(|it| it["number"] == number)) {
+                    if let Some(ev) = it["events"].as_array_mut() {
+                        ev.push(e);
+                    }
+                }
+            }
+            RepoOp::State { name, number, state, manifest } if name == full => {
+                let w = ["", "reopen", "close", "merge"].get(state as usize).copied().unwrap_or("");
+                let e = json!({"by": by, "w": w, "v": 0,
+                               "b": hex::encode(manifest), "txid": txid, "height": null, "pending": true});
+                if let Some(it) = v["items"].as_array_mut().and_then(|a| a.iter_mut().find(|it| it["number"] == number)) {
+                    if let Some(ev) = it["events"].as_array_mut() {
+                        ev.push(e);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 /// `ledger.balances {address}`: an address's arcade token balances on ARCADE, each [free, reserved, offered, accepted].
 pub fn balances(node: &Node, address: &str) -> Result<Value, String> {
     if let Some(v) = borrowed_read(node, "balances", json!({"address": address}))? {

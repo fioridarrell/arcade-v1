@@ -75,10 +75,18 @@ pub fn stopping_reply() -> Value {
     json!({"ok": false, "error": "the arcade service is stopping (writing the coin caches, then exiting)", "stopping": true, "state": "stopping", "code": "stopping", "retry_after_s": 10})
 }
 
+/// Every error code an answer may carry (openapi.json lists them; agents match on these, not on the text).
+pub const ERROR_CODES: &[&str] = &[
+    "unknown_command", "unknown_route", "not_found", "bad_args", "forbidden", "unknown_chain", "not_installed",
+    "insufficient_funds", "not_enough_arcade", "client_ref_used", "starting", "stopping", "error",
+];
+
 /// A stable code for an error's text (ARCADE #25: scripts matched the text): kept beside `error`.
 pub fn error_code(e: &str) -> &'static str {
     let l = e.to_ascii_lowercase();
-    if l.starts_with("unknown command") || l.starts_with("unknown method") {
+    if l.starts_with("client_ref ") && l.contains("already signed") {
+        "client_ref_used"
+    } else if l.starts_with("unknown command") || l.starts_with("unknown method") {
         "unknown_command"
     } else if l.starts_with("unknown route") {
         "unknown_route"
@@ -202,6 +210,11 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     // `"as": "@tag"` on an ARCADE write (ledger.*, a.*, arc.blob_publish*): signed by the key holding that tag, the
     // wallet's own or an imported one (crate::arcledger::with_sign_as).
     let cmd = req["cmd"].as_str().unwrap_or("");
+    // One table for every surface (crate::commands): a name it doesn't list is no command here either, so the socket
+    // answers nothing the web API and JSON-RPC can't (the socket's own lines, commands::PRIVATE, never come here).
+    if crate::commands::find(cmd).is_none() {
+        return Err(format!("unknown command {cmd:?}: rpc.help lists them"));
+    }
     if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish")) {
         return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
     }
@@ -221,7 +234,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
 fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
     let cmd = req["cmd"].as_str().unwrap_or("");
     // Sends leave a receipt, and a client_ref makes a retry return the first answer (crate::receipts).
-    if crate::receipts::SENDS.contains(&cmd) {
+    if crate::receipts::is_send(cmd) {
         return crate::receipts::run(node, cmd, req, || dispatch_cmd(node, req));
     }
     dispatch_cmd(node, req)
@@ -259,7 +272,7 @@ fn chain_status_short(node: &Node, key: &str) -> Result<Value, String> {
     };
     let arc = crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no);
     let mut v = json!({
-        "chain": p.key, "name": p.name, "phase": phase(), "installed": installed, "mode": st["mode"], "source": st["source"],
+        "chain": p.key, "name": p.name, "phase": phase(), "installed": installed, "mode": st["mode"], "source": crate::explorer::source_of(node, p), "source_detail": st["source"],
         "sync": sync, "state": st["state"], "tip": tip.map(|t| json!({"height": t, "hash": tip_hash})),
         "best_known": best, "best_known_from": from, "best_known_age_s": st["best_known_age_s"], "behind": behind,
         "peer_tips": st["peer_tips"], "overall": st["overall"], "waiting": st["waiting"],
@@ -289,7 +302,8 @@ fn filter_items(mut v: Value, req: &Value) -> Result<Value, String> {
             state.is_none_or(|x| it["state"] == x)
                 && kind.is_none_or(|k| it["kind"] == k)
                 && since.is_none_or(|h| {
-                    it["height"].as_u64().is_some_and(|ih| ih >= h) || it["events"].as_array().into_iter().flatten().any(|e| e["height"].as_u64().is_some_and(|eh| eh >= h))
+                    it["pending"] == true
+                        || it["height"].as_u64().is_some_and(|ih| ih >= h) || it["events"].as_array().into_iter().flatten().any(|e| e["height"].as_u64().is_some_and(|eh| eh >= h))
                 })
         });
         for it in items.iter_mut() {
@@ -306,6 +320,81 @@ fn filter_items(mut v: Value, req: &Value) -> Result<Value, String> {
         v["count"] = json!(n);
     }
     Ok(v)
+}
+
+/// Most ledger.items on one page.
+const ITEMS_MAX: usize = 500;
+
+/// `ledger.items` a page at a time (ARCADE #25 part 2): numbered items in order after `cursor` (the `next` of the
+/// page before, opaque to callers), at most `limit`; the last page (`next` null) also carries the pending ones.
+fn page_items(mut v: Value, req: &Value) -> Result<Value, String> {
+    let limit = req["limit"].as_u64().or_else(|| req["limit"].as_str().and_then(|x| x.parse().ok())).unwrap_or(50).clamp(1, ITEMS_MAX as u64) as usize;
+    let after: Option<u64> = match req["cursor"].as_str().filter(|c| !c.is_empty()) {
+        None => None,
+        Some(c) => Some(c.strip_prefix("n.").and_then(|n| n.parse().ok()).ok_or_else(|| format!("bad request: cursor {c} is not one ledger.items gave"))?),
+    };
+    let Some(items) = v["items"].as_array_mut() else { return Ok(v) };
+    let all = std::mem::take(items);
+    let (mut numbered, pending): (Vec<Value>, Vec<Value>) = all.into_iter().partition(|it| it["number"].is_u64());
+    numbered.sort_by_key(|it| it["number"].as_u64().unwrap_or(0));
+    numbered.retain(|it| after.is_none_or(|a| it["number"].as_u64().unwrap_or(0) > a));
+    let more = numbered.len() > limit;
+    numbered.truncate(limit);
+    let next = if more { numbered.last().and_then(|it| it["number"].as_u64()).map(|n| format!("n.{n}")) } else { None };
+    if next.is_none() {
+        numbered.extend(pending);
+    }
+    let n = numbered.len();
+    v["items"] = json!(numbered);
+    v["count"] = json!(n);
+    v["next"] = json!(next);
+    v["limit"] = json!(limit);
+    Ok(v)
+}
+
+/// `events.since {cursor?, kinds?, limit?, wait?}`: the event log after a cursor, oldest first (ARCADE #25 part 2).
+/// No cursor: from now (only what comes next); "0": from the oldest event kept.
+fn events_since(node: &Node, req: &Value) -> Result<Value, String> {
+    let limit = req["limit"].as_u64().or_else(|| req["limit"].as_str().and_then(|x| x.parse().ok())).unwrap_or(100).clamp(1, 1000) as usize;
+    let wait = req["wait"].as_u64().or_else(|| req["wait"].as_str().and_then(|x| x.parse().ok())).unwrap_or(0).min(60);
+    let kinds: Option<Vec<String>> = match &req["kinds"] {
+        Value::Null => None,
+        Value::String(s) => Some(s.split(',').map(|k| k.trim().to_string()).filter(|k| !k.is_empty()).collect()),
+        Value::Array(a) => Some(a.iter().filter_map(|k| k.as_str().map(String::from)).collect()),
+        _ => return Err("bad request: kinds is a comma list or an array of kinds".into()),
+    };
+    let cur = match &req["cursor"] {
+        Value::Number(n) if n.as_u64() == Some(0) => Some("0".to_string()),
+        v => v.as_str().map(String::from),
+    };
+    let after: Option<Vec<u8>> = match cur.as_deref() {
+        None | Some("") => Some(node.app.last_event_key().map_err(|e| e.to_string())?.unwrap_or_default()),
+        Some("0") => None,
+        Some(c) => Some(c.strip_prefix("e.").and_then(|h| hex::decode(h).ok()).ok_or_else(|| format!("bad request: cursor {c} is not one events.since gave"))?),
+    };
+    let end = std::time::Instant::now() + std::time::Duration::from_secs(wait);
+    let mut cursor = after.clone().filter(|a| !a.is_empty());
+    loop {
+        let rows = node.app.events_after(cursor.as_deref(), 2000).map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        let mut last = cursor.clone();
+        for (k, e) in rows {
+            last = Some(k.clone());
+            if kinds.as_ref().is_none_or(|ks| ks.iter().any(|x| *x == e.kind)) {
+                out.push(json!({"cursor": format!("e.{}", hex::encode(&k)), "at": e.at, "kind": e.kind, "text": e.text}));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        cursor = last;
+        let done = !out.is_empty() || std::time::Instant::now() >= end || crate::STOP_ASKED.load(std::sync::atomic::Ordering::Relaxed);
+        if done {
+            let next = cursor.as_ref().map(|k| format!("e.{}", hex::encode(k))).unwrap_or_else(|| "0".into());
+            return Ok(json!({"events": out, "next": next, "waited": wait > 0, "timed_out": out.is_empty() && wait > 0}));
+        }
+        std::thread::sleep(std::time::Duration::from_millis(250));
+    }
 }
 
 fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
@@ -704,6 +793,10 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "apps.storage" => crate::appsvc::storage(node, &s("page").ok_or("page required")?, &s("op").ok_or("op required")?, req["key"].as_str(), req["value"].as_str()),
         "apps.launch" => crate::appsvc::launch(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
         "rpc.help" => Ok(crate::commands::help()),
+        "rpc.openapi" => Ok(crate::openapi::document()),
+        "rpc.guide" => Ok(json!(crate::openapi::GUIDE)),
+        "events.since" => events_since(node, req),
+        "chains.wait" => crate::explorer::chain_wait(node, req),
         "apikey.list" => Ok(crate::apikeys::list(node)),
         "apikey.create" => {
             let perms: Vec<String> = req["perms"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
@@ -756,7 +849,13 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "ledger.item_open" => crate::arcledger::item_open(node, &req),
         "ledger.item_comment" => crate::arcledger::item_comment(node, &req),
         "ledger.item_state" => crate::arcledger::item_state(node, &req),
-        "ledger.items" => filter_items(crate::arcledger::items(node, &req)?, req),
+        "ledger.items" => {
+            let mut v = crate::arcledger::items(node, &req)?;
+            if req["pending"] != false {
+                crate::arcledger::add_pending(node, &mut v);
+            }
+            page_items(filter_items(v, req)?, req)
+        }
         "ledger.repo" => crate::arcledger::repo(node, &s("name").ok_or("name required")?),
         "ledger.repos" => crate::arcledger::repos(node, s("owner").as_deref()),
         // A:// (profiles, follows, the address book, posts) on the ARCADE chain.
@@ -1157,8 +1256,12 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.blob_publish_many" => {
             let mut items = Vec::new();
             for f in req["files"].as_array().ok_or("files required")? {
-                let path = f["path"].as_str().ok_or("each file needs its path")?;
-                let bytes = std::fs::read(path).map_err(|e| format!("{path}: {e}"))?;
+                // The bytes as hex (any surface), or a file on this computer (the socket and the cookie RPC).
+                let bytes = match (f["hex"].as_str(), f["path"].as_str()) {
+                    (Some(h), _) => hex::decode(h.trim()).map_err(|_| "a file's hex is not hex".to_string())?,
+                    (None, Some(path)) => std::fs::read(path).map_err(|e| format!("{path}: {e}"))?,
+                    _ => return Err("each file needs its hex (or its path on this computer)".into()),
+                };
                 let class = arcade_arc::blob::Class::from_u8(f["class"].as_u64().unwrap_or(0) as u8).ok_or("class is 0 to 3")?;
                 let enc = if f["gzip"] == true { arcade_arc::blob::Encoding::Gzip } else { arcade_arc::blob::Encoding::Plain };
                 items.push((bytes, f["type"].as_str().unwrap_or("application/octet-stream").to_string(), class, enc));
@@ -1346,5 +1449,69 @@ mod agent_tests {
         assert!(s["items"][0].get("events").is_none() && s["items"][0]["text"] == json!({"title": "one"}) && s["items"][0]["comments"] == 1);
         assert_eq!(s["count"], 3);
         assert!(filter_items(v.clone(), &json!({"state": "shut"})).is_err());
+    }
+
+    #[test]
+    fn items_page_with_a_cursor_and_pending_ones_come_last() {
+        let it = |n: u64| json!({"number": n, "kind": "issue", "state": "open", "height": n, "text": {}, "events": []});
+        let mut items: Vec<Value> = (1..=5).rev().map(it).collect();
+        items.push(json!({"number": null, "kind": "issue", "state": "open", "height": null, "txid": "ab", "text": {}, "events": [], "pending": true}));
+        let v = json!({"repo": "@a/b", "items": items});
+        let nums = |r: &Value| r["items"].as_array().unwrap().iter().map(|i| i["number"].as_u64()).collect::<Vec<_>>();
+        let p1 = page_items(filter_items(v.clone(), &json!({})).unwrap(), &json!({"limit": 2})).unwrap();
+        assert_eq!(nums(&p1), vec![Some(1), Some(2)]);
+        assert_eq!(p1["next"], "n.2");
+        let p2 = page_items(v.clone(), &json!({"limit": 2, "cursor": "n.2"})).unwrap();
+        assert_eq!(nums(&p2), vec![Some(3), Some(4)]);
+        let p3 = page_items(v.clone(), &json!({"limit": 2, "cursor": p2["next"]})).unwrap();
+        assert_eq!(nums(&p3), vec![Some(5), None], "the last page carries the pending item");
+        assert!(p3["next"].is_null());
+        assert!(page_items(v.clone(), &json!({"cursor": "bogus"})).is_err());
+        // A since filter keeps what is pending (it is newer than any height).
+        assert_eq!(filter_items(v, &json!({"since": 5})).unwrap()["count"], 2);
+    }
+
+    #[test]
+    fn events_since_follows_the_log_with_a_cursor() {
+        let (_g, t) = crate::http::tests::node();
+        t.node.app.event("test", "before").unwrap();
+        let now = events_since(&t.node, &json!({})).unwrap();
+        assert!(now["events"].as_array().unwrap().is_empty(), "no cursor: from now");
+        t.node.app.event("test", "one").unwrap();
+        t.node.app.event("other", "two").unwrap();
+        let a = events_since(&t.node, &json!({"cursor": now["next"]})).unwrap();
+        let texts = |v: &Value| v["events"].as_array().unwrap().iter().map(|e| e["text"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        assert_eq!(texts(&a), vec!["one", "two"]);
+        let b = events_since(&t.node, &json!({"cursor": now["next"], "kinds": "other"})).unwrap();
+        assert_eq!(texts(&b), vec!["two"]);
+        let c = events_since(&t.node, &json!({"cursor": a["next"], "wait": 1})).unwrap();
+        assert!(c["events"].as_array().unwrap().is_empty() && c["timed_out"] == true);
+        let all = events_since(&t.node, &json!({"cursor": "0"})).unwrap();
+        assert!(texts(&all).contains(&"before".to_string()));
+        assert!(events_since(&t.node, &json!({"cursor": "zz"})).is_err());
+    }
+
+    #[test]
+    fn a_name_outside_the_table_is_no_command_on_any_surface() {
+        let (_g, t) = crate::http::tests::node();
+        let e = dispatch(&t.node, &json!({"cmd": "no.such_thing"})).unwrap_err();
+        assert_eq!(error_code(&e), "unknown_command");
+        let e = dispatch(&t.node, &json!({"cmd": "service.stop"})).unwrap_err();
+        assert_eq!(error_code(&e), "unknown_command", "service.stop is the socket's own line, never dispatched");
+        assert!(dispatch(&t.node, &json!({"cmd": "rpc.openapi"})).unwrap()["paths"].is_object());
+        assert!(dispatch(&t.node, &json!({"cmd": "rpc.guide"})).unwrap().as_str().unwrap().contains("client_ref"));
+        for c in ERROR_CODES {
+            assert!(!c.is_empty());
+        }
+        let w = dispatch(&t.node, &json!({"cmd": "chains.wait", "chain": t.node.params.key, "height": 0, "timeout": 1})).unwrap();
+        assert_eq!(w["chain"], t.node.params.key);
+        assert!(w["source"].is_string());
+        let late = dispatch(&t.node, &json!({"cmd": "chains.wait", "chain": t.node.params.key, "height": 1_000_000_000u64, "timeout": 1})).unwrap();
+        assert!(late["timed_out"] == true && late["reached"] == false);
+        assert_eq!(error_code(&dispatch(&t.node, &json!({"cmd": "chains.wait", "chain": "nochain", "height": 1})).unwrap_err()), "unknown_chain");
+        let feed = dispatch(&t.node, &json!({"cmd": "explorer.blocks", "order": "asc", "from": 0, "limit": 5})).unwrap();
+        assert_eq!(feed["order"], "asc");
+        assert!(feed["next_from"].is_u64() && feed["source"].is_string());
+        assert_eq!(error_code(&dispatch(&t.node, &json!({"cmd": "explorer.blocks", "order": "sideways"})).unwrap_err()), "bad_args");
     }
 }

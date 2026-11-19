@@ -124,6 +124,36 @@ pub fn on_sz(node: &Node, from: &str, h: &Value) {
     save(node);
 }
 
+/// The groups that are the chain itself (what `modes.full` adds up): the rest are its indexes.
+const CHAIN_GROUPS: &[&str] = &["headers", "blocks", "coins"];
+
+/// A chain's measured groups as one arcade's sizes: {"b": the chain itself (headers, blocks, coins), "ix": {index: bytes}}.
+pub fn split(groups: &Map<String, Value>) -> Value {
+    let b: u64 = CHAIN_GROUPS.iter().filter_map(|g| groups.get(*g).and_then(|x| x.as_u64())).sum();
+    let ix: Map<String, Value> = groups.iter().filter(|(n, v)| !CHAIN_GROUPS.contains(&n.as_str()) && group_of_name(n) && v.as_u64().is_some_and(|b| b > 0)).map(|(n, v)| (n.clone(), v.clone())).collect();
+    json!({"b": b, "ix": ix})
+}
+
+/// What our hold report ("sh hold", crate::shares::hold_frame) carries per chain from our own measurement, so arcades
+/// we aren't linked to (who never get our "sz" frame) know what we keep, not only the network's median: [`split`] of
+/// the chain's groups, None before the first measurement. Arcades before it drop the unknown field from what they keep
+/// and pass the signed report on unchanged.
+pub fn hold_part(node: &Node, net: &str) -> Option<Value> {
+    let m = node.my_sizes.lock().unwrap();
+    let g = m.get(net)?["groups"].as_object()?;
+    (!g.is_empty()).then(|| split(g))
+}
+
+/// Another arcade's hold `sz` as kept: only {b, ix} with known index names and whole numbers (None when malformed).
+pub fn clean_hold(v: &Value) -> Option<Value> {
+    let b = v["b"].as_u64()?;
+    let ix: Map<String, Value> = v["ix"]
+        .as_object()
+        .map(|g| g.iter().take(16).filter(|(n, x)| !CHAIN_GROUPS.contains(&n.as_str()) && group_of_name(n) && x.as_u64().is_some()).map(|(n, x)| (n.clone(), x.clone())).collect())
+        .unwrap_or_default();
+    Some(json!({"b": b, "ix": ix}))
+}
+
 fn group_of_name(n: &str) -> bool {
     matches!(n, "headers" | "blocks" | "coins" | "addresses" | "ledger" | "profiles" | "ord" | "names" | "maps" | "tokens")
 }

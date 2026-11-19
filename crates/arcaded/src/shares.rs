@@ -325,6 +325,10 @@ pub fn hold_frame(node: &Node) -> Frame {
         // What connecting the chain here found against its rules not switched on (evidence for
         // switching them on; chains.rule_reports gathers the mesh's).
         let mut v = v;
+        // Its measured size here (crate::sizes::hold_part): what explorer.arc_nodes shows for arcades not linked to us.
+        if let Some(sz) = crate::sizes::hold_part(node, p.net) {
+            v["sz"] = sz;
+        }
         if let Some(w) = node.chain.rule_watch(p.chain_no).ok().flatten() {
             v["rw"] = crate::rulecheck::watch_json(&w);
         }
@@ -812,6 +816,9 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
             if let Some(fog) = crate::fogstore::clean(&v["fog"]) {
                 e["fog"] = fog;
             }
+            if let Some(sz) = crate::sizes::clean_hold(&v["sz"]) {
+                e["sz"] = sz;
+            }
             clean.insert(k.clone(), e);
         }
     }
@@ -887,6 +894,34 @@ fn keep_hold(holds: &mut std::collections::BTreeMap<String, (u64, Value)>, id: &
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hold_carries_its_measured_size_and_passes_it_on() {
+        let t = crate::sitesvc::tests::setup();
+        let net = t.p.net;
+        // Ours: in the frame once measured, still signed.
+        assert!(hold_frame(&t.node).head["chains"][net].get("sz").is_none(), "nothing before a measurement");
+        t.node.my_sizes.lock().unwrap().insert(net.into(), json!({"h": 5, "at": 1, "groups": {"headers": 10, "blocks": 900, "coins": 90, "ledger": 40}}));
+        let mine = hold_frame(&t.node).head;
+        assert_eq!(mine["chains"][net]["sz"], json!({"b": 1000, "ix": {"ledger": 40}}));
+        assert!(arcade_mesh::canon::verify_json(&mine, &["sig"], "o", b""));
+        // Theirs: kept cleaned (bad entries dropped), the signed report passed on as it came.
+        let k = ed25519_dalek::SigningKey::from_bytes(&[4u8; 32]);
+        let kid = hex::encode(k.verifying_key().to_bytes());
+        let mut h = json!({"t": "sh", "op": "hold", "o": kid, "at": arcade_app::now(),
+                           "chains": {net: {"mode": "full", "h": 5, "blocks": "all", "sz": {"b": 1000, "ix": {"ledger": 40, "junk": 1, "ord": "x"}}}}});
+        arcade_mesh::canon::sign_json(&k, &mut h, &["sig"], b"");
+        on_hold(&t.node, &"ef".repeat(32), &h);
+        assert_eq!(t.node.holds.lock().unwrap()[&kid].1[net]["sz"], json!({"b": 1000, "ix": {"ledger": 40}}));
+        assert_eq!(t.node.mesh_outbox.lock().unwrap().last().unwrap()["chains"][net]["sz"]["ix"]["junk"], 1, "passed on unchanged, so its signature holds");
+        // A malformed one is dropped, the rest of the hold kept.
+        let mut bad = json!({"t": "sh", "op": "hold", "o": kid, "at": arcade_app::now() + 1, "chains": {net: {"mode": "full", "h": 6, "sz": {"b": "lots"}}}});
+        arcade_mesh::canon::sign_json(&k, &mut bad, &["sig"], b"");
+        on_hold(&t.node, &"ef".repeat(32), &bad);
+        let kept = t.node.holds.lock().unwrap()[&kid].1[net].clone();
+        assert_eq!(kept["h"], 6);
+        assert!(kept.get("sz").is_none());
+    }
 
     #[test]
     fn holds_count_only_when_signed_by_their_arcade() {

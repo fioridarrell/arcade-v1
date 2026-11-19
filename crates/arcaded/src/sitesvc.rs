@@ -487,6 +487,10 @@ fn send_raw(node: &Node, req: &Value, checked: bool) -> R {
     if tx.is_coinbase() || tx.inputs.is_empty() {
         return Err("a coinbase or input-less transaction can't be broadcast".into());
     }
+    // This arcade's own (signed here): its receipt before any network step (crate::receipts).
+    if !checked {
+        crate::receipts::signed(node, p.key, &tx.txid);
+    }
     // An ARCADE transaction goes into the ARCADE chain's own pool, which checks it by that chain's rules and passes it
     // on to the arcades it is linked to. (Installed but borrowed meanwhile: through the lenders, below.)
     if crate::arcsvc::own(p) {

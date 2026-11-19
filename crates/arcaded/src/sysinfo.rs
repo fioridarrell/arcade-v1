@@ -985,13 +985,22 @@ pub fn read(node: &Node) -> Value {
 pub fn machine(node: &str) -> Option<Value> {
     let now = arcade_app::now();
     let h = heard();
-    let r = h.get(node, now)?;
+    Some(machine_line(h.get(node, now)?))
+}
+
+/// This arcade's own machine line, while it shares (None when off).
+pub fn own_machine() -> Option<Value> {
+    let m = if is_on() { mine().clone().filter(|m| m["off"] != true) } else { None };
+    m.as_ref().map(machine_line)
+}
+
+fn machine_line(r: &Value) -> Value {
     let gpus: Vec<Value> = r["gpus"].as_array().into_iter().flatten().map(|g| json!({"name": g["name"], "vram_gb": g["vram_gb"], "unified": g["unified"] == true})).collect();
-    Some(json!({
+    json!({
         "cpu": r["cpu"], "cores": r["cores"]["physical"].as_u64().or(r["cores"]["logical"].as_u64()), "threads": r["cores"]["logical"],
         "ram_gb": r["ram_gb"], "gpus": gpus, "disk_free_gb": r["disk_gb"]["free"], "disk_total_gb": r["disk_gb"]["total"],
-        "seal": r["seal"], "os": r["os"], "arch": r["arch"], "at": r["at"],
-    }))
+        "seal": r["seal"], "os": r["os"], "arch": r["arch"], "version": r["version"], "at": r["at"],
+    })
 }
 
 #[cfg(test)]
@@ -1093,7 +1102,7 @@ mod tests {
     fn a_record_never_holds_a_host_name_path_or_address() {
         let private = vec!["workbench-07".to_string(), "workbench".to_string(), "alice".to_string()];
         let secrets = [
-            "/home/alice/.local/share/arcade", "C:\\Users\\alice\\AppData", "192.168.1.220", "10.0.0.5:8421", "fe80::1",
+            "/home/alice/.local/share/arcade", "C:\\Users\\alice\\AppData", "192.0.2.10", "10.0.0.5:8421", "fe80::1",
             "2001:db8::7", "00:1b:44:11:3a:b7", "aa-bb-cc-dd-ee-ff", "alice@example.com", "workbench-07", "alice",
             "SN=7F3A9C21", "serial:0x00001234abcd", "1f8e3c2a9b7d4e61", "file:///etc/hostname", "ws://203.0.113.5",
             "user=alice", "host_workbench", "WORKBENCH-07.local", "ALICE",
@@ -1116,7 +1125,7 @@ mod tests {
             };
             let r = record(&"ab".repeat(32), 1_800_000_000, &f, "v0.1.140", None, &private);
             let text = r.to_string().to_ascii_lowercase();
-            for s in ["/home", "\\users", "192.168", "10.0.0", "8421", "fe80", "2001:db8", "00:1b", "aa-bb", "example.com", "workbench", "alice", "7f3a9c21", "1234abcd", "1f8e3c2a", "hostname", "203.0.113", ".local"] {
+            for s in ["/home", "\\users", "192.0.2", "10.0.0", "8421", "fe80", "2001:db8", "00:1b", "aa-bb", "example.com", "workbench", "alice", "7f3a9c21", "1234abcd", "1f8e3c2a", "hostname", "203.0.113", ".local"] {
                 assert!(!text.contains(s), "{s} in {text}");
             }
             let mut signed = r.clone();

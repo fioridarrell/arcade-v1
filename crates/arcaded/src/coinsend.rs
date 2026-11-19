@@ -344,6 +344,8 @@ pub fn send_parts(node: &Node, key: Option<&str>, to: &str, parts: &[u64], from:
     let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
     out["caution"] = json!(crate::ordsafe::caution(node, p, &spent));
     if broadcast {
+        // Signed: its receipt is written before it goes out (crate::receipts, ARCADE #25 part 2).
+        crate::receipts::signed(node, p.key, &tx.txid);
         let r = if arc {
             let (id, fee) = crate::ownwait::send_arc(node, &tx)?;
             json!({"txid": id.to_hex(), "fee": fee, "size": tx.raw.len()})

@@ -372,6 +372,11 @@ pub fn publish_blob(node: &Node, bytes: &[u8], kind: &str, class: arcade_arc::bl
 pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool) -> Result<Value, String> {
     use arcade_arc::blob::{self, Record};
     use arcade_wallet::tx::{fee_for_size, sign_keyhash, verify_keyhash, TxOutSpec};
+    // Blobs travel with their transaction from this arcade's own pool (crate::arcblob holds their bytes until a block
+    // takes them); lenders take transactions only, so a borrowed ARCADE can't carry them yet.
+    if crate::arcsvc::usable_chain().is_some_and(|p| !crate::arcsvc::own(p)) {
+        return Err("long texts and files go on the ARCADE chain as blobs, and those need ARCADE installed here (it is only borrowed): install it in Chains & Coins".into());
+    }
     let p = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or("the ARCADE chain isn't running here")?;
     let net = crate::arcsvc::svc_net().ok_or("the ARCADE chain isn't running here")?;
     if items.is_empty() {

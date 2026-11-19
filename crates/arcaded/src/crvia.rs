@@ -57,6 +57,11 @@ pub fn linked(peer: &str) -> bool {
     PEERS.lock().unwrap().get(peer).is_some_and(|p| p.links > 0)
 }
 
+/// Every peer with a mesh link up now (node ids).
+pub fn linked_ids() -> Vec<String> {
+    PEERS.lock().unwrap().iter().filter(|(_, p)| p.links > 0).map(|(id, _)| id.clone()).collect()
+}
+
 /// The lender name borrowing uses for `peer` over its mesh link.
 pub fn name(peer: &str) -> String {
     format!("{PREFIX}{peer}")

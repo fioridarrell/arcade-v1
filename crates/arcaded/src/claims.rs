@@ -462,6 +462,19 @@ fn arc_owner_on_mesh(node: &Node, arc: &'static ChainParams, tag: &str) -> Resul
     }
 }
 
+/// [`arc_owner_on_mesh`] for writes on a borrowed ARCADE chain: who holds `tag`, or Err when no arcade keeping it could say.
+pub(crate) fn arc_owner(node: &Node, arc: &'static ChainParams, tag: &str) -> Result<Option<String>, String> {
+    arc_owner_on_mesh(node, arc, tag).map_err(|e| format!("no arcade keeping {} could say who holds @{tag} ({e}); try again in a minute", arc.name))
+}
+
+/// The @tag `address` holds on the ARCADE chain `arc`, by the word of an arcade keeping it (for an arcade borrowing it,
+/// whose own ledger doesn't have the chain's tags). None when it holds none or no arcade could say.
+pub(crate) fn arc_tag_on_mesh(node: &Node, arc: &'static ChainParams, address: &str) -> Option<String> {
+    let q = serde_json::json!({"chain": arc.key, "address": address, "local": true, "history": false, "inscriptions": false});
+    let (v, _) = crate::explorer::mesh_ask(node, arc, "ledger", "explorer.address", &q).ok()?;
+    v["tag"].as_str().filter(|t| !t.is_empty()).map(String::from)
+}
+
 /// Whether two addresses (any chain's p2pkh form) are the same key.
 fn same_key(a: &str, b: &str) -> bool {
     let h = |x: &str| arcade_ledger::address::decode_base58check(x).filter(|(_, h)| h.len() == 20).map(|(_, h)| h);

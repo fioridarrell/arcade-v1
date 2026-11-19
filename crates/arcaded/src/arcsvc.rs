@@ -1302,6 +1302,13 @@ pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
     let def = DEF.get_or_init(|| def);
+    // The A:// ops' heights, known whether the chain runs here or is borrowed: an arcade that only borrows it writes
+    // records too, and checks them against these (`run` sets them again, the same).
+    arcade_ledger::aproto::set_wallets_from(def.params.chain_no, crate::walletproofs::known_from(def.params.net));
+    arcade_ledger::aproto::set_social_from(def.params.chain_no, crate::asocial::known_from(def.params.net));
+    // The blob store and its viewer's cache, whether the chain runs here or is borrowed: a borrowing arcade keeps the
+    // blobs it views under its home and serves them on (`run` points at the same place).
+    blob_store(node, &net);
     let installed = node.app.store.read(|r| r.get(arcade_app::META, &installed_key(&net))).map_err(db_err)?.is_some();
     if installed {
         let _changing = CHANGING.lock().unwrap();
@@ -1365,6 +1372,14 @@ pub fn remove(node: &Arc<Node>) -> Result<(), String> {
     Ok(())
 }
 
+/// The blob store at `<home>/arc/<net>/blobs`, with the operator's viewer-cache size (`arc_cache_mb`).
+fn blob_store(node: &Node, net: &Net) {
+    crate::arcblob::init(node.home.join("arc").join(net.key).join("blobs"));
+    if let Some(mb) = node.app.store.read(|r| r.get(arcade_app::META, b"arc_cache_mb")).ok().flatten().and_then(|v| String::from_utf8(v).ok()?.parse::<u64>().ok()) {
+        crate::arcblob::set_cache_limit(mb << 20);
+    }
+}
+
 /// Bring the chain up from the store's copy and start its writer. The caller holds `CHANGING`.
 fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     let (net, s, genesis, p) = (def.net, &def.settings, def.genesis, def.params);
@@ -1374,11 +1389,8 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
 
     let dir = node.home.join("arc").join(net.key);
     std::fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    crate::arcblob::init(dir.join("blobs"));
+    blob_store(node, &net);
     crate::arcblob::set_boost_secs(s.blob_temporary);
-    if let Some(mb) = node.app.store.read(|r| r.get(arcade_app::META, b"arc_cache_mb")).ok().flatten().and_then(|v| String::from_utf8(v).ok()?.parse::<u64>().ok()) {
-        crate::arcblob::set_cache_limit(mb << 20);
-    }
     {
         // A dropped plain copy is read back from this arcade's sealed replica of the blob family.
         let (n, net2) = (Arc::downgrade(node), net);
@@ -1643,10 +1655,22 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
 // The mesh
 
 /// An "ac" frame of the time keepers' (crate::arckeep), as every ARCADE frame is made.
-pub(crate) fn keeper_frame(op: &str, head: Value) -> Frame {
+pub(crate) fn keeper_frame(op: &str, mut head: Value) -> Frame {
     match svc() {
         Some(svc) => frame(&svc, op, head),
-        None => Frame::new(head),
+        // Not running here (only borrowed): the same frame from the chain this arcade knows, so a keeper takes its
+        // blob asks (crate::arcblob::view) and other arcades its blob answers.
+        None => match DEF.get() {
+            Some(d) => {
+                head["t"] = json!("ac");
+                head["op"] = json!(op);
+                head["g"] = json!(d.genesis.to_hex());
+                head["pv"] = json!(params::PROTOCOL);
+                head["rules"] = json!(d.net.rules.iter().map(|(v, h)| [*v as u64, *h]).collect::<Vec<_>>());
+                Frame::new(head)
+            }
+            None => Frame::new(head),
+        },
     }
 }
 
@@ -1914,7 +1938,15 @@ fn test_holds_sync(svc: &Svc) -> bool {
 }
 
 pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError> {
-    let Some(svc) = svc() else { return Ok(()) };
+    let Some(svc) = svc() else {
+        // Not running here (borrowed, or not installed at all): blob pieces this arcade holds (viewed, so cached)
+        // are still served, so a blob one arcade fetched spreads to the next (Martin 2026-11-18: "then they would
+        // both have the blob to serve").
+        if f.head["op"] == "bq" && DEF.get().is_some_and(|d| f.head["g"] == d.genesis.to_hex().as_str()) && speaks(&link.peer_id, &f.head) {
+            crate::arcblob::serve_piece(link, &f.head)?;
+        }
+        return Ok(());
+    };
     let svc = &*svc;
     if f.head["g"] != svc.genesis_hex.as_str() || !speaks(&link.peer_id, &f.head) {
         return Ok(());

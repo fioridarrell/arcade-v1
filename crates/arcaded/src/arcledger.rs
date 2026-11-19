@@ -6,9 +6,44 @@ use crate::node::Node;
 use arcade_chain::params::ChainParams;
 use serde_json::{json, Value};
 
-/// The ARCADE chain running here.
+/// The ARCADE chain running here: its own copy, whose ledger tables the reads below look in.
 pub fn chain() -> Result<&'static ChainParams, String> {
-    crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or_else(|| "the ARCADE chain isn't running here".to_string())
+    if let Some(p) = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)) {
+        return Ok(p);
+    }
+    // Borrowed only: this arcade has no ledger tables of its own to read, and says so rather than answer empty.
+    if crate::arcsvc::usable_chain().is_some() {
+        return Err("ARCADE is borrowed here, not installed: this read needs its ledger, so install ARCADE in Chains & Coins (writes work borrowed)".into());
+    }
+    Err("the ARCADE chain isn't running here".to_string())
+}
+
+/// The ARCADE chain records are written to: installed here or borrowed (Martin 2026-11-18: "It's just a transaction
+/// that needs to be sent"). Coins, waiting change and the broadcast follow whichever copy stands in (claims::arc_coins,
+/// arcsvc::waiting_outputs, ownwait::send_arc).
+pub fn write_chain() -> Result<&'static ChainParams, String> {
+    crate::arcsvc::usable_chain().ok_or_else(|| "the ARCADE chain isn't installed or borrowed here".to_string())
+}
+
+/// The ARCADE chain's height as the copy standing in knows it: the borrowed copy's while it stands in, else this
+/// arcade's own.
+pub fn tip_height(node: &Node, p: &ChainParams) -> u64 {
+    if crate::arcsvc::borrowed(p) {
+        return crate::borrow::tip(node, p.key).unwrap_or(0) as u64;
+    }
+    node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0)
+}
+
+/// The @tag `address` holds on ARCADE: this arcade's own ledger; while ARCADE is borrowed, the tag recorded for that
+/// key here (`recorded`, set once its claim confirmed) or an arcade keeping the chain's word.
+fn tag_here(node: &Node, p: &'static ChainParams, address: &str, recorded: Option<&str>) -> Option<String> {
+    if let Ok(Some(t)) = arcade_ledger::index::tag_of(&node.chain, p.chain_no, address) {
+        return Some(t);
+    }
+    if !crate::arcsvc::borrowed(p) {
+        return None;
+    }
+    recorded.map(String::from).or_else(|| crate::claims::arc_tag_on_mesh(node, p, address))
 }
 
 thread_local! {
@@ -36,22 +71,32 @@ pub fn sign_as() -> Option<String> {
 pub fn sender(node: &Node, p: &'static ChainParams) -> Result<(String, Option<String>, arcade_wallet::SecretKey), String> {
     if let Some(want) = sign_as() {
         for k in node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())? {
-            if arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address).ok().flatten().as_deref() == Some(want.as_str()) {
+            if tag_here(node, p, &k.address, k.tag.as_deref()).as_deref() == Some(want.as_str()) {
                 let (k, sk) = node.app.tag_key(p, k.index).map_err(|e| e.to_string())?;
                 return Ok((k.address, Some(want), sk));
             }
         }
         for (address, _, sk, kind) in crate::importsvc::wallets_on(node, p.key) {
-            if kind == "legacy" && arcade_ledger::index::tag_of(&node.chain, p.chain_no, &address).ok().flatten().as_deref() == Some(want.as_str()) {
+            if kind == "legacy" && tag_here(node, p, &address, None).as_deref() == Some(want.as_str()) {
                 return Ok((address, Some(want), sk));
             }
         }
         return Err(format!("no key here holds @{want} on the ARCADE chain (import it first: wallet.import with chain {})", p.key));
     }
-    for k in node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())? {
-        if let Ok(Some(t)) = arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address) {
-            let (k, sk) = node.app.tag_key(p, k.index).map_err(|e| e.to_string())?;
-            return Ok((k.address, Some(t), sk));
+    let keys = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?;
+    // Borrowed: a key whose tag is recorded here first (no asking), then the arcades keeping the chain.
+    let borrowed = crate::arcsvc::borrowed(p);
+    for pass in 0..if borrowed { 2 } else { 1 } {
+        for k in &keys {
+            let t = match pass {
+                0 if borrowed => k.tag.clone().or_else(|| arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address).ok().flatten()),
+                0 => arcade_ledger::index::tag_of(&node.chain, p.chain_no, &k.address).ok().flatten(),
+                _ => crate::claims::arc_tag_on_mesh(node, p, &k.address),
+            };
+            if let Some(t) = t {
+                let (k, sk) = node.app.tag_key(p, k.index).map_err(|e| e.to_string())?;
+                return Ok((k.address, Some(t), sk));
+            }
         }
     }
     let (k, sk) = node.app.tag_key(p, 0).map_err(|e| e.to_string())?;
@@ -61,7 +106,7 @@ pub fn sender(node: &Node, p: &'static ChainParams) -> Result<(String, Option<St
 /// One `arcd` record from the sender's key on ARCADE: `payload` is the whole record after the marker (version, type,
 /// data; tags::claim_payload and the like make it whole). Its txid and fee.
 pub fn send(node: &Node, payload: &[u8]) -> Result<(String, u64), String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let (_, _, sk) = sender(node, p)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
     let script = arcade_wallet::keys::p2pkh_script_for(&pk);
@@ -79,7 +124,7 @@ pub fn send(node: &Node, payload: &[u8]) -> Result<(String, u64), String> {
 
 /// [`send`], also paying `value` to `to` (an ARCADE address) in the same transaction: an A:// tip (crate::asocial).
 pub fn send_paying(node: &Node, payload: &[u8], to: &str, value: u64) -> Result<(String, u64), String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or_else(|| format!("{to} isn't an ARCADE address"))?;
     let (_, _, sk) = sender(node, p)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
@@ -95,13 +140,13 @@ pub fn send_paying(node: &Node, payload: &[u8], to: &str, value: u64) -> Result<
 
 /// This wallet's sending address on ARCADE (its @tag's, else its first): where a relay asks to be paid (relaysvc).
 pub fn own_address(node: &Node) -> Result<String, String> {
-    Ok(sender(node, chain()?)?.0)
+    Ok(sender(node, write_chain()?)?.0)
 }
 
 /// Pay `value` to `to` on ARCADE with `memo` in the same transaction (an AnyData record, so the payee can tell whose
 /// payment it is): spends confirmed coins and this wallet's change still waiting. Its txid and fee.
 pub fn pay_with_memo(node: &Node, to: &str, value: u64, memo: &[u8]) -> Result<(String, u64), String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or_else(|| format!("{to} isn't an ARCADE address"))?;
     let (_, _, sk) = sender(node, p)?;
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
@@ -118,7 +163,7 @@ pub fn pay_with_memo(node: &Node, to: &str, value: u64, memo: &[u8]) -> Result<(
 /// `ledger.announce` on ARCADE: the wallet's messaging key and profile name under its @tag there (a key announcement,
 /// what `msg.announce` sends on the home chain), so every arcade reads the profile back from the ARCADE chain.
 pub fn announce(node: &Node) -> Result<Value, String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let (address, tag, _) = sender(node, p)?;
     let tag = tag.ok_or("claim an @tag on the ARCADE chain first (tag.claim with chain arctest)")?;
     let k = crate::msgsvc::keys(node)?;
@@ -157,7 +202,7 @@ pub fn committed_salt(node: &Node, tag: &str) -> Option<Vec<u8>> {
 /// `ledger.tag_commit {tag}`: commit ahead to claiming a released @tag (§15 step 8): a commit record naming
 /// `commitment(tag, address, salt)` with a fresh salt kept here; the claim (tag.claim) then carries the salt.
 pub fn tag_commit(node: &Node, tag: &str) -> Result<Value, String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let tag = tag.trim().trim_start_matches('@').to_lowercase();
     if let Some(why) = arcade_ledger::tags::tag_problem(&tag) {
         return Err(format!("@{tag}: {why}"));
@@ -173,7 +218,7 @@ pub fn tag_commit(node: &Node, tag: &str) -> Result<Value, String> {
 
 /// `ledger.tag_checkin`: keep this wallet's @tag on ARCADE with a check-in (0.1 ARCADE into the pot).
 pub fn tag_checkin(node: &Node) -> Result<Value, String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let (_, tag, sk) = sender(node, p)?;
     let tag = tag.ok_or("this wallet has no @tag on the ARCADE chain")?;
     let x = arcade_ledger::tags::expiry(p.chain_no).ok_or("tags don't expire on this chain")?;
@@ -603,17 +648,25 @@ pub fn a_profile_set(node: &Node, req: &Value) -> Result<Value, String> {
 
 /// `a.follow {tag}` / `a.unfollow {tag}`.
 pub fn a_follow(node: &Node, tag: &str, on: bool) -> Result<Value, String> {
-    let p = chain()?;
+    let p = write_chain()?;
     let t = tag.trim().trim_start_matches('@').to_lowercase();
     // A key hash (someone known by a name on another chain, no ARCADE @tag yet) is followed as #<hex>.
     let t = if t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit()) { format!("#{t}") } else { t };
-    if !t.starts_with('#') && arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t).map_err(|e| e.to_string())?.is_none() {
-        return Err(format!("@{t} isn't claimed on the ARCADE chain"));
-    }
     let me = sender(node, p)?.0;
-    let following = node.chain.store(p.chain_no).read(|r| r.get(arcade_ledger::engine::A_FOLLOW, &arcade_store::KeyBuf::new().u16(p.chain_no).bytes(me.as_bytes()).u8(0).bytes(t.as_bytes()).done())).ok().flatten().is_some();
-    if on == following {
-        return Err(if on { format!("you already follow @{t}") } else { format!("you don't follow @{t}") });
+    if crate::arcsvc::borrowed(p) {
+        // Borrowed: the tables are at the arcades keeping the chain, so they say whether the tag is claimed. Whether
+        // this wallet follows it already isn't asked: a second follow (or an unfollow of no one) changes nothing on chain.
+        if !t.starts_with('#') && crate::claims::arc_owner(node, p, &t)?.is_none() {
+            return Err(format!("@{t} isn't claimed on the ARCADE chain"));
+        }
+    } else {
+        if !t.starts_with('#') && arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t).map_err(|e| e.to_string())?.is_none() {
+            return Err(format!("@{t} isn't claimed on the ARCADE chain"));
+        }
+        let following = node.chain.store(p.chain_no).read(|r| r.get(arcade_ledger::engine::A_FOLLOW, &arcade_store::KeyBuf::new().u16(p.chain_no).bytes(me.as_bytes()).u8(0).bytes(t.as_bytes()).done())).ok().flatten().is_some();
+        if on == following {
+            return Err(if on { format!("you already follow @{t}") } else { format!("you don't follow @{t}") });
+        }
     }
     let op = if on { arcade_ledger::aproto::OP_FOLLOW } else { arcade_ledger::aproto::OP_UNFOLLOW };
     let body = t.trim_start_matches('#');

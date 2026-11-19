@@ -118,6 +118,62 @@ pub fn send_arc(node: &Node, tx: &Tx) -> Result<(Hash256, u64), String> {
     Ok(r)
 }
 
+/// How [`send_own`] sends a transaction on chain `p`.
+#[derive(Debug, PartialEq, Clone, Copy)]
+enum Way {
+    /// The ARCADE chain (own copy or borrowed): [`send_arc`].
+    Arcade,
+    /// Borrowed (not installed, or installed and still catching up): to the lenders, which pool and send it; its
+    /// change is in the borrowed pool at once, so the next transaction can spend it.
+    Lenders,
+    /// The home chain kept here: its own pool, then its peers (the outbox, resent until a block has it).
+    OwnPool,
+    /// Another installed chain: its own peers (crate::sitesvc::broadcast).
+    Installed,
+}
+
+fn way(arcade: bool, borrowed: bool, home: bool) -> Way {
+    if arcade {
+        Way::Arcade
+    } else if borrowed {
+        Way::Lenders
+    } else if home {
+        Way::OwnPool
+    } else {
+        Way::Installed
+    }
+}
+
+/// One of this arcade's own transactions out to chain `p`'s network, whichever way the chain is kept here: the one
+/// place a send leaves (a home chain only borrowed sent nothing before: its outbox is drained by a sync loop that
+/// doesn't run then). Err when it was refused (spent coins, no lender took it).
+pub fn send_own(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<(), String> {
+    let home = p.chain_no == node.params.chain_no;
+    match way(crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no), crate::borrow::is_borrowed(p.key), home) {
+        Way::Arcade => send_arc(node, tx).map(|_| ()),
+        Way::Lenders => {
+            crate::borrow::broadcast_tx(node, p, tx).map_err(|(why, _)| format!("the transaction was refused: {why}"))?;
+            if home {
+                // Its coins stay spent here meanwhile; an installed home catching up also sends it to its own peers.
+                crate::claims::mark_spent(node, tx);
+                if crate::homeinst::installed() {
+                    node.tx_outbox.lock().unwrap().push(tx.raw.clone());
+                }
+            }
+            Ok(())
+        }
+        Way::OwnPool => {
+            if !crate::mempoolshare::add(node, p, tx) {
+                return Err("the transaction was refused: its coins are spent by another waiting transaction".into());
+            }
+            crate::claims::mark_spent(node, tx);
+            crate::resend::send(node, p, tx);
+            Ok(())
+        }
+        Way::Installed => crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key})).map(|_| ()),
+    }
+}
+
 #[derive(Debug, PartialEq)]
 enum Where {
     Block,
@@ -333,6 +389,36 @@ mod tests {
         t.node.chain.connect_blocks(t.p, &[block(tip.hash, vec![tx(&[], &[(5000, p2pkh(3))], 12), ours.clone()], 12)]).unwrap();
         sweep(&t.node, now + 1);
         assert!(remembered(&t.node).is_empty());
+    }
+
+    /// Which way a send leaves: the ARCADE chain its own way, anything borrowed through the lenders (the home chain
+    /// too: its outbox isn't sent while it is only borrowed), the kept home chain through its pool and outbox.
+    #[test]
+    fn a_send_leaves_by_how_the_chain_is_kept() {
+        assert_eq!(way(true, true, false), Way::Arcade);
+        assert_eq!(way(true, false, false), Way::Arcade);
+        assert_eq!(way(false, true, true), Way::Lenders);
+        assert_eq!(way(false, true, false), Way::Lenders);
+        assert_eq!(way(false, false, true), Way::OwnPool);
+        assert_eq!(way(false, false, false), Way::Installed);
+    }
+
+    /// The kept home chain: pooled, out through the outbox, remembered until a block has it; a second spend of the
+    /// same coin is refused and sends nothing.
+    #[test]
+    fn a_home_send_is_pooled_sent_and_remembered() {
+        let (t, coins) = crate::mempoolshare::tests::funded();
+        let k = crate::mempoolshare::tests::key();
+        let a = arcade_wallet::tx::sign_keyhash(t.p, 1, &coins[1..], &[arcade_wallet::tx::TxOutSpec { value: 1300, script: p2pkh(1) }], &k, 0).unwrap();
+        let b = arcade_wallet::tx::sign_keyhash(t.p, 1, &coins[1..], &[arcade_wallet::tx::TxOutSpec { value: 1200, script: p2pkh(2) }], &k, 0).unwrap();
+        t.node.tx_outbox.lock().unwrap().clear();
+        send_own(&t.node, t.p, &a).unwrap();
+        assert!(t.node.chain.mempool_tx(t.p.chain_no, &a.txid).unwrap().is_some(), "pooled");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[a.raw.clone()], "sent");
+        assert_eq!(remembered(&t.node)[t.p.key], 1, "remembered");
+        let e = send_own(&t.node, t.p, &b).unwrap_err();
+        assert!(e.contains("spent by another"), "{e}");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 1, "the refused one isn't sent");
     }
 
     /// One the network would refuse (no signature) isn't put back, though its coin is there.

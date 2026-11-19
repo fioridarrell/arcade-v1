@@ -345,6 +345,9 @@ fn relay(node: &Node) {
             if crate::arcsvc::runs(p) {
                 // Its own pool hands it on; one it holds already is refused, which is fine.
                 let _ = crate::ownwait::send_arc(node, &tx);
+            } else if p.chain_no == node.params.chain_no && crate::borrow::is_borrowed(p.key) {
+                // Borrowed: its lenders hold its parents already (they were sent through them too).
+                let _ = crate::ownwait::send_own(node, node.params, &tx);
             } else if p.chain_no == node.params.chain_no {
                 // Its unconfirmed parents first, oldest first: a peer drops a child whose parent it hasn't seen.
                 for parent in ancestors(node, p, &tx) {
@@ -384,11 +387,7 @@ fn relay_once(node: &Node, p: &ChainParams, tx: &Tx) -> Result<String, String> {
         return Ok(crate::ownwait::send_arc(node, &tx)?.0.to_hex());
     }
     if p.chain_no == node.params.chain_no {
-        if !crate::mempoolshare::add(node, p, tx) {
-            return Err("refused: its coins are spent by another waiting transaction".into());
-        }
-        crate::claims::mark_spent(node, tx);
-        node.tx_outbox.lock().unwrap().push(tx.raw.clone());
+        crate::ownwait::send_own(node, node.params, tx).map_err(|e| e.replace("the transaction was refused", "refused"))?;
         return Ok(tx.txid.to_hex());
     }
     let v = crate::sitesvc::broadcast(node, &json!({"hex": hex::encode(&tx.raw), "chain": p.key}))?;

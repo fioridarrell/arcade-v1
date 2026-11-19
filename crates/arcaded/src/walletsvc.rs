@@ -662,11 +662,7 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
         .collect();
     let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
     if send {
-        if !crate::mempoolshare::add(node, p, &tx) {
-            return Err("the transaction was refused: its coins are spent by another waiting transaction".into());
-        }
-        crate::claims::mark_spent(node, &tx);
-        node.tx_outbox.lock().unwrap().push(tx.raw.clone());
+        crate::ownwait::send_own(node, p, &tx)?;
     }
     let spent: Vec<arcade_chain::OutPoint> = tx.inputs.iter().map(|i| i.prevout).collect();
     let caution = if send { None } else { crate::ordsafe::caution(node, p, &spent) };

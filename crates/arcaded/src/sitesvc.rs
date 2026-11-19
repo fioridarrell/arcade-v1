@@ -14,7 +14,7 @@
 //! Chains: the home chain or an installed one, with its Addresses index on.
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, ChainParams};
+use arcade_chain::params::ChainParams;
 use arcade_chain::{OutPoint, Tx};
 use arcade_wallet::tx::Utxo;
 use serde_json::{json, Value};
@@ -43,13 +43,21 @@ pub(crate) fn chain(node: &Node, req: &Value) -> Result<&'static ChainParams, St
 /// The chain a request names, and whether it is borrowed now: not kept here, or kept but still
 /// syncing or indexing (the home chain included). Borrowed, its coins and broadcasts go through
 /// its lenders (crate::borrow), so a website works while the chain catches up.
-fn chain_or_borrowed(node: &Node, req: &Value) -> Result<(&'static ChainParams, bool), String> {
+pub(crate) fn chain_or_borrowed(node: &Node, req: &Value) -> Result<(&'static ChainParams, bool), String> {
     match chain(node, req) {
         Ok(p) => Ok((p, crate::borrow::is_borrowed(p.key))),
-        Err(why) => match req["chain"].as_str().and_then(by_key).filter(|p| crate::borrow::is_borrowed(p.key)) {
+        // Not kept here: borrowed, when it is (any chain the arcade knows, the ARCADE chain too; no chain = the home).
+        Err(why) => match named_or_home(node, req).filter(|p| crate::borrow::is_borrowed(p.key)) {
             Some(p) => Ok((p, true)),
             None => Err(why),
         },
+    }
+}
+
+fn named_or_home(node: &Node, req: &Value) -> Option<&'static ChainParams> {
+    match req["chain"].as_str().filter(|k| !k.is_empty()) {
+        Some(k) => crate::chains::find(k),
+        None => Some(node.params),
     }
 }
 
@@ -353,6 +361,17 @@ fn borrowed_coins(node: &Node, p: &'static ChainParams, req: &Value) -> R {
 }
 
 pub fn activity(node: &Node, req: &Value) -> R {
+    // Borrowed (not kept here, or kept but still catching up): the history from an arcade keeping the chain's
+    // Addresses index, plus what this arcade sent through its lenders that they haven't listed yet.
+    if req["local"] != true {
+        if let Ok((p, true)) = chain_or_borrowed(node, req) {
+            let mut q = req.clone();
+            q["chain"] = json!(p.key);
+            let mut v = crate::explorer::handle(node, "explorer.activity", &q)?;
+            add_lent_waiting(node, p, &addresses(p, req)?, &mut v);
+            return Ok(v);
+        }
+    }
     let p = chain(node, req)?;
     need_addresses(node, p)?;
     let want = addresses(p, req)?;
@@ -406,6 +425,32 @@ pub fn activity(node: &Node, req: &Value) -> R {
         }
     }
     Ok(json!({"chain": p.key, "height": tip, "since": since, "addresses": out}))
+}
+
+/// Into a borrowed chain's activity `v`: this arcade's own transactions waiting at its lenders (crate::borrow's pool)
+/// that pay or spend one of `want`'s addresses, when the answer doesn't list them yet.
+fn add_lent_waiting(node: &Node, p: &ChainParams, want: &[(String, Vec<u8>)], v: &mut Value) {
+    let pooled = crate::borrow::pool_txs(p);
+    let outs: HashMap<OutPoint, (Vec<u8>, u64)> = pooled
+        .iter()
+        .flat_map(|t| t.outputs.iter().enumerate().map(move |(i, o)| (OutPoint { txid: t.txid, vout: i as u32 }, (o.script_pubkey.clone(), o.value))))
+        .collect();
+    for t in &pooled {
+        let id = t.txid.to_hex();
+        // What each input spent: a waiting parent's output, or the confirmed coin as the borrowed copy knows it.
+        let ins: Vec<(Vec<u8>, u64)> = t.inputs.iter().filter_map(|i| outs.get(&i.prevout).cloned().or_else(|| crate::borrow::unspent_coin(node, p, &i.prevout))).collect();
+        for (a, script) in want {
+            let received: u64 = t.outputs.iter().filter(|o| &o.script_pubkey == script).map(|o| o.value).sum();
+            let spent: u64 = ins.iter().filter(|(s, _)| s == script).map(|(_, v)| *v).sum();
+            if received == 0 && spent == 0 {
+                continue;
+            }
+            let Some(w) = v["addresses"][a.as_str()]["waiting"].as_array_mut() else { continue };
+            if !w.iter().any(|r| r["txid"] == id.as_str()) {
+                w.push(json!({"txid": id, "seen": arcade_app::now(), "received": received, "spent": spent, "lent": true}));
+            }
+        }
+    }
 }
 
 /// tx.fee: what this arcade's own wallet builds with on that chain (coinsend::fee_policy), on an

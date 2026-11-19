@@ -756,10 +756,11 @@ fn send_payloads_coin(node: &Node, p: &'static arcade_chain::params::ChainParams
         let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
         let outs: u64 = tx.outputs.iter().map(|o| o.value).sum();
         fees += ins.saturating_sub(outs);
-        // A mainnet coin borrowed here: sent by its lenders (Pepecoin testnet keeps its own way, borrowed or not).
-        if p.chain_no != node.params.chain_no && crate::borrow::is_borrowed(p.key) {
-            if let Err((why, _)) = crate::borrow::broadcast_tx(node, p, &tx) {
-                return Err(if txids.is_empty() { format!("the transaction was refused ({why}); nothing was sent") } else { format!("only {} of {} transactions went out ({why})", txids.len(), payloads.len()) });
+        // A chain borrowed here, Pepecoin testnet too: sent by its lenders (an only-borrowed home's own outbox isn't
+        // sent), and its change is in the borrowed pool for the next transaction of the batch.
+        if crate::borrow::is_borrowed(p.key) && !crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no) {
+            if let Err(why) = crate::ownwait::send_own(node, p, &tx) {
+                return Err(if txids.is_empty() { format!("{why}; nothing was sent") } else { format!("only {} of {} transactions went out ({why})", txids.len(), payloads.len()) });
             }
             txids.push(tx.txid.to_hex());
             continue;

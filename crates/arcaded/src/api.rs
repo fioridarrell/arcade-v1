@@ -538,7 +538,19 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "faucet.arc_status" => Ok(crate::arcfaucet::status(node)),
         "mempool" => {
             // The chain asked for (`--chain`), the home chain by default; the ARCADE chain's pool is its own.
-            let p = crate::sitesvc::chain(node, req)?;
+            let (p, borrowed) = crate::sitesvc::chain_or_borrowed(node, req)?;
+            if borrowed && !crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no) {
+                // Borrowed: the lenders' pool (the Explorer's), plus what this arcade sent that they don't list yet.
+                let got = crate::explorer::handle(node, "explorer.mempool", &json!({"chain": p.key})).unwrap_or_else(|_| json!({"txs": []}));
+                let mut txs: Vec<Value> = got["txs"].as_array().cloned().unwrap_or_default().into_iter()
+                    .map(|t| json!({"txid": t["txid"], "seen": t["seen"], "size": t["size"], "outputs": t["out"]})).collect();
+                for t in crate::borrow::pool_txs(p) {
+                    if !txs.iter().any(|x| x["txid"] == t.txid.to_hex().as_str()) {
+                        txs.push(json!({"txid": t.txid.to_hex(), "seen": 0, "size": t.raw.len(), "outputs": t.outputs.iter().map(|o| o.value).sum::<u64>()}));
+                    }
+                }
+                return Ok(json!({"count": txs.len(), "txs": txs, "pending_tags": crate::claims::pending_tags(node), "borrowed": true}));
+            }
             let pool = if crate::arcsvc::borrowed(p) {
                 // Borrowed: what this arcade sent that still waits at the lenders.
                 crate::borrow::pool_txs(p).into_iter().map(|t| (0, t.raw)).collect()
@@ -630,7 +642,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             use arcade_ledger::index;
             // Balance and history on the chain asked for (`--chain`, the ARCADE chain too), the home chain by default.
             // Tags and profiles: that chain's own ledger first (the ARCADE chain keeps one), else the home chain's.
-            let pc = crate::sitesvc::chain(node, req)?;
+            // (Borrowed too: balance and history from arcades keeping it, the profile from lent rows.)
+            let (pc, pc_borrowed) = crate::sitesvc::chain_or_borrowed(node, req)?;
             let ledgers: Vec<u16> = if pc.chain_no == c { vec![c] } else { vec![pc.chain_no, c] };
             let q = s("who").ok_or("give an @tag or an address")?;
             let address = match q.strip_prefix('@') {
@@ -651,7 +664,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 None => q.clone(),
             };
             let tag = ledgers.iter().find_map(|&l| index::tag_of(&node.chain, l, &address).ok().flatten());
-            let mut prof = ledgers.iter().find_map(|&l| index::profile(&node.chain, l, &address).ok().flatten());
+            let mut prof = ledgers.iter().find_map(|&l| index::profile(&node.chain, l, &address).ok().flatten())
+                .or_else(|| crate::msgsvc::profile_on(node, node.ledger_home(), &address));
             // A chain this arcade did not know when the profile was indexed is kept as "h160:<hex>": its address is
             // read now (2026-11-12: Bellscoin and Luckycoin showed as hashes, so nobody could pay them there).
             if let Some(list) = prof.as_mut().and_then(|v| v["linked"].as_array_mut()) {
@@ -668,6 +682,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             let follow_counts = json!({"followers": crate::follows::followers_of(node, &address).len(), "following": crate::follows::following_of(node, &address).len()});
             let script = arcade_ledger::address::script_for_address(pc, &address);
             let (balance, history) = match &script {
+                Some(_) if pc_borrowed => {
+                    let v = crate::explorer::handle(node, "explorer.address", &json!({"chain": pc.key, "address": address, "inscriptions": false})).unwrap_or(Value::Null);
+                    (v["balance"].as_u64().unwrap_or(0), v["tx_count"].as_u64().unwrap_or(0) as usize)
+                }
                 Some(sc) => (node.chain.balance_for_script(pc.chain_no, sc).unwrap_or(0), node.chain.history_for_script(pc.chain_no, sc).map(|h| h.len()).unwrap_or(0)),
                 None => (0, 0),
             };

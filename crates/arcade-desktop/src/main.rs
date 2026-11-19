@@ -82,7 +82,7 @@ fn ask(label: &str, req: Value) -> Value {
     let mut s = match UnixStream::connect(&sock) {
         Ok(s) => s,
         Err(e) => {
-            #[cfg(windows)]
+            #[cfg(any(windows, target_os = "macos"))]
             if start_service() {
                 return json!({"ok": false, "error": "starting the arcade service", "starting": true});
             }
@@ -146,6 +146,48 @@ fn start_service() -> bool {
                 let mut c = Command::new(d.join("arcaded.exe"));
                 c.arg("--home").arg(&home).current_dir(&home);
                 // Below normal, as the installer's login task starts it (install.ps1), unless set otherwise.
+                if std::env::var_os("ARCADE_NICE").is_none() {
+                    c.env("ARCADE_NICE", "10");
+                }
+                quiet(&mut c);
+                c.spawn().is_ok()
+            }
+            _ => false,
+        }
+    };
+    *last = Some(Instant::now());
+    started
+}
+
+/// macOS: the window opened but arcaded isn't running. Start it, at most once a minute: the installer's launchd agent
+/// (scripts/install-macos.sh) first, else arcaded beside this program with the app's own data folder. True while a
+/// start is under way (90 s), so the window says "starting" instead of "not running".
+#[cfg(target_os = "macos")]
+fn start_service() -> bool {
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(t) = *last {
+        if t.elapsed() < Duration::from_secs(60) {
+            return t.elapsed() < Duration::from_secs(90);
+        }
+    }
+    let quiet = |c: &mut Command| {
+        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    };
+    let mut agent = Command::new("/bin/launchctl");
+    agent.args(["start", "com.dogecoinarcade.arcaded"]);
+    quiet(&mut agent);
+    let started = agent.status().is_ok_and(|s| s.success()) || {
+        let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        match dir {
+            Some(d) if d.join("arcaded").exists() => {
+                let home = home();
+                let _ = std::fs::create_dir_all(&home);
+                let mut c = Command::new(d.join("arcaded"));
+                c.arg("--home").arg(&home).current_dir(&home);
                 if std::env::var_os("ARCADE_NICE").is_none() {
                     c.env("ARCADE_NICE", "10");
                 }

@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Merged into the macOS app bundle's Info.plist by tauri (cargo tauri build): why an app window asks for the camera
+     and microphone (media.js: rooms with video and voice). -->
+<plist version="1.0">
+<dict>
+  <key>NSCameraUsageDescription</key>
+  <string>Apps you open in Arcade may use the camera for video in their rooms, after you turn on Camera &amp; microphone for that app.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Apps you open in Arcade may use the microphone for voice in their rooms, after you turn on Camera &amp; microphone for that app.</string>
+</dict>
+</plist>

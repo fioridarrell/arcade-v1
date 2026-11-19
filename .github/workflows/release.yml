@@ -197,7 +197,7 @@ jobs:
             arcade-v1-${{ matrix.platform }}-setup.exe*
 
   # macOS: built from the same commit, not required yet (a failure here doesn't stop the release). The archive holds
-  # the programs only; the Mac installer (launchd, app bundle) comes later.
+  # the programs and scripts/install-macos.sh (launchd agent, a small app in ~/Applications); no signed .app/.dmg yet.
   macos:
     name: build ${{ matrix.platform }} (optional)
     continue-on-error: true
@@ -235,10 +235,11 @@ jobs:
       - name: Package
         run: |
           name=arcade-v1-${{ matrix.platform }}
-          mkdir -p "$name/bin"
+          mkdir -p "$name/bin" "$name/scripts"
           cp target/release/arcaded target/release/arcade target/release/arcade-desktop "$name/bin/"
           strip "$name"/bin/*
-          cp crates/arcade-desktop/icons/icon.png "$name/icon.png"
+          cp crates/arcade-desktop/icons/icon.png crates/arcade-desktop/icons/icon.icns "$name/"
+          cp scripts/install-macos.sh "$name/scripts/"
           git rev-parse HEAD > "$name/COMMIT"
           tar -czf "$name.tar.gz" "$name"
           shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"

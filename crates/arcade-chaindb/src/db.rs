@@ -528,6 +528,9 @@ pub struct ChainDb {
     /// disk: a sealed block's plain body is pruned and read through this.
     sealed: std::sync::RwLock<Option<SealedReader>>,
     sealed_journal: std::sync::RwLock<Option<SealedJournalReader>>,
+    /// Chains whose tip was wound back when the databases opened (a stop that left without
+    /// writing the coin caches): chain -> (tip it had, height it was wound back to).
+    recovered_at_start: std::sync::Mutex<std::collections::HashMap<u16, (u32, u32)>>,
 }
 
 /// Reads a sealed block back: (chain number, block hash) -> its raw bytes.
@@ -657,10 +660,13 @@ impl ChainDb {
             addr_progress: Default::default(),
             sealed: Default::default(),
             sealed_journal: Default::default(),
+            recovered_at_start: Default::default(),
         };
         db.open_own_files()?;
         for c in 0..=255u16 {
-            db.recover_coins(c)?;
+            if let Some(w) = db.recover_coins(c)? {
+                db.recovered_at_start.lock().unwrap().insert(c, w);
+            }
         }
         db.load_runs()?;
         Ok(db)
@@ -682,6 +688,7 @@ impl ChainDb {
             addr_progress: Default::default(),
             sealed: Default::default(),
             sealed_journal: Default::default(),
+            recovered_at_start: Default::default(),
         };
         db.open_own_files()?;
         db.load_runs()?;
@@ -1098,16 +1105,16 @@ impl ChainDb {
 
     /// The coins are complete up to STATE "coins_at". A tip past it (the arcade stopped before
     /// the coin cache was flushed) is wound back to it: the blocks stay stored, and their stretch
-    /// is connected again.
-    fn recover_coins(&self, c: u16) -> Result<()> {
+    /// is connected again. Returns (tip it had, height wound back to) when it wound back.
+    fn recover_coins(&self, c: u16) -> Result<Option<(u32, u32)>> {
         self.store(c).write(|w| {
-            let Some(tip) = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)) else { return Ok(()) };
+            let Some(tip) = w.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)) else { return Ok(None) };
             let Some(at) = w.get(STATE, &k_state(c, "coins_at"))?.map(|v| decode_tip(&v)) else {
                 w.put(STATE, &k_state(c, "coins_at"), &encode_tip(&tip))?;
-                return Ok(());
+                return Ok(None);
             };
             if at.hash == tip.hash || at.height >= tip.height {
-                return Ok(());
+                return Ok(None);
             }
             for h in (at.height + 1)..=tip.height {
                 if let Some(v) = w.get(HEIGHT, &k_height(c, h))? {
@@ -1120,9 +1127,21 @@ impl ChainDb {
                 }
             }
             w.put(STATE, &k_state(c, "tip"), &encode_tip(&at))?;
-            eprintln!("chain {c}: the coins were complete at {}; tip wound back from {} to connect that stretch again", at.height, tip.height);
-            Ok(())
+            eprintln!(
+                "chain {c} ({}): the coins were complete at {}; tip wound back from {} to connect that stretch again",
+                chain_dir_name(c),
+                at.height,
+                tip.height
+            );
+            Ok(Some((tip.height, at.height)))
         })
+    }
+
+    /// The wind-back this chain had when the databases opened, if any: (tip it had, height it was
+    /// wound back to). After a stop that left without writing the coin caches, the stretch between
+    /// is connected again from the stored blocks.
+    pub fn recovered_at_start(&self, c: u16) -> Option<(u32, u32)> {
+        self.recovered_at_start.lock().unwrap().get(&c).copied()
     }
 
     /// Run an indexer on one chain: creates its tables. If the chain is already past the

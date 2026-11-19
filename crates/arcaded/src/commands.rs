@@ -285,7 +285,7 @@ cmds! {
     "chains.peers" Read "key" "A chain's P2P address book: nodes known, working in the last day, resting after failures; the working ones and the next to try.";
     "mesh.overview" Public "" "The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours.";
     "chains.list" Public "" "Every chain V1.0 knows, installed or not, with sizes reported by arcades; per chain: hidden (chains.hide), queued (position), queued_resume and installing (the chain being installed now).";
-    "chains.status" Public "key" "One chain's staged progress.";
+    "chains.status" Public "key" "One chain's staged progress. `recovered_at_start` is `{from, to}` when this start wound the tip back (the last stop left without writing the coin caches, exit code 3), else null.";
     "chains.offers" Public "" "Chains other arcades offer over the mesh.";
     "chains.sizes" Admin "" "Measure this arcade's disk use per chain now.";
     "chains.add" Admin "key, mode?, with?, drive?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";

@@ -617,11 +617,9 @@ pub fn claim(node: &Node, page: &str, m: &Value, send: bool) -> Result<Value, St
     }
     let raw = legacy::serialize(&shape, &script_sigs);
     let tx = arcade_chain::Tx::parse_with(&raw, &crate::pagechain::params(node).format).map_err(|e| format!("built a claim that does not parse: {e}"))?;
-    if !crate::mempoolshare::add(node, crate::pagechain::params(node), &tx) {
-        return Err("the claim was refused: that lot was just taken".into());
-    }
-    crate::claims::mark_spent(node, &tx);
-    crate::resend::send(node, crate::pagechain::params(node), &tx);
+    crate::ownwait::send_own(node, crate::pagechain::params(node), &tx).map_err(|e| {
+        if e.contains("spent by another") { "the claim was refused: that lot was just taken".to_string() } else { e }
+    })?;
     let _ = node.app.event("wallet", &format!("claimed {what} from prize pool #{} for {me}", p["number"]));
     Ok(json!({"txid": tx.txid.to_hex(), "piece": what, "lot": n}))
 }

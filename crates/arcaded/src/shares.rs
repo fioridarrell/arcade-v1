@@ -334,7 +334,12 @@ pub fn hold_frame(node: &Node) -> Frame {
     // its whole chain and its ledger, posts, messages and profiles (crate::lentrows reads them from such holders).
     if let (Some(p), Some(h)) = (crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)), crate::arcsvc::height()) {
         if !chains.contains_key(p.net) {
-            chains.insert(p.net.into(), json!({"mode": "full", "h": h, "blocks": "all", "ord": "all", "tok": "all", "ix": ["ledger", "messages", "profiles"]}));
+            // (And its Addresses index when it keeps one: tx.activity for arcades that only borrow the chain.)
+            let mut ix = vec!["ledger", "messages", "profiles"];
+            if node.chain.addresses_on(p.chain_no).unwrap_or(false) {
+                ix.push("addresses");
+            }
+            chains.insert(p.net.into(), json!({"mode": "full", "h": h, "blocks": "all", "ord": "all", "tok": "all", "ix": ix}));
         }
     }
     // o/at/sig: whose hold this is and when, signed, so it can be passed on across the mesh

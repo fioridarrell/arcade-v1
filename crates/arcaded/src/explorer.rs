@@ -126,7 +126,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription", "explorer.dogefeed_address",
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
-    "explorer.msg_rows", "explorer.a_reactions", "explorer.a_replies",
+    "explorer.msg_rows", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -257,6 +257,9 @@ fn mesh_from(id: &str) -> Value {
 fn needed_index(cmd: &str) -> Option<&'static str> {
     if cmd == "explorer.ord_outpoints" {
         return Some("ord");
+    }
+    if cmd == "explorer.activity" {
+        return Some("addresses");
     }
     (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies")).then_some("ledger")
 }
@@ -722,6 +725,16 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             Ok(json!({"claim": q, "number": num, "id": id, "owner": owner, "owner_tag": owner.as_deref().and_then(|o| tag_of(&x, o))}))
         }
         "explorer.mempool" => mempool(&x),
+        // tx.activity's history of up to 500 addresses, from an arcade keeping the chain's Addresses index: what an
+        // arcade that only borrows the chain reads instead (crate::sitesvc::activity).
+        "explorer.activity" => {
+            if crate::borrow::is_borrowed(x.p.key) {
+                return Err(format!("{} is borrowed here", x.p.name)); // asked of an arcade keeping it (answer)
+            }
+            let mut q = req.clone();
+            q["local"] = json!(true);
+            crate::sitesvc::activity(x.node, &q)
+        }
         // A page of one posts-and-messages table, rows in key order after `after` (hex, the key past the chain number), each
         // with its key `k` and, where it has a height, its block's time `t`: what an arcade whose own copy of this chain is
         // borrowed or still catching up reads instead (crate::lentrows; HOMECHAIN.md option C, 2c).

@@ -397,8 +397,10 @@ pub fn pay_asks(node: &Node) {
         if change < KEEP {
             return;
         }
-        crate::claims::mark_spent(node, &tx); // (pools it, so the mesh hears it at once)
-        crate::resend::send(node, node.params, &tx);
+        // Pooled here so the mesh hears it at once, or through the lenders while the home chain is borrowed.
+        if crate::ownwait::send_own(node, node.params, &tx).is_err() {
+            return;
+        }
         let sent = arcade_mesh::welcome::sign(
             serde_json::json!({"a": me, "ask": asker, "at": now, "k": "sent", "tag": ask["tag"], "txid": tx.txid.to_hex()}),
             &node.identity,

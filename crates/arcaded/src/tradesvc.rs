@@ -189,11 +189,7 @@ fn sign_and_send(node: &Node, shape: &Shape, given: &[(usize, Vec<u8>)], mine: &
     }
     let raw = legacy::serialize(shape, &sigs);
     let tx = Tx::parse_with(&raw, &node.params.format).map_err(|e| format!("built a transaction that does not parse: {e}"))?;
-    if !crate::mempoolshare::add(node, node.params, &tx) {
-        return Err("the transaction was refused: one of its coins is already spent by a waiting transaction".into());
-    }
-    crate::claims::mark_spent(node, &tx);
-    node.tx_outbox.lock().unwrap().push(tx.raw.clone());
+    crate::ownwait::send_own(node, node.params, &tx)?;
     Ok(tx.txid)
 }
 

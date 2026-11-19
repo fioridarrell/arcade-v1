@@ -204,7 +204,7 @@
       e.enc = new AudioEncoder({
         output: (chunk) => {
           const bytes = new Uint8Array(chunk.byteLength); chunk.copyTo(bytes);
-          sendPiece(s, kind, true, e.seq++, Math.round(chunk.timestamp / 1000), bytes, 0, 0, targets(s, kind));
+          sendPiece(s, kind, true, e.seq++, Math.round(chunk.timestamp / 1000), bytes, levelWord(e.level), 0, targets(s, kind));
         },
         error: () => {},
       });
@@ -229,6 +229,13 @@
           }
         }
       };
+    }
+    // How loud a piece of sound is, for a viewer on WebRTC (the arcade puts it in the RTP audio-level extension,
+    // RFC 6464, which a browser's "who is speaking" reads): in the width field of a sound piece, 1 + the level in
+    // -dBov (0 loudest, 127 silent). 0 says nothing; players of pieces ignore the field for sound.
+    function levelWord(level) {
+      const db = level > 0 ? Math.round(-20 * Math.log10(Math.min(1, level))) : 127;
+      return 1 + Math.max(0, Math.min(127, db));
     }
     function stopSlot(s, slot) {
       const md = s.media, e = md && md.enc[slot];

@@ -519,6 +519,7 @@
       if (s.fast !== fast || !r) return;
       const up = new Set(r.up || []);
       fast.routes = r.routes || {};
+      if (r.rtc) rtcLook(name, s, r.rtc);
       for (const id in fast.peers) {
         const peer = fast.peers[id];
         if (up.has(id) && peer.state !== "direct") { clearTimeout(peer.timer); fastSay(name, s, peer.p, "direct"); }
@@ -532,7 +533,7 @@
     if (!s) return;
     media.close(s);
     if (!s.fast) return;
-    for (const id in s.fast.peers) clearTimeout(s.fast.peers[id].timer);
+    for (const id in s.fast.peers) { clearTimeout(s.fast.peers[id].timer); if (s.fast.peers[id].rtc) rtcClose(s, id); }
     clearInterval(s.fast.pump);
     clearInterval(s.fast.lanes);
     s.fast = null;
@@ -548,8 +549,9 @@
     if (Object.keys(s.fast.peers).length >= s.fastMax) return;
     const fast = s.fast, peer = (fast.peers[p.id] = { p, state: "" });
     fastSay(name, s, p, "connecting");
-    // A viewer with a higher id waits for this side's WebRTC offer, which never comes: say so at once.
-    if (s.me.id < p.id) piecesHint(name, s, peer);
+    // A viewer with a higher id waits for this side's WebRTC offer: the arcade makes it (rtcOffer);
+    // an arcade that can't says 'p' instead (pieces).
+    if (s.me.id < p.id) rtcOffer(name, s, peer);
     // No lane by then: the room carries the pair (and it goes 'direct' if a lane comes up later).
     peer.timer = setTimeout(() => {
       if (s.fast !== fast || fast.peers[p.id] !== peer || peer.state === "direct") return;
@@ -569,6 +571,7 @@
     if (!peer) return;
     media.gone(s, id);
     clearTimeout(peer.timer);
+    if (peer.rtc) rtcClose(s, id);
     delete s.fast.peers[id];
   }
   function fastLink(name, s, link, max) {
@@ -641,11 +644,66 @@
     if (o.t === "n") {                              // they do not link with us: let them go
       if (s.fast.peers[p.id]) { fastDrop(s, p.id); fastSay(name, s, p, "gone"); }
     } else if (o.t === "o" || o.t === "h") {
-      // They want a direct link. One the page does not link with is told so; the rest are told 'p'
-      // (an original arcade's viewer ignores it, and the pair stays on the room).
+      // They want a direct link. One the page does not link with is told so; the rest get one made
+      // by the arcade (rtcSignal), or 'p' where it can't be made.
       if (!s.fast.peers[p.id]) fastMeet(name, s, p);
       if (!s.fast.peers[p.id] && !fastLinks(s, p.id)) fastSignal(name, s, p.id, { t: "n" });
-      else if (s.fast.peers[p.id]) piecesHint(name, s, s.fast.peers[p.id]);
+      else if (s.fast.peers[p.id]) rtcSignal(name, s, s.fast.peers[p.id], o);
+    } else if ((o.t === "a" || o.t === "p") && s.fast.peers[p.id]) {
+      rtcSignal(name, s, s.fast.peers[p.id], o);
+    }
+  }
+  // WEBRTC MADE BY THE ARCADE (2026-11-19, Martin: "Both should use WebRTC and the UDP punching so that
+  // they can connect"; arcaded rtcsvc.rs). This window has no RTCPeerConnection, so its arcade is the
+  // WebRTC peer for it: the viewer's compact offer goes to the arcade (realtime.rtc signal) and its
+  // answer back over the room, or the arcade offers when this side's id is the lower. Once the link is
+  // up (realtime.lanes: rtc), media.js's pieces and the fast sends for that viewer go over it as RTP and
+  // data channels, and what the viewer sends comes back as the same pieces and fast events. A link not
+  // up within RTC_WAIT, or failed, gives way to the arcades' lane: the viewer is told 'p'. Another V1.0
+  // window (its offer says v1) keeps the lane between the arcades, as before.
+  const RTC_WAIT = 9000, RTC_FRESH = 8000;
+  async function rtcAsk(name, s, peer, ask) {
+    const fast = s.fast;
+    peer.rtc = { at: Date.now(), up: false };
+    const mine = peer.rtc;
+    let r;
+    try { r = await api("realtime.rtc", { token: s.token, peer: peer.p.id, ...ask }); }
+    catch (err) { if (peer.rtc === mine) { peer.rtc = null; piecesHint(name, s, peer); } return; }   // an arcade without it: pieces
+    if (s.fast !== fast || fast.peers[peer.p.id] !== peer || peer.rtc !== mine) return;
+    if (r && r.signal) fastSignal(name, s, peer.p.id, r.signal);
+  }
+  function rtcOffer(name, s, peer) { return rtcAsk(name, s, peer, { op: "offer" }); }
+  function rtcSignal(name, s, peer, o) {
+    if (o.t === "p") { if (peer.rtc) { peer.rtc = null; rtcClose(s, peer.p.id); } return; }   // a V1.0 window: the lane
+    if (o.t === "a") {
+      if (!peer.rtc) return;
+      api("realtime.rtc", { token: s.token, peer: peer.p.id, op: "signal", signal: o }).catch(() => {});
+      return;
+    }
+    if (o.t === "o") {
+      if (o.v1) { piecesHint(name, s, peer); return; }
+      rtcAsk(name, s, peer, { op: "signal", signal: o });
+      return;
+    }
+    // 'h': they wait for our offer. A new page of theirs (s) gets a new link; the one being made stays.
+    if (s.me.id >= peer.p.id) { piecesHint(name, s, peer); return; }
+    const fresh = peer.rtc && Date.now() - peer.rtc.at < RTC_FRESH && (!peer.hs || !o.s || peer.hs === o.s);
+    if (o.s) peer.hs = o.s;
+    if (!fresh && !(peer.rtc && peer.rtc.up && (!o.s || peer.hs === o.s))) rtcOffer(name, s, peer);
+  }
+  function rtcClose(s, id) { api("realtime.rtc", { token: s.token, peer: id, op: "close" }).catch(() => {}); }
+  // Each look at the lanes: a link that is up stays; one that failed, or is not up in time, gives way.
+  function rtcLook(name, s, links) {
+    for (const id in s.fast.peers) {
+      const peer = s.fast.peers[id], st = links[id];
+      if (!peer.rtc) continue;
+      if (st === "up") { peer.rtc.up = true; continue; }
+      const late = !peer.rtc.up && Date.now() - peer.rtc.at > RTC_WAIT;
+      if (st === "failed" || late || (!st && Date.now() - peer.rtc.at > 3000)) {
+        peer.rtc = null;
+        rtcClose(s, id);
+        piecesHint(name, s, peer);
+      }
     }
   }
   // The page's fast.send: through the room to the players it is for.

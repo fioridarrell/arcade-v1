@@ -76,6 +76,7 @@ fn asset_for(os: &str, arch: &str) -> Option<String> {
     match (os, arch) {
         ("linux", a @ ("x86_64" | "aarch64")) => Some(format!("arcade-v1-linux-{a}.tar.gz")),
         ("windows", "x86_64") => Some("arcade-v1-windows-x86_64.zip".into()),
+        ("macos", a @ ("x86_64" | "aarch64")) => Some(format!("arcade-v1-macos-{a}.tar.gz")),
         _ => None,
     }
 }
@@ -595,7 +596,10 @@ mod tests {
         assert_eq!(asset_for("linux", "aarch64").as_deref(), Some("arcade-v1-linux-aarch64.tar.gz"));
         assert_eq!(asset_for("windows", "x86_64").as_deref(), Some("arcade-v1-windows-x86_64.zip"));
         assert!(asset_for("windows", "aarch64").is_none());
-        assert!(asset_for("macos", "aarch64").is_none());
+        assert_eq!(asset_for("macos", "aarch64").as_deref(), Some("arcade-v1-macos-aarch64.tar.gz"));
+        assert_eq!(asset_for("macos", "x86_64").as_deref(), Some("arcade-v1-macos-x86_64.tar.gz"));
+        assert_eq!(program_file_for("arcade-v1-macos-aarch64.tar.gz"), "program-macos-aarch64");
+        assert!(asset_for("macos", "riscv64").is_none());
         assert_eq!(program_file_for("arcade-v1-linux-x86_64.tar.gz"), "program-linux-x86_64");
         assert_eq!(program_file_for("arcade-v1-linux-aarch64.tar.gz"), "program-linux-aarch64");
         assert_eq!(program_file_for("arcade-v1-windows-x86_64.zip"), "program-windows-x86_64");

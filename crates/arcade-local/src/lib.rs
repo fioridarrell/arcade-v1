@@ -2,8 +2,9 @@
 //! reach a running arcaded.
 //!
 //! Linux: `~/.local/share/arcade` (or `$XDG_DATA_HOME/arcade`), and a Unix socket.
+//! macOS: `~/Library/Application Support/arcade`, and a Unix socket.
 //! Windows: `%LOCALAPPDATA%\arcade`, and the same socket kind (Windows 10 1803 and
-//! later speak Unix sockets). `$ARCADE_HOME` / `%ARCADE_HOME%` wins on both.
+//! later speak Unix sockets). `$ARCADE_HOME` / `%ARCADE_HOME%` wins on all.
 
 use std::path::{Path, PathBuf};
 
@@ -39,13 +40,24 @@ fn resolve(db_counts: bool) -> PathBuf {
         let _ = db_counts;
         windows_home()
     }
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
+    {
+        let _ = db_counts;
+        macos_home()
+    }
+    #[cfg(not(any(windows, target_os = "macos")))]
     {
         unix_home(db_counts)
     }
 }
 
-#[cfg(not(windows))]
+/// macOS keeps per-user app data in ~/Library/Application Support (no system install yet).
+#[cfg(target_os = "macos")]
+fn macos_home() -> PathBuf {
+    PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join("Library/Application Support/arcade")
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 fn unix_home(db_counts: bool) -> PathBuf {
     let system = Path::new("/var/lib/arcade");
     if system.join("arcaded.sock").exists() || (db_counts && system.join("arcade.mdbx").exists()) {
@@ -76,8 +88,19 @@ pub fn socket_path(home: &Path) -> PathBuf {
     home.join("arcaded.sock")
 }
 
-/// Windows AF_UNIX paths are limited to 108 bytes including the trailing NUL.
+/// Windows AF_UNIX paths are limited to 108 bytes including the trailing NUL; macOS's
+/// sun_path is 104 bytes, so 103 before the NUL.
 pub fn check_socket_path(path: &Path) -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        let n = path.as_os_str().len();
+        if n > MACOS_SOCKET_MAX {
+            return Err(format!(
+                "the API socket path is {n} bytes long, and macOS allows {MACOS_SOCKET_MAX}. Set ARCADE_HOME to a shorter folder. Path: {}",
+                path.display()
+            ));
+        }
+    }
     #[cfg(windows)]
     {
         let n = path.to_string_lossy().len();
@@ -91,6 +114,10 @@ pub fn check_socket_path(path: &Path) -> Result<(), String> {
     let _ = path;
     Ok(())
 }
+
+/// The longest Unix socket path macOS takes (sun_path is 104 bytes with its NUL).
+#[cfg(target_os = "macos")]
+const MACOS_SOCKET_MAX: usize = 103;
 
 #[cfg(test)]
 mod tests {

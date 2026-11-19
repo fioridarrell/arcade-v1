@@ -133,7 +133,11 @@ fn be_polite() {
     #[cfg(unix)]
     unsafe {
         libc::setpriority(libc::PRIO_PROCESS, 0, nice);
-        // ioprio_set(IOPRIO_WHO_PROCESS, this thread, best-effort class 2, level 7: the lowest).
+    }
+    // ioprio_set(IOPRIO_WHO_PROCESS, this thread, best-effort class 2, level 7: the lowest). Linux only; elsewhere the
+    // CPU priority above is all.
+    #[cfg(target_os = "linux")]
+    unsafe {
         let _ = libc::syscall(libc::SYS_ioprio_set, 1, 0, (2 << 13) | 7);
     }
     #[cfg(windows)]
@@ -373,8 +377,35 @@ fn try_lock_exclusive(f: &std::fs::File) -> bool {
     unsafe { LockFileEx(f.as_raw_handle() as *mut _, 0x2 | 0x1, 0, 1, 0, &mut ov) != 0 }
 }
 
+/// The open-files limit, raised toward min(hard limit, 10,240) at start: every chain keeps databases, block files and
+/// mesh links open, and macOS starts a program with 256 (Linux usually 1,024). Never lowered.
+#[cfg(unix)]
+fn more_open_files() {
+    const WANT: u64 = 10_240;
+    unsafe {
+        let mut r: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut r) != 0 {
+            return;
+        }
+        let want = open_files_limit(r.rlim_cur as u64, r.rlim_max as u64, WANT);
+        if want > r.rlim_cur as u64 {
+            r.rlim_cur = want as libc::rlim_t;
+            let _ = libc::setrlimit(libc::RLIMIT_NOFILE, &r);
+        }
+    }
+}
+#[cfg(not(unix))]
+fn more_open_files() {}
+
+/// The soft limit to ask for: `want`, but never above the hard limit and never below what it is.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn open_files_limit(cur: u64, hard: u64, want: u64) -> u64 {
+    want.min(hard).max(cur)
+}
+
 fn main() {
     tame_malloc();
+    more_open_files();
     be_polite();
     let args: Vec<String> = std::env::args().collect();
     // Asking what it is never starts one (a bare run starts the service in the default home).
@@ -731,5 +762,16 @@ fn main() {
     // Everything runs on its own threads now (the API's included); a stop ends the process (stop_cleanly_on_signal).
     loop {
         std::thread::park();
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    #[test]
+    fn open_files_limit_is_raised_never_lowered() {
+        assert_eq!(super::open_files_limit(256, u64::MAX, 10_240), 10_240, "macOS: 256 soft, unlimited hard");
+        assert_eq!(super::open_files_limit(1_024, 524_288, 10_240), 10_240, "Linux under systemd");
+        assert_eq!(super::open_files_limit(1_024, 4_096, 10_240), 4_096, "never above the hard limit");
+        assert_eq!(super::open_files_limit(65_536, 524_288, 10_240), 65_536, "never lowered");
     }
 }

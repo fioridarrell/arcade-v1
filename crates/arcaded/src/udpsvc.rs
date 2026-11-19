@@ -280,7 +280,18 @@ fn bind_dual(port: u16) -> std::io::Result<UdpSocket> {
     {
         use std::os::fd::FromRawFd;
         unsafe {
+            // Closed on exec (an update starts the new arcaded): SOCK_CLOEXEC on Linux, FD_CLOEXEC set after on the
+            // other Unixes (macOS has no SOCK_CLOEXEC).
+            #[cfg(target_os = "linux")]
             let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+            #[cfg(not(target_os = "linux"))]
+            let fd = {
+                let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+                if fd >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                fd
+            };
             if fd < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -289,6 +300,10 @@ fn bind_dual(port: u16) -> std::io::Result<UdpSocket> {
             let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
             sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sa.sin6_port = port.to_be();
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+            {
+                sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            }
             if libc::bind(fd, &sa as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as u32) != 0 {
                 let e = std::io::Error::last_os_error();
                 libc::close(fd);

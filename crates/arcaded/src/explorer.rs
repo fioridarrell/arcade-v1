@@ -146,6 +146,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.search", "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription",
     "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn", "explorer.a_reactions", "explorer.a_replies",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
+    "explorer.arc_machines",
 ];
 
 /// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
@@ -426,6 +427,10 @@ fn link_previews(v: &mut Value) {
 }
 
 fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
+    // The machines this arcade heard of (crate::sysinfo): mesh gossip, the same on any chain, never asked on.
+    if cmd == "explorer.arc_machines" {
+        return Ok(crate::sysinfo::read(node));
+    }
     // The storage analytics are of the ARCADE chain only: asked of it whatever chain the question names.
     let arc_req;
     let req = if cmd.starts_with("explorer.arc_") {

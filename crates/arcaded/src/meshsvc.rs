@@ -752,8 +752,13 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     }
     // Who runs this arcade: existing arcades show the operator's @tag from this (operators.py).
     link.send(&Frame::new(operator_me(node)))?;
+    // V1.0: the machine it runs on, when its operator shares it (sysinfo.rs; existing arcades ignore it).
+    if let Some(si) = crate::sysinfo::link_frame() {
+        link.send(&Frame::new(si))?;
+    }
     let mut cr_reqs = crate::coreshare::Requests::default();
-    let mut last_ping = std::time::Instant::now();
+    // The first ping goes at once (then every 15 s), so the Home tab has this link's round trip soon (linkrtt.rs).
+    let mut last_ping = std::time::Instant::now().checked_sub(Duration::from_secs(16)).unwrap_or_else(std::time::Instant::now);
     let mut sent_outbox = 0usize;
     let peer = link.peer_id.clone();
     let conn = crate::realtime::link_up(node, &peer);
@@ -769,6 +774,7 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
+    crate::linkrtt::link_down(&peer);
     crate::svcmesh::link_down(&peer);
     crate::relaysvc::link_ended(link);
     crate::udpsvc::link_down(&peer, link.session_keys());
@@ -848,7 +854,7 @@ fn serve_loop(
             *last_sz = std::time::Instant::now();
         }
         if last_ping.elapsed() > Duration::from_secs(15) {
-            link.send(&Frame::new(json!({"t": "ping", "n": format!("{:08x}", now() as u32)})))?;
+            link.send(&Frame::new(json!({"t": "ping", "n": crate::linkrtt::ping_n(peer)})))?;
             crate::udpsvc::keepalive(link)?;
             *last_ping = std::time::Instant::now();
         }
@@ -870,6 +876,8 @@ fn serve_loop(
         heard = std::time::Instant::now();
         match f.kind() {
             "ping" => link.send(&Frame::pong(&f))?,
+            "pong" => crate::linkrtt::on_pong(peer, f.head["n"].as_str().unwrap_or(""), crate::relaysvc::is_relayed(link)),
+            "si" => crate::sysinfo::on_frame(node, peer, &f.head),
             #[cfg(feature = "oldimport")]
             "ix" if f.head["op"] == "a" => crate::lxfetch::on_ix(&link.peer_id, &f.head),
             "ix" if f.head["op"] == "tip" => {

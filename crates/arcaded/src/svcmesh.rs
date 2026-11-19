@@ -657,7 +657,7 @@ pub fn pay(node: &Node, req: &Value) -> Result<Value, String> {
 pub fn paid(node: &Node, req: &Value) -> Result<Value, String> {
     let txid = req["txid"].as_str().filter(|t| crate::udpsvc::is_hex(t, 64)).ok_or("txid required")?;
     let id = arcade_chain::hash::Hash256::from_hex(txid).map_err(|_| "not a txid")?;
-    let p = crate::arcledger::chain()?;
+    let p = crate::arcledger::write_chain()?;
     let me = crate::arcledger::own_address(node)?;
     let to = arcade_ledger::address::script_for_address(p, &me).ok_or("this arcade has no ARCADE address")?;
     let Some(tx) = crate::relaysvc::confirmed_tx(node, &id) else {

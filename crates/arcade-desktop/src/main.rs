@@ -145,6 +145,10 @@ fn start_service() -> bool {
                 let _ = std::fs::create_dir_all(&home);
                 let mut c = Command::new(d.join("arcaded.exe"));
                 c.arg("--home").arg(&home).current_dir(&home);
+                // Below normal, as the installer's login task starts it (install.ps1), unless set otherwise.
+                if std::env::var_os("ARCADE_NICE").is_none() {
+                    c.env("ARCADE_NICE", "10");
+                }
                 quiet(&mut c);
                 c.spawn().is_ok()
             }

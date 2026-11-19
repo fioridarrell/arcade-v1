@@ -113,6 +113,8 @@ if ((Test-Path -LiteralPath $DataDir) -and (Get-Process -Name 'arcaded' -ErrorAc
 }
 Stop-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue
 Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -ErrorAction SilentlyContinue
+# The installer's firewall rule (added only when it ran as administrator; removing it needs one too).
+try { Remove-NetFirewallRule -DisplayName 'Arcade V1.0 (arcaded)' -ErrorAction SilentlyContinue } catch {}
 Get-Process -Name 'arcaded','arcade-desktop' -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
 $startup = Join-Path ([Environment]::GetFolderPath('Startup')) 'Arcade V1.0.lnk'

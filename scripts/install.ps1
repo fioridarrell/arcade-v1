@@ -13,12 +13,16 @@
 # What it installs, for the current user (no administrator account):
 #   arcaded, arcade, and Arcade V1.0 (the window; WebView2) into %LOCALAPPDATA%\Programs\Arcade
 #   data into %LOCALAPPDATA%\arcade   (or --home)
-#   a Task Scheduler entry "Arcade V1.0" that starts arcaded at login
+#   a Task Scheduler entry "Arcade V1.0" that starts arcaded at login, at below-normal priority
+#     (ARCADE_NICE=10, so games and the app window stay smooth while chains catch up)
 #   a Start menu shortcut
+#   a Windows Firewall rule for arcaded (mesh TCP, STUN UDP) only when run as administrator; otherwise
+#     it prints the one command to add it (Windows asks the first time arcaded listens)
 #
 # Options: --no-desktop  --build  --prebuilt DIR  --home DIR
 #          --http-port N  --mesh-port N  --stun-port N
-# Environment: ARCADE_BUILD=1, ARCADE_HOME, ARCADE_GITHUB, ARCADE_BRANCH, ARCADE_NO_OPEN=1
+# Environment: ARCADE_BUILD=1, ARCADE_HOME, ARCADE_GITHUB, ARCADE_BRANCH, ARCADE_NO_OPEN=1,
+#              ARCADE_NICE (default 10: below normal; 0 = normal priority, 11-19 = idle)
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
@@ -28,6 +32,11 @@ $OwnerRepo = if ($env:ARCADE_GITHUB) { $env:ARCADE_GITHUB } else { 'martinseeger
 $Branch = if ($env:ARCADE_BRANCH) { $env:ARCADE_BRANCH } else { 'main' }
 $TaskName = 'Arcade V1.0'
 $NoOpen = ($env:ARCADE_NO_OPEN -eq '1')
+# arcaded's priority (crates/arcaded/src/main.rs be_polite): 10 = below normal, so a chain catching up
+# doesn't starve the app window and games on a small PC; 0 = normal; 11-19 = idle.
+$Nice = 10
+if ($env:ARCADE_NICE -match '^\d+$') { $Nice = [Math]::Min([int]$env:ARCADE_NICE, 19) }
+$FirewallRule = 'Arcade V1.0 (arcaded)'
 
 $NoDesktop = $false
 $Build = ($env:ARCADE_BUILD -eq '1')
@@ -107,6 +116,45 @@ function Test-UdpBusy([int]$Port) {
     } finally {
         $udp.Close()
     }
+}
+
+function Test-Admin {
+    try {
+        $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+        return (New-Object Security.Principal.WindowsPrincipal $id).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+    } catch {
+        return $false
+    }
+}
+
+# Inbound mesh (TCP) and STUN (UDP) for this arcaded.exe only. Adding a firewall rule needs an
+# administrator; without one Windows asks the first time arcaded listens (that prompt can sit
+# behind other windows), so this says how to add the rule instead.
+function Set-FirewallRule([string]$Exe, [int]$Mesh, [int]$Stun) {
+    $tcp = if ($Mesh -gt 0) { "$Mesh" } else { $null }
+    $udp = if ($Stun -gt 0) { "$Stun" } else { $null }
+    if (-not $tcp -and -not $udp) { return }
+    if (-not (Get-Command New-NetFirewallRule -ErrorAction SilentlyContinue)) { return }
+    if (Test-Admin) {
+        try {
+            Remove-NetFirewallRule -DisplayName $FirewallRule -ErrorAction SilentlyContinue
+            if ($tcp) {
+                New-NetFirewallRule -DisplayName $FirewallRule -Direction Inbound -Action Allow -Program $Exe -Protocol TCP -LocalPort $tcp -Profile Private,Domain | Out-Null
+            }
+            if ($udp) {
+                New-NetFirewallRule -DisplayName $FirewallRule -Direction Inbound -Action Allow -Program $Exe -Protocol UDP -LocalPort $udp -Profile Private,Domain | Out-Null
+            }
+            Write-Host "  firewall: inbound mesh/STUN allowed for arcaded.exe (private networks)"
+            return
+        } catch {
+            Say "The firewall rule could not be added ($($_.Exception.Message))."
+        }
+    }
+    $q = $Exe.Replace("'", "''")
+    $cmd = @()
+    if ($tcp) { $cmd += "New-NetFirewallRule -DisplayName '$FirewallRule' -Direction Inbound -Action Allow -Program '$q' -Protocol TCP -LocalPort $tcp -Profile Private,Domain" }
+    if ($udp) { $cmd += "New-NetFirewallRule -DisplayName '$FirewallRule' -Direction Inbound -Action Allow -Program '$q' -Protocol UDP -LocalPort $udp -Profile Private,Domain" }
+    $script:FirewallHint = $cmd -join '; '
 }
 
 function Get-FreeTcp([int]$Port) {
@@ -404,6 +452,7 @@ function Install-Programs([string]$FromDir, [string]$IconPng, [string]$IconIco) 
     @"
 Set sh = CreateObject("WScript.Shell")
 sh.Environment("Process")("ARCADE_HOME") = "$DataDir"
+sh.Environment("Process")("ARCADE_NICE") = "$Nice"
 sh.CurrentDirectory = "$DataDir"
 code = sh.Run("$runVbs", 0, True)
 WScript.Quit code
@@ -419,7 +468,9 @@ WScript.Quit code
         } catch {
             $trigger = New-ScheduledTaskTrigger -AtLogOn
         }
-        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero)
+        # Task priority 7 = below normal (the default, 7, as well; said here so it stays so). arcaded sets its own
+        # priority from ARCADE_NICE (the .vbs above) either way.
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) -ExecutionTimeLimit ([TimeSpan]::Zero) -Priority 7
         Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Settings $settings -Force | Out-Null
         Start-ScheduledTask -TaskName $TaskName
     } catch {
@@ -439,6 +490,7 @@ WScript.Quit code
         Start-Process -FilePath $wscript -ArgumentList "//B `"$vbs`""
     }
     Set-Content -LiteralPath (Join-Path $bin 'start-method.txt') -Value $method -Encoding ascii
+    Set-FirewallRule $exe $MeshPort $StunPort
 
     if ($haveDesktop) {
         $desk = Join-Path $bin 'arcade-desktop.exe'
@@ -491,6 +543,18 @@ sh.Run "$deskRun", 1, False
     if ($haveDesktop) { Write-Host "  app:      Arcade V1.0 in the Start menu" }
     Write-Host "  setup:    the app's Home tab walks you through it (or: arcade setup)"
     Write-Host "  logs:     run arcaded.exe in a terminal to see them. A hidden login start does not keep a console."
+    $prio = if ($Nice -eq 0) { 'normal' } elseif ($Nice -ge 11) { 'idle' } else { 'below normal' }
+    Write-Host "  priority: $prio (ARCADE_NICE=$Nice)"
+    if ($script:FirewallHint) {
+        Write-Host ""
+        Write-Host "Windows will ask once whether arcaded may accept connections (mesh $MeshPort, STUN $stunText). To allow"
+        Write-Host "it ahead of time, run this in a PowerShell opened as administrator:"
+        Write-Host "  $($script:FirewallHint)"
+    }
+    Write-Host ""
+    Write-Host "Optional: if the PC slows down while chains catch up, Microsoft Defender scanning the data folder can be"
+    Write-Host "the cause. This installer does not change Defender. To exclude the data folder yourself (administrator):"
+    Write-Host "  Add-MpPreference -ExclusionPath '$DataDir'"
     Write-Host ""
     Write-Host "Open a new terminal if `"arcade`" is not found yet (PATH was updated for this user)."
 }

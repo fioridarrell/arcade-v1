@@ -102,6 +102,11 @@ pub fn api_keep(node: &Node, req: &Value) -> Result<Value, String> {
               "used_mb": kept_bytes(node) >> 20}))
 }
 
+/// The family name `arc.fog` lists segments under (for the storage reads).
+pub fn family_label(f: u8) -> &'static str {
+    family_name(f)
+}
+
 fn family_name(f: u8) -> &'static str {
     if f == FAMILY_BLOBS_TEMP { "temporary blobs" } else { "blobs" }
 }
@@ -413,14 +418,12 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
 }
 
 /// A blob class's copy floor (for the storage reads, explorer.arc_*).
-#[allow(dead_code)] // for the storage reads (claude/arc-storage-reads)
 pub fn blob_floor(class: Class) -> usize {
     blob::floor(class)
 }
 
 /// The segments short of their copy floor, as the last round saw them (for the storage reads, explorer.arc_*):
 /// [{family, first, last, copies, floor, counted, bytes}].
-#[allow(dead_code)] // for the storage reads (claude/arc-storage-reads)
 pub fn short_of_copies() -> Vec<Value> {
     STATUS.lock().unwrap().as_ref().and_then(|s| s["short"].as_array().cloned()).unwrap_or_default()
 }

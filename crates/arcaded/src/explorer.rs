@@ -15,7 +15,7 @@
 //!   explorer.search   {q}                  what a search box string points at
 
 use crate::node::Node;
-use arcade_chain::params::{by_key, ChainParams};
+use arcade_chain::params::ChainParams;
 use arcade_chain::{Block, Hash256, OutPoint, Tx};
 use arcade_ledger::{address, maps, names, ord, tokens};
 use arcade_store::KeyBuf;
@@ -126,7 +126,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription", "explorer.dogefeed_address",
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
-    "explorer.msg_rows",
+    "explorer.msg_rows", "explorer.a_reactions", "explorer.a_replies",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -139,7 +139,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.name", "explorer.maps", "explorer.map", "explorer.mempool", "explorer.ledger", "explorer.ledger_tokens",
     "explorer.ledger_token", "explorer.ledger_inscriptions", "explorer.ledger_inscription", "explorer.tag",
     "explorer.search", "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription",
-    "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn",
+    "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn", "explorer.a_reactions", "explorer.a_replies",
 ];
 
 /// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
@@ -258,7 +258,7 @@ fn needed_index(cmd: &str) -> Option<&'static str> {
     if cmd == "explorer.ord_outpoints" {
         return Some("ord");
     }
-    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards")).then_some("ledger")
+    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies")).then_some("ledger")
 }
 
 fn missing_index(e: &str) -> Option<String> {
@@ -323,7 +323,8 @@ fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
     if req["local"] == true || !FORWARDABLE.contains(&cmd) {
         return local;
     }
-    let Some(p) = (match req["chain"].as_str() { Some(k) => by_key(k), None => Some(node.params) }) else { return local };
+    // (The ARCADE chain too: its ledger reads are asked of arcades that keep it.)
+    let Some(p) = (match req["chain"].as_str() { Some(k) => crate::chains::find(k), None => Some(node.params) }) else { return local };
     match local {
         Ok(mut v) => {
             if cmd == "explorer.summary" {
@@ -751,6 +752,9 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let indexed = x.node.chain.indexed_to(x.c(), if ix == "messages" { "messages.v1" } else { "profiles.v1" }).ok().flatten();
             Ok(json!({"rows": items, "more": rows.len() == want, "indexed": indexed}))
         }
+        // A:// reacts, replies and tips (crate::asocial): the ARCADE chain's ledger.
+        "explorer.a_reactions" => { x.need("ledger")?; crate::asocial::ledger_reactions(x.node, x.c(), req) }
+        "explorer.a_replies" => { x.need("ledger")?; crate::asocial::ledger_replies(x.node, x.c(), req) }
         "explorer.ledger" => { x.need("ledger")?; ledger_summary(&x) }
         "explorer.ledger_tokens" => {
             x.need("ledger")?;

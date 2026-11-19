@@ -17,6 +17,15 @@
 //!   such as `doge`) ‖ `address` (u8 length ‖ text) ‖ a 65-byte recoverable signature by that address's key of
 //!   [`wallet_proof_message`] (Core's signmessage with [`WALLET_MAGIC`]). Every entry must check, or the record is
 //!   refused. Known from [`set_wallets_from`]'s height on (refused as an unknown op below it, as before).
+//! - 8 **react**, 9 **reply**, 10 **tip** (Martin 2026-11-18: for any app to build on): on a *target*, any transaction
+//!   on any chain (a post, an inscription, a game's record, an app's own item: nothing is assumed about it), as
+//!   `chain` (u8 length ‖ a chain key such as `peptest`, `arctest`, `doge`: 1 to 12 lowercase letters and digits) ‖
+//!   `txid` (32 bytes, in the order the txid is shown). A react is the target ‖ a kind (1 like, 2 unlike, 3 dislike,
+//!   4 undislike): the author's newest react on a target wins (none, liked or disliked). A reply is the target ‖ UTF-8
+//!   text of 1 to [`MAX_REPLY`] bytes. A tip is the target ‖ an optional memo of at most [`MAX_TIP_MEMO`] bytes, and
+//!   its own transaction pays whoever the tipper chose: every output to an address other than the sender's counts as
+//!   tipped to that address (none: refused). The target isn't looked up. Known from [`set_social_from`]'s height on.
+//!   docs/APROTO.md describes them for app developers.
 
 use crate::tags::TYPE_ANY_DATA;
 use serde_json::Value;
@@ -30,6 +39,16 @@ pub const OP_CONTACT: u8 = 4;
 pub const OP_CONTACT_DEL: u8 = 5;
 pub const OP_POST: u8 = 6;
 pub const OP_WALLETS: u8 = 7;
+pub const OP_REACT: u8 = 8;
+pub const OP_REPLY: u8 = 9;
+pub const OP_TIP: u8 = 10;
+pub const MAX_REPLY: usize = 500;
+pub const MAX_TIP_MEMO: usize = 100;
+/// A react's kinds.
+pub const LIKE: u8 = 1;
+pub const UNLIKE: u8 = 2;
+pub const DISLIKE: u8 = 3;
+pub const UNDISLIKE: u8 = 4;
 /// The signmessage magic of wallet proofs: one for every coin, so a proof means nothing as a coin's own message.
 pub const WALLET_MAGIC: &str = "ARCADE Signed Message:\n";
 /// Entries in one wallets record at most (each about 110 to 140 bytes; a record carries 1,024).
@@ -47,6 +66,125 @@ pub enum AOp {
     ContactDel([u8; 8]),
     Post(String),
     Wallets { set: u64, proofs: Vec<WalletProof> },
+    React(Target, u8),
+    Reply(Target, String),
+    Tip(Target, String),
+}
+
+/// What a react, reply or tip is on: a transaction (a post) on any chain.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub struct Target {
+    pub chain: String,
+    pub txid: [u8; 32],
+}
+
+impl Target {
+    /// From a chain key and a txid as shown (64 hex).
+    pub fn new(chain: &str, txid_hex: &str) -> Option<Target> {
+        let chain = chain.trim().to_ascii_lowercase();
+        if !chain_key_ok(&chain) {
+            return None;
+        }
+        let txid: [u8; 32] = hex::decode(txid_hex.trim()).ok()?.try_into().ok()?;
+        Some(Target { chain, txid })
+    }
+    pub fn txid_hex(&self) -> String {
+        hex::encode(self.txid)
+    }
+    /// The wire form: chain (u8 length ‖ key) ‖ txid.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut b = vec![self.chain.len() as u8];
+        b.extend_from_slice(self.chain.as_bytes());
+        b.extend_from_slice(&self.txid);
+        b
+    }
+    /// The ledger's key part for this target: chain ‖ 00 ‖ txid.
+    pub fn key(&self) -> Vec<u8> {
+        let mut b = self.chain.as_bytes().to_vec();
+        b.push(0);
+        b.extend_from_slice(&self.txid);
+        b
+    }
+    /// A target at the start of `b`, and what follows it.
+    fn decode(b: &[u8]) -> Result<(Target, &[u8]), &'static str> {
+        let (&n, rest) = b.split_first().ok_or("a target is a chain and a txid")?;
+        let n = n as usize;
+        if rest.len() < n + 32 {
+            return Err("a target is a chain and a txid");
+        }
+        let chain = std::str::from_utf8(&rest[..n]).map_err(|_| "a target's chain is a chain key")?;
+        if !chain_key_ok(chain) {
+            return Err("a target's chain is a chain key (1 to 12 lowercase letters and digits)");
+        }
+        let txid: [u8; 32] = rest[n..n + 32].try_into().expect("32 bytes");
+        Ok((Target { chain: chain.to_string(), txid }, &rest[n + 32..]))
+    }
+}
+
+fn chain_key_ok(c: &str) -> bool {
+    (1..=12).contains(&c.len()) && c.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+}
+
+/// The body of a react.
+pub fn react_body(t: &Target, kind: u8) -> Vec<u8> {
+    let mut b = t.encode();
+    b.push(kind);
+    b
+}
+
+/// The body of a reply or a tip: the target ‖ the text (a tip's memo may be empty).
+pub fn text_body(t: &Target, text: &str) -> Vec<u8> {
+    let mut b = t.encode();
+    b.extend_from_slice(text.as_bytes());
+    b
+}
+
+static SOCIAL_FROM: std::sync::RwLock<std::collections::BTreeMap<u16, u64>> = std::sync::RwLock::new(std::collections::BTreeMap::new());
+
+/// The height from which chain `c` knows ops 8 to 10 (react, reply, tip); None = never. Set by the ARCADE chain's
+/// service when it starts, as [`set_wallets_from`].
+pub fn set_social_from(c: u16, from: Option<u64>) {
+    let mut m = SOCIAL_FROM.write().unwrap();
+    match from {
+        Some(h) => m.insert(c, h),
+        None => m.remove(&c),
+    };
+}
+
+/// Whether chain `c`'s block at `height` knows ops 8 to 10.
+pub fn social_known(c: u16, height: u64) -> bool {
+    SOCIAL_FROM.read().unwrap().get(&c).is_some_and(|from| height >= *from)
+}
+
+/// An author's react state on a target after a react of `kind` (0 none, [`LIKE`] liked, [`DISLIKE`] disliked): the
+/// newest wins; like and dislike replace what was, unlike and undislike clear only their own.
+pub fn react_next(was: u8, kind: u8) -> u8 {
+    match kind {
+        LIKE => LIKE,
+        DISLIKE => DISLIKE,
+        UNLIKE if was == LIKE => 0,
+        UNDISLIKE if was == DISLIKE => 0,
+        _ => was,
+    }
+}
+
+/// What a tip's transaction pays, per recipient: every output (address, value) to an address other than the
+/// sender's. Empty: not a tip.
+pub fn tip_paid<'a>(sender: &str, outputs: impl IntoIterator<Item = (Option<&'a str>, u64)>) -> std::collections::BTreeMap<String, u64> {
+    let mut paid = std::collections::BTreeMap::new();
+    for (a, v) in outputs {
+        if let Some(a) = a.filter(|a| *a != sender) {
+            if v > 0 {
+                *paid.entry(a.to_string()).or_insert(0u64) += v;
+            }
+        }
+    }
+    paid
+}
+
+/// Whether `op` is one of ops 8 to 10.
+pub fn is_social(op: &AOp) -> bool {
+    matches!(op, AOp::React(..) | AOp::Reply(..) | AOp::Tip(..))
 }
 
 /// One address's proof: its coin (a chain key), the address, and the signature of [`wallet_proof_message`].
@@ -261,6 +399,27 @@ pub fn parse(payload: &[u8]) -> Option<Result<AOp, &'static str>> {
                 Ok(AOp::Post(std::str::from_utf8(body).map_err(|_| "a post is UTF-8 text")?.to_string()))
             }
             OP_WALLETS => wallets_of(body),
+            OP_REACT => {
+                let (t, rest) = Target::decode(body)?;
+                match rest {
+                    [k @ LIKE..=UNDISLIKE] => Ok(AOp::React(t, *k)),
+                    _ => Err("a react is a target and a kind (1 like, 2 unlike, 3 dislike, 4 undislike)"),
+                }
+            }
+            OP_REPLY => {
+                let (t, rest) = Target::decode(body)?;
+                if rest.is_empty() || rest.len() > MAX_REPLY {
+                    return Err("a reply is 1 to 500 bytes");
+                }
+                Ok(AOp::Reply(t, std::str::from_utf8(rest).map_err(|_| "a reply is UTF-8 text")?.to_string()))
+            }
+            OP_TIP => {
+                let (t, rest) = Target::decode(body)?;
+                if rest.len() > MAX_TIP_MEMO {
+                    return Err("a tip's memo is 100 bytes at most");
+                }
+                Ok(AOp::Tip(t, std::str::from_utf8(rest).map_err(|_| "a tip's memo is UTF-8 text")?.to_string()))
+            }
             _ => Err("unknown A:// op"),
         }
     })())
@@ -301,7 +460,58 @@ mod tests {
         assert!(matches!(parse(&payload(OP_FOLLOW, b"admin")), Some(Err(_))));
         assert!(matches!(parse(&payload(OP_CONTACT, b"1234")), Some(Err(_))));
         assert!(matches!(parse(&payload(OP_POST, &vec![b'a'; 1001])), Some(Err(_))));
-        assert!(matches!(parse(&payload(9, b"x")), Some(Err(_))));
+        assert!(matches!(parse(&payload(11, b"x")), Some(Err(_))));
+    }
+
+    #[test]
+    fn reacts_replies_and_tips_read_back_and_bad_ones_are_named() {
+        let t = Target::new("peptest", &"ab".repeat(32)).unwrap();
+        assert_eq!(t.txid_hex(), "ab".repeat(32));
+        assert!(Target::new("PepTest", &"ab".repeat(32)).is_some_and(|x| x.chain == "peptest"));
+        assert!(Target::new("pep-test", &"ab".repeat(32)).is_none() && Target::new("peptest", "ab").is_none() && Target::new("", &"ab".repeat(32)).is_none());
+        for k in [LIKE, UNLIKE, DISLIKE, UNDISLIKE] {
+            assert_eq!(parse(&payload(OP_REACT, &react_body(&t, k))), Some(Ok(AOp::React(t.clone(), k))));
+        }
+        assert!(matches!(parse(&payload(OP_REACT, &react_body(&t, 5))), Some(Err(_))));
+        assert!(matches!(parse(&payload(OP_REACT, &react_body(&t, 0))), Some(Err(_))));
+        assert!(matches!(parse(&payload(OP_REACT, &t.encode())), Some(Err(_))), "no kind");
+        let mut two = react_body(&t, LIKE);
+        two.push(LIKE);
+        assert!(matches!(parse(&payload(OP_REACT, &two)), Some(Err(_))), "one kind only");
+        assert_eq!(parse(&payload(OP_REPLY, &text_body(&t, "nice ☀"))), Some(Ok(AOp::Reply(t.clone(), "nice ☀".into()))));
+        assert!(matches!(parse(&payload(OP_REPLY, &text_body(&t, ""))), Some(Err(_))));
+        assert!(parse(&payload(OP_REPLY, &text_body(&t, &"a".repeat(MAX_REPLY)))).is_some_and(|r| r.is_ok()));
+        assert!(matches!(parse(&payload(OP_REPLY, &text_body(&t, &"a".repeat(MAX_REPLY + 1)))), Some(Err(_))));
+        assert_eq!(parse(&payload(OP_TIP, &text_body(&t, ""))), Some(Ok(AOp::Tip(t.clone(), String::new()))));
+        assert_eq!(parse(&payload(OP_TIP, &text_body(&t, "gm"))), Some(Ok(AOp::Tip(t.clone(), "gm".into()))));
+        assert!(matches!(parse(&payload(OP_TIP, &text_body(&t, &"m".repeat(MAX_TIP_MEMO + 1)))), Some(Err(_))));
+        // A cut target, a chain that isn't a key.
+        let mut cut = t.encode();
+        cut.truncate(20);
+        assert!(matches!(parse(&payload(OP_TIP, &cut)), Some(Err(_))));
+        let mut bad = vec![3];
+        bad.extend_from_slice(b"P-T");
+        bad.extend_from_slice(&[0u8; 32]);
+        assert!(matches!(parse(&payload(OP_REPLY, &[bad, b"x".to_vec()].concat())), Some(Err(_))));
+        // A whole reply fits one record.
+        assert!(payload(OP_REPLY, &text_body(&Target::new("dgbtest", &"00".repeat(32)).unwrap(), &"a".repeat(MAX_REPLY))).len() <= 1_024);
+        // The newest react wins.
+        assert_eq!(react_next(0, LIKE), LIKE);
+        assert_eq!(react_next(LIKE, LIKE), LIKE);
+        assert_eq!(react_next(LIKE, DISLIKE), DISLIKE);
+        assert_eq!(react_next(DISLIKE, LIKE), LIKE);
+        assert_eq!(react_next(LIKE, UNLIKE), 0);
+        assert_eq!(react_next(DISLIKE, UNLIKE), DISLIKE, "unlike doesn't clear a dislike");
+        assert_eq!(react_next(DISLIKE, UNDISLIKE), 0);
+        assert_eq!(react_next(0, UNDISLIKE), 0);
+        // A tip pays every output to someone else; change and data don't count.
+        let paid = tip_paid("me", [(Some("bob"), 5_000), (Some("me"), 90_000), (None, 0), (Some("bob"), 1_000), (Some("ann"), 700), (Some("zed"), 0)]);
+        assert_eq!(paid.into_iter().collect::<Vec<_>>(), vec![("ann".to_string(), 700), ("bob".to_string(), 6_000)]);
+        assert!(tip_paid("me", [(Some("me"), 5_000), (None, 0)]).is_empty());
+        set_social_from(4242, Some(70));
+        assert!(!social_known(4242, 69) && social_known(4242, 70) && !social_known(4243, 99));
+        set_social_from(4242, None);
+        assert!(!social_known(4242, 70));
     }
 
     #[test]

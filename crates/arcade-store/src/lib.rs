@@ -100,6 +100,18 @@ fn geometry_max(requested: isize) -> isize {
     }
 }
 
+/// When libmdbx gives free space at the end of the file back (MDBX shrink_threshold; None = its default, twice the
+/// growth step). On Windows a shrink remaps the file, and to do that libmdbx suspends every thread that has it mapped
+/// (SuspendThread); a suspended thread holding a lock the shrinking one then needs (the allocator's, a reader's) stops
+/// both, and the arcade hung. 0 turns shrinking off there: the file keeps its size and reuses its free pages.
+fn shrink_threshold() -> Option<isize> {
+    if cfg!(windows) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 pub struct Store {
     db: Database<NoWriteMap>,
     schema: &'static Schema,
@@ -140,6 +152,7 @@ impl Store {
                 min_size: None,
                 max_size: Some(geometry_max(schema.max_size)),
                 growth_step: Some(64 << 20),
+                shrink_threshold: shrink_threshold(),
                 ..Default::default()
             }),
             ..Default::default()

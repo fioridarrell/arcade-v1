@@ -54,8 +54,60 @@ fn wait_ready(limit: std::time::Duration) -> bool {
 
 /// The answer to a request that came while arcaded is still starting (`starting`, as the desktop app's own answer when
 /// it starts the service: the window says "starting the service").
-fn starting_reply() -> Value {
-    json!({"ok": false, "error": "the arcade service is starting (opening its chains)", "starting": true})
+pub fn starting_reply() -> Value {
+    json!({"ok": false, "error": "the arcade service is starting (opening its chains)", "starting": true, "state": "starting", "code": "starting", "retry_after_s": 5})
+}
+
+/// Where arcaded is in its life: "starting" (until set_ready), "ready", or "stopping" (once a stop began: writing the
+/// coin caches, then exiting). ARCADE #25: a stop of several minutes looked like a crash.
+pub fn phase() -> &'static str {
+    if crate::STOP_ASKED.load(std::sync::atomic::Ordering::SeqCst) {
+        "stopping"
+    } else if !wait_ready(std::time::Duration::ZERO) {
+        "starting"
+    } else {
+        "ready"
+    }
+}
+
+/// The answer to a request that came after a stop began.
+pub fn stopping_reply() -> Value {
+    json!({"ok": false, "error": "the arcade service is stopping (writing the coin caches, then exiting)", "stopping": true, "state": "stopping", "code": "stopping", "retry_after_s": 10})
+}
+
+/// A stable code for an error's text (ARCADE #25: scripts matched the text): kept beside `error`.
+pub fn error_code(e: &str) -> &'static str {
+    let l = e.to_ascii_lowercase();
+    if l.starts_with("unknown command") || l.starts_with("unknown method") {
+        "unknown_command"
+    } else if l.starts_with("unknown route") {
+        "unknown_route"
+    } else if l.contains("not enough arcade") {
+        "not_enough_arcade"
+    } else if l.contains("not enough") || l.contains("insufficient") {
+        "insufficient_funds"
+    } else if l.starts_with("unknown chain") {
+        "unknown_chain"
+    } else if l.starts_with("not_found") || l.starts_with("no transaction") || l.starts_with("no block") || l.starts_with("no such") || l.contains(" not found") {
+        "not_found"
+    } else if l.contains("service is starting") {
+        "starting"
+    } else if l.contains("service is stopping") {
+        "stopping"
+    } else if l.contains("needs an api key") || l.contains("malformed api key") || l.contains("only available on this computer") || l.contains("not allowed") {
+        "forbidden"
+    } else if l.contains(" required") || l.starts_with("bad request") || l.contains("is not a ") || l.contains(" must be ") || l.starts_with("give ") {
+        "bad_args"
+    } else if l.contains("not installed") || l.contains("isn't running here") || (l.contains("borrowed") && l.contains("install")) {
+        "not_installed"
+    } else {
+        "error"
+    }
+}
+
+/// An error answer: the text and its code.
+pub fn error_reply(e: &str) -> Value {
+    json!({"ok": false, "error": e, "code": error_code(e)})
 }
 
 fn handle(node: Arc<Node>, s: UnixStream) {
@@ -64,8 +116,16 @@ fn handle(node: Arc<Node>, s: UnixStream) {
     while let Some(Ok(line)) = lines.next() {
         // While arcaded is starting, only a stop is taken (it is acted on once the stop watcher runs); anything else
         // waits a moment, then is answered "starting".
+        let stop = serde_json::from_str::<Value>(&line).is_ok_and(|r| r["cmd"] == "service.stop");
+        // Once a stop began, only another stop is taken (the second one leaves without writing the caches, as a
+        // second signal does not: the socket's stop only asks once).
+        if !stop && crate::STOP_ASKED.load(std::sync::atomic::Ordering::SeqCst) {
+            if writeln!(w, "{}", stopping_reply()).is_err() {
+                break;
+            }
+            continue;
+        }
         if !wait_ready(std::time::Duration::ZERO) {
-            let stop = serde_json::from_str::<Value>(&line).is_ok_and(|r| r["cmd"] == "service.stop");
             if !stop && !wait_ready(STARTING_WAIT) {
                 if writeln!(w, "{}", starting_reply()).is_err() {
                     break;
@@ -87,7 +147,7 @@ fn handle(node: Arc<Node>, s: UnixStream) {
                 let r = crate::svcmesh::ask_cmd(&node, &req, Some(&mut |v: Value| writeln!(ww, "{v}").map_err(|e| e.to_string())));
                 let reply = match r {
                     Ok(v) => json!({"ok": true, "result": v}),
-                    Err(e) => json!({"ok": false, "error": e}),
+                    Err(e) => error_reply(&e),
                 };
                 if writeln!(w, "{reply}").is_err() {
                     break;
@@ -104,9 +164,9 @@ fn handle(node: Arc<Node>, s: UnixStream) {
             }
             Ok(req) => match dispatch(&node, &req) {
                 Ok(v) => json!({"ok": true, "result": v}),
-                Err(e) => json!({"ok": false, "error": e}),
+                Err(e) => error_reply(&e),
             },
-            Err(e) => json!({"ok": false, "error": format!("bad request: {e}")}),
+            Err(e) => error_reply(&format!("bad request: {e}")),
         };
         if writeln!(w, "{reply}").is_err() {
             break;
@@ -159,12 +219,103 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
 }
 
 fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
+    let cmd = req["cmd"].as_str().unwrap_or("");
+    // Sends leave a receipt, and a client_ref makes a retry return the first answer (crate::receipts).
+    if crate::receipts::SENDS.contains(&cmd) {
+        return crate::receipts::run(node, cmd, req, || dispatch_cmd(node, req));
+    }
+    dispatch_cmd(node, req)
+}
+
+/// `status chain=<key>` (ARCADE #25): one chain in a few fields: its tip, the best height peers tell of and how many
+/// told it, how far behind, where it is read from, and the rules warning for the ARCADE chain. Never 100% made up:
+/// null where no peer has told a height.
+fn chain_status_short(node: &Node, key: &str) -> Result<Value, String> {
+    let p = crate::chains::find(key).ok_or_else(|| format!("unknown chain {key}"))?;
+    let st = crate::chains::status(node, p.key)?;
+    let blocks = st["stages"].as_array().and_then(|a| a.iter().find(|x| x["name"] == "Blocks" || x["name"] == "Headers").cloned()).unwrap_or(Value::Null);
+    let tip = st["tip"].as_u64().or_else(|| blocks["at"].as_u64());
+    let lenders: Vec<u64> = st["lenders"].as_array().into_iter().flatten().filter_map(|l| l["tip"].as_u64()).collect();
+    let best = st["best_known"].as_u64().or_else(|| blocks["of"].as_u64().filter(|b| *b > 0)).or_else(|| lenders.iter().max().copied()).map(|b| b.max(tip.unwrap_or(0)));
+    let from = if st["best_known_from"].is_u64() { st["best_known_from"].clone() } else if !lenders.is_empty() { json!(lenders.len()) } else { Value::Null };
+    let tip_hash = st["tip_hash"].as_str().map(String::from).or_else(|| {
+        let h = tip? as u32;
+        node.chain.hash_at(p.chain_no, h).ok().flatten().map(|x| x.to_hex())
+    });
+    let behind = match (tip, best) {
+        (Some(t), Some(b)) => Some(b.saturating_sub(t)),
+        _ => None,
+    };
+    let installed = st["installed"] == true;
+    let borrowed = st["borrowed"] == true || st["mode"] == "borrowed";
+    let sync = if !installed && !borrowed {
+        "not_kept"
+    } else {
+        match behind {
+            None => "unknown",
+            Some(0..=2) => "synced",
+            Some(_) => "syncing",
+        }
+    };
+    let arc = crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no);
+    let mut v = json!({
+        "chain": p.key, "name": p.name, "phase": phase(), "installed": installed, "mode": st["mode"], "source": st["source"],
+        "sync": sync, "state": st["state"], "tip": tip.map(|t| json!({"height": t, "hash": tip_hash})),
+        "best_known": best, "best_known_from": from, "best_known_age_s": st["best_known_age_s"], "behind": behind,
+        "peer_tips": st["peer_tips"], "overall": st["overall"], "waiting": st["waiting"],
+        "unit": crate::explorer::unit(p), "decimals": 8,
+    });
+    if arc {
+        v["rules"] = crate::arcsvc::status(node).ok().map(|a| a["rules"].clone()).filter(|r| !r.is_null()).unwrap_or_else(|| json!({"update_needed": crate::arcsvc::update_needed()}));
+    }
+    Ok(v)
+}
+
+/// `ledger.items` with filters (ARCADE #25): state (open, closed, merged), kind (issue, pull), since (items or
+/// events at or after this height), summary (true: no events, the text cut to its title line).
+fn filter_items(mut v: Value, req: &Value) -> Result<Value, String> {
+    let state = req["state"].as_str();
+    let kind = req["kind"].as_str();
+    if let Some(k) = kind.filter(|k| !matches!(*k, "issue" | "pull")) {
+        return Err(format!("kind is issue or pull, not {k}"));
+    }
+    if let Some(x) = state.filter(|x| !matches!(*x, "open" | "closed" | "merged")) {
+        return Err(format!("state is open, closed or merged, not {x}"));
+    }
+    let since = req["since"].as_u64().or_else(|| req["since"].as_str().and_then(|x| x.parse().ok()));
+    let summary = req["summary"] == true;
+    if let Some(items) = v["items"].as_array_mut() {
+        items.retain(|it| {
+            state.is_none_or(|x| it["state"] == x)
+                && kind.is_none_or(|k| it["kind"] == k)
+                && since.is_none_or(|h| {
+                    it["height"].as_u64().is_some_and(|ih| ih >= h) || it["events"].as_array().into_iter().flatten().any(|e| e["height"].as_u64().is_some_and(|eh| eh >= h))
+                })
+        });
+        for it in items.iter_mut() {
+            it["comments"] = json!(it["events"].as_array().map(|a| a.iter().filter(|e| e["w"] == "comment" || e["w"] == "review").count()).unwrap_or(0));
+            if summary {
+                if let Some(o) = it.as_object_mut() {
+                    o.remove("events");
+                }
+                let title = it["text"]["title"].clone();
+                it["text"] = json!({"title": title});
+            }
+        }
+        let n = items.len();
+        v["count"] = json!(n);
+    }
+    Ok(v)
+}
+
+fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
     let s = |k: &str| req[k].as_str().map(String::from);
     let p = node.params;
     let c = p.chain_no;
     match req["cmd"].as_str().unwrap_or("") {
         // The link that opens the desktop app's window in a browser (crate::webui; `arcade web`).
         "ui.link" => crate::webui::link(node, node.http_port.get().copied().unwrap_or(8420)),
+        "status" if req["chain"].as_str().is_some_and(|k| crate::chains::find(k).is_none_or(|x| x.chain_no != c)) => chain_status_short(node, req["chain"].as_str().unwrap()),
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
@@ -190,6 +341,11 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 "mesh": {"links": node.links.lock().unwrap().len(), "tips": mesh},
                 "node_id": node.id_hex(),
                 "wallet": node.app.has_wallet().unwrap_or(false),
+                "key": p.key,
+                "phase": phase(),
+                // The ARCADE rules warning where agents look (ARCADE #25: it was only in arc.status).
+                "rules": {"update_needed": crate::arcsvc::update_needed()},
+                "chains": "status chain=<key> for one chain (the ARCADE chain: arctest)",
             }))
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
@@ -594,7 +750,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "ledger.item_open" => crate::arcledger::item_open(node, &req),
         "ledger.item_comment" => crate::arcledger::item_comment(node, &req),
         "ledger.item_state" => crate::arcledger::item_state(node, &req),
-        "ledger.items" => crate::arcledger::items(node, &req),
+        "ledger.items" => filter_items(crate::arcledger::items(node, &req)?, req),
         "ledger.repo" => crate::arcledger::repo(node, &s("name").ok_or("name required")?),
         "ledger.repos" => crate::arcledger::repos(node, s("owner").as_deref()),
         // A:// (profiles, follows, the address book, posts) on the ARCADE chain.
@@ -926,6 +1082,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "chains.drives" => Ok(crate::chaindrive::drives(node)),
         "chains.move" => crate::chaindrive::start(&node.self_arc(), &s("key").ok_or("key required")?, &s("drive").unwrap_or_else(|| "home".into())),
         "arc.status" => crate::arcsvc::status(node),
+        "tx.status" => crate::receipts::status(node, req),
+        "tx.wait" => crate::receipts::wait(node, req),
         "arc.earning" => crate::arcsvc::earning(node),
         "arc.block" => crate::arcsvc::block(req),
         "arc.submit" => crate::arcsvc::submit(req),
@@ -1133,5 +1291,43 @@ mod start_tests {
         set_ready();
         assert!(t.join().unwrap(), "a waiting request goes on once arcaded has started");
         assert!(wait_ready(std::time::Duration::ZERO));
+    }
+}
+
+#[cfg(test)]
+mod agent_tests {
+    use super::*;
+
+    #[test]
+    fn errors_carry_a_stable_code() {
+        assert_eq!(error_code("unknown command \"x.y\""), "unknown_command");
+        assert_eq!(error_code("unknown route /api/v1/r/mesh: GET /api/v1/routes lists them"), "unknown_route");
+        assert_eq!(error_code("not enough ARCADE: 0.1 needed, 0.05 here"), "not_enough_arcade");
+        assert_eq!(error_code("not enough coins for 5 DOGE"), "insufficient_funds");
+        assert_eq!(error_code("no transaction 55dd on ARCADE testnet (asked the mesh too: x)"), "not_found");
+        assert_eq!(error_code("repo required"), "bad_args");
+        assert_eq!(error_code("ARCADE testnet is not installed"), "not_installed");
+        assert_eq!(error_code("unknown chain zzz"), "unknown_chain");
+        assert_eq!(error_code("something else"), "error");
+        assert_eq!(error_reply("repo required")["code"], "bad_args");
+        assert_eq!(stopping_reply()["state"], "stopping");
+        assert_eq!(starting_reply()["state"], "starting");
+    }
+
+    #[test]
+    fn items_are_filtered_by_state_kind_and_height() {
+        let v = json!({"repo": "@a/b", "items": [
+            {"number": 1, "kind": "issue", "state": "open", "height": 10, "text": {"title": "one", "body": "x"}, "events": [{"w": "comment", "height": 30}]},
+            {"number": 2, "kind": "pull", "state": "merged", "height": 20, "text": {"title": "two"}, "events": []},
+            {"number": 3, "kind": "issue", "state": "closed", "height": 5, "text": {"title": "three"}, "events": []},
+        ]});
+        let n = |r: Value| r["items"].as_array().unwrap().iter().map(|i| i["number"].as_u64().unwrap()).collect::<Vec<_>>();
+        assert_eq!(n(filter_items(v.clone(), &json!({"state": "open"})).unwrap()), vec![1]);
+        assert_eq!(n(filter_items(v.clone(), &json!({"kind": "issue"})).unwrap()), vec![1, 3]);
+        assert_eq!(n(filter_items(v.clone(), &json!({"since": 15})).unwrap()), vec![1, 2], "a comment at 30 counts");
+        let s = filter_items(v.clone(), &json!({"summary": true})).unwrap();
+        assert!(s["items"][0].get("events").is_none() && s["items"][0]["text"] == json!({"title": "one"}) && s["items"][0]["comments"] == 1);
+        assert_eq!(s["count"], 3);
+        assert!(filter_items(v.clone(), &json!({"state": "shut"})).is_err());
     }
 }

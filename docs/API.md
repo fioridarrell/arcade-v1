@@ -67,7 +67,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `status` | `/api/v1/status` | public | — | Home chain, sync state, tags, profiles, mesh links, node id. |
+| `status` | `/api/v1/status` | public | chain? | Home chain, sync state, tip, best_known (the best height anyone tells us of), tags, profiles, mesh links, node id, phase (starting, ready, stopping) and rules.update_needed. With chain (a key, e.g. arctest): that chain alone: tip {height, hash}, best_known (from linked peers, null when none told), best_known_from, behind, sync (synced, syncing, unknown, not_kept), mode and source (own or borrowed), and for the ARCADE chain its rules. |
 | `peers` | `/api/v1/peers` | read | — | Arcades linked over the mesh right now. |
 | `events` | `/api/v1/events` | read | n?, kind? | Recent activity (newest first), optionally of one kind. |
 | `mempool` | `/api/v1/mempool` | public | — | Home chain transactions waiting for a block. |
@@ -97,6 +97,8 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `tx.activity` | `/api/v1/tx/activity` | public | addresses, since?, chain? | What changed for up to 500 addresses: history rows above height since, and waiting transactions paying or spending them; height to pass as since next time. |
 | `tx.fee` | `/api/v1/tx/fee` | public | chain? | The fee rate (per 1000 bytes) and dust limit this arcade's wallet builds transactions with on that chain (kept or borrowed). |
 | `tx.broadcast` | `/api/v1/tx/broadcast` | post | hex, chain? | Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network. On a borrowed chain it goes to the lenders' nodes, which check it; refused by all, it is not sent. |
+| `tx.status` | `/api/v1/tx/status` | read | chain, txid \| client_ref | Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding}), signed (signed here moments ago, in no pool or block), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, and code not_found when this arcade never signed it. |
+| `tx.wait` | `/api/v1/tx/wait` | read | chain, txid \| client_ref, until?, timeout? | tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped, or after timeout seconds (default 60, at most 600) with timed_out: true. |
 
 ### Id
 
@@ -135,7 +137,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `wallet.phrase` | `/api/v1/wallet/phrase` | local | — | The wallet's 12 words. |
 | `wallet.keys` | `/api/v1/wallet/keys` | read | chain? | Your addresses on a chain, their @tags and balances (on SegWit chains each address type's address and balance under kinds; balance counts every type). balance follows the mempool (confirmed coins less those a waiting transaction spends, plus waiting outputs to you); confirmed is the blocks' figure; free the confirmed coins spendable now (not spent by a waiting transaction, mature, no inscription); pending / pending_coins what is arriving; waiting and dropped this wallet's transactions in the mempool and those that left it without a block. |
 | `wallet.addr_kind` | `/api/v1/wallet/addr_kind` | wallet | chain, kind? | The address type the Wallet shows on a chain (legacy, p2sh-p2wpkh, p2wpkh, p2tr; remembered per chain) and the types it offers; kind: remember that one. |
-| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, kind?, all_kinds?, send? | Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
+| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, kind?, all_kinds?, send?, client_ref? | client_ref (with send): as for ledger.item_open. Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
 | `wallet.link` | `/api/v1/wallet/link` | wallet | chain, wif, tag | Link another wallet to your @tag (signed by both keys). |
 | `wallet.unlink` | `/api/v1/wallet/unlink` | wallet | chain, address, tag | Remove a linked wallet. |
 | `wallet.links` | `/api/v1/wallet/links` | read | chain | Your linked wallets on a chain. |
@@ -254,10 +256,10 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `explorer.summary` | `/api/v1/explorer/summary` | public | chain? | Chain summary for the explorer's front page. |
 | `explorer.earn` | `/api/v1/explorer/earn` | public | chain? | This arcade's ARCADE pay, read only (docs/EARN.md): its turn, next payout, accrued pay, pay and draw weight, why pay waits, and its sealed replicas waiting to register; with a chain, that coin's Earn ARCADE progress too. App pages read it at `/r/explorer/earn`. |
-| `explorer.blocks` | `/api/v1/explorer/blocks` | public | chain?, offset?, limit? | Recent blocks. |
-| `explorer.block` | `/api/v1/explorer/block` | public | chain?, id | One block (height or hash). |
-| `explorer.tx` | `/api/v1/explorer/tx` | public | chain?, txid | One transaction. |
-| `explorer.address` | `/api/v1/explorer/address` | public | chain?, address | An address: balance, history, inscriptions, tokens. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address). |
+| `explorer.blocks` | `/api/v1/explorer/blocks` | public | chain?, offset?, limit?, before?, n? | Recent blocks, newest first. offset (back from the tip) and limit (at most 100) answer a page: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the next page; null at block 0), chain, as_of, source}. before and n (at most 100) answer the plain list, as before. |
+| `explorer.block` | `/api/v1/explorer/block` | public | chain?, id | One block (id: a height, as a number or text, or a hash). Carries chain, as_of {height, hash} (the tip its confirmations count against), source (local, borrowed or mesh), unit and decimals. |
+| `explorer.tx` | `/api/v1/explorer/tx` | public | chain?, txid | One transaction: height, block (its hash), confirmations, fee, inputs and outputs in base units (decimals: 8); an OP_RETURN output carries data (hex) and decoded (an arcade record: repository or A:// with its op). Carries chain, as_of, source; without chain it answers on the home chain and says so (chain_note). |
+| `explorer.address` | `/api/v1/explorer/address` | public | chain?, address, history?, inscriptions?, content?, history_offset?, history_limit? | An address: balance, history (newest first, a page at a time: history_offset (or offset) and history_limit (or limit; default 50, at most 500); history_next is the next page's offset, null after the oldest; tx_count the total), inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address). |
 | `explorer.inscriptions` | `/api/v1/explorer/inscriptions` | public | chain?, offset?, limit? | Inscriptions, newest first. |
 | `explorer.inscription` | `/api/v1/explorer/inscription` | public | chain?, id | One inscription. |
 | `explorer.tokens` | `/api/v1/explorer/tokens` | public | chain?, offset?, limit? | Tokens. |
@@ -402,7 +404,41 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `rpc.help` | `/api/v1/rpc/help` | public | — | Every command, its parameters and what it needs. |
+| `arc.status` | `/api/v1/arc/status` | public | — | The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here. |
 | `rpc.info` | `/api/v1/rpc/info` | local | — | Where the RPC and the web API are, and the cookie file. |
+
+## For agents and scripts
+
+- **Starting and stopping.** The web port opens before the chains. Until the arcade is ready, every request is
+  answered at once with `503` and `{"ok": false, "state": "starting", "code": "starting", "retry_after_s": 5}`.
+  Once a stop begins, the answer is `503` with `"state": "stopping"`. The socket gives the same answers, and
+  `status` carries `phase` (starting, ready, stopping).
+- **Error codes.** Every error keeps its `error` text and adds a stable `code`: `unknown_command`, `unknown_route`
+  (`/api/v1/<unknown>` is `404`), `not_found` (`404` over the web API), `bad_args`, `not_enough_arcade`,
+  `insufficient_funds`, `unknown_chain`, `not_installed`, `forbidden`, `starting`, `stopping`, or `error`. JSON-RPC
+  errors carry it in `error.data.code`.
+- **One chain's status.** `status chain=arctest` (`/api/v1/status?chain=arctest`) gives:
+  - `tip {height, hash}`;
+  - `best_known`, the best height linked peers tell of, with `best_known_from` and `best_known_age_s` (null while
+    none has told one);
+  - `behind`, `sync` (synced, syncing, unknown, not_kept), `mode` and `source` (own or borrowed);
+  - for the ARCADE chain, `rules` with `update_needed`.
+
+  `status` alone has `rules.update_needed` too, and the log repeats that warning every 10 minutes while it holds.
+  `arc.status` is public.
+- **Receipts.** `ledger.item_open`, `ledger.item_comment`, `ledger.send` and `wallet.send` (with `send`) take an
+  optional `client_ref`. The same key sent again returns the first answer with `"replayed": true`, and nothing is
+  signed twice. Each answer carries a `receipt`. `tx.status chain txid` (or `client_ref`) gives one of these states:
+  - `confirmed {height, block, confirmations}`;
+  - `accepted_local`: in this arcade's pool; on the ARCADE chain it adds `broadcast {peers_linked, peers_sent,
+    peers_holding}`, where holding means peers that named it back as being in their pool;
+  - `signed`;
+  - `dropped`;
+  - `unknown`, with `ever_signed_here`.
+
+  `tx.wait chain txid until timeout` answers once that state is reached.
+- **Explorer answers** for tx, block, address, summary and mempool carry `chain`, `as_of {height, hash}` (the tip
+  they were counted against), `source` (local, borrowed or mesh) and `decimals`.
 
 ## Sign-in for websites
 
@@ -445,7 +481,7 @@ No page pass is needed (public data); like the rest of `/r/`, it answers this co
 answered: `summary`, `blocks`, `block`, `tx`, `address`, `inscriptions`, `inscription`, `inscription_types`,
 `tokens`, `token`, `collections`, `collection`, `collection_of`, `held`, `names`, `name`, `maps`, `map`,
 `mempool`, `ledger`, `ledger_tokens`, `ledger_token`, `ledger_inscriptions`, `ledger_inscription`, `tag`,
-`search`, and `chains`; any other name is 404.
+`search`, `msg_rows`, `msg_file`, and `chains`; any other name is 404.
 
 ## Repositories for apps
 

@@ -2298,6 +2298,23 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     };
     let w = watched(node, p);
     let bal: u64 = w.iter().filter_map(|x| balance(node, p, &x.script)).sum();
+    // What a send can spend now (as ledger.write_chains counts it): confirmed, mature, not spent by a waiting
+    // transaction; waiting change not counted (ARCADE #25: the two figures differed with no word why).
+    let tip_now = tip_of(node, p.key);
+    let spent_set = pool_spent(p.key);
+    let spent_now = &spent_set;
+    let spendable_now: u64 = w
+        .iter()
+        .flat_map(|x| {
+            let hs = hex::encode(&x.script);
+            coin_rows(node, p.key)
+                .into_iter()
+                .filter(move |(op, c)| c["sp"].is_null() && c["s"] == hs.as_str() && !spent_now.contains(op))
+                .filter(|(_, c)| !(c["cb"] == true && c["h"].as_u64().unwrap_or(0) as u32 + p.coinbase_maturity > tip_now))
+                .map(|(_, c)| c["v"].as_u64().unwrap_or(0))
+                .collect::<Vec<_>>()
+        })
+        .sum();
     let coins_n = coin_rows(node, p.key).iter().filter(|(_, c)| c["sp"].is_null()).count();
     let top = tips.iter().max().copied().unwrap_or(tip).max(tip);
     let scan = run.scan.lock().unwrap().clone();
@@ -2310,7 +2327,11 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     Some(json!({"key": p.key, "name": p.name, "installed": false, "borrowed": true, "home": false, "mode": "borrowed", "indexes": [],
                 "state": run.state.lock().unwrap().clone(), "overall": if top == 0 { 0.0 } else { (tip as f64 * 100.0 / top as f64).min(100.0) },
                 "stages": stages, "tip": tip, "floor": st["floor"], "trust": t["trust"], "trust_note": t["note"], "trust_hosts": t["hosts"], "lenders": lenders_v, "mismatch": mismatch, "scan": scan,
-                "balance": bal, "coins": coins_n, "addresses": w.len(), "unit": crate::explorer::unit(p)}))
+                "balance": bal, "spendable": spendable_now,
+                "balance_counts": "confirmed coins not yet spent in a block; waiting (mempool) transactions are not counted",
+                "spendable_counts": "confirmed, mature coins less those waiting transactions spend; waiting change not counted",
+                "source": if crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no) && crate::arcsvc::runs(p) { "borrowed (installed copy catching up)" } else { "borrowed" },
+                "coins": coins_n, "addresses": w.len(), "unit": crate::explorer::unit(p), "decimals": 8}))
 }
 
 /// borrow.status: the switches and every borrowed chain.
@@ -2349,6 +2370,12 @@ pub fn explorer(node: &Node, cmd: &str, req: &Value, p: &'static ChainParams) ->
         "explorer.search" => return None,
         _ => Err(format!("{} is borrowed (not installed): blocks, transactions and your own addresses are looked up from lenders; install it in Chains & Coins for the rest", p.name)),
     })
+}
+
+/// The borrowed copy's tip (height, hash when its header is held): what an answer from it was counted against.
+pub fn tip_pin(node: &Node, p: &ChainParams) -> (u32, Option<String>) {
+    let t = tip_of(node, p.key);
+    (t, stored_header(node, p, t).map(|x| x.0.to_hex()))
 }
 
 fn x_rows(node: &Node, p: &ChainParams, before: u32, n: u32) -> Vec<Value> {

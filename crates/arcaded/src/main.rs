@@ -33,6 +33,7 @@ mod arcseg;
 mod arcblob;
 mod fogstore;
 mod arcgit;
+mod receipts;
 mod reposvc;
 mod relrepo;
 mod arcledger;
@@ -522,6 +523,36 @@ fn main() {
     // Pruned blocks of coins held sealed for Earn ARCADE read back from their sealed copies.
     node.chain.set_sealed_reader(arcseal::reader(Arc::downgrade(&node)));
     node.chain.set_sealed_journal_reader(arcseal::journal_reader(Arc::downgrade(&node)));
+    // The web port opens now too, before the chains: until api::set_ready below it answers every request 503
+    // {"state": "starting"} at once (and once a stop begins, "stopping"), instead of not answering (ARCADE #25).
+    let http_port: u16 = opt("--http-port").and_then(|v| v.parse().ok()).unwrap_or(8420);
+    if http_port != 0 {
+        match http::write_cookie(&home) {
+            Ok(c) => {
+                let _ = node.rpc_cookie.set(c);
+            }
+            Err(e) => eprintln!("arcaded: no RPC cookie ({e}); /rpc will refuse everyone"),
+        }
+        let _ = node.http_port.set(http_port);
+        // Home-network entrances that show this arcade's window (docs/WEBUI.md): app pages may be
+        // framed by them. Each --ui-origin, and ARCADE_UI_ORIGINS (comma-separated).
+        let mut ui: Vec<String> = args.iter().enumerate().filter(|(_, a)| *a == "--ui-origin").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
+        ui.extend(std::env::var("ARCADE_UI_ORIGINS").unwrap_or_default().split(',').map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()));
+        let (good, bad): (Vec<String>, Vec<String>) = ui.into_iter().map(|s| s.trim_end_matches('/').to_string()).partition(|o| http::ui_origin_ok(o));
+        for b in bad {
+            eprintln!("arcaded: --ui-origin {b} ignored: an origin is https://host[:port] (no path)");
+        }
+        let _ = http::UI_ORIGINS.set(good);
+        let o = http::Opts {
+            // 127.0.0.1 unless the operator opens it; the API and RPC still answer only this computer.
+            bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),
+            port: http_port,
+            site: opt("--site").map(std::path::PathBuf::from),
+            behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
+        };
+        let n = node.clone();
+        std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, o)).unwrap();
+    }
     // The API socket opens now, before the chains (which can take minutes on a slow disk): until api::set_ready below,
     // the desktop app and the CLI are answered "starting" instead of finding no arcade (on Windows the app then tried to
     // start a second one).
@@ -736,36 +767,10 @@ fn main() {
             std::thread::Builder::new().name("mesh listen".into()).spawn(move || meshsvc::listen(n, port)).unwrap();
         }
     }
-    let http_port: u16 = opt("--http-port").and_then(|v| v.parse().ok()).unwrap_or(8420);
-    if http_port != 0 {
-        match http::write_cookie(&home) {
-            Ok(c) => {
-                let _ = node.rpc_cookie.set(c);
-            }
-            Err(e) => eprintln!("arcaded: no RPC cookie ({e}); /rpc will refuse everyone"),
-        }
-        let _ = node.http_port.set(http_port);
-        // Home-network entrances that show this arcade's window (docs/WEBUI.md): app pages may be
-        // framed by them. Each --ui-origin, and ARCADE_UI_ORIGINS (comma-separated).
-        let mut ui: Vec<String> = args.iter().enumerate().filter(|(_, a)| *a == "--ui-origin").filter_map(|(i, _)| args.get(i + 1).cloned()).collect();
-        ui.extend(std::env::var("ARCADE_UI_ORIGINS").unwrap_or_default().split(',').map(|s| s.trim().trim_end_matches('/').to_string()).filter(|s| !s.is_empty()));
-        let (good, bad): (Vec<String>, Vec<String>) = ui.into_iter().map(|s| s.trim_end_matches('/').to_string()).partition(|o| http::ui_origin_ok(o));
-        for b in bad {
-            eprintln!("arcaded: --ui-origin {b} ignored: an origin is https://host[:port] (no path)");
-        }
-        let _ = http::UI_ORIGINS.set(good);
-        let o = http::Opts {
-            // 127.0.0.1 unless the operator opens it; the API and RPC still answer only this computer.
-            bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),
-            port: http_port,
-            site: opt("--site").map(std::path::PathBuf::from),
-            behind_proxy: args.iter().any(|a| a == "--behind-proxy"),
-        };
-        let n = node.clone();
-        std::thread::Builder::new().name("http".into()).spawn(move || http::serve(n, o)).unwrap();
-    }
     stop_cleanly_on_signal(node.clone());
     updater::start(node.clone());
+    // The ARCADE rules warning, repeated in the log every 10 minutes while an update is needed (ARCADE #25).
+    arcsvc::warn_rules_while_needed();
     api::set_ready();
     // Everything runs on its own threads now (the API's included); a stop ends the process (stop_cleanly_on_signal).
     loop {

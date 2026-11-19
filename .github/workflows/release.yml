@@ -1,14 +1,18 @@
-# Prebuilt downloads for the installers (scripts/install.sh, scripts/install.ps1).
+# Prebuilt downloads for the installers (scripts/install.sh, scripts/install.ps1), every platform from ONE commit.
 #
-# Push a tag like v0.1.1 (or run this workflow by hand with a version) and it builds arcaded, arcade and
-# arcade-desktop for x86_64 and aarch64 on Ubuntu 22.04 (glibc 2.35: runs on Ubuntu 22.04+, Mint 21+, Debian 12+)
-# and for x86_64 on Windows (MSVC; runs on Windows 10/11 x64), packs each with the icon and the matching
-# installer, and attaches them to the GitHub release:
-#   arcade-v1-linux-x86_64.tar.gz      (+ .sha256)
+# Push a tag like v0.1.1 (or run this workflow by hand with a version) and it builds arcaded, arcade and arcade-desktop
+# from the tag's commit, one build matrix, and attaches them all to that one GitHub release:
+#   arcade-v1-linux-x86_64.tar.gz      (+ .sha256)   Ubuntu 22.04 (glibc 2.35: Ubuntu 22.04+, Mint 21+, Debian 12+)
 #   arcade-v1-linux-aarch64.tar.gz     (+ .sha256)
-#   arcade-v1-windows-x86_64.zip       (+ .sha256)
+#   arcade-v1-windows-x86_64.zip       (+ .sha256)   MSVC; Windows 10/11 x64
 #   arcade-v1-windows-x86_64-setup.exe (+ .sha256)   one-click installer around the zip's install.ps1
-# install.sh downloads arcade-v1-linux-<arch>.tar.gz. install.ps1 downloads arcade-v1-windows-x86_64.zip.
+#   arcade-v1-macos-aarch64.tar.gz     (+ .sha256)   for now only when the macOS build succeeds (not required yet)
+#   arcade-v1-macos-x86_64.tar.gz      (+ .sha256)
+# Every archive carries COMMIT (the commit it was built from); the release job refuses to publish unless every
+# archive's COMMIT is the tag's commit and every required platform (Linux x86_64 + aarch64, Windows x86_64) built.
+# No separate Windows releases (the old vX.Y.Z-windows pre-releases): a tag with a hyphen is refused.
+# install.sh downloads arcade-v1-linux-<arch>.tar.gz. install.ps1 downloads arcade-v1-windows-x86_64.zip. Arcades
+# take the same archives as program-<platform> files of the signed code release (scripts/code-publish.py).
 name: release
 
 on:
@@ -26,51 +30,68 @@ permissions:
   contents: read
 
 jobs:
+  # The required builds. Each row's steps for the other system are skipped (if: runner.os == ...).
   build:
+    name: build ${{ matrix.platform }}
     strategy:
       fail-fast: false
       matrix:
         include:
-          - arch: x86_64
+          - platform: linux-x86_64
             runner: ubuntu-22.04
-          - arch: aarch64
+          - platform: linux-aarch64
             runner: ubuntu-22.04-arm
+          - platform: windows-x86_64
+            runner: windows-latest
+            # Bitcoin Core's consensus library (crate bitcoinconsensus) builds secp256k1 statically;
+            # on MSVC its header declares the functions as DLL imports unless SECP256K1_STATIC is
+            # defined (link errors __imp_secp256k1_*). cl.exe adds CL to every compile.
+            # Core 26's pubkey.cpp also calls the ElligatorSwift module, which the crate leaves out (GNU ld
+            # drops the unused call on Linux; MSVC must resolve it): compile it in too.
+            cl: /DSECP256K1_STATIC /DENABLE_MODULE_ELLSWIFT=1
     runs-on: ${{ matrix.runner }}
+    env:
+      CL: ${{ matrix.cl }}
+      ARCADE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
         with:
           persist-credentials: false
 
+      # ---- Linux
       - name: Build tools
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update -q
           sudo apt-get install -y -q build-essential pkg-config clang libclang-dev \
             libwebkit2gtk-4.1-dev libgtk-3-dev libgmp-dev cmake
 
       - name: Rust
+        if: runner.os == 'Linux'
         run: |
           curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal
           echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
       - uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        if: runner.os == 'Linux'
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          key: ${{ matrix.platform }}-cargo-${{ hashFiles('Cargo.lock') }}
 
       - name: Build
-        env:
-          ARCADE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+        if: runner.os == 'Linux'
         run: |
           export LIBCLANG_PATH="$(dirname "$(ls /usr/lib/llvm-*/lib/libclang.so* | head -1)")"
           export BINDGEN_EXTRA_CLANG_ARGS="-I$(gcc -print-file-name=include)"
           cargo build --release --locked -p arcaded -p arcade-cli -p arcade-desktop
 
       - name: Package
+        if: runner.os == 'Linux'
         run: |
-          name=arcade-v1-linux-${{ matrix.arch }}
+          name=arcade-v1-${{ matrix.platform }}
           mkdir -p "$name/bin" "$name/scripts"
           cp target/release/arcaded target/release/arcade target/release/arcade-desktop "$name/bin/"
           strip "$name"/bin/*
@@ -81,38 +102,31 @@ jobs:
           sha256sum "$name.tar.gz" > "$name.tar.gz.sha256"
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Linux'
         with:
-          name: arcade-v1-linux-${{ matrix.arch }}
-          path: arcade-v1-linux-${{ matrix.arch }}.tar.gz*
+          name: arcade-v1-${{ matrix.platform }}
+          path: arcade-v1-${{ matrix.platform }}.tar.gz*
 
-  windows:
-    runs-on: windows-latest
-    env:
-      # Bitcoin Core's consensus library (crate bitcoinconsensus) builds secp256k1 statically;
-      # on MSVC its header declares the functions as DLL imports unless SECP256K1_STATIC is
-      # defined (link errors __imp_secp256k1_*). cl.exe adds CL to every compile.
-      # Core 26's pubkey.cpp also calls the ElligatorSwift module, which the crate leaves out (GNU ld
-      # drops the unused call on Linux; MSVC must resolve it): compile it in too.
-      CL: /DSECP256K1_STATIC /DENABLE_MODULE_ELLSWIFT=1
-    steps:
-      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
-        with:
-          persist-credentials: false
-
+      # ---- Windows
       - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+        if: runner.os == 'Windows'
 
       - name: "LLVM (libclang for libmdbx and chiavdf: the MSVC headers want Clang 20 or newer)"
+        if: runner.os == 'Windows'
         uses: KyleMayes/install-llvm-action@ebc0426251bc40c7cd31162802432c68818ab8f0 # v2
         with:
           version: "20.1.8"
 
       - name: MSVC headers for bindgen
+        if: runner.os == 'Windows'
         shell: pwsh
         run: . .\scripts\msvc-env.ps1
 
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+        if: runner.os == 'Windows'
 
-      - name: Test
+      - name: Test (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # chiavdf (the ARCADE chain's proof of time) links MPIR's DLLs: on the PATH for the tests.
@@ -121,16 +135,16 @@ jobs:
           if ($mpir) { $env:PATH = "$($mpir.FullName);$env:PATH" }
           cargo test --locked --workspace --exclude arcade-desktop -- --test-threads=2
 
-      - name: Build
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
-        run: |
-          $env:ARCADE_VERSION = if ('${{ github.event.inputs.version }}') { '${{ github.event.inputs.version }}' } else { '${{ github.ref_name }}' }
-          cargo build --release --locked -p arcaded -p arcade-cli -p arcade-desktop
+        run: cargo build --release --locked -p arcaded -p arcade-cli -p arcade-desktop
 
-      - name: Package
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          $name = 'arcade-v1-windows-x86_64'
+          $name = 'arcade-v1-${{ matrix.platform }}'
           New-Item -ItemType Directory -Force -Path "$name\bin","$name\scripts" | Out-Null
           Copy-Item target\release\arcaded.exe,target\release\arcade.exe,target\release\arcade-desktop.exe "$name\bin\"
           # MPIR (LGPL), which chiavdf links on Windows: its DLLs beside arcaded.exe, with its license.
@@ -140,32 +154,33 @@ jobs:
           Copy-Item (Join-Path $mpir.FullName 'LICENSE') "$name\bin\MPIR-LICENSE.txt"
           Copy-Item crates\arcade-desktop\icons\icon.png,crates\arcade-desktop\icons\icon.ico $name
           Copy-Item scripts\install.ps1,scripts\uninstall.ps1 "$name\scripts\"
-          # A double-click way in at the top of the folder without the installer program (Martin 2026-11-17).
+          # A double-click way in at the top of the folder without the installer program.
           Copy-Item scripts\windows\Install-PowerShell.cmd $name
           git rev-parse HEAD | Set-Content "$name\COMMIT" -Encoding ascii -NoNewline
           # Zipped after the installer is built (next step), so the zip carries it as Install.exe.
 
       - name: One-click installer (Setup.exe)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
           # The packaged folder above, wrapped in an NSIS installer (scripts/windows/setup.nsi) that runs
           # its install.ps1: double-click, no PowerShell, listed in Settings > Apps.
-          $name = 'arcade-v1-windows-x86_64'
+          $name = 'arcade-v1-${{ matrix.platform }}'
           $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
           if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress | Out-Null }
-          $ver = if ('${{ github.event.inputs.version }}') { '${{ github.event.inputs.version }}' } else { '${{ github.ref_name }}' }
-          & $nsis /NOCD /V2 "/DVERSION=$ver" "/DPKG=$name" "/DOUT=$name-setup.exe" scripts\windows\setup.nsi
+          & $nsis /NOCD /V2 "/DVERSION=$env:ARCADE_VERSION" "/DPKG=$name" "/DOUT=$name-setup.exe" scripts\windows\setup.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
           $hash = (Get-FileHash "$name-setup.exe" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("$pwd\$name-setup.exe.sha256", "$hash  $name-setup.exe`n")
           Get-ChildItem "$name-setup.exe*" | Format-Table Name,Length
 
       - name: Zip (with the installer inside)
+        if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # The zip's folder opens on Install.exe (Martin 2026-11-17: an installer at the top of the zip), beside
+          # The zip's folder opens on Install.exe (an installer at the top of the zip), beside
           # Install-PowerShell.cmd. The installer was built from the folder before this copy, so it doesn't carry itself.
-          $name = 'arcade-v1-windows-x86_64'
+          $name = 'arcade-v1-${{ matrix.platform }}'
           Copy-Item "$name-setup.exe" "$name\Install.exe"
           if (Test-Path "$name.zip") { Remove-Item "$name.zip" -Force }
           Compress-Archive -Path $name -DestinationPath "$name.zip"
@@ -174,47 +189,130 @@ jobs:
           Get-ChildItem "$name.zip*" | Format-Table Name,Length
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: runner.os == 'Windows'
         with:
-          name: arcade-v1-windows-x86_64
+          name: arcade-v1-${{ matrix.platform }}
           path: |
-            arcade-v1-windows-x86_64.zip*
-            arcade-v1-windows-x86_64-setup.exe*
+            arcade-v1-${{ matrix.platform }}.zip*
+            arcade-v1-${{ matrix.platform }}-setup.exe*
+
+  # macOS: built from the same commit, not required yet (a failure here doesn't stop the release). The archive holds
+  # the programs only; the Mac installer (launchd, app bundle) comes later.
+  macos:
+    name: build ${{ matrix.platform }} (optional)
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-aarch64
+            runner: macos-15
+          - platform: macos-x86_64
+            runner: macos-15-intel
+    runs-on: ${{ matrix.runner }}
+    env:
+      ARCADE_VERSION: ${{ github.event.inputs.version || github.ref_name }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
+      - uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
+
+      - name: Build tools
+        run: |
+          brew install gmp cmake
+          # chiavdf finds GMP's headers and library through these (Homebrew: /opt/homebrew on Apple silicon,
+          # /usr/local on Intel).
+          echo "CPATH=$(brew --prefix)/include" >> "$GITHUB_ENV"
+          echo "LIBRARY_PATH=$(brew --prefix)/lib" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2
+
+      - name: Build
+        run: cargo build --release --locked -p arcaded -p arcade-cli -p arcade-desktop
+
+      - name: Package
+        run: |
+          name=arcade-v1-${{ matrix.platform }}
+          mkdir -p "$name/bin"
+          cp target/release/arcaded target/release/arcade target/release/arcade-desktop "$name/bin/"
+          strip "$name"/bin/*
+          cp crates/arcade-desktop/icons/icon.png "$name/icon.png"
+          git rev-parse HEAD > "$name/COMMIT"
+          tar -czf "$name.tar.gz" "$name"
+          shasum -a 256 "$name.tar.gz" > "$name.tar.gz.sha256"
+
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: arcade-v1-${{ matrix.platform }}
+          path: arcade-v1-${{ matrix.platform }}.tar.gz*
 
   release:
-    needs: [build, windows]
-    if: ${{ always() && (needs.windows.result == 'success' || needs.build.result == 'success') }}
+    # Every required build must have succeeded (not always()); macOS is waited for and attached when it built.
+    needs: [build, macos]
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
+          pattern: arcade-v1-*
           merge-multiple: true
+
+      - name: Same commit everywhere
+        env:
+          WANT: ${{ github.sha }}
+        run: |
+          ls -la
+          # Every archive's COMMIT must be the commit this release is tagged on, and every required platform must
+          # be here: one release, one commit, every system.
+          python3 - <<'PY'
+          import glob, os, sys, tarfile, zipfile
+          want = os.environ["WANT"]
+          required = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+          def commit_of(path):
+              name = os.path.basename(path)
+              folder = name[:-7] if name.endswith(".tar.gz") else name[:-4]
+              if name.endswith(".zip"):
+                  with zipfile.ZipFile(path) as z:
+                      for i in z.infolist():
+                          if i.filename.replace("\\", "/") == f"{folder}/COMMIT":
+                              return z.read(i).decode().strip()
+              else:
+                  with tarfile.open(path) as t:
+                      for m in t.getmembers():
+                          if m.name.lstrip("./") == f"{folder}/COMMIT":
+                              return t.extractfile(m).read().decode().strip()
+              return None
+          bad, have = [], set()
+          for path in sorted(glob.glob("arcade-v1-*.tar.gz") + glob.glob("arcade-v1-*.zip")):
+              c = commit_of(path)
+              print(f"{path}: {c}")
+              if c != want:
+                  bad.append(f"{path}: COMMIT {c!r}, not {want}")
+              have.add(os.path.basename(path).removeprefix("arcade-v1-").removesuffix(".tar.gz").removesuffix(".zip"))
+          bad += [f"no arcade-v1-{p} archive" for p in required if p not in have]
+          if bad:
+              sys.exit("refusing to publish:\n  " + "\n  ".join(bad))
+          PY
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.event.inputs.version || github.ref_name }}
         run: |
-          ls -la
-          shopt -s nullglob
-          files=(arcade-v1-linux-* arcade-v1-windows-*)
-          if [ ${#files[@]} -eq 0 ]; then
-            echo "No release artifacts were built." >&2
-            exit 1
-          fi
-          # A hyphen in the tag (v0.1.0-windows) is a pre-release. Plain tags stay releases.
-          pre=()
+          # One release per version for every system: no more vX.Y.Z-windows pre-releases.
           case "$TAG" in
-            *-*) pre=(--prerelease) ;;
+            *-*) echo "refusing tag $TAG: releases are plain vX.Y.Z, one for every system" >&2; exit 1 ;;
           esac
+          shopt -s nullglob
+          files=(arcade-v1-*)
           if gh release view "$TAG" -R "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$TAG" "${files[@]}" --clobber -R "$GITHUB_REPOSITORY"
-            if [ ${#pre[@]} -gt 0 ]; then
-              gh release edit "$TAG" --prerelease -R "$GITHUB_REPOSITORY"
-            fi
           else
             gh release create "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
-              "${pre[@]}" \
               --title "Arcade V1.0 $TAG" \
-              --notes "**Windows 10/11 x64:** download **arcade-v1-windows-x86_64-setup.exe** and double-click it. Or download the zip, unpack it, and run **Install.exe** (or Install-PowerShell.cmd) from its folder.  **Linux** (x86_64, aarch64): curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash"
+              --notes "Every download here is built from one commit, $GITHUB_SHA (each archive's COMMIT file says so).  **Windows 10/11 x64:** download **arcade-v1-windows-x86_64-setup.exe** and double-click it. Or download the zip, unpack it, and run **Install.exe** (or Install-PowerShell.cmd) from its folder.  **Linux** (x86_64, aarch64): curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash"
           fi

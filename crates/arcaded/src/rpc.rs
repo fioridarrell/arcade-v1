@@ -546,6 +546,26 @@ fn block_of(node: &Node, p: &arcade_chain::params::ChainParams, b: u32) -> Optio
 mod tests {
     use super::*;
 
+    /// TxTOK 2026-11-18: a commit, then a chain of reveals each spending the one before, all sent
+    /// before any is mined. Every reveal was taken only after its parent's block ("spends an
+    /// unknown coin"); now the whole chain is taken at once, up to the ancestor limit.
+    #[test]
+    fn sendrawtransaction_takes_a_chain_of_waiting_reveals() {
+        use crate::mempoolshare::tests::{p2sh_funded, raw_spend};
+        let (t, fund, sh, sig) = p2sh_funded(11);
+        let mut prev = fund;
+        let mut value = 100_011u64;
+        for n in 0..20 {
+            value -= 100;
+            let raw = raw_spend(&prev, &sig, value, &sh, 0);
+            let id = call_on(&t.node, t.p, "sendrawtransaction", &[json!(hex::encode(&raw))]);
+            let tx = Tx::parse_with(&raw, &t.p.format).unwrap();
+            assert_eq!(id, Ok(json!(tx.txid.to_hex())), "reveal {n}");
+            prev = tx.txid;
+        }
+        assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 20, "all on their way to the coin's peers, in order");
+    }
+
     #[test]
     fn each_caller_lists_only_its_own_addresses() {
         let t = crate::sitesvc::tests::shared();

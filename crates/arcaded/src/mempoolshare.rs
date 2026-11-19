@@ -32,6 +32,96 @@ pub const POOL_BYTES: u64 = 20 << 20;
 /// Waiting ancestors a transaction from others may have (as a coin node's default limit), so
 /// a chain of children can't grow without end.
 pub const MAX_ANCESTORS: usize = 25;
+/// Virtual bytes a transaction and its waiting ancestors may add up to (as a coin node's default
+/// ancestor size limit, 101 kvB).
+pub const MAX_ANCESTOR_VBYTES: usize = 101_000;
+/// How long a passed-on transaction (one with an input this arcade can't check, sent to the coin's
+/// own peers without pooling) is remembered, so its children can spend its outputs before a block
+/// confirms it.
+const PASSED_FOR: u64 = 48 * 3600;
+/// Passed-on transactions remembered per chain, at most (oldest forgotten first).
+const PASSED_MAX: usize = 5_000;
+
+/// Transactions passed on to a coin's peers without being pooled here (an inscription's reveal and
+/// the like, whose input script this arcade can't check), by chain and txid. Their outputs are
+/// what the next reveal of a chain spends (TxTOK 2026-11-18: a chain of reveals stalled at one per
+/// block, "spends an unknown coin"). A child of one is passed on too, never pooled.
+#[derive(Default)]
+struct Passed {
+    /// (chain, txid) -> (seen, raw)
+    txs: HashMap<(u16, arcade_chain::Hash256), (u64, Vec<u8>)>,
+    /// (chain, coin) -> the passed-on transaction spending it
+    spent: HashMap<(u16, OutPoint), arcade_chain::Hash256>,
+}
+
+static PASSED: Mutex<Option<Passed>> = Mutex::new(None);
+
+fn passed<T>(f: impl FnOnce(&mut Passed) -> T) -> T {
+    let mut g = PASSED.lock().unwrap();
+    f(g.get_or_insert_with(Passed::default))
+}
+
+impl Passed {
+    fn forget(&mut self, p: &ChainParams, txid: &arcade_chain::Hash256) {
+        if let Some((_, raw)) = self.txs.remove(&(p.chain_no, *txid)) {
+            if let Ok(t) = Tx::parse_with(&raw, &p.format) {
+                for i in &t.inputs {
+                    if self.spent.get(&(p.chain_no, i.prevout)) == Some(txid) {
+                        self.spent.remove(&(p.chain_no, i.prevout));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Remember a passed-on transaction (and forget old ones).
+fn remember_passed(p: &ChainParams, tx: &Tx) {
+    let now = arcade_app::now();
+    passed(|m| {
+        if m.txs.contains_key(&(p.chain_no, tx.txid)) {
+            return;
+        }
+        let old: Vec<arcade_chain::Hash256> = m.txs.iter().filter(|(k, v)| k.0 == p.chain_no && now.saturating_sub(v.0) >= PASSED_FOR).map(|(k, _)| k.1).collect();
+        for t in old {
+            m.forget(p, &t);
+        }
+        if m.txs.keys().filter(|k| k.0 == p.chain_no).count() >= PASSED_MAX {
+            if let Some(oldest) = m.txs.iter().filter(|(k, _)| k.0 == p.chain_no).min_by_key(|(_, v)| v.0).map(|(k, _)| k.1) {
+                m.forget(p, &oldest);
+            }
+        }
+        m.txs.insert((p.chain_no, tx.txid), (now, tx.raw.clone()));
+        for i in &tx.inputs {
+            m.spent.insert((p.chain_no, i.prevout), tx.txid);
+        }
+    });
+}
+
+/// A passed-on transaction still remembered (and not yet in a block).
+fn passed_tx(node: &Node, p: &ChainParams, txid: &arcade_chain::Hash256) -> Option<Tx> {
+    let raw = passed(|m| m.txs.get(&(p.chain_no, *txid)).map(|v| v.1.clone()))?;
+    if node.chain.tx_raw(p, txid).ok().flatten().is_some() {
+        passed(|m| m.forget(p, txid));
+        return None;
+    }
+    Tx::parse_with(&raw, &p.format).ok().filter(|t| t.txid == *txid)
+}
+
+/// Whether a passed-on transaction other than `me` already spends this coin.
+fn passed_spender(p: &ChainParams, op: &OutPoint, me: &arcade_chain::Hash256) -> bool {
+    passed(|m| m.spent.get(&(p.chain_no, *op)).is_some_and(|t| t != me))
+}
+
+/// A transaction's virtual size: witness bytes count a quarter.
+pub fn vbytes(tx: &Tx) -> usize {
+    if !tx.has_witness() {
+        return tx.raw.len();
+    }
+    let wit: usize = tx.inputs.iter().map(|i| 1 + i.witness.iter().map(|w| w.len() + 1 + (w.len() >= 0xfd) as usize * 2).sum::<usize>()).sum::<usize>() + 2;
+    let base = tx.raw.len().saturating_sub(wit);
+    (base * 4 + wit).div_ceil(4)
+}
 /// Frames kept for links to send (oldest dropped; a slow link resends its pool instead).
 const RING: usize = 4000;
 /// Transactions a new link gets from our pool, per chain.
@@ -201,8 +291,11 @@ pub fn sort(node: &Node, p: &ChainParams, tx: &Tx) -> Result<Option<(usize, arca
     }
     let mut utxos = Vec::with_capacity(tx.inputs.len());
     let mut parents = Vec::new();
-    for i in &tx.inputs {
-        if node.chain.mempool_spender(c, &i.prevout).map_err(|e| e.to_string())?.is_some() {
+    // The first input that spends a passed-on transaction's output: the whole transaction is then
+    // passed on too (its parent was never checked here), not pooled.
+    let mut unchecked_parent: Option<usize> = None;
+    for (n, i) in tx.inputs.iter().enumerate() {
+        if node.chain.mempool_spender(c, &i.prevout).map_err(|e| e.to_string())?.is_some() || passed_spender(p, &i.prevout, &tx.txid) {
             return Err("spends a pooled coin twice".into());
         }
         let (value, script) = match node.chain.coin(p, &i.prevout).map_err(|e| e.to_string())? {
@@ -213,8 +306,18 @@ pub fn sort(node: &Node, p: &ChainParams, tx: &Tx) -> Result<Option<(usize, arca
             }
             Some(coin) => (coin.value, coin.script),
             None => {
-                let parent = node.chain.mempool_tx(c, &i.prevout.txid).map_err(|e| e.to_string())?.ok_or("spends an unknown coin")?;
-                let t = Tx::parse_with(&parent, &p.format).map_err(|e| e.to_string())?;
+                let t = match node.chain.mempool_tx(c, &i.prevout.txid).map_err(|e| e.to_string())? {
+                    Some(parent) => Tx::parse_with(&parent, &p.format).map_err(|e| e.to_string())?,
+                    // A parent passed on to the coin's peers (a reveal before this one): its outputs
+                    // are spendable, but this transaction is passed on too.
+                    None => match passed_tx(node, p, &i.prevout.txid) {
+                        Some(t) => {
+                            unchecked_parent.get_or_insert(n);
+                            t
+                        }
+                        None => return Err("spends an unknown coin".into()),
+                    },
+                };
                 if t.txid != i.prevout.txid {
                     return Err("spends an unknown coin".into());
                 }
@@ -225,8 +328,12 @@ pub fn sort(node: &Node, p: &ChainParams, tx: &Tx) -> Result<Option<(usize, arca
         };
         utxos.push(arcade_wallet::tx::Utxo { outpoint: OutPoint { txid: i.prevout.txid, vout: i.prevout.vout }, value, script });
     }
-    if ancestors(node, p, parents)? > MAX_ANCESTORS {
-        return Err(format!("more than {MAX_ANCESTORS} waiting ancestors"));
+    let (count, vb) = ancestors(node, p, parents)?;
+    if count > MAX_ANCESTORS {
+        return Err(format!("too-long-mempool-chain: more than {MAX_ANCESTORS} waiting ancestors"));
+    }
+    if vb + vbytes(tx) > MAX_ANCESTOR_VBYTES {
+        return Err(format!("too-long-mempool-chain: waiting ancestors and this transaction exceed {MAX_ANCESTOR_VBYTES} virtual bytes"));
     }
     let ins = utxos.iter().try_fold(0u64, |a, u| a.checked_add(u.value)).ok_or("inputs overflow")?;
     let outs = tx.outputs.iter().try_fold(0u64, |a, o| a.checked_add(o.value)).ok_or("outputs overflow")?;
@@ -239,13 +346,23 @@ pub fn sort(node: &Node, p: &ChainParams, tx: &Tx) -> Result<Option<(usize, arca
     // pending payment and makes a tag claim look taken, so an unchecked one must not get in. Such
     // transactions still reach every arcade once a block confirms them, or through the coin's
     // own peers (whose nodes check every script, `pass_on`), just not from other arcades.
-    arcade_wallet::verify::each(p, tx, &utxos).map_err(|(n, e)| format!("input {n}: {e}"))
+    match arcade_wallet::verify::each(p, tx, &utxos).map_err(|(n, e)| format!("input {n}: {e}"))? {
+        None => Ok(unchecked_parent.map(|n| (n, arcade_wallet::verify::Refused::Unknown("its coin comes from a transaction passed on unchecked".into())))),
+        some => Ok(some),
+    }
 }
 
 /// How many distinct waiting ancestors a transaction with these pooled parents has (counting
 /// stops just past MAX_ANCESTORS).
-fn ancestors(node: &Node, p: &ChainParams, parents: Vec<arcade_chain::Hash256>) -> Result<usize, String> {
+fn ancestors(node: &Node, p: &ChainParams, parents: Vec<arcade_chain::Hash256>) -> Result<(usize, usize), String> {
+    let waiting = |t: &arcade_chain::Hash256| -> Result<Option<Tx>, String> {
+        Ok(match node.chain.mempool_tx(p.chain_no, t).map_err(|e| e.to_string())? {
+            Some(raw) => Tx::parse_with(&raw, &p.format).ok(),
+            None => passed_tx(node, p, t),
+        })
+    };
     let mut seen = std::collections::HashSet::new();
+    let mut vb = 0usize;
     let mut todo = parents;
     while let Some(t) = todo.pop() {
         if !seen.insert(t) {
@@ -254,15 +371,15 @@ fn ancestors(node: &Node, p: &ChainParams, parents: Vec<arcade_chain::Hash256>) 
         if seen.len() > MAX_ANCESTORS {
             break;
         }
-        let Some(raw) = node.chain.mempool_tx(p.chain_no, &t).map_err(|e| e.to_string())? else { continue };
-        let Ok(tx) = Tx::parse_with(&raw, &p.format) else { continue };
+        let Some(tx) = waiting(&t)? else { continue };
+        vb += vbytes(&tx);
         for i in &tx.inputs {
-            if !seen.contains(&i.prevout.txid) && node.chain.mempool_tx(p.chain_no, &i.prevout.txid).map_err(|e| e.to_string())?.is_some() {
+            if !seen.contains(&i.prevout.txid) && waiting(&i.prevout.txid)?.is_some() {
                 todo.push(i.prevout.txid);
             }
         }
     }
-    Ok(seen.len())
+    Ok((seen.len(), vb))
 }
 
 /// Per link, each round: new pooled transactions; a link new to us (or back after a gap) gets
@@ -419,6 +536,115 @@ pub(crate) mod tests {
         assert!(shared(&small.raw));
     }
 
+    /// A transaction spending output 0 of `prev` with `script_sig`, paying `value` to `out` and, if
+    /// `pad` > 0, an OP_RETURN output of that many bytes (to make it big).
+    pub(crate) fn raw_spend(prev: &Hash256, script_sig: &[u8], value: u64, out: &[u8], pad: usize) -> Vec<u8> {
+        let push = |o: &mut Vec<u8>, n: usize| {
+            if n < 0xfd {
+                o.push(n as u8);
+            } else {
+                o.push(0xfd);
+                o.extend_from_slice(&(n as u16).to_le_bytes());
+            }
+        };
+        let mut o = 1i32.to_le_bytes().to_vec();
+        o.push(1);
+        o.extend_from_slice(&prev.0);
+        o.extend_from_slice(&0u32.to_le_bytes());
+        push(&mut o, script_sig.len());
+        o.extend_from_slice(script_sig);
+        o.extend_from_slice(&u32::MAX.to_le_bytes());
+        o.push(if pad > 0 { 2 } else { 1 });
+        o.extend_from_slice(&value.to_le_bytes());
+        push(&mut o, out.len());
+        o.extend_from_slice(out);
+        if pad > 0 {
+            o.extend_from_slice(&0u64.to_le_bytes());
+            push(&mut o, pad);
+            o.push(0x6a);
+            o.extend(std::iter::repeat(0u8).take(pad - 1));
+        }
+        o.extend_from_slice(&0u32.to_le_bytes());
+        o
+    }
+
+    /// A confirmed coin at a P2SH script this arcade can't check (as an inscription's commit
+    /// pays): (the chain, the coin's txid, the script, the redeem script's push).
+    pub(crate) fn p2sh_funded(salt: u64) -> (T, Hash256, Vec<u8>, Vec<u8>) {
+        let (t, _) = funded();
+        let redeem = [0x51u8, 0x75, 0x51];
+        let sh = arcade_ledger::address::p2sh_script(&arcade_ledger::address::hash160(&redeem));
+        // Each test its own coin: the passed-on table is shared by every test.
+        let fund = tx(&[(t.spend.txid, 1)], &[(100_000 + salt, sh.clone())], 7);
+        let tip = t.node.chain.tip(t.p.chain_no).unwrap().unwrap();
+        t.node.chain.connect_blocks(t.p, &[block(tip.hash, vec![tx(&[], &[(5000, p2pkh(3))], 8), fund.clone()], 5)]).unwrap();
+        (t, fund.txid, sh, vec![3, 0x51, 0x75, 0x51])
+    }
+
+    /// A chain of reveals (each spending the one before, all waiting): every one is passed on to the
+    /// coin's peers as its parent was, up to the ancestor limit; none waits for a block
+    /// (TxTOK 2026-11-18: reveal 2 got "spends an unknown coin" until reveal 1 was mined).
+    #[test]
+    fn a_chain_of_unchecked_reveals_is_passed_on_up_to_the_ancestor_limit() {
+        let (t, fund, sh, sig) = p2sh_funded(1);
+        let mut prev = fund;
+        let mut value = 100_001u64;
+        for n in 0..=MAX_ANCESTORS {
+            value -= 100;
+            let raw = raw_spend(&prev, &sig, value, &sh, 0);
+            let tx = Tx::parse_with(&raw, &t.p.format).unwrap();
+            let sorted = sort(&t.node, t.p, &tx);
+            assert!(matches!(sorted, Ok(Some(_))), "reveal {n} ({n} waiting ancestors): {sorted:?}");
+            pass_on(&t.node, t.p, raw);
+            prev = tx.txid;
+        }
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty(), "none pooled");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().len(), MAX_ANCESTORS + 1, "all passed on, in order");
+        let next = Tx::parse_with(&raw_spend(&prev, &sig, value - 100, &sh, 0), &t.p.format).unwrap();
+        assert!(sort(&t.node, t.p, &next).unwrap_err().contains("too-long-mempool-chain"));
+    }
+
+    /// A second spend of a passed-on transaction's output is refused, as for a pooled one.
+    #[test]
+    fn a_passed_on_output_is_spent_once() {
+        let (t, fund, sh, sig) = p2sh_funded(2);
+        let r1 = raw_spend(&fund, &sig, 99_000, &sh, 0);
+        let t1 = Tx::parse_with(&r1, &t.p.format).unwrap();
+        pass_on(&t.node, t.p, r1);
+        let a = Tx::parse_with(&raw_spend(&t1.txid, &sig, 98_000, &sh, 0), &t.p.format).unwrap();
+        assert!(matches!(sort(&t.node, t.p, &a), Ok(Some(_))));
+        pass_on(&t.node, t.p, a.raw.clone());
+        let b = Tx::parse_with(&raw_spend(&t1.txid, &sig, 97_000, &sh, 0), &t.p.format).unwrap();
+        assert_eq!(sort(&t.node, t.p, &b).unwrap_err(), "spends a pooled coin twice");
+    }
+
+    /// Ancestors are also capped by their virtual size (101 kvB with the transaction itself).
+    #[test]
+    fn a_chain_is_capped_by_size_too() {
+        let (t, fund, sh, sig) = p2sh_funded(3);
+        let mut prev = fund;
+        let mut value = 100_003u64;
+        let mut n = 0;
+        loop {
+            value -= 100;
+            let tx = Tx::parse_with(&raw_spend(&prev, &sig, value, &sh, 30_000), &t.p.format).unwrap();
+            match sort(&t.node, t.p, &tx) {
+                Ok(Some(_)) => {
+                    pass_on(&t.node, t.p, tx.raw.clone());
+                    prev = tx.txid;
+                    n += 1;
+                }
+                Err(e) => {
+                    assert!(e.contains("virtual bytes"), "{e}");
+                    break;
+                }
+                Ok(None) => panic!("an unchecked parent was pooled"),
+            }
+            assert!(n < 10);
+        }
+        assert_eq!(n, 3, "three of ~30 kB fit under 101 kvB, a fourth doesn't");
+    }
+
     #[test]
     fn a_full_pool_takes_nothing_more_from_others() {
         let (t, coins) = funded();
@@ -435,17 +661,54 @@ pub(crate) mod tests {
 /// Send `raw` to the coin's own network without pooling it: the home chain's through its P2P
 /// link, an installed chain we lend straight to a few of its own peers.
 pub fn pass_on(node: &Node, p: &'static ChainParams, raw: Vec<u8>) {
+    // Remembered, so a child spending its outputs can follow it before a block confirms it.
+    if let Ok(tx) = Tx::parse_with(&raw, &p.format) {
+        remember_passed(p, &tx);
+    }
     if p.chain_no == node.params.chain_no {
         node.tx_outbox.lock().unwrap().push(raw);
         return;
     }
-    let peers: Vec<String> = node.coin_candidates(p).into_iter().take(4).collect();
-    std::thread::spawn(move || {
-        for a in peers {
-            if let Ok(mut peer) = arcade_chain::p2p::Peer::connect(p, &a, std::time::Duration::from_secs(10)) {
-                let _ = peer.send_tx(&raw);
+    // In order, through one sender per chain: a reveal must reach the coin's peers after the
+    // transaction it spends (a thread per transaction could send a child first).
+    let start = {
+        let mut q = SEND_Q.lock().unwrap();
+        let q = q.get_or_insert_with(HashMap::new);
+        let e = q.entry(p.chain_no).or_insert_with(|| (VecDeque::new(), false));
+        e.0.push_back(raw);
+        let start = !e.1;
+        e.1 = true;
+        start
+    };
+    if start {
+        let peers: Vec<String> = node.coin_candidates(p).into_iter().take(4).collect();
+        std::thread::Builder::new().name(format!("pass on {}", p.key)).spawn(move || send_in_order(p, peers)).ok();
+    }
+}
+
+/// Transactions waiting to be passed on, per chain, and whether that chain's sender runs.
+static SEND_Q: Mutex<Option<HashMap<u16, (VecDeque<Vec<u8>>, bool)>>> = Mutex::new(None);
+
+/// One chain's sender: everything queued, oldest first, to each peer over one connection, until
+/// the queue is empty.
+fn send_in_order(p: &'static ChainParams, peers: Vec<String>) {
+    loop {
+        let batch: Vec<Vec<u8>> = {
+            let mut q = SEND_Q.lock().unwrap();
+            let e = q.get_or_insert_with(HashMap::new).entry(p.chain_no).or_insert_with(|| (VecDeque::new(), false));
+            if e.0.is_empty() {
+                e.1 = false;
+                return;
+            }
+            e.0.drain(..).collect()
+        };
+        for a in &peers {
+            if let Ok(mut peer) = arcade_chain::p2p::Peer::connect(p, a, std::time::Duration::from_secs(10)) {
+                for raw in &batch {
+                    let _ = peer.send_tx(raw);
+                }
                 std::thread::sleep(std::time::Duration::from_secs(2));
             }
         }
-    });
+    }
 }

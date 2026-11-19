@@ -32,6 +32,8 @@ mod arcstats;
 mod arcnodes;
 mod arcseg;
 mod arcblob;
+mod diskbudget;
+mod fogmap;
 mod fogstore;
 mod arcgit;
 mod receipts;

@@ -2744,14 +2744,25 @@ fn blob_copies(node: &Node, svc: &Svc, h: u64) -> (u64, bool) {
     (copies, here)
 }
 
-/// The audited replicas the registry counts of the ARCADE blob-family segment of `family` covering height `h`: None
-/// while no listed segment covers it (crate::fogstore).
-pub fn segment_replicas(family: u8, h: u64) -> Option<u64> {
+/// The registered replicas of the listed ARCADE blob-family segment of `family` covering height `h`, each as (owner key
+/// hex, audited): audited = it passed an audit and hasn't missed one since (the whitepaper's "copies count only when
+/// audited"). None while no listed segment covers it (crate::fogstore). A read of the chain's state only: what the
+/// registry counts for pay (`Registry::holders_of`, consensus) is untouched.
+pub fn segment_holders(family: u8, h: u64) -> Option<Vec<(String, bool)>> {
     let svc = svc()?;
     let st = svc.st.lock().unwrap();
     let reg = st.chain.storage();
-    let n = reg.catalog().spans(svc.net.key, family).filter(|(first, last, _)| *first <= h && h <= *last).find_map(|(_, _, listed)| listed.map(|l| reg.holders_of(&l.id)));
-    n
+    let listed = reg.catalog().spans(svc.net.key, family).filter(|(first, last, _)| *first <= h && h <= *last).find_map(|(_, _, listed)| listed.map(|l| l.id))?;
+    Some(replicas_audited(reg, &listed))
+}
+
+/// A segment's registered replicas: (owner key hex, audited).
+pub(crate) fn replicas_audited(reg: &arcade_arc::registry::Registry, segment: &arcade_arc::merkle::Hash) -> Vec<(String, bool)> {
+    reg.all_replicas()
+        .into_iter()
+        .filter(|(_, seg, _, _)| seg == segment)
+        .map(|(id, _, owner, _)| (hex::encode(owner), reg.replica_audit(&id).is_some_and(|a| a.1 == 0) && reg.draw_from(&id).is_some()))
+        .collect()
 }
 
 /// Whether this arcade keeps every blob's plain copy (`arc.archive`).
@@ -3176,6 +3187,24 @@ pub fn earn(node: &Node, req: &Value) -> Result<Value, String> {
 /// Whether a coin's data can earn on the ARCADE network this arcade knows: one of its listed chains for the next block
 /// (params.rs `Net::listed_at`; adding one is a rules version, so it flips at that version's height). Before block 0
 /// (a defined network not running yet) block 0's list. Never call with the chain's state locked.
+/// Whether Earn ARCADE is on here for any coin (the per-coin switch, a coin kept here in full, not borrowed, and
+/// paid), with the ARCADE chain running: what the app's keep-share suggestion asks (crate::fogstore::api_keep).
+pub fn earning_any(node: &Node) -> bool {
+    let Some(arc) = defined() else { return false };
+    if let Some(on) = crate::diskbudget::test_earn() {
+        return on && svc().is_some();
+    }
+    svc().is_some()
+        && crate::chains::all().any(|p| {
+            p.key != arc.key
+                && node.mode_of(p.key).as_deref() == Some("full")
+                && crate::chains::kept(node, p)
+                && !crate::borrow::is_borrowed(p.key)
+                && crate::arcseg::earn_on(node, p.key)
+                && paid_here(p)
+        })
+}
+
 fn paid_here(p: &ChainParams) -> bool {
     let at = svc().map(|s| (s.net, s.next_height())).or_else(|| defined_net().map(|d| (d.0, 0)));
     at.is_none_or(|(n, h)| n.is_listed_at(p.key, h))

@@ -330,6 +330,24 @@ mod tests {
         });
     }
 
+    /// A borrower's chain of reveals (each spending the one before, none mined yet) is taken by the
+    /// lender one after another, not one per block.
+    #[test]
+    fn a_borrowers_chain_of_reveals_is_taken_at_once() {
+        use crate::mempoolshare::tests::{p2sh_funded, raw_spend};
+        let (t, fund, sh, sig) = p2sh_funded(12);
+        let mut prev = fund;
+        let mut value = 100_012u64;
+        for n in 0..10 {
+            value -= 100;
+            let raw = raw_spend(&prev, &sig, value, &sh, 0);
+            assert!(on_tx(&t.node, t.p, &raw), "reveal {n}");
+            prev = arcade_chain::Tx::parse_with(&raw, &t.p.format).unwrap().txid;
+        }
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty(), "passed on, not pooled");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 10);
+    }
+
     /// A spend of a P2SH coin whose script this arcade can't check (an inscription reveal, say)
     /// goes on to the coin's own peers but never into the pool; one with the wrong script doesn't.
     #[test]

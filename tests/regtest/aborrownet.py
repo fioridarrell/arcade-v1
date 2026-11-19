@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""A:// writes from an arcade that only borrows ARCADE (Martin 2026-11-18: "It's just a transaction that needs to be
+"""A:// writes (and blobs) from an arcade that only borrows ARCADE (Martin 2026-11-18: "It's just a transaction that needs to be
 sent"), on a closed local ARCADE chain. A writes the chain; C never installs it. C publishes a profile, follows A's
 @tag, saves a contact, likes, replies to and tips A's post, all signed at C and sent by its lender, and every one
-confirms on A and is counted there. A blob (a long body) is refused with a clear reason.
+confirms on A and is counted there. Publishing a blob from C is refused with a clear reason. A blob A published is
+viewed at C (kept in C's cache under its home); then, with A gone, D (linked to C only) gets it from C.
 
 Run inside: unshare -Urn sh -c "ip link set lo up; python3 aborrownet.py ARCADED WORKDIR"
 """
 import hashlib, json, os, shutil, socket, subprocess, sys, time
 
 EXE, WORK = sys.argv[1], sys.argv[2]
-PORTS = {"A": (18641, 18651), "C": (18642, 18652)}
+PORTS = {"A": (18641, 18651), "C": (18642, 18652), "D": (18643, 18653)}
 procs = {}
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
@@ -210,6 +211,37 @@ def main():
         print("   refused:", str(e)[:160])
         if "need ARCADE installed" not in str(e):
             fails.append(f"the refusal doesn't say why: {e}")
+    print("6. A publishes a blob; C (borrowing) views it and keeps it; with A gone, D gets it from C")
+    data = ("blob for the borrowers " * 400).encode()
+    pub = call("A", "arc.blob_publish", hex=data.hex(), type="text/plain", send=True)
+    bid = pub["blob"]
+    print("   blob", bid[:16], len(data), "bytes")
+    if not wait("the blob's transaction in a block", lambda: confirmed("A", pub["txid"]), 300):
+        fails.append("the blob didn't confirm")
+    try:
+        got = call("C", "arc.blob", id=bid)
+        if bytes.fromhex(got["hex"]) != data:
+            fails.append("C got other bytes")
+    except RuntimeError as e:
+        fails.append(f"C can't view the blob: {e}")
+    cached = os.path.join(home("C"), "arc", "arctest", "blobs", "cache", bid)
+    print("   C's cache file:", os.path.exists(cached), cached.replace(WORK, "<work>"))
+    if not os.path.exists(cached):
+        fails.append("C didn't keep the blob under its home")
+    if os.path.exists(os.path.join(os.getcwd(), "cache", bid)):
+        fails.append("the blob went to a cache/ folder in the working directory")
+    stop("A")
+    start("D", peer="C", settings=sp)
+    if not wait("D links to C", lambda: any(x.get("node_id") == call("C", "status")["node_id"] for x in call("D", "peers")), 120):
+        fails.append("D didn't link to C")
+    try:
+        got = call("D", "arc.blob", id=bid)
+        if bytes.fromhex(got["hex"]) != data:
+            fails.append("D got other bytes")
+        else:
+            print("   D got the blob from C:", got["bytes"], "bytes")
+    except RuntimeError as e:
+        fails.append(f"D can't get the blob from C: {e}")
     print("RESULT:", "PASS" if not fails else "FAIL", fails)
     return 0 if not fails else 1
 

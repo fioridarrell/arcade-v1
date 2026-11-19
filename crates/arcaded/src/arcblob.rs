@@ -35,7 +35,7 @@ fn with<R>(f: impl FnOnce(&mut Waiting) -> R) -> R {
 
 static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-/// Where the store is: `<home>/arc/<net>/blobs` (set when the chain starts).
+/// Where the store is: `<home>/arc/<net>/blobs` (set when the chain is defined, installed or borrowed).
 pub fn init(dir: PathBuf) {
     let _ = std::fs::create_dir_all(&dir);
     let _ = DIR.set(dir);
@@ -204,15 +204,24 @@ pub fn view(id: &Hash) -> Option<Vec<u8>> {
         return Some(b);
     }
     // Installed: the arcades its chain is linked to. Only borrowed (no chain running here): the arcades lending it.
-    let (net, peers) = match crate::arcsvc::svc_net() {
+    // Installed: the arcades its chain is linked to. Only borrowed (no chain running here): the arcades lending it.
+    // Then any other arcade linked now (one that viewed the blob keeps it and serves it, borrowing or not).
+    let (net, mut peers) = match crate::arcsvc::svc_net() {
         Some(net) => (net, crate::arcsvc::linked_peers()),
         None => {
             let (net, ..) = crate::arcsvc::defined_net()?;
             (net, crate::arcsvc::defined().map(|p| crate::borrow::linked_lenders(p.key)).unwrap_or_default())
         }
     };
+    // At most a few of those: each that has no answer costs its wait.
+    let extra: Vec<String> = crate::crvia::linked_ids().into_iter().filter(|id| !peers.contains(id)).take(OTHER_PEERS).collect();
+    peers.extend(extra);
     for peer in peers {
-        if let Ok((b, kind, gz)) = fetch_from(&peer, id) {
+        let got = fetch_from(&peer, id);
+        if let Err(e) = &got {
+            eprintln!("arc: blob {} not fetched from {}: {e}", &hex::encode(id)[..12], &peer[..peer.len().min(16)]);
+        }
+        if let Ok((b, kind, gz)) = got {
             if arcade_arc::blob::id_of_bytes(&net, &b) == *id {
                 cache_put(id, &b);
                 if !kind.is_empty() {
@@ -241,6 +250,9 @@ pub fn gzipped(id: &Hash) -> bool {
         None => cache_dir().join(format!("{}.gz", hex::encode(id))).exists(),
     }
 }
+
+/// Other linked arcades a blob is asked of once its chain's own peers (or lenders) don't have it.
+const OTHER_PEERS: usize = 6;
 
 /// Bytes of a blob per answer piece (a mesh frame is 64 KiB at most, head and blob).
 const PIECE: u64 = 48_000;

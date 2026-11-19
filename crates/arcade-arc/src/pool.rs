@@ -73,6 +73,12 @@ impl Waiting {
     fn bytes(&self) -> usize {
         self.tx.raw.len()
     }
+
+    /// Its number in the order of arrival (what `Pool::after` goes by): a peer told of numbers up to this one has
+    /// been told of it.
+    pub fn seq(&self) -> u64 {
+        self.seq
+    }
 }
 
 /// Does `a` pay more per byte than `b`? (fee, bytes)

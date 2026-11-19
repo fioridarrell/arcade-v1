@@ -354,6 +354,9 @@ struct Peer {
     /// `ignored_until` (as coin nodes ban a peer that sends bad blocks).
     strikes: VecDeque<Instant>,
     ignored_until: Option<Instant>,
+    /// The height its last tip frame named, and when (its word only: what `chains.status` and `status chain=` show
+    /// as the best height peers know of, never used to judge a block).
+    told_height: Option<(u64, Instant)>,
 }
 
 impl Svc {
@@ -1966,6 +1969,9 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
                 }
                 p.heard = true;
                 p.wants = (!have).then_some(id);
+                if let Some(h) = f.head["h"].as_u64() {
+                    p.told_height = Some((h, Instant::now()));
+                }
                 // While an ask is out, its answer decides whether to ask again.
                 // An answer still arriving is waited for: only one that stalled is asked over.
                 let streaming = p.parts.is_some() && p.answer_at.is_some_and(|t| t.elapsed() <= ASK_AGAIN);
@@ -2016,7 +2022,10 @@ fn blob_of(ids: &[Hash256]) -> Vec<u8> {
 fn on_inv(svc: &Svc, link: &mut Link, blob: &[u8]) -> Result<(), LinkError> {
     let new: Vec<Hash256> = {
         let st = svc.st.lock().unwrap();
-        ids_of(blob, INV_IDS).into_iter().filter(|id| !st.pool.contains(id) && !st.refused.contains(id)).collect()
+        let ids = ids_of(blob, INV_IDS);
+        // Ones we have: that arcade holds them in its pool too (tx.status: peers_holding).
+        note_held(&link.peer_id, ids.iter().filter(|id| st.pool.contains(id)));
+        ids.into_iter().filter(|id| !st.pool.contains(id) && !st.refused.contains(id)).collect()
     };
     {
         let mut peers = svc.peers.lock().unwrap();
@@ -2029,6 +2038,35 @@ fn on_inv(svc: &Svc, link: &mut Link, blob: &[u8]) -> Result<(), LinkError> {
         }
     }
     ask_txs(svc, link)
+}
+
+/// Waiting transactions of ours that linked arcades named back in their "inv" (so they hold them): txid -> peers.
+fn held_by() -> std::sync::MutexGuard<'static, HashMap<Hash256, std::collections::BTreeSet<String>>> {
+    static H: std::sync::OnceLock<Mutex<HashMap<Hash256, std::collections::BTreeSet<String>>>> = std::sync::OnceLock::new();
+    H.get_or_init(Default::default).lock().unwrap()
+}
+
+fn note_held<'a>(peer: &str, ids: impl Iterator<Item = &'a Hash256>) {
+    let mut h = held_by();
+    if h.len() > 4096 {
+        h.clear();
+    }
+    for id in ids {
+        h.entry(*id).or_default().insert(peer.to_string());
+    }
+}
+
+/// How far a waiting transaction went (tx.status, ARCADE #25): in this arcade's pool; how many linked arcades it
+/// was offered to ("inv", peers_sent) out of those linked, and how many named it back as held in theirs
+/// (peers_holding). None when the ARCADE chain doesn't run here.
+pub fn relay_status(txid: &Hash256) -> Option<Value> {
+    let svc = svc()?;
+    let seq = svc.st.lock().unwrap().pool.get(txid).map(|w| w.seq());
+    let peers = svc.peers.lock().unwrap();
+    let linked: Vec<(&String, &Peer)> = peers.iter().filter(|(_, p)| p.seen.is_some_and(|t| t.elapsed() < LINKED)).collect();
+    let sent = seq.map(|s| linked.iter().filter(|(_, p)| p.tx_told.is_some_and(|t| t >= s)).count());
+    let holding = held_by().get(txid).map(|s| s.len()).unwrap_or(0);
+    Some(json!({"in_pool": seq.is_some(), "peers_linked": linked.len(), "peers_sent": sent, "peers_holding": holding}))
 }
 
 /// Ask `peer` for the next transactions it named, unless an ask is out.
@@ -2537,6 +2575,16 @@ pub fn unspent(op: &OutPoint) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().chain.coins().contains_key(op))
 }
 
+/// An unspent coin of the running ARCADE chain's best branch, (script, value), and the transaction that made it, read
+/// from its block (the store copy follows a block a moment later; a website's PSBT needs it at once).
+pub fn coin_and_tx(op: &OutPoint) -> Option<(Vec<u8>, u64, Option<Vec<u8>>)> {
+    let svc = svc()?;
+    let st = svc.st.lock().unwrap();
+    let c = st.chain.coins().get(op)?;
+    let tx = st.chain.id_at(c.height).and_then(|id| st.chain.block(&id)).and_then(|b| b.txs.iter().find(|t| t.txid == op.txid).map(|t| t.raw.clone()));
+    Some((c.script.clone(), c.value, tx))
+}
+
 /// How many blocks in a row up to the tip `me` wrote (at most `max`).
 fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(chain: &Chain<T, S>, me: &[u8; 32], max: u64) -> u64 {
     alone_streak_from(chain, me, max, chain.tip().height)
@@ -2833,21 +2881,64 @@ pub fn chain_status(node: &Node) -> Option<Value> {
         let state = if REMOVING.load(Ordering::Relaxed) { "being removed" } else { "" };
         return Some(json!({"key": p.key, "name": p.name, "installed": false, "home": false, "arcade": true, "local": true, "state": state}));
     };
-    let (height, waiting) = {
+    let (height, tip_id, waiting) = {
         let st = svc.st.lock().unwrap();
-        (st.chain.tip().height, st.pool.len())
+        (st.chain.tip().height, st.chain.tip().id.to_hex(), st.pool.len())
     };
     let addresses = node.chain.addresses_on(p.chain_no).unwrap_or(false);
     let links = svc.peers.lock().unwrap().len();
+    // Measured against the best height linked arcades tell of, never a made-up 100 (ARCADE #25): unknown (null)
+    // while none has told one lately.
+    let told = peer_heights();
+    let best = told.iter().map(|t| t.1).max().map(|b| b.max(height));
+    let overall = best.map(|b| if b == 0 { 100.0 } else { (height as f64 * 100.0 / b as f64).min(100.0) });
+    // Installed, and still read through a borrowed copy while it catches up (crate::arcsvc::source): said so, as
+    // borrow.status says it (ARCADE #25: the two answers disagreed).
+    let borrowed = borrowed(p);
+    let behind = best.map(|b| b.saturating_sub(height));
+    let state = match behind {
+        None => format!("block {height}"),
+        Some(0) => format!("block {height}"),
+        Some(n) => format!("block {height}, {n} behind"),
+    };
     Some(json!({
         "key": p.key, "name": p.name, "installed": true, "home": false, "arcade": true, "local": true,
-        "mode": "full", "indexes": if addresses { vec!["addresses"] } else { vec![] },
-        "overall": 100.0, "state": format!("block {height}"), "tip": height, "waiting": waiting,
+        "mode": if borrowed { "borrowed" } else { "full" }, "source": if borrowed { "borrowed" } else { "own" },
+        "own_copy": {"mode": "full", "tip": height},
+        "indexes": if addresses { vec!["addresses"] } else { vec![] },
+        "overall": overall, "state": state, "tip": height, "tip_hash": tip_id, "waiting": waiting,
+        "best_known": best, "best_known_from": told.len(), "best_known_age_s": told.iter().map(|t| t.2).min(), "behind": behind,
+        "peer_tips": told.iter().map(|t| json!({"node": &t.0[..t.0.len().min(16)], "height": t.1, "age_s": t.2})).collect::<Vec<_>>(),
         "stages": [{
-            "name": "Blocks", "pct": 100.0, "info": true,
-            "detail": format!("block {height} · {waiting} transaction{} waiting · heard from {links} arcade{}", if waiting == 1 { "" } else { "s" }, if links == 1 { "" } else { "s" }),
+            "name": "Blocks", "pct": overall, "info": true, "at": height, "of": best,
+            "detail": format!("block {height}{} · {waiting} transaction{} waiting · heard from {links} arcade{}",
+                match best { Some(b) if b > height => format!(" of {b}"), Some(_) => String::new(), None => " (no linked arcade has told its height yet)".into() },
+                if waiting == 1 { "" } else { "s" }, if links == 1 { "" } else { "s" }),
         }],
     }))
+}
+
+/// The heights linked arcades told in their tip frames within the last 10 minutes: (node, height, seconds ago),
+/// the freshest first.
+pub fn peer_heights() -> Vec<(String, u64, u64)> {
+    let Some(svc) = svc() else { return Vec::new() };
+    let peers = svc.peers.lock().unwrap();
+    let mut v: Vec<(String, u64, u64)> = peers
+        .iter()
+        .filter_map(|(id, p)| p.told_height.filter(|(_, at)| at.elapsed() < Duration::from_secs(600)).map(|(h, at)| (id.clone(), h, at.elapsed().as_secs())))
+        .collect();
+    v.sort_by_key(|x| x.2);
+    v
+}
+
+/// Say the rules warning in the log every 10 minutes while an update is needed (ARCADE #25: it was 1 line in 201).
+pub fn warn_rules_while_needed() {
+    let _ = std::thread::Builder::new().name("rules warning".into()).spawn(|| loop {
+        std::thread::sleep(Duration::from_secs(600));
+        if let Some(w) = update_needed() {
+            eprintln!("arcaded: UPDATE NEEDED: {w}");
+        }
+    });
 }
 
 /// `arc.block`: a block of the branch this arcade is on, by height, or any block it holds, by id.

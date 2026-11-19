@@ -67,7 +67,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `status` | `/api/v1/status` | public | — | Home chain, sync state, tags, profiles, mesh links, node id. |
+| `status` | `/api/v1/status` | public | chain? | Home chain, sync state, tip, best_known (the best height anyone tells us of), tags, profiles, mesh links, node id, phase (starting, ready, stopping) and rules.update_needed. With chain (a key, e.g. arctest): that chain alone: tip {height, hash}, best_known (from linked peers, null when none told), best_known_from, behind, sync (synced, syncing, unknown, not_kept), mode and source (own or borrowed), and for the ARCADE chain its rules. |
 | `peers` | `/api/v1/peers` | read | — | Arcades linked over the mesh right now. |
 | `events` | `/api/v1/events` | read | n?, kind? | Recent activity (newest first), optionally of one kind. |
 | `mempool` | `/api/v1/mempool` | public | — | Home chain transactions waiting for a block. |
@@ -87,7 +87,11 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `mesh.udp` | `/api/v1/mesh/udp` | read | — | UDP hole punching: STUN server and proved addresses, NAT kind, which links run over UDP paths (RTT, packets), introductions. `relay`: the media relay (allocations, this month's use, its limit, the address its sockets are reached at). |
 | `mesh.udp_set` | `/api/v1/mesh/udp_set` | admin | on?, lan_dial?, stun_port?, turn?, turn_limit_gb?, drop? | Turn UDP paths and introductions on or off (ARCADE_MESH_UDP=0 overrides), offer LAN addresses to every peer, set the STUN port for the next start (0 = none); drop = a peer id prefix whose path to fail now (falls back to TCP). `turn` turns the media relay on the STUN port on or off, `turn_limit_gb` is its monthly limit (100 by default); both from the next start. |
-| `mesh.overview` | `/api/v1/mesh/overview` | public | — | The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours. |
+| `mesh.overview` | `/api/v1/mesh/overview` | public | — | The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours. Each arcade's row has `ping_ms` (the link's round trip: the least of its last pongs; null when not linked) with `ping_via` (`link` or `relay`), and `machine` when it shares its system info. |
+| `mesh.sysinfo` | `/api/v1/mesh/sysinfo` | public | — | The machines behind the mesh, as their operators share them (opt-in): every other arcade's newest signed record heard in the last 24 h (CPU, cores, RAM, GPUs with VRAM or `unified`, disk total and free, OS, architecture, version; `seal`: core-seconds per GiB, measured from its own seals), `sharing` of `heard` arcades, `totals` (cores, RAM, disk, GPUs and VRAM where known, fastest/median/slowest seal speed) and this arcade's own (`me`). Reported and rounded; never on a chain; nothing that pays reads it. |
+| `sysinfo.status` | `/api/v1/sysinfo/status` | read | — | Whether this arcade shares its system info, and the exact record it sends or would send (`record`), its size, the seal measurement (`sealed_bytes` of the 64 MiB needed) and what is never shared. |
+| `sysinfo.set` | `/api/v1/sysinfo/set` | admin | on | Share this arcade's system info with the mesh (`on: true`) or stop (`on: false`: an off record goes out and every arcade drops the machine at once). Off by default; kept across restarts and updates. |
+| `explorer.arc_machines` | `/api/v1/explorer/arc_machines` | public | — | The same as `mesh.sysinfo`, for apps (also `/r/explorer/arc_machines`). A record's `node` is the key an earner has in `explorer.arc_holders`. |
 
 ### Tx
 
@@ -97,6 +101,30 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `tx.activity` | `/api/v1/tx/activity` | public | addresses, since?, chain? | What changed for up to 500 addresses: history rows above height since, and waiting transactions paying or spending them; height to pass as since next time. |
 | `tx.fee` | `/api/v1/tx/fee` | public | chain? | The fee rate (per 1000 bytes) and dust limit this arcade's wallet builds transactions with on that chain (kept or borrowed). |
 | `tx.broadcast` | `/api/v1/tx/broadcast` | post | hex, chain? | Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network. On a borrowed chain it goes to the lenders' nodes, which check it; refused by all, it is not sent. |
+| `tx.status` | `/api/v1/tx/status` | read | chain, txid \| client_ref | Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding}), signed (signed here moments ago, in no pool or block), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, and code not_found when this arcade never signed it. |
+| `tx.wait` | `/api/v1/tx/wait` | read | chain, txid \| client_ref, until?, timeout? | tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped, or after timeout seconds (default 60, at most 600) with timed_out: true. |
+
+### Psbt
+
+Build-only transactions for an account that signs in the ARCADE app (see "Account sign-in and payments" below). No
+keys and nothing signed or sent: `address` and `pubkey` (hex, compressed) are the paired account's, from the pairing's
+`home` (or its Dogecoin key with `chain: "doge"`); `chain` defaults to this arcade's home chain (ARCADE testnet on the
+test arcades). Coins are the ones `tx.coins` lists (never one carrying an inscription), the fee rate and dust
+`tx.fee`'s, and records are byte for byte what `feed.post` and `feed.act` write. One transaction each; a record too long
+for one is refused. At most 600 builds a minute per arcade, 60 per address.
+
+Every builder answers
+`{psbt, chain, unit, address, what, summary: {inputs: [{coin, value, from}], outputs: [{index, value, to, mine}], fee}}`:
+`psbt` is base64 (each input carries its whole previous transaction), `to` an address or `data (OP_RETURN)`, `mine`
+marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finalize: true}`; its answer's `txHex` (or
+`psbt.finalize` of its `psbtHex`) goes to `tx.broadcast`.
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `psbt.send` | `/api/v1/psbt/send` | public | address, pubkey, chain?, to, amount | A payment: `amount` (smallest units, at least the dust) to `to`, an address of the chain or a @tag (paid where `wallet.send` would pay it), change back. |
+| `psbt.feed_post` | `/api/v1/psbt/feed_post` | public | address, pubkey, chain?, text, channel?, file? | A public post (needs a @tag): `channel` such as `txtok` (default `main`, at most 24 characters), `file` = `{name, type, data}` (base64, at most 1 MB, and the whole record at most 7,646 bytes). |
+| `psbt.feed_act` | `/api/v1/psbt/feed_act` | public | address, pubkey, chain?, kind, target, text?, amount? | A feed act on `target` (a post's or reply's txid): like, unlike, dislike, undislike, reply, share, edit, delete (`text` for reply, share and edit), or tip: `amount` paid to the post's author on that chain in the same transaction (their address there: the same key's on a chain that derives keys as the home chain does, else the one they proved). |
+| `psbt.finalize` | `/api/v1/psbt/finalize` | public | psbt, chain? | A signed PSBT (base64 or hex): every P2PKH signature checked, a partial one finished; `{hex, txid, chain, size, fee}` for `tx.broadcast`. Refused when an input isn't signed or a signature doesn't check. |
 
 ### Id
 
@@ -111,11 +139,11 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `id.link_answer` | `/api/v1/id/link_answer` | local | qr, send? | The desktop app as the other device: an arcadelink:// text in. Without send: the site, the number to compare and the @tag that would go. With send: the active account's words sealed to the browser's key and posted to `<via or https://host>/api/v1/id/link_send`. Sealed = {v: 1, kem: "X25519", epk, nonce, ct} (hex): AES-256-GCM under sha256("ARCADE/link\0" + X25519(shared) + epk + the browser's key); inside, {words, tag}. |
 | `id.box_put` | `/api/v1/id/box_put` | public | box, msg | A sealed message for the other end of an ARCADE ID signing pairing (box: 32 hex characters only the two ends know; up to 16 waiting, 1,500,000 characters each, 64 MB in all boxes, ten minutes). The arcade only passes it on. |
 | `id.box_take` | `/api/v1/id/box_take` | public | box | Everything waiting in a box, oldest first; the box is emptied. |
-| `id.sign_pair` | `/api/v1/id/sign_pair` | local | qr, send? | Pair a website with this app so it can ask the app to sign: an `arcadesign://site/<pairbox>?k=<page X25519 key>[&a=<arcade>]` code in. Without send: the site, the 6-digit number to compare and the account and Dogecoin address. With send: the app puts {v: 1, apk, n, c} in the pair box; both ends derive K = sha256("ARCADE/sign\0" + shared + app key + page key), the request box = first 16 bytes of sha256("ARCADE/sign/req\0" + K), the answer box likewise with "res"; {n, c} = AES-256-GCM under K (nonce hex, ciphertext base64). |
+| `id.sign_pair` | `/api/v1/id/sign_pair` | local | qr, send? | Pair a website with this app so it can ask the app to sign: an `arcadesign://site/<pairbox>?k=<page X25519 key>[&a=<arcade>]` code in. Without send: the site, the 6-digit number to compare, the account, its Dogecoin address and `home: {chain, name, address}`. With send: the app puts {v: 1, apk, n, c} in the pair box (inside: `{address, pubkey, tag, chain: "doge", home: {chain, address, pubkey}}`: the Dogecoin key m/44'/3'/0'/0/0 and the home-chain key its @tag names); both ends derive K = sha256("ARCADE/sign\0" + shared + app key + page key), the request box = first 16 bytes of sha256("ARCADE/sign/req\0" + K), the answer box likewise with "res"; {n, c} = AES-256-GCM under K (nonce hex, ciphertext base64). |
 | `id.sign_sites` | `/api/v1/id/sign_sites` | local | — | Websites paired with this app. |
 | `id.sign_forget` | `/api/v1/id/sign_forget` | local | id | Unpair a website. |
-| `id.sign_pending` | `/api/v1/id/sign_pending` | local | — | What paired sites ask this app to sign (taken from their request boxes every 3 s): a message, or a PSBT (each signed input must carry its previous transaction, which must hash to its txid) with the coins it signs, every output, the fee and whether a signed coin carries an inscription (this arcade's ord index, else the mesh's). Requests inside: {id, type: "psbt", psbt, inputToSign?, finalize?, label?}, {id, type: "psbts", psbts: [{psbt, inputToSign?, finalize?, label?}]} (up to 50, signed together on one yes; the answer has `results`) or {id, type: "message", message, label?}. `label` is the site's own name for it, shown as the site's. An inscription reveal is signed only when named in `inputToSign` with sighashType 1 (ALL): its coin is P2SH of the redeem script the PSBT carries (input key 0x04), that script is exactly `6b 6b`, 1–200 × `75`, `6c 6c`, `ab`, then the account's P2PKH; it is signed over that P2PKH (after OP_CODESEPARATOR) and left as a partial signature even with `finalize`, for the site to build the scriptSig. Such inputs show `reveal: true`. |
-| `id.sign_decide` | `/api/v1/id/sign_decide` | local | id, ok | Sign a waiting request (Dogecoin key m/44'/3'/0'/0/0; legacy P2PKH inputs, ALL, ALL\|ANYONECANPAY or SINGLE\|ANYONECANPAY; a named inscription reveal, ALL, partial signature only) or refuse; the answer {id, ok, psbtHex, txHex?} or {id, ok, signature} or {id, ok: false, error} goes to the answer box. |
+| `id.sign_pending` | `/api/v1/id/sign_pending` | local | — | What paired sites ask this app to sign (taken from their request boxes every 3 s): a message, or a PSBT (each signed input must carry its previous transaction, which must hash to its txid) with the coins it signs, every output, the fee and whether a signed coin carries an inscription (this arcade's ord index, else the mesh's). Requests inside: {id, type: "psbt", psbt, inputToSign?, finalize?, label?}, {id, type: "psbts", psbts: [{psbt, inputToSign?, finalize?, label?}]} (up to 50, signed together on one yes; the answer has `results`) or {id, type: "message", message, label?}. `label` is the site's own name for it, shown as the site's. Which key: the Dogecoin key, unless the request has `key: "home"` (a message) or `chain: "<home chain key>"` (a PSBT; `key: "home"` works too): then the home key, a message signed with ARCADE's prefix, a PSBT shown in that chain's addresses and units, and every coin it signs must be an unspent coin of that chain here. Any other chain is refused; a `psbts` batch is on one chain. Each shows `key`, `chain`, `chain_name`, `unit` and `address` (the signing one). An inscription reveal is signed only when named in `inputToSign` with sighashType 1 (ALL): its coin is P2SH of the redeem script the PSBT carries (input key 0x04), that script is exactly `6b 6b`, 1–200 × `75`, `6c 6c`, `ab`, then the account's P2PKH; it is signed over that P2PKH (after OP_CODESEPARATOR) and left as a partial signature even with `finalize`, for the site to build the scriptSig. Such inputs show `reveal: true`. |
+| `id.sign_decide` | `/api/v1/id/sign_decide` | local | id, ok | Sign a waiting request (Dogecoin key m/44'/3'/0'/0/0, or the home key when the request names it; legacy P2PKH inputs of that key's, ALL, ALL\|ANYONECANPAY or SINGLE\|ANYONECANPAY; a named inscription reveal, ALL, partial signature only) or refuse; the answer {id, ok, psbtHex, txHex?} or {id, ok, signature, address} or {id, ok: false, error} goes to the answer box. |
 | `id.answer` | `/api/v1/id/answer` | local | code, chain?, send? | Sign in to a Digi-ID site with this arcade's wallet (the active account), as a phone wallet such as Coinomi does: a digiid:// code in. Without send: the site's name, where the answer goes and this wallet's key for that site (SLIP-0013, never a key that holds coins; the same one the web wallet makes from the same words), to show first. With send: signed and sent to the site. chain: dgb (Digi-ID, the default) or another chain this wallet holds (ARCADE ID). |
 | `id.relay` | `/api/v1/id/relay` | public | uri, address, signature, chain? | A website's user signed a Digi-ID code in the browser; the site's server passes the answer here and the arcade sends it to the code's site (a page may not post to another site; a server may). Only a well-formed code, signed by that address, once, and only to a public internet address (never this computer or its network; no redirects). |
 
@@ -135,7 +163,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `wallet.phrase` | `/api/v1/wallet/phrase` | local | — | The wallet's 12 words. |
 | `wallet.keys` | `/api/v1/wallet/keys` | read | chain? | Your addresses on a chain, their @tags and balances (on SegWit chains each address type's address and balance under kinds; balance counts every type). balance follows the mempool (confirmed coins less those a waiting transaction spends, plus waiting outputs to you); confirmed is the blocks' figure; free the confirmed coins spendable now (not spent by a waiting transaction, mature, no inscription); pending / pending_coins what is arriving; waiting and dropped this wallet's transactions in the mempool and those that left it without a block. |
 | `wallet.addr_kind` | `/api/v1/wallet/addr_kind` | wallet | chain, kind? | The address type the Wallet shows on a chain (legacy, p2sh-p2wpkh, p2wpkh, p2tr; remembered per chain) and the types it offers; kind: remember that one. |
-| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, kind?, all_kinds?, send? | Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
+| `wallet.send` | `/api/v1/wallet/send` | local | chain?, to, amount, from?, kind?, all_kinds?, send?, client_ref? | client_ref (with send): as for ledger.item_open. Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain). |
 | `wallet.link` | `/api/v1/wallet/link` | wallet | chain, wif, tag | Link another wallet to your @tag (signed by both keys). |
 | `wallet.unlink` | `/api/v1/wallet/unlink` | wallet | chain, address, tag | Remove a linked wallet. |
 | `wallet.links` | `/api/v1/wallet/links` | read | chain | Your linked wallets on a chain. |
@@ -188,6 +216,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `msg.stats` | `/api/v1/msg/stats` | public | — | How many message candidates, posts, acts and machine records the home chain holds. |
 | `msg.scan` | `/api/v1/msg/scan` | message | — | Look for new messages now (it also runs every 15 seconds). |
 | `msg.who` | `/api/v1/msg/who` | public | name | Who a @tag or address is, and their published messaging key. |
+| `msg.verify` | `/api/v1/msg/verify` | public | address, message, signature, prefix?, chain? | Whether `signature` (Core signmessage: 65-byte compact, base64) is `address`'s over `message`, with `prefix`, else `chain`'s message prefix, else ARCADE's (`Pepecoin Signed Message:\n`, what the ARCADE app signs with the home key). Answer `{valid, address, prefix}`. |
 | `msg.conversations` | `/api/v1/msg/conversations` | read | requests? | Conversations, newest first (requests: people not in your contacts). |
 | `msg.thread` | `/api/v1/msg/thread` | read | peer | Every message with one person (their messaging key). |
 | `msg.read` | `/api/v1/msg/read` | message | peer | Mark a conversation read. |
@@ -254,10 +283,10 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `explorer.summary` | `/api/v1/explorer/summary` | public | chain? | Chain summary for the explorer's front page. |
 | `explorer.earn` | `/api/v1/explorer/earn` | public | chain? | This arcade's ARCADE pay, read only (docs/EARN.md): its turn, next payout, accrued pay, pay and draw weight, why pay waits, and its sealed replicas waiting to register; with a chain, that coin's Earn ARCADE progress too. App pages read it at `/r/explorer/earn`. |
-| `explorer.blocks` | `/api/v1/explorer/blocks` | public | chain?, offset?, limit? | Recent blocks. |
-| `explorer.block` | `/api/v1/explorer/block` | public | chain?, id | One block (height or hash). |
-| `explorer.tx` | `/api/v1/explorer/tx` | public | chain?, txid | One transaction. |
-| `explorer.address` | `/api/v1/explorer/address` | public | chain?, address | An address: balance, history, inscriptions, tokens. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address). |
+| `explorer.blocks` | `/api/v1/explorer/blocks` | public | chain?, offset?, limit?, before?, n? | Recent blocks, newest first. offset (back from the tip) and limit (at most 100) answer a page: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the next page; null at block 0), chain, as_of, source}. before and n (at most 100) answer the plain list, as before. |
+| `explorer.block` | `/api/v1/explorer/block` | public | chain?, id | One block (id: a height, as a number or text, or a hash). Carries chain, as_of {height, hash} (the tip its confirmations count against), source (local, borrowed or mesh), unit and decimals. |
+| `explorer.tx` | `/api/v1/explorer/tx` | public | chain?, txid | One transaction: height, block (its hash), confirmations, fee, inputs and outputs in base units (decimals: 8); an OP_RETURN output carries data (hex) and decoded (an arcade record: repository or A:// with its op). Carries chain, as_of, source; without chain it answers on the home chain and says so (chain_note). |
+| `explorer.address` | `/api/v1/explorer/address` | public | chain?, address, history?, inscriptions?, content?, history_offset?, history_limit? | An address: balance, history (newest first, a page at a time: history_offset (or offset) and history_limit (or limit; default 50, at most 500); history_next is the next page's offset, null after the oldest; tx_count the total), inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address). |
 | `explorer.inscriptions` | `/api/v1/explorer/inscriptions` | public | chain?, offset?, limit? | Inscriptions, newest first. |
 | `explorer.inscription` | `/api/v1/explorer/inscription` | public | chain?, id | One inscription. |
 | `explorer.tokens` | `/api/v1/explorer/tokens` | public | chain?, offset?, limit? | Tokens. |
@@ -282,7 +311,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 |---|---|---|---|---|
 | `chains.peers` | `/api/v1/chains/peers` | read | key | A chain's P2P address book: nodes known, working in the last day, resting after failures; the working ones and the next to try. |
 | `chains.list` | `/api/v1/chains/list` | public | — | Every chain V1.0 knows, installed or not, with sizes reported by arcades; per chain: hidden (chains.hide), queued (position), queued_resume and installing (the chain being installed now). |
-| `chains.status` | `/api/v1/chains/status` | public | key | One chain's staged progress. |
+| `chains.status` | `/api/v1/chains/status` | public | key | One chain's staged progress. `recovered_at_start` is `{from, to}` when this start wound the tip back (the last stop left without writing the coin caches, exit code 3), else null. |
 | `chains.offers` | `/api/v1/chains/offers` | public | — | Chains other arcades offer over the mesh. |
 | `chains.sizes` | `/api/v1/chains/sizes` | admin | — | Measure this arcade's disk use per chain now. |
 | `chains.add` | `/api/v1/chains/add` | admin | key, mode?, with? | Install a chain (mode full, shared or chain; with = indexes). |
@@ -402,7 +431,41 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | method | route | needs | params | what |
 |---|---|---|---|---|
 | `rpc.help` | `/api/v1/rpc/help` | public | — | Every command, its parameters and what it needs. |
+| `arc.status` | `/api/v1/arc/status` | public | — | The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here. |
 | `rpc.info` | `/api/v1/rpc/info` | local | — | Where the RPC and the web API are, and the cookie file. |
+
+## For agents and scripts
+
+- **Starting and stopping.** The web port opens before the chains. Until the arcade is ready, every request is
+  answered at once with `503` and `{"ok": false, "state": "starting", "code": "starting", "retry_after_s": 5}`.
+  Once a stop begins, the answer is `503` with `"state": "stopping"`. The socket gives the same answers, and
+  `status` carries `phase` (starting, ready, stopping).
+- **Error codes.** Every error keeps its `error` text and adds a stable `code`: `unknown_command`, `unknown_route`
+  (`/api/v1/<unknown>` is `404`), `not_found` (`404` over the web API), `bad_args`, `not_enough_arcade`,
+  `insufficient_funds`, `unknown_chain`, `not_installed`, `forbidden`, `starting`, `stopping`, or `error`. JSON-RPC
+  errors carry it in `error.data.code`.
+- **One chain's status.** `status chain=arctest` (`/api/v1/status?chain=arctest`) gives:
+  - `tip {height, hash}`;
+  - `best_known`, the best height linked peers tell of, with `best_known_from` and `best_known_age_s` (null while
+    none has told one);
+  - `behind`, `sync` (synced, syncing, unknown, not_kept), `mode` and `source` (own or borrowed);
+  - for the ARCADE chain, `rules` with `update_needed`.
+
+  `status` alone has `rules.update_needed` too, and the log repeats that warning every 10 minutes while it holds.
+  `arc.status` is public.
+- **Receipts.** `ledger.item_open`, `ledger.item_comment`, `ledger.send` and `wallet.send` (with `send`) take an
+  optional `client_ref`. The same key sent again returns the first answer with `"replayed": true`, and nothing is
+  signed twice. Each answer carries a `receipt`. `tx.status chain txid` (or `client_ref`) gives one of these states:
+  - `confirmed {height, block, confirmations}`;
+  - `accepted_local`: in this arcade's pool; on the ARCADE chain it adds `broadcast {peers_linked, peers_sent,
+    peers_holding}`, where holding means peers that named it back as being in their pool;
+  - `signed`;
+  - `dropped`;
+  - `unknown`, with `ever_signed_here`.
+
+  `tx.wait chain txid until timeout` answers once that state is reached.
+- **Explorer answers** for tx, block, address, summary and mempool carry `chain`, `as_of {height, hash}` (the tip
+  they were counted against), `source` (local, borrowed or mesh) and `decimals`.
 
 ## Sign-in for websites
 
@@ -427,6 +490,19 @@ wallet such as Coinomi does. A website's users sign in the browser, and the site
 `id.relay`, which sends it on: a page can't post to another site, but the arcade can. Both make the same key for a
 site from the same 12 words.
 
+**Signing in to other Digi-ID sites is a per-site key.** `id.answer` and Digi-ID wallets sign with a key made for that
+one site (SLIP-0013): it proves the same person comes back, but it holds no coins and isn't the account's @tag key, so
+nothing can be paid or posted with it.
+
+**Account sign-in and payments: ARCADE ID signing.** For a site that acts *as* the account (posts, likes, replies,
+tips, payments, as the ARCADE app does), pair it with the app (`id.sign_pair`, an `arcadesign://` code): the app tells
+the page the account's home-chain key (`home: {chain, address, pubkey}`, the one its @tag names) beside its Dogecoin
+key. Sign-in: the page sends `{type: "message", key: "home", message: <the site's nonce>}` and checks the answer with
+`msg.verify {address: home.address, message, signature}` (ARCADE's prefix). Actions: the site's server builds them
+unsigned (`psbt.feed_post`, `psbt.feed_act`, `psbt.send` with the home address and pubkey), the page sends
+`{type: "psbt", chain: home.chain, psbt, finalize: true}`, the user approves it in the app, and the answer's `txHex`
+goes to `tx.broadcast`. The 12 words never leave the app.
+
 **Both.** Offer the password and ARCADE ID side by side. A user who turns the password off: `vault.delete`, signed
 by the @tag's address, drops the sealed record, and the account then opens on the site with ARCADE ID or the 12
 words only.
@@ -445,7 +521,7 @@ No page pass is needed (public data); like the rest of `/r/`, it answers this co
 answered: `summary`, `blocks`, `block`, `tx`, `address`, `inscriptions`, `inscription`, `inscription_types`,
 `tokens`, `token`, `collections`, `collection`, `collection_of`, `held`, `names`, `name`, `maps`, `map`,
 `mempool`, `ledger`, `ledger_tokens`, `ledger_token`, `ledger_inscriptions`, `ledger_inscription`, `tag`,
-`search`, and `chains`; any other name is 404.
+`search`, `msg_rows`, `msg_file`, and `chains`; any other name is 404.
 
 ## Repositories for apps
 

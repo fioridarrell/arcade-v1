@@ -182,6 +182,37 @@ function chainChips(c) {
   return out;
 }
 const IX_NAMES = { addresses: "addresses", ord: "inscriptions", tokens: "tokens", names: "names", maps: "maps", ledger: "arcade ledger", profiles: "profiles", messages: "messages" };
+// An arcade's round trip (mesh.overview ping_ms, the least of its link's last pings): "—" when not linked or not
+// timed yet; marked when the link goes through a relay.
+function pingPill(a) {
+  const tip = "Round trip over the mesh link: the fastest of its last pings";
+  if (!a.linked || a.ping_ms == null) return h("span", { class: "pill ping", title: tip }, "—");
+  const ms = a.ping_ms < 10 ? a.ping_ms.toFixed(1) : Math.round(a.ping_ms);
+  return h("span", { class: "pill ping", title: tip }, a.ping_via === "relay" ? `${ms} ms relayed` : `${ms} ms`);
+}
+// What an arcade runs on, when its operator shares it (mesh.overview machine, from its signed record): one short
+// line, each figure as reported by it; the seal speed is measured from its own seals.
+const sig2 = (x) => Number(x.toPrecision(2)).toString();
+function machineLine(m) {
+  if (!m) return null;
+  const parts = [];
+  if (m.cores) parts.push(`${m.cores} cores`);
+  if (m.ram_gb) parts.push(`${m.ram_gb} GB`);
+  const names = new Map();
+  for (const g of m.gpus || []) {
+    const n = String(g.name || "").replace(/^NVIDIA\s+/, "").replace(/^GeForce\s+/, "") + (g.unified ? " (unified)" : "");
+    names.set(n, (names.get(n) || 0) + 1);
+  }
+  for (const [n, c] of names) parts.push(h("span", { translate: "no" }, c > 1 ? `${c}× ${n}` : n));
+  if (m.disk_free_gb != null) parts.push(m.disk_free_gb >= 1000 ? `${(m.disk_free_gb / 1000).toFixed(1)} TB free` : `${m.disk_free_gb} GB free`);
+  parts.push("reported");
+  if (m.seal) parts.push(`seals ${sig2(m.seal / 3600)} core-h/GiB, measured`);
+  const tip = [m.cpu, m.threads ? `${m.threads} threads` : null, m.os && m.arch ? `${m.os} ${m.arch}` : null].filter(Boolean).join(" · ");
+  const kids = [];
+  parts.forEach((p, i) => { if (i) kids.push(" · "); kids.push(typeof p === "string" ? h("span", {}, p) : p); });
+  return h("div", { class: "meta machine", title: tip || null }, ...kids);
+}
+
 function drawMesh(ov) {
   const all = ov.arcades || [];
   const linked = all.filter((a) => a.linked).length;
@@ -226,8 +257,10 @@ function drawMesh(ov) {
       h("div", { class: "top" },
         h("span", { class: "who" }, who),
         a.version ? h("span", { class: "pill" }, a.version) : null,
-        h("span", { class: "pill " + (a.linked ? "ok" : "") }, a.linked ? `linked ${ago(a.since)}` : "heard, not linked")),
+        h("span", { class: "pill " + (a.linked ? "ok" : "") }, a.linked ? `linked ${ago(a.since)}` : "heard, not linked"),
+        pingPill(a)),
       h("div", { class: "meta" }, `node ${short(a.node, 16)}${a.addr ? " · " + a.addr : ""}`),
+      machineLine(a.machine),
       chains.length
         ? h("div", { class: "lines" }, ...chains.map((c) => h("div", { class: "line" },
             coinLogo(c.key, c.name, "span", "logo"), h("span", { class: "cn" }, c.name), h("span", { class: "chips" }, ...chainChips(c)))))
@@ -718,7 +751,8 @@ $("w-pubaddr-send").addEventListener("click", async () => {
 // it would do first (no send), and goes on only on a second click. Paired sites' requests wait in id.sign_pending,
 // each shown with what it does, signed or refused with id.sign_decide.
 const aidKind = () => { const c = $("w-aid-code").value.trim(); return c.startsWith("arcadelink://") ? "link" : c.startsWith("arcadesign://") ? "sign" : "digiid"; };
-const aidDoge = (k) => (k == null ? "?" : (Number(k) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })) + " DOGE";
+// Amounts in the unit of the chain a request is on (Dogecoin, or the home chain when it names the home key).
+const aidAmt = (k, unit) => (k == null ? "?" : (Number(k) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })) + " " + (unit || "DOGE");
 $("w-aid-code").addEventListener("input", () => { $("w-aid-chain").hidden = aidKind() !== "digiid"; $("w-aid-confirm").hidden = true; });
 $("w-aid-check").addEventListener("click", async () => {
   const b = $("w-aid-check");
@@ -731,7 +765,8 @@ $("w-aid-check").addEventListener("click", async () => {
       $("w-aid-send").textContent = `The number is ${r.number}: send`;
     } else if (kind === "sign") {
       const r = await api("id.sign_pair", { qr: code });
-      $("w-aid-text").textContent = `Let ${r.host} ask this app to sign, as ${r.tag ? "@" + r.tag : "this account"} (Dogecoin ${r.address})? Only if that screen shows ${r.number}. Your words stay here: the site only gets your address, and you approve every signature in this app.`;
+      const home = r.home && r.home.address ? `${r.home.name || r.home.chain} ${r.home.address} and ` : "";
+      $("w-aid-text").textContent = `Let ${r.host} ask this app to sign, as ${r.tag ? "@" + r.tag : "this account"} (${home}Dogecoin ${r.address})? Only if that screen shows ${r.number}. Your words stay here: the site only gets your addresses, and you approve every signature in this app.`;
       $("w-aid-send").textContent = `The number is ${r.number}: pair`;
     } else {
       const r = await api("id.answer", { code, chain: $("w-aid-chain").value });
@@ -801,32 +836,35 @@ $("w-aid-scan").addEventListener("click", async () => {
 // What paired sites ask: one card each, with what it does, and Sign / Refuse.
 const aidShown = new Set();
 // One PSBT's lines: what it spends and returns, any inscription, every output, the coins it signs.
-function aidPsbtLines(r) {
+function aidPsbtLines(r, unit) {
   const body = [];
+  const amt = (k) => aidAmt(k, r.unit || unit);
   if (r.label) body.push(h("div", { class: "aid-sub" }, `The site calls it: “${r.label}”`));
   const net = Number(r.to_you || 0) - Number(r.from_you || 0);
-  body.push(h("div", {}, `Spends ${aidDoge(r.from_you)} of your coins; ${aidDoge(r.to_you)} comes back to you; fee ${r.fee == null ? "unknown (not every coin's transaction is given)" : aidDoge(r.fee)}. You ${net < 0 ? "pay " + aidDoge(-net) : "receive " + aidDoge(net)} in all.`));
+  body.push(h("div", {}, `Spends ${amt(r.from_you)} of your coins; ${amt(r.to_you)} comes back to you; fee ${r.fee == null ? "unknown (not every coin's transaction is given)" : amt(r.fee)}. You ${net < 0 ? "pay " + amt(-net) : "receive " + amt(net)} in all.`));
   if (r.inscriptions) body.push(h("div", { class: "msg bad" }, `${r.inscriptions} of the coins you sign carries an inscription (or no arcade could tell it doesn't). Only go on if this is meant to move or list it: a name or Doginal sent by mistake can't be taken back.`));
-  const rows = r.outputs.map((o) => h("tr", {}, h("td", {}, String(o.index)), h("td", { class: "mono" }, o.to + (o.mine ? " (you)" : "")), h("td", { class: "num" }, aidDoge(o.value))));
+  const rows = r.outputs.map((o) => h("tr", {}, h("td", {}, String(o.index)), h("td", { class: "mono" }, o.to + (o.mine ? " (you)" : "")), h("td", { class: "num" }, amt(o.value))));
   body.push(h("table", { class: "aid-outs" }, h("thead", {}, h("tr", {}, h("th", {}, "#"), h("th", {}, "Pays to"), h("th", { class: "num" }, "Amount"))), h("tbody", {}, rows)));
-  const signs = r.inputs.filter((i) => i.sign).map((i) => `#${i.index} ${aidDoge(i.value)} (${i.hash_type})`).join(", ");
+  const signs = r.inputs.filter((i) => i.sign).map((i) => `#${i.index} ${amt(i.value)} (${i.hash_type})`).join(", ");
   body.push(h("div", { class: "aid-sub" }, `Signs your coin${r.inputs.filter((i) => i.sign).length === 1 ? "" : "s"} ${signs}.${r.finalize ? "" : " The site finishes the transaction."}`));
   r.inputs.filter((i) => i.reveal).forEach((i) => body.push(h("div", { class: "aid-sub" }, `Input #${i.index} reveals an inscription you committed: its coin is locked to your key (D:// style); the site writes the inscription itself.`)));
   return body;
 }
 function aidCard(r) {
-  const head = h("div", { class: "aid-req-head" }, h("b", {}, r.site), ` asks ${r.account ? "@" + r.account : "this account"} to sign`);
+  const amt = (k) => aidAmt(k, r.unit);
+  const on = r.key === "home" ? ` with its ${r.chain_name || r.chain} key (${r.address})` : "";
+  const head = h("div", { class: "aid-req-head" }, h("b", {}, r.site), ` asks ${r.account ? "@" + r.account : "this account"} to sign${on}`);
   const body = [];
   if (r.kind === "message") {
     if (r.label) body.push(h("div", { class: "aid-sub" }, `The site calls it: “${r.label}”`));
     body.push(h("div", { class: "aid-sub" }, "A message (it proves you hold this address; it moves no coins):"), h("pre", { class: "aid-msgtext" }, r.message));
   } else if (r.kind === "psbts") {
     const net = Number(r.to_you || 0) - Number(r.from_you || 0);
-    body.push(h("div", {}, `${r.items.length} transactions, signed together with one yes. In all: spends ${aidDoge(r.from_you)} of your coins; ${aidDoge(r.to_you)} comes back to you; fees ${r.fee == null ? "unknown" : aidDoge(r.fee)}. You ${net < 0 ? "pay " + aidDoge(-net) : "receive " + aidDoge(net)} in all.`));
+    body.push(h("div", {}, `${r.items.length} transactions, signed together with one yes. In all: spends ${amt(r.from_you)} of your coins; ${amt(r.to_you)} comes back to you; fees ${r.fee == null ? "unknown" : amt(r.fee)}. You ${net < 0 ? "pay " + amt(-net) : "receive " + amt(net)} in all.`));
     if (r.inscriptions) body.push(h("div", { class: "msg bad" }, `${r.inscriptions} of the coins you sign carry an inscription. Only go on if these are meant to move or be listed.`));
-    r.items.forEach((it, n) => body.push(h("details", { class: "aid-item" }, h("summary", {}, `${n + 1}. ${it.label || "Transaction " + (n + 1)}${it.inscriptions ? " · inscription" : ""}`), aidPsbtLines(it))));
+    r.items.forEach((it, n) => body.push(h("details", { class: "aid-item" }, h("summary", {}, `${n + 1}. ${it.label || "Transaction " + (n + 1)}${it.inscriptions ? " · inscription" : ""}`), aidPsbtLines(it, r.unit))));
   } else {
-    body.push(...aidPsbtLines(r));
+    body.push(...aidPsbtLines(r, r.unit));
   }
   const out = h("p", { class: "msg" });
   const go = (ok) => async (ev) => {

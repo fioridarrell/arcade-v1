@@ -2298,6 +2298,23 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     };
     let w = watched(node, p);
     let bal: u64 = w.iter().filter_map(|x| balance(node, p, &x.script)).sum();
+    // What a send can spend now (as ledger.write_chains counts it): confirmed, mature, not spent by a waiting
+    // transaction; waiting change not counted (ARCADE #25: the two figures differed with no word why).
+    let tip_now = tip_of(node, p.key);
+    let spent_set = pool_spent(p.key);
+    let spent_now = &spent_set;
+    let spendable_now: u64 = w
+        .iter()
+        .flat_map(|x| {
+            let hs = hex::encode(&x.script);
+            coin_rows(node, p.key)
+                .into_iter()
+                .filter(move |(op, c)| c["sp"].is_null() && c["s"] == hs.as_str() && !spent_now.contains(op))
+                .filter(|(_, c)| !(c["cb"] == true && c["h"].as_u64().unwrap_or(0) as u32 + p.coinbase_maturity > tip_now))
+                .map(|(_, c)| c["v"].as_u64().unwrap_or(0))
+                .collect::<Vec<_>>()
+        })
+        .sum();
     let coins_n = coin_rows(node, p.key).iter().filter(|(_, c)| c["sp"].is_null()).count();
     let top = tips.iter().max().copied().unwrap_or(tip).max(tip);
     let scan = run.scan.lock().unwrap().clone();
@@ -2310,7 +2327,11 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
     Some(json!({"key": p.key, "name": p.name, "installed": false, "borrowed": true, "home": false, "mode": "borrowed", "indexes": [],
                 "state": run.state.lock().unwrap().clone(), "overall": if top == 0 { 0.0 } else { (tip as f64 * 100.0 / top as f64).min(100.0) },
                 "stages": stages, "tip": tip, "floor": st["floor"], "trust": t["trust"], "trust_note": t["note"], "trust_hosts": t["hosts"], "lenders": lenders_v, "mismatch": mismatch, "scan": scan,
-                "balance": bal, "coins": coins_n, "addresses": w.len(), "unit": crate::explorer::unit(p)}))
+                "balance": bal, "spendable": spendable_now,
+                "balance_counts": "confirmed coins not yet spent in a block; waiting (mempool) transactions are not counted",
+                "spendable_counts": "confirmed, mature coins less those waiting transactions spend; waiting change not counted",
+                "source": if crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no) && crate::arcsvc::runs(p) { "borrowed (installed copy catching up)" } else { "borrowed" },
+                "coins": coins_n, "addresses": w.len(), "unit": crate::explorer::unit(p), "decimals": 8}))
 }
 
 /// borrow.status: the switches and every borrowed chain.
@@ -2349,6 +2370,12 @@ pub fn explorer(node: &Node, cmd: &str, req: &Value, p: &'static ChainParams) ->
         "explorer.search" => return None,
         _ => Err(format!("{} is borrowed (not installed): blocks, transactions and your own addresses are looked up from lenders; install it in Chains & Coins for the rest", p.name)),
     })
+}
+
+/// The borrowed copy's tip (height, hash when its header is held): what an answer from it was counted against.
+pub fn tip_pin(node: &Node, p: &ChainParams) -> (u32, Option<String>) {
+    let t = tip_of(node, p.key);
+    (t, stored_header(node, p, t).map(|x| x.0.to_hex()))
 }
 
 fn x_rows(node: &Node, p: &ChainParams, before: u32, n: u32) -> Vec<Value> {
@@ -2904,6 +2931,70 @@ pub fn pool_spender(p: &ChainParams, op: &OutPoint) -> Option<Hash256> {
     pool_txs(p).into_iter().find(|t| t.inputs.iter().any(|i| i.prevout == *op)).map(|t| t.txid)
 }
 
+// ---------------- swaps on a borrowed chain (borrowed = installed, batch 7) ----------------
+
+/// The time of the block at `height` on a borrowed chain, from the headers followed here (None below the floor).
+pub fn header_time(node: &Node, p: &ChainParams, height: u32) -> Option<u32> {
+    stored_header(node, p, height).map(|(_, h)| h.time)
+}
+
+/// What spends `op` on a borrowed chain: None while it is unspent (as a lender says, its mempool included); the
+/// spending transaction once it is known; Err while a lender calls it spent but its spender can't be shown yet.
+///
+/// A transaction this arcade sent and still waits is its own word. Any other spender is named by arcades keeping the
+/// chain (explorer.tx's `spent_by`), read from a lender by its txid, and taken only when it really spends `op` and sits
+/// in a block checked against the headers followed here ([`depth`]): a swap reads a claim's secret from it, or stops
+/// waiting on a refunded lock, so one arcade's word alone never decides it.
+pub fn spender_of(node: &Node, p: &'static ChainParams, op: &OutPoint) -> Result<Option<Tx>, String> {
+    if let Some(t) = pool_txs(p).into_iter().find(|t| t.inputs.iter().any(|i| i.prevout == *op)) {
+        return Ok(Some(t));
+    }
+    if unspent_of(node, p, &[*op])?.contains(op) {
+        return Ok(None);
+    }
+    let q = json!({"chain": p.key, "txid": op.txid.to_hex(), "local": true});
+    let answers = crate::shares::ask_explorer_each(node, p, "", "explorer.tx", &q, 3, 6000);
+    let named = spenders_named(&answers, op.vout);
+    for txid in named {
+        let Ok(t) = raw_tx(node, p, &txid) else { continue };
+        if t.inputs.iter().any(|i| i.prevout == *op) && depth(node, p, &txid) >= 1 {
+            return Ok(Some(t));
+        }
+    }
+    Err(format!("{}:{} is spent at the lenders, but no arcade keeping {} shows its spender in a block yet", op.txid.to_hex(), op.vout, p.name))
+}
+
+/// The spenders of output `vout` that explorer.tx answers name (`outputs[vout].spent_by.txid`), each once.
+fn spenders_named(answers: &[(Value, String)], vout: u32) -> Vec<Hash256> {
+    let mut out: Vec<Hash256> = Vec::new();
+    for (v, _) in answers {
+        let outs = v["outputs"].as_array().or_else(|| v["vout"].as_array());
+        let Some(o) = outs.and_then(|a| a.iter().find(|o| o["vout"].as_u64() == Some(vout as u64))) else { continue };
+        if let Some(h) = o["spent_by"]["txid"].as_str().and_then(|s| Hash256::from_hex(s).ok()) {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
+/// One output of a transaction on a borrowed chain, spent or not: (script, value). For reading a waiting
+/// transaction's inputs (whose sender and values a ledger record needs): a coin followed here, a transaction waiting
+/// here, else the transaction a lender sends, checked against its txid (the txid commits to every output).
+pub fn prevout(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<(Vec<u8>, u64)> {
+    if let Some(c) = coin(node, p, op) {
+        if let (Some(s), Some(v)) = (c["s"].as_str().and_then(|s| hex::decode(s).ok()), c["v"].as_u64()) {
+            return Some((s, v));
+        }
+    }
+    if let Some((v, s, _)) = CHECKED.lock().unwrap().get(&(p.key.to_string(), *op)).cloned() {
+        return Some((s, v));
+    }
+    let t = pool_txs(p).into_iter().find(|t| t.txid == op.txid).or_else(|| raw_tx(node, p, &op.txid).ok())?;
+    t.outputs.get(op.vout as usize).map(|o| (o.script_pubkey.clone(), o.value))
+}
+
 /// The arcades lending `key` that this one is linked to now (node ids), newest tip first: where an arcade that only
 /// borrows the ARCADE chain fetches its blobs (crate::arcblob::view).
 pub fn linked_lenders(key: &str) -> Vec<String> {
@@ -3011,6 +3102,18 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
 
 #[cfg(test)]
 mod tests {
+    /// Borrowed = installed, batch 7: the spender of one output, as explorer.tx answers name it (each once; another
+    /// output's spender, or an answer without one, names none).
+    #[test]
+    fn spenders_are_read_from_explorer_answers() {
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let said = |vout: u32, by: &str| (json!({"outputs": [{"vout": vout, "spent_by": {"txid": by, "vin": 0}}, {"vout": 9, "spent_by": null}]}), "x".to_string());
+        let got = spenders_named(&[said(0, &a), said(0, &a), said(0, &b), said(1, &b), (json!({"error": "no"}), "y".into())], 0);
+        assert_eq!(got, vec![Hash256::from_hex(&a).unwrap(), Hash256::from_hex(&b).unwrap()]);
+        assert!(spenders_named(&[said(0, &a)], 9).is_empty(), "unspent output");
+        assert!(spenders_named(&[said(0, "junk")], 0).is_empty());
+    }
+
     use super::{arc_borrows, home_borrows, stalled, tips_apart, tips_slack, ARC_START_BEHIND};
 
     /// A coin made and spent in one block is spent here too, whichever of the two transactions comes first (the

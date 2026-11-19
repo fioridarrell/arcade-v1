@@ -128,6 +128,11 @@ pub struct Peer {
     pub source: String,
     pub last_seen: u64,
     pub failures: u32,
+    /// A name it can also be dialed by (wss://host/mesh or host:port), kept beside `host`/`port` when the last link
+    /// was by IP: on a network that lets a connection out only to an address it just looked up, the name is the way
+    /// in, looked up again on every dial (ARCADE #12). Older arcades ignore it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

@@ -59,12 +59,15 @@ macro_rules! cmds {
 }
 
 cmds! {
-    "status" Public "" "Home chain, sync state, tip, best_known (the best height anyone tells us of), tags, profiles, mesh links, node id.";
+    "status" Public "chain?" "Home chain, sync state, tip, best_known (the best height anyone tells us of), tags, profiles, mesh links, node id, phase (starting, ready, stopping) and rules.update_needed. With chain (a key, e.g. arctest): that chain alone: tip {height, hash}, best_known (from linked peers, null when none told), best_known_from, behind, sync (synced, syncing, unknown, not_kept), mode and source (own or borrowed), and for the ARCADE chain its rules.";
     "peers" Read "" "Arcades linked over the mesh right now.";
     "mesh.udp" Read "" "UDP hole punching: STUN server and proved addresses, NAT kind, which links run over UDP paths (RTT, packets), introductions.";
     "mesh.udp_set" Admin "on?, lan_dial?, stun_port?, drop?" "Turn UDP paths and introductions on or off (ARCADE_MESH_UDP=0 overrides), offer LAN addresses to every peer, set the STUN port for the next start (0 = none); drop = a peer id prefix whose path to fail now (falls back to TCP).";
     "mesh.dials" Read "" "The last mesh dials (to a bare IP or a name, how long, why they failed), and a note when this network seems to refuse bare IPs while names connect (ARCADE #12).";
     "mesh.name" Read "" "The public name other arcades dial this one by, if set.";
+    "mesh.sysinfo" Public "" "The machines behind the mesh, as their operators share them (opt-in, sysinfo.set): every other arcade's newest record heard in the last 24 h (CPU, cores, RAM, GPUs, disk, OS, version; seal speed in core-seconds per GiB, measured from its own seals), arcades sharing of arcades heard, network totals (cores, RAM, disk total and free, GPUs and VRAM where known, fastest, median and slowest seal speed), and this arcade's own. Reported, rounded, never on a chain.";
+    "sysinfo.status" Read "" "Whether this arcade shares its system info, and the exact record it sends (or would send), field by field: what is reported, what is measured (seal speed, after 64 MiB sealed) and what is never shared.";
+    "sysinfo.set" Admin "on" "Share this arcade's system info with the mesh (on: true) or stop (on: false; every arcade drops it at once). Off by default; kept across restarts and updates.";
     "mesh.name_set" Admin "name" "Set the public name other arcades may dial this arcade by (wss://host/mesh or host:port, a host name): shared with every link, so networks that reach only names can find it. \"\" clears it.";
     "mesh.relay" Read "" "Relayed links: whether this arcade relays links for others, its month's traffic limit and cap on links, what it has passed this month and today, the links it passes now, and this arcade's own links through relays.";
     "mesh.relay_set" Admin "on?, limit_gb?, max_links?, price_per_gb?, free_mb?, pay_to?, pay_on?, pay_cap?" "Relay mesh links between arcades that can't reach each other (end-to-end encrypted: the relay sees only sealed bytes). Off by default; limit_gb is the month's traffic limit (default 50), max_links the links passed at once (default 32); price_per_gb (ARCADE, default 0: free) and free_mb (a month per arcade, default 100) are the usage fee, paid to pay_to (any ARCADE address; default this arcade's wallet, and no price without one). pay_on and pay_cap (ARCADE a month, default 1) let this arcade pay relays that charge.";
@@ -86,11 +89,11 @@ cmds! {
     "id.link_answer" Local "qr, send?" "The desktop app as the other device of a device link: an arcadelink:// text in. Without send: the site, the 6-digit number to compare with the new browser's and the @tag that would go. With send: the active account's 12 words sealed to the new browser's X25519 key (only it can open them) and sent to the arcade holding the link.";
     "id.box_put" Public "box, msg" "A sealed message for the other end of an ARCADE ID signing pairing (box: 32 hex characters only the two ends know; up to 16 waiting, 1,500,000 characters each, 64 MB in all boxes, ten minutes). This arcade only passes it on.";
     "id.box_take" Public "box" "Everything waiting in a box, oldest first; the box is emptied.";
-    "id.sign_pair" Local "qr, send?" "Pair a website with this app so it can ask the app to sign (an arcadesign:// code in). Without send: the site, the 6-digit number to compare and the account and Dogecoin address it would use. With send: paired; the site learns that address. The words never leave the app.";
+    "id.sign_pair" Local "qr, send?" "Pair a website with this app so it can ask the app to sign (an arcadesign:// code in). Without send: the site, the 6-digit number to compare and the account, its Dogecoin address and its home-chain address (home). With send: paired; the site learns both keys (address, pubkey; home: {chain, address, pubkey}). The words never leave the app.";
     "id.sign_sites" Local "" "Websites paired with this app for signing.";
     "id.sign_forget" Local "id" "Unpair a website.";
     "id.sign_pending" Local "" "What paired websites are asking this app to sign: a message, a PSBT, or several PSBTs signed together, each with the coins it signs, every output, the fee and whether a signed coin carries an inscription. Signed: the account's own P2PKH coins and, only when named in inputToSign with ALL, an inscription reveal (a P2SH coin whose redeem script, carried in the PSBT, is a D:// style lock ending OP_CODESEPARATOR + the account's P2PKH; left as a partial signature).";
-    "id.sign_decide" Local "id, ok" "Sign a waiting request (ok: true) or say no; the website gets the answer.";
+    "id.sign_decide" Local "id, ok" "Sign a waiting request (ok: true) or say no; the website gets the answer. The Dogecoin key signs unless the request names key \"home\" or the home chain (chain): then the home key (messages with ARCADE's prefix; a PSBT's coins must be the home chain's).";
     "id.answer" Local "code, chain?, send?" "Sign in to a Digi-ID site with this arcade's wallet (the active account), as a phone wallet such as Coinomi does: a digiid:// code in. Without send: the site's name, where the answer goes and this wallet's key for that site (SLIP-0013, never a key that holds coins; the same one the web wallet makes from the same words), to show first. With send: signed and sent to the site. chain: dgb (Digi-ID, the default) or another chain this wallet holds (ARCADE ID).";
     "id.relay" Public "uri, address, signature, chain?" "A website's user signed a Digi-ID code in the browser; the site's server passes the answer here and the arcade sends it to the code's site (a page may not post to another site; a server may). Only a well-formed code, signed by that address, once, and only to a public internet address (never this computer or its network; no redirects).";
     "vault.put" Public "tag, address, pubkey, blob, signature" "Password accounts: keep @tag's sealed record here (the 12 words sealed under the password in the browser: {kdf: PBKDF2-SHA512, iterations, salt, nonce, sealed}; nothing here can open it). address = the one @tag names on chain, or for a free @tag a home-chain address (kept as a reservation, first come, until a claim on chain; a claim by anybody else ends it); signature = its Core signmessage (ARCADE's prefix) over \"ARCADE vault @tag address pubkey sha256\", sha256 of the record as {kdf, iterations, salt, nonce, sealed} JSON. Replaces an older one.";
@@ -106,6 +109,10 @@ cmds! {
     "swap.told" Admin "node, order, hash, taker, taker_keys, taker_time, taker_height?, taker_lock" "For a taker outside this arcade: tell the maker's arcade the taker's lock is on the chain; it checks it on its own copy and locks its side.";
     "swap.status" Admin "node, hash" "For a taker outside this arcade: the maker's side of a swap (its step and its lock).";
     "tx.broadcast" Post "hex, chain?" "Send a transaction signed elsewhere (a website user's browser): every input must spend a coin this arcade knows, outputs no more than inputs; pooled here and sent to the coin's network.";
+    "psbt.send" Public "address, pubkey, chain?, to, amount" "Build, unsigned, a payment from a key that signs elsewhere (a website user's ARCADE app, through id.sign_pair): amount (smallest units) to an address or @tag of chain (default the home chain), change back; coins as tx.coins lists them (never an inscribed one), the fee rate and dust as tx.fee. Answer {psbt (base64), chain, unit, address, what, summary: {inputs, outputs, fee}}. Nothing is signed or sent.";
+    "psbt.feed_post" Public "address, pubkey, chain?, text, channel?, file?" "Build, unsigned, a public post from that key, the same record feed.post writes (and the original website builds): one transaction, a @tag needed. Answer as psbt.send.";
+    "psbt.feed_act" Public "address, pubkey, chain?, kind, target, text?, amount?" "Build, unsigned, a feed act from that key, as feed.act writes it: like, unlike, dislike, undislike, reply, share, edit, delete, or tip (amount in the smallest units, paid to the post's author on that chain in the same transaction). Answer as psbt.send.";
+    "psbt.finalize" Public "psbt, chain?" "A signed PSBT in (base64 or hex): every P2PKH signature checked and any partial one finished; the raw transaction {hex, txid, chain, size, fee} out, for tx.broadcast.";
     // Wallet
     "wallet.create" Local "phrase?" "Create a wallet (or restore one from 12 words). Returns the new words once.";
     "wallet.phrase" Local "" "The wallet's 12 words.";
@@ -114,7 +121,7 @@ cmds! {
     "dd.wallet" Read "chain?" "Your DigiDollar on DigiByte (chain dgb, the default, or dgbtest): address (DD.../TD...), cents, coins, borrowed, whole (false when only coins from the borrow floor on can be seen).";
     "dd.coins" Read "chain?, pubkey" "The DigiDollar address and coins (txid, vout, cents, height) of any DigiByte key (33-byte hex), as dd.wallet shows this wallet's: for a website whose accounts sign in their browsers.";
     "dd.send" Local "chain?, to, cents, send?" "Send DigiDollars (cents, $1 to $100,000 per send) to a DD.../TD... address, with DGB from the same wallet for the fee (0.35 DGB/kB, at least 0.1, at most 0.5 DGB); send: true broadcasts, otherwise it's only built and shown.";
-    "wallet.send" Local "chain?, to, amount, from?, kind?, all_kinds?, send?" "Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
+    "wallet.send" Local "chain?, to, amount, from?, kind?, all_kinds?, send?, client_ref?" "client_ref (with send): as for ledger.item_open. Pay amount (satoshis) on a chain (home, installed or borrowed) from this wallet (from: one of its addresses or an imported wallet's; otherwise the own address with the most), signed here; kind: the address type it's sent from, change back to it (default: from's type, else the one the Wallet shows); all_kinds: also spend the wallet's other address types' coins; send: true broadcasts, otherwise it's only built and shown with its fee (and a warning when the address could be meant for another chain).";
     "wallet.link" Wallet "chain, wif, tag" "Link another wallet to your @tag (signed by both keys).";
     "wallet.unlink" Wallet "chain, address, tag" "Remove a linked wallet.";
     "wallet.links" Read "chain" "Your linked wallets on a chain.";
@@ -141,6 +148,7 @@ cmds! {
     "msg.stats" Public "" "How many message candidates, posts, acts and machine records the home chain holds.";
     "msg.scan" Message "" "Look for new messages now (it also runs every 15 seconds).";
     "msg.who" Public "name" "Who a @tag or address is, and their published messaging key.";
+    "msg.verify" Public "address, message, signature, prefix?, chain?" "Whether signature (Core signmessage, base64) is address's over message: with prefix, else chain's message prefix, else ARCADE's (\"Pepecoin Signed Message:\\n\"). {valid, address, prefix}.";
     "msg.conversations" Read "requests?" "Conversations, newest first (requests: people not in your contacts).";
     "msg.thread" Read "peer" "Every message with one person (their messaging key).";
     "msg.read" Message "peer" "Mark a conversation read.";
@@ -190,7 +198,7 @@ cmds! {
     "arc.cache" Admin "mb?, clear?" "The viewer cache of ARCADE blobs: its size limit (MB), what it holds, or clear it.";
     "ledger.announce" Wallet "" "Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain.";
     "ledger.profile" Read "address | tag" "A profile and @tag as the ARCADE chain's ledger holds them.";
-    "ledger.send" Wallet "hex" "Send one arcade record (the whole payload after the marker) on the ARCADE chain.";
+    "ledger.send" Wallet "hex, client_ref?" "Send one arcade record (the whole payload after the marker) on the ARCADE chain. client_ref as for ledger.item_open.";
     "arc.keep" Admin "mb?" "Keep a share of the ARCADE chain's blobs by choice (rules version 5): whole segments, sealed and paid; segments short of copies first. mb: the share in MB (0 or \"off\": none).";
     "arc.fog" Read "" "Fog storage here: what it holds (own, kept, viewed), the segments it keeps, those short of copies on the network, warnings.";
     "arc.blob" Read "id" "A blob of the ARCADE chain (hex), fetched from linked arcades when it isn't here.";
@@ -224,10 +232,10 @@ cmds! {
     "ledger.repo_fork" Wallet "from, name" "Fork @owner/name under your @tag.";
     "ledger.repo" Read "name" "A repository under an @tag: its manifest, maintainers and push history.";
     "ledger.repos" Read "owner?" "Repositories on the ARCADE chain.";
-    "ledger.item_open" Wallet "repo, kind, title, body, from?, manifest?, head?" "Open an issue or a pull request on a repository.";
-    "ledger.item_comment" Wallet "repo, number, body, review?" "Comment on, or review (approve | changes), an issue or pull request.";
+    "ledger.item_open" Wallet "repo, kind, title, body, from?, manifest?, head?, client_ref?" "Open an issue or a pull request on a repository. client_ref: a key of yours; sent again with the same key, the first answer comes back (replayed: true) and nothing is signed twice. The answer's receipt names what tx.status follows.";
+    "ledger.item_comment" Wallet "repo, number, body, review?, client_ref?" "Comment on, or review (approve | changes), an issue or pull request. client_ref as for ledger.item_open.";
     "ledger.item_state" Wallet "repo, number, state, manifest?" "Close, reopen or merge an issue or pull request.";
-    "ledger.items" Read "repo, number?" "A repository's issues and pull requests with their comments and reviews.";
+    "ledger.items" Read "repo, number?, state?, kind?, since?, summary?" "A repository's issues and pull requests with their comments and reviews. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items or comments at or after it); summary: true leaves out the events and keeps the title. count: how many.";
     "arc.earn" Admin "chain, on?" "The Earn ARCADE switch for a chain kept here in full (docs/EARN.md), and where it stands: sealing, the catalog, replicas waiting to register, this arcade's turn and next payout.";
     "arc.earning" Read "" "Whether this arcade earns ARCADE: a light (green, yellow, grey, red) and why, pay built up, audits, the next payout turn, and the account paid.";
     "ord.chunks" Public "from?, chain?" "Ord fingerprint chunks (as other arcades compare them).";
@@ -238,10 +246,10 @@ cmds! {
     // Explorer
     "explorer.summary" Public "chain?" "Chain summary for the explorer's front page.";
     "explorer.earn" Public "chain?" "This arcade's ARCADE pay, read only (docs/EARN.md): its turn, next payout, accrued pay, pay and draw weight, why pay waits, and its sealed replicas waiting to register; with a chain, that coin's Earn ARCADE progress too.";
-    "explorer.blocks" Public "chain?, offset?, limit?" "Recent blocks.";
-    "explorer.block" Public "chain?, id" "One block (height or hash).";
-    "explorer.tx" Public "chain?, txid" "One transaction.";
-    "explorer.address" Public "chain?, address, history?, inscriptions?, content?" "An address: balance, history, inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address).";
+    "explorer.blocks" Public "chain?, offset?, limit?, before?, n?" "Recent blocks, newest first. offset (back from the tip) and limit (at most 100) answer a page: {items, offset, limit, limit_applied (when the limit asked for was cut), next (the offset of the next page; null at block 0), chain, as_of, source}. before and n (at most 100) answer the plain list, as before.";
+    "explorer.block" Public "chain?, id" "One block (id: a height, as a number or text, or a hash). Carries chain, as_of {height, hash} (the tip its confirmations count against), source (local, borrowed or mesh), unit and decimals.";
+    "explorer.tx" Public "chain?, txid" "One transaction: height, block (its hash), confirmations, fee, inputs and outputs in base units (decimals: 8); an OP_RETURN output carries data (hex) and decoded (an arcade record: repository or A:// with its op). Carries chain, as_of, source; without chain it answers on the home chain and says so (chain_note).";
+    "explorer.address" Public "chain?, address, history?, inscriptions?, content?, history_offset?, history_limit?" "An address: balance, history (newest first, a page at a time: history_offset (or offset) and history_limit (or limit; default 50, at most 500); history_next is the next page's offset, null after the oldest; tx_count the total), inscriptions (the first 60; all with explorer.held), tokens. history: false or inscriptions: false leaves that part out; content: false lists inscriptions without previews. pending: the balance with the mempool taken in, what arrives and leaves, and the waiting transactions (when the mempool touches the address).";
     "explorer.inscriptions" Public "chain?, offset?, limit?" "Inscriptions, newest first.";
     "explorer.inscription" Public "chain?, id" "One inscription.";
     "explorer.tokens" Public "chain?, q?, open?, offset?, limit?" "Tokens, in tick order: q, those starting with it; open: true, only those still being minted (minted under supply).";
@@ -262,6 +270,7 @@ cmds! {
     "explorer.arc_segments" Public "family?, source?, offset?, limit? (<= 500)" "Every confirmed (sealed) ARCADE segment, newest first: chain, family, range, bytes, root, poster, confirmation height, settled, replicas, weight each, and each holder (owner, node, tag, replica, audits missed in a row, draw-from height).";
     "explorer.arc_holders" Public "offset?, limit? (<= 500)" "Every ARCADE earner by pay weight: replica owners (replicas, bytes, pay and draw weight, share, audits passed/missed/running, accrued pay, serving verdicts, turn and next turn, punished, silenced) and genesis earners (address, keys, weight, accrued).";
     "explorer.arc_payouts" Public "blocks? (<= 1152, default 300)" "The last blocks' ARCADE coinbases by epoch: minted, coinbase total, the writer's share, what was released to each earner; with totals per earner and the pot now.";
+    "explorer.arc_machines" Public "" "The machines behind the mesh for apps (the Storage app's Machines): the same as mesh.sysinfo. Join a record's node with an earner's key in explorer.arc_holders to show what it reports beside what it has proven.";
     "explorer.msg_rows" Public "chain?, table (post, act, cand or profile), after?, limit?" "A page of one posts-and-messages table in key order after `after` (hex): {rows: [{k, v, t}], more, indexed}. What an arcade whose own copy is borrowed or catching up reads instead.";
     "explorer.msg_file" Public "chain?, txid" "The file a post carries, {txid, name, type, data (base64)}, at most 4 MB: what an arcade whose own copy is borrowed or catching up asks for a lent post's picture.";
     "explorer.names" Public "chain?" "Names.";
@@ -281,7 +290,7 @@ cmds! {
     "chains.peers" Read "key" "A chain's P2P address book: nodes known, working in the last day, resting after failures; the working ones and the next to try.";
     "mesh.overview" Public "" "The arcade mesh at a glance: every arcade linked or heard lately, its operator, and per chain what it lends, the chain copies it can make (and why not), the index copies it offers, how far it walks ord, and whether its ledger fingerprint matches ours.";
     "chains.list" Public "" "Every chain V1.0 knows, installed or not, with sizes reported by arcades; per chain: hidden (chains.hide), queued (position), queued_resume and installing (the chain being installed now).";
-    "chains.status" Public "key" "One chain's staged progress.";
+    "chains.status" Public "key" "One chain's staged progress. `recovered_at_start` is `{from, to}` when this start wound the tip back (the last stop left without writing the coin caches, exit code 3), else null.";
     "chains.offers" Public "" "Chains other arcades offer over the mesh.";
     "chains.sizes" Admin "" "Measure this arcade's disk use per chain now.";
     "chains.add" Admin "key, mode?, with?, drive?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
@@ -403,6 +412,9 @@ cmds! {
     "apikey.create" Local "name, perms, tip_limit?" "Make an API key; the secret is shown once.";
     "apikey.revoke" Local "id" "Revoke an API key.";
     "rpc.help" Public "" "Every command, its parameters and what it needs.";
+    "arc.status" Public "" "The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here.";
+    "tx.status" Read "chain, txid | client_ref" "Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding}), signed (signed here moments ago, in no pool or block), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, and code not_found when this arcade never signed it.";
+    "tx.wait" Read "chain, txid | client_ref, until?, timeout?" "tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped, or after timeout seconds (default 60, at most 600) with timed_out: true.";
     "rpc.info" Local "" "Where the RPC and the web API are, and the cookie file.";
 }
 

@@ -20,7 +20,6 @@
 use crate::node::Node;
 use arcade_chain::params::ChainParams;
 use arcade_chain::{Hash256, OutPoint, Tx};
-use arcade_ledger::engine as led;
 use arcade_wallet::ddlock::{self, Lock};
 use arcade_wallet::htlc::{self, Htlc};
 use arcade_wallet::secp256k1::{PublicKey, XOnlyPublicKey, SECP256K1};
@@ -67,10 +66,17 @@ fn list(node: &Node, kind: &str) -> Vec<Value> {
 }
 fn chain(node: &Node, k: &str) -> Result<&'static ChainParams, String> {
     let p = crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?;
-    if !crate::chains::kept(node, p) {
-        return Err(format!("{} is not installed here: a swap's legs are read on this arcade's own copy", p.name));
+    // Installed, or borrowed (borrowed = installed, batch 7: locks are read from a lender, checked against the headers
+    // followed here; claims and refunds are built and signed here and sent through the lenders).
+    if !crate::chains::kept(node, p) && !crate::borrow::is_borrowed(p.key) {
+        return Err(format!("{} is neither installed nor borrowed here: a swap's legs are read on a copy of the chain this arcade keeps or borrows", p.name));
     }
     Ok(p)
+}
+
+/// A chain this arcade reads through its lenders (borrowed, and not its own running ARCADE chain).
+fn lent(p: &ChainParams) -> bool {
+    crate::borrow::is_borrowed(p.key) && !crate::arcsvc::runs(p)
 }
 pub(crate) fn wallet_key(node: &Node, p: &ChainParams) -> Result<(arcade_wallet::SecretKey, PublicKey), String> {
     let sk = node.app.tag_key(p, 0).map_err(|e| e.to_string())?.1;
@@ -201,7 +207,7 @@ pub(crate) fn p2pkh_of(pk: &PublicKey) -> Vec<u8> {
 }
 pub(crate) fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
     // Borrowed (not installed, or catching up): from the block a lender names, checked against our headers.
-    if crate::borrow::is_borrowed(p.key) && !crate::arcsvc::runs(p) {
+    if lent(p) {
         return crate::borrow::depth(node, p, txid);
     }
     let Ok(Some((b, _))) = node.chain.tx_location(p, txid) else { return 0 };
@@ -213,6 +219,11 @@ pub(crate) fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
 /// the transaction counts (arcade_chaindb::proven). The other side's lock is read with this; this side's own steps
 /// use the plain depth.
 pub(crate) fn money_depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
+    // Borrowed: in a block a lender names, fetched and checked (its work, its parent) against the headers followed
+    // here, every one of them checked by the chain's rules as it came (crate::borrow).
+    if lent(p) {
+        return crate::borrow::depth(node, p, txid);
+    }
     let Ok(Some((b, _))) = node.chain.tx_location(p, txid) else { return 0 };
     let Some((_, h, _)) = node.chain.block_at(p, b).ok().flatten() else { return 0 };
     node.chain.money_depth(p).map(|m| m.at(h)).unwrap_or(0)
@@ -234,6 +245,10 @@ fn confirmable_on(node: &Node, p: &ChainParams) -> Result<(), String> {
     Ok(())
 }
 fn tx_of(node: &Node, p: &ChainParams, txid: &Hash256) -> Option<Tx> {
+    // Borrowed: one sent from here and still waiting, else the lender's, checked against its txid.
+    if lent(p) {
+        return crate::borrow::pool_txs(p).into_iter().find(|t| &t.txid == txid).or_else(|| crate::borrow::raw_tx(node, p, txid).ok());
+    }
     if let Ok(Some((raw, _))) = node.chain.tx_raw(p, txid) {
         return Tx::parse_with(&raw, &p.format).ok();
     }
@@ -254,6 +269,9 @@ pub(crate) fn pool_spender(node: &Node, p: &ChainParams, op: &OutPoint) -> Optio
     node.chain.mempool_spender(p.chain_no, op).ok().flatten()
 }
 fn spender(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<Tx> {
+    if lent(p) {
+        return crate::chains::find(p.key).and_then(|p| crate::borrow::spender_of(node, p, op).ok().flatten());
+    }
     if let Ok(Some((b, pos, _))) = node.chain.spender(p, op) {
         return tx_of(node, p, &node.chain.txid_at(p, b, pos).ok().flatten()?);
     }
@@ -283,12 +301,20 @@ fn taker_factor(o: &Value) -> u32 {
     if h(&o["give"]) || h(&o["get"]) { 4 } else { 2 }
 }
 fn tip_height(node: &Node, p: &ChainParams) -> u32 {
+    if lent(p) {
+        return crate::borrow::tip(node, p.key).unwrap_or(0);
+    }
     node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0)
 }
 /// Seconds per block over the last 60 blocks here (at least 1), else the ARCADE chain's 150.
 fn block_secs(node: &Node, p: &ChainParams) -> u32 {
     let tip = tip_height(node, p);
-    let time = |h: u32| node.chain.hash_at(p.chain_no, h).ok().flatten().and_then(|id| node.chain.header(p.chain_no, &id).ok().flatten()).map(|r| r.header.time);
+    let time = |h: u32| {
+        if lent(p) {
+            return crate::borrow::header_time(node, p, h);
+        }
+        node.chain.hash_at(p.chain_no, h).ok().flatten().and_then(|id| node.chain.header(p.chain_no, &id).ok().flatten()).map(|r| r.header.time)
+    };
     if tip > 60 {
         if let (Some(a), Some(b)) = (time(tip - 60), time(tip)) {
             return (b.saturating_sub(a) / 60).max(1);
@@ -534,6 +560,10 @@ fn leg_ok(node: &Node, leg: &Value) -> Result<&'static ChainParams, String> {
     if kind == "dd" && !matches!(p.key, "dgb" | "dgbtest") {
         return Err("DigiDollars are on dgb or dgbtest".into());
     }
+    // (A DigiDollar trade reads the dollar coins off this arcade's own address index: refused before anything locks.)
+    if kind == "dd" && lent(p) {
+        return Err(format!("{} is borrowed here: a DigiDollar leg needs it installed", p.name));
+    }
     if kind == "token" && p.chain_no != node.params.chain_no {
         return Err("an arcade-ledger token leg is on this arcade's home chain (its ledger)".into());
     }
@@ -548,6 +578,10 @@ fn leg_ok(node: &Node, leg: &Value) -> Result<&'static ChainParams, String> {
 }
 
 fn token20_kept(node: &Node, p: &ChainParams) -> bool {
+    // Borrowed: the tokens index of arcades keeping the chain is read (explorer.token_note; batch 7).
+    if lent(p) {
+        return arcade_ledger::tokens::protocol(p).is_some();
+    }
     arcade_ledger::tokens::protocol(p).is_some()
         && if p.chain_no == node.params.chain_no {
             crate::chains::home_indexes(node).iter().any(|i| i == "tokens")
@@ -558,6 +592,87 @@ fn token20_kept(node: &Node, p: &ChainParams) -> bool {
 
 fn units(leg: &Value) -> u64 {
     leg["amount"].as_str().and_then(|a| a.parse().ok()).unwrap_or(0)
+}
+
+// ---------------- inscriptions and token notes on a borrowed chain (borrowed = installed, batch 7) ----------------
+
+/// The coin of this key's carrying inscription `id` at its first unit on `p`. Installed: this arcade's ord index.
+/// Borrowed: where the arcades keeping the chain's ord index say it sits among this key's coins (each coin from a
+/// lender, checked against its block; every keeper that answers must agree, crate::ordsend::locate).
+fn own_ord_coin(node: &Node, p: &'static ChainParams, pk: &PublicKey, id: &str) -> Result<Utxo, String> {
+    let scripts: Vec<Vec<u8>> = crate::coinsend::key_scripts(p, pk).into_iter().map(|(_, s)| s).chain(std::iter::once(p2pkh_of(pk))).collect();
+    if lent(p) {
+        let mut held: Vec<Utxo> = Vec::new();
+        for s in &scripts {
+            for u in crate::borrow::own_coins(node, p, s) {
+                if !held.iter().any(|h| h.outpoint == u.outpoint) {
+                    held.push(u);
+                }
+            }
+        }
+        let list: Vec<String> = held.iter().take(500).map(|u| format!("{}:{}", u.outpoint.txid.to_hex(), u.outpoint.vout)).collect();
+        let q = json!({"chain": p.key, "outpoints": list, "local": true});
+        let answers = crate::shares::ask_explorer_each(node, p, "ord", "explorer.ord_outpoints", &q, 3, 6000);
+        if answers.is_empty() {
+            return Err(format!("no arcade keeping {}'s ord index answered: nothing is locked", p.name));
+        }
+        let (op, _, off, _, _) = crate::ordsend::locate(&answers, id.trim().trim_start_matches('#'))?;
+        if off != 0 {
+            return Err("that inscription isn't at its coin's first unit".into());
+        }
+        return held.into_iter().find(|u| u.outpoint == op).ok_or_else(|| "that inscription is not this wallet's".into());
+    }
+    let (at, off) = arcade_ledger::ord::location(&node.chain, p, id).ok_or("no such inscription here")?;
+    if off != 0 {
+        return Err("that inscription isn't at its coin's first unit".into());
+    }
+    let coin = node.chain.coin(p, &at).ok().flatten().ok_or("its coin is spent")?;
+    if !scripts.contains(&coin.script) {
+        return Err("that inscription is not this wallet's".into());
+    }
+    Ok(Utxo { outpoint: at, value: coin.value, script: coin.script })
+}
+
+/// Where inscription `id` sits (its coin and offset) when it should be on `on`: this arcade's ord index, or, borrowed,
+/// what the arcades keeping it say of that coin (all that answer agree). Ok(None) while nobody has read that far yet;
+/// Err when keepers disagree.
+fn ord_at(node: &Node, p: &'static ChainParams, id: &str, on: &OutPoint) -> Result<Option<(OutPoint, u64)>, String> {
+    if !lent(p) {
+        return arcade_ledger::ord::location(&node.chain, p, id).map(Some).ok_or_else(|| "no such inscription here".to_string());
+    }
+    let q = json!({"chain": p.key, "outpoints": [format!("{}:{}", on.txid.to_hex(), on.vout)], "local": true});
+    let answers = crate::shares::ask_explorer_each(node, p, "ord", "explorer.ord_outpoints", &q, 3, 6000);
+    match crate::ordsend::locate(&answers, id.trim().trim_start_matches('#')) {
+        Ok((op, _, off, _, _)) => Ok(Some((op, off))),
+        Err(e) if e.contains("disagree") => Err(e),
+        Err(_) => Ok(None),
+    }
+}
+
+/// A transfer note on a borrowed chain, as the arcades keeping its tokens index read it (every one that answers must
+/// say the same); None while none has it.
+fn lent_note(node: &Node, p: &'static ChainParams, iid: &str) -> Result<Option<Value>, String> {
+    let q = json!({"chain": p.key, "id": iid, "local": true});
+    let answers = crate::shares::ask_explorer_each(node, p, "tokens", "explorer.token_note", &q, 3, 6000);
+    agreed_note(&answers)
+}
+
+/// The note the answers agree on (those that have one); Err when two differ.
+fn agreed_note(answers: &[(Value, String)]) -> Result<Option<Value>, String> {
+    let mut found: Option<Value> = None;
+    for (v, _) in answers {
+        let n = &v["note"];
+        if !n.is_object() {
+            continue;
+        }
+        let key = |n: &Value| ["tick", "owner", "amt"].map(|k| n[k].clone());
+        match &found {
+            Some(f) if key(f) != key(n) => return Err("the arcades keeping the tokens index disagree about that transfer note".into()),
+            Some(_) => {}
+            None => found = Some(n.clone()),
+        }
+    }
+    Ok(found)
 }
 
 /// One step of locking `leg` under `spec` with `key` (this side's, [`signer`]); `st` is the lock's own record. Done
@@ -618,17 +733,10 @@ fn lock_step(node: &Node, leg: &Value, spec: &Spec, st: &mut Value, o: Option<&V
             st["step"] = json!("locked");
         }
         ("ord", "start") => {
-            let id = leg["asset"].as_str().unwrap_or("");
-            let (at, off) = arcade_ledger::ord::location(&node.chain, p, id).ok_or("no such inscription here")?;
-            if off != 0 {
-                return Err("that inscription isn't at its coin's first unit".into());
-            }
-            let coin = node.chain.coin(p, &at).ok().flatten().ok_or("its coin is spent")?;
-            if coin.script != own && coin.script != p2pkh_of(&pk) {
-                return Err("that inscription is not this wallet's".into());
-            }
-            let first = vec![Utxo { outpoint: at, value: coin.value, script: coin.script.clone() }];
-            let tx = build(node, p, &sk, first, coins(node, p, &pk), vec![TxOutSpec { value: coin.value, script: script.clone() }, TxOutSpec { value: RESERVE, script: script.clone() }], &own)?;
+            let coin = own_ord_coin(node, p, &pk, leg["asset"].as_str().unwrap_or(""))?;
+            let value = coin.value;
+            let fee_coins: Vec<Utxo> = coins(node, p, &pk).into_iter().filter(|u| u.outpoint != coin.outpoint).collect();
+            let tx = build(node, p, &sk, vec![coin], fee_coins, vec![TxOutSpec { value, script: script.clone() }, TxOutSpec { value: RESERVE, script: script.clone() }], &own)?;
             st["txid"] = json!(send(node, p, &tx)?);
             st["vout"] = json!(0);
             st["step"] = json!("locked");
@@ -709,19 +817,20 @@ fn seen(node: &Node, leg: &Value, spec: &Spec, st: &Value) -> Result<bool, Strin
         "token" => {
             let pid: u32 = leg["asset"].as_str().and_then(|a| a.parse().ok()).ok_or("bad property")?;
             let addr = arcade_ledger::address::sender_address_of(&script, p).ok_or("bad lock")?;
-            let held = led::holdings(&node.chain, p.chain_no, &addr).into_iter().find(|(x, _)| *x == pid).map(|x| x.1).unwrap_or(0);
+            // (Borrowed home: what an arcade keeping its ledger says the lock holds, asked now.)
+            let held = crate::walletsvc::send_holdings(node, p, &addr).into_iter().find(|(x, _)| *x == pid).map(|x| x.1).unwrap_or(0);
             if held < units(leg) {
                 return Ok(false); // the ledger reads the block after the coins: wait for it
             }
         }
         "ord" => {
-            let (at, off) = arcade_ledger::ord::location(&node.chain, p, leg["asset"].as_str().unwrap_or("")).ok_or("no such inscription here")?;
+            let Some((at, off)) = ord_at(node, p, leg["asset"].as_str().unwrap_or(""), &OutPoint { txid, vout: 0 })? else { return Ok(false) };
             if at != (OutPoint { txid, vout: 0 }) || off != 0 || tx.outputs.get(1).map(|o| &o.script_pubkey) != Some(&script) {
                 return Err("the inscription is not at the lock's first coin".into());
             }
         }
         "token20" => {
-            let note = arcade_ledger::tokens::note(&node.chain, p.chain_no, &arcade_ledger::ord::iid_bytes(&txid, 0));
+            let note = if lent(p) { lent_note(node, p, &arcade_ledger::ord::iid_str(&arcade_ledger::ord::iid_bytes(&txid, 0)))? } else { arcade_ledger::tokens::note(&node.chain, p.chain_no, &arcade_ledger::ord::iid_bytes(&txid, 0)) };
             let want = arcade_ledger::tokens::num(leg["amount"].as_str().unwrap_or("")).and_then(|n| n.units(18)).map(|u| u.to_string());
             let addr = spec.htlc().address(p);
             let ok = note.as_ref().is_some_and(|n| n["tick"] == leg["asset"].as_str().unwrap_or("").to_lowercase() && n["owner"] == addr.as_str() && n["amt"].as_str().map(String::from) == want);
@@ -812,7 +921,10 @@ fn spent_secret(node: &Node, leg: &Value, spec: &Spec, st: &Value) -> Result<Opt
     let p = leg_ok(node, leg)?;
     let txid = h256(&st["txid"])?;
     let op = OutPoint { txid, vout: st["vout"].as_u64().unwrap_or(0) as u32 };
-    let Some(t) = spender(node, p, &op) else { return Ok(None) };
+    // Borrowed: a lock a lender calls spent whose spender isn't shown yet is neither unspent (no refund is tried) nor
+    // claimed (nothing is claimed without the secret): asked again next round.
+    let found = if lent(p) { crate::borrow::spender_of(node, p, &op)? } else { spender(node, p, &op) };
+    let Some(t) = found else { return Ok(None) };
     let found = t.inputs.iter().filter(|i| i.prevout == op).find_map(|i| {
         let items: Vec<Vec<u8>> = if leg["kind"] == "dd" { i.witness.clone() } else { return htlc::secret_from_script_sig(&i.script_sig, &spec.htlc().redeem()) };
         items.into_iter().find(|w| <[u8; 32]>::from(Sha256::digest(w)) == spec.hash)
@@ -933,13 +1045,12 @@ fn sweep(node: &Node, p: &'static ChainParams, o: &Value, give: Option<&Value>) 
     match give.and_then(|g| g["kind"].as_str()) {
         Some("ord") => {
             let id = give.unwrap()["asset"].as_str().unwrap_or("");
-            if let Some((at, 0)) = arcade_ledger::ord::location(&node.chain, p, id) {
-                if let Some(coin) = node.chain.coin(p, &at).ok().flatten().filter(|c| c.script == own || c.script == p2pkh_of(&pk)) {
-                    let first = vec![Utxo { outpoint: at, value: coin.value, script: coin.script.clone() }];
-                    let tx = build(node, p, &sk, first, coins(node, p, &pk), vec![TxOutSpec { value: coin.value, script: to.clone() }], &to)?;
-                    sent.push(send(node, p, &tx)?);
-                    return Ok(sent); // its fee coins went with it, change to the payout address
-                }
+            if let Ok(coin) = own_ord_coin(node, p, &pk, id) {
+                let value = coin.value;
+                let fee_coins: Vec<Utxo> = coins(node, p, &pk).into_iter().filter(|u| u.outpoint != coin.outpoint).collect();
+                let tx = build(node, p, &sk, vec![coin], fee_coins, vec![TxOutSpec { value, script: to.clone() }], &to)?;
+                sent.push(send(node, p, &tx)?);
+                return Ok(sent); // its fee coins went with it, change to the payout address
             }
         }
         Some("dd") => {
@@ -975,7 +1086,7 @@ fn sweep(node: &Node, p: &'static ChainParams, o: &Value, give: Option<&Value>) 
             let g = give.unwrap();
             let pid: u32 = g["asset"].as_str().and_then(|a| a.parse().ok()).ok_or("bad property")?;
             let addr = arcade_ledger::address::address_of(&own, p).ok_or("no address")?;
-            let held = led::holdings(&node.chain, p.chain_no, &addr).into_iter().find(|(x, _)| *x == pid).map(|x| x.1).unwrap_or(0);
+            let held = crate::walletsvc::send_holdings(node, p, &addr).into_iter().find(|(x, _)| *x == pid).map(|x| x.1).unwrap_or(0);
             if held > 0 {
                 let mut payload = vec![0, 0, 0, 0];
                 payload.extend_from_slice(&pid.to_be_bytes());
@@ -1735,5 +1846,33 @@ mod account_tests {
         // A taker tells of its own lock only.
         let told = answer(&t.node, "pc", &json!({"op": "slocked", "order": ids[0], "hash": "00", "taker": "pd"}));
         assert!(told.unwrap_err().contains("own lock"));
+    }
+}
+
+#[cfg(test)]
+mod borrowed_tests {
+    use super::*;
+
+    /// Borrowed = installed, batch 7: a token lock on a borrowed chain is checked against the transfer note the arcades
+    /// keeping the tokens index read; those that have it must agree (tick, owner, amount), and none having it means wait.
+    #[test]
+    fn a_lent_transfer_note_is_taken_where_the_keepers_agree() {
+        let n = |amt: &str| json!({"note": {"tick": "pepe", "owner": "Lock1", "amt": amt}});
+        let a = |v: Value, by: &str| (v, by.to_string());
+        let got = agreed_note(&[a(n("100"), "x"), a(json!({"note": null}), "y"), a(n("100"), "z")]).unwrap().unwrap();
+        assert_eq!(got["amt"], "100");
+        assert!(agreed_note(&[a(n("100"), "x"), a(n("90"), "y")]).unwrap_err().contains("disagree"));
+        assert!(agreed_note(&[a(json!({"note": null}), "x")]).unwrap().is_none(), "nobody has read it yet");
+        assert!(agreed_note(&[]).unwrap().is_none());
+    }
+
+    /// A leg on a chain this arcade neither keeps nor borrows is still refused, saying so; the home chain kept here goes.
+    #[test]
+    fn a_leg_is_on_a_chain_kept_or_borrowed() {
+        let t = crate::sitesvc::tests::setup();
+        let other = crate::chains::all().into_iter().find(|p| p.key != t.p.key && !crate::chains::kept(&t.node, p) && !crate::borrow::is_borrowed(p.key)).unwrap();
+        let e = leg_ok(&t.node, &json!({"chain": other.key, "kind": "coin", "amount": "1"})).unwrap_err();
+        assert!(e.contains("neither installed nor borrowed"), "{e}");
+        assert!(leg_ok(&t.node, &json!({"chain": t.p.key, "kind": "coin", "amount": "1"})).is_ok());
     }
 }

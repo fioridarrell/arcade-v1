@@ -178,6 +178,34 @@ fn holdings(node: &Node, address: &str) -> Vec<(u32, u64)> {
     led::holdings(&node.chain, c(node), address)
 }
 
+/// /r/balances/<address>'s rows for holdings `have`; with `pending`, `arriving` and `leaving` units per token from the
+/// transactions still waiting (crate::walletsvc::pending_moves).
+pub(crate) fn balances_json(node: &Node, a: &str, have: &[(u32, u64)], pending: bool) -> Value {
+    let mut rows = balance_rows(node, have);
+    // pending=1 (as the original): `arriving` and `leaving` units per token from the
+    // mempool, and a row for a token only arriving; `units` stays what the blocks say.
+    if pending {
+        let (inc, out) = pending_moves(node, a);
+        let list = rows.as_array_mut().unwrap();
+        for (key, side) in [("arriving", &inc), ("leaving", &out)] {
+            for m in side.iter().filter(|m| m["kind"] == "token") {
+                let pid = m["property_id"].as_u64().unwrap_or(0);
+                let i = match list.iter().position(|r| r["propertyid"].as_u64() == Some(pid)) {
+                    Some(i) => i,
+                    None => {
+                        let p = prop(node, pid as u32).unwrap_or(Value::Null);
+                        list.push(json!({"propertyid": pid, "name": p["name"], "balance": "0", "units": 0, "divisible": divisible(&p)}));
+                        list.len() - 1
+                    }
+                };
+                let have = list[i][key].as_u64().unwrap_or(0);
+                list[i][key] = json!(have + m["units"].as_u64().unwrap_or(0));
+            }
+        }
+    }
+    rows
+}
+
 /// Token holdings a send from `address` on `p` may spend: this arcade's own ledger, or, while `p` is borrowed here (not
 /// installed, or still catching up, so our copy may lack the newest moves), an arcade keeping its ledger (its
 /// explorer.address, answered from its own tables). Our own copy when no such arcade answers.
@@ -330,29 +358,8 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
             (200, text(&json!(rows)))
         }
         ["balances", a] => {
-            let mut rows = balance_rows(node, &holdings(node, a));
-            // pending=1 (as the original): `arriving` and `leaving` units per token from the
-            // mempool, and a row for a token only arriving; `units` stays what the blocks say.
-            if qs("pending").is_some_and(|v| v != "0" && !v.is_empty()) {
-                let (inc, out) = pending_moves(node, a);
-                let list = rows.as_array_mut().unwrap();
-                for (key, side) in [("arriving", &inc), ("leaving", &out)] {
-                    for m in side.iter().filter(|m| m["kind"] == "token") {
-                        let pid = m["property_id"].as_u64().unwrap_or(0);
-                        let i = match list.iter().position(|r| r["propertyid"].as_u64() == Some(pid)) {
-                            Some(i) => i,
-                            None => {
-                                let p = prop(node, pid as u32).unwrap_or(Value::Null);
-                                list.push(json!({"propertyid": pid, "name": p["name"], "balance": "0", "units": 0, "divisible": divisible(&p)}));
-                                list.len() - 1
-                            }
-                        };
-                        let have = list[i][key].as_u64().unwrap_or(0);
-                        list[i][key] = json!(have + m["units"].as_u64().unwrap_or(0));
-                    }
-                }
-            }
-            (200, rows.to_string())
+            let pending = qs("pending").is_some_and(|v| v != "0" && !v.is_empty());
+            (200, balances_json(node, a, &holdings(node, a), pending).to_string())
         }
         ["tag", name] => {
             let t = name.trim_start_matches('@').to_lowercase();
@@ -473,6 +480,15 @@ fn put_req(node: &Node, r: &Value) {
 
 fn with_confirmations(node: &Node, mut r: Value) -> Value {
     if r["status"] == "sent" {
+        // A request sent on the ARCADE chain (a page inscribed there): its depth there, installed or borrowed.
+        if let (Some(p), Some(h)) = (r["chain"].as_str().and_then(crate::chains::find), r["txid"].as_str().and_then(|t| arcade_chain::Hash256::from_hex(t).ok())) {
+            if p.chain_no != node.params.chain_no {
+                let d = crate::swaps::depth(node, p, &h);
+                r["confirmations"] = json!(d);
+                r["confirmed"] = json!(d >= 1);
+                return r;
+            }
+        }
         if let Some(t) = r["txid"].as_str().and_then(|t| tx_status(node, t)) {
             r["confirmations"] = t["confirmations"].clone();
             r["confirmed"] = t["confirmed"].clone();
@@ -492,6 +508,12 @@ pub fn requests(node: &Node, page: Option<&str>) -> Value {
     json!(out)
 }
 
+/// The chain a page's send request is on: the ARCADE chain for a page inscribed there, else the home chain.
+fn send_chain(node: &Node) -> &'static arcade_chain::params::ChainParams {
+    let pc = crate::pagechain::params(node);
+    if pc.chain_no != node.params.chain_no && crate::arcsvc::defines(pc.key) { pc } else { node.params }
+}
+
 fn resolve_to(node: &Node, to: &str) -> Result<String, String> {
     let to = to.trim();
     if let Some(t) = to.strip_prefix('@') {
@@ -499,7 +521,8 @@ fn resolve_to(node: &Node, to: &str) -> Result<String, String> {
     }
     match arcade_ledger::address::decode_base58check(to) {
         // A key's address or a script's (a refereed prize pool lives at one).
-        Some(_) if arcade_ledger::address::script_for_address(node.params, to).is_some() => Ok(to.to_string()),
+        // (The ARCADE chain's addresses for a page there, whose sends are on that chain.)
+        Some(_) if arcade_ledger::address::script_for_address(send_chain(node), to).is_some() => Ok(to.to_string()),
         Some(_) => Err("that is an address on another chain".into()),
         None => Err("not an address: give an address or an @tag".into()),
     }
@@ -537,8 +560,13 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
     if !matches!(kind, "coins" | "token" | "inscription") {
         return refuse("kind is coins, token or inscription".into());
     }
-    if body["chain"].as_str().is_some_and(|ch| ch != node.params.net && ch != node.params.key) {
-        return refuse("this arcade's own wallet sends on its own chain only".into());
+    // On the home chain, or on the ARCADE chain for a page inscribed there (its reads are on that chain, and so is the
+    // send: batch 7; before, its token and inscription were looked up on ARCADE and the send built on the home chain).
+    let pc = send_chain(node);
+    let on_arc = pc.chain_no != node.params.chain_no;
+    let chain_ok = |ch: &str| ch == node.params.net || ch == node.params.key || (on_arc && (ch == pc.net || ch == pc.key));
+    if body["chain"].as_str().is_some_and(|ch| !chain_ok(ch)) {
+        return refuse("this arcade's own wallet sends on its own chain (or, for a page on the ARCADE chain, on that chain) only".into());
     }
     // A repeat of the same ref within 7 days: the first request as it stands.
     let rf = body["ref"].as_str().map(String::from);
@@ -561,7 +589,7 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
     };
     let (units, what) = match kind {
         "coins" => match amount_units(body["amount"].as_str().unwrap_or(""), true) {
-            Ok(u) => (u, format!("{} PEPtest", body["amount"].as_str().unwrap_or(""))),
+            Ok(u) => (u, format!("{} {}", body["amount"].as_str().unwrap_or(""), if on_arc { "ARCADE" } else { "PEPtest" })),
             Err(e) => return refuse(e),
         },
         "token" => {
@@ -592,7 +620,8 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
                    "propertyid": body["propertyid"], "inscription": body["inscription"], "from": body["from"],
                    "label": body["label"].as_str().map(|s| s.chars().take(60).collect::<String>()),
                    "note": body["note"].as_str().map(|s| s.chars().take(200).collect::<String>()),
-                   "ref": rf, "status": "pending", "created": arcade_app::now(), "txid": Value::Null, "error": Value::Null});
+                   "ref": rf, "status": "pending", "created": arcade_app::now(), "txid": Value::Null, "error": Value::Null,
+                   "chain": if on_arc { json!(pc.key) } else { Value::Null }});
     put_req(node, &r);
     if let Some(rf) = &rf {
         let _ = node.app.store.write(|w| w.put(arcade_app::META, format!("sendref:{rf}").as_bytes(), id.as_bytes()));
@@ -654,6 +683,11 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
         // A repository write (reposvc.rs): on the ARCADE chain, signed by this wallet's @tag there.
         let built = if send { crate::reposvc::start(node, r) } else { crate::reposvc::preview(node, r).map(|(fee, outs)| (String::new(), fee, outs)) };
         return built.map(|(t, f, o)| (t, f, o, None));
+    }
+    // A request a page on the ARCADE chain made (batch 7): built and sent on that chain, not the home chain.
+    if let Some(k) = r["chain"].as_str().filter(|k| *k != p.key) {
+        let ap = crate::chains::find(k).filter(|ap| crate::arcsvc::defines(ap.key)).ok_or_else(|| format!("a page's send is on the home chain or the ARCADE chain, not {k}"))?;
+        return arc_send(node, ap, r, send).map(|(t, f, o)| (t, f, o, None));
     }
     let to = r["to"].as_str().unwrap_or("");
     let to_script = arcade_ledger::address::script_for_address(p, to).ok_or("bad address")?;
@@ -727,29 +761,63 @@ pub fn token_send(node: &Node, pid: u32, units: u64, to: &str, send: bool) -> Re
 /// [`token_send`] on the ARCADE chain's ledger (installed, or borrowed: holdings from an arcade keeping its ledger,
 /// coins from a lender too, each checked against its block): the key on ARCADE that holds the units signs, here.
 pub fn arc_token_send(node: &Node, p: &'static arcade_chain::params::ChainParams, pid: u32, units: u64, to: &str, send: bool) -> Result<(String, u64, Vec<Value>), String> {
-    let to_script = arcade_ledger::address::script_for_address(p, to.trim()).ok_or_else(|| format!("{to} isn't an ARCADE address"))?;
-    // The wallet's tag keys on ARCADE, its first key too (wallet.keys's: no tag key listed yet on a chain only borrowed).
+    arc_send(node, p, &json!({"kind": "token", "propertyid": pid, "units": units, "to": to}), send)
+}
+
+/// This wallet's keys on the ARCADE chain: its tag keys there, and its first key too (wallet.keys's: no tag key is
+/// listed yet on a chain only borrowed).
+fn arc_slots(node: &Node, p: &'static arcade_chain::params::ChainParams) -> Result<Vec<(arcade_app::TagKey, arcade_wallet::SecretKey)>, String> {
     let mut slots: Vec<u32> = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?.into_iter().map(|k| k.index).collect();
     if !slots.contains(&0) {
         slots.push(0);
     }
-    let (mut found, mut held) = (None, 0u64);
-    for i in slots {
-        let (k, sk) = node.app.tag_key(p, i).map_err(|e| e.to_string())?;
-        let has = send_holdings(node, p, &k.address).iter().find(|(x, _)| *x == pid).map(|(_, u)| *u).unwrap_or(0);
-        if has >= units {
-            found = Some((k, sk));
-            break;
+    slots.into_iter().map(|i| node.app.tag_key(p, i).map_err(|e| e.to_string())).collect()
+}
+
+/// A send of `r` ({kind: coins | token | inscription, to, units, propertyid, inscription, from}) on the ARCADE chain,
+/// installed or borrowed (borrowed = installed, batches 6 and 7): from the key there that holds what moves (coins: the
+/// request's `from` when it is one of ours, else the first key), its coins (borrowed: a lender's too, each checked
+/// against its block), built and signed here and sent when `send`. (txid, fee, outputs).
+pub(crate) fn arc_send(node: &Node, p: &'static arcade_chain::params::ChainParams, r: &Value, send: bool) -> Result<(String, u64, Vec<Value>), String> {
+    let to = r["to"].as_str().unwrap_or("").trim();
+    let to_script = arcade_ledger::address::script_for_address(p, to).ok_or_else(|| format!("{to} isn't an ARCADE address"))?;
+    let units = r["units"].as_u64().unwrap_or(0);
+    let slots = arc_slots(node, p)?;
+    let kind = r["kind"].as_str().unwrap_or("");
+    let pid = r["propertyid"].as_u64().or_else(|| r["propertyid"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0) as u32;
+    let insc = r["inscription"].as_str().map(String::from).or_else(|| r["inscription"].as_u64().map(|n| n.to_string())).unwrap_or_default();
+    let (k, sk) = match kind {
+        "token" => {
+            let mut held = 0u64;
+            let mut found = None;
+            for (k, sk) in slots {
+                let has = send_holdings(node, p, &k.address).iter().find(|(x, _)| *x == pid).map(|(_, u)| *u).unwrap_or(0);
+                if has >= units {
+                    found = Some((k, sk));
+                    break;
+                }
+                held = held.max(has);
+            }
+            match found {
+                Some(f) => f,
+                None => {
+                    // Borrowed: say what the arcade keeping the ledger answered, when it didn't.
+                    let why = if crate::borrow::is_borrowed(p.key) { lent_send_holdings(node, p, &node.app.tag_key(p, 0).map_err(|e| e.to_string())?.0.address).err() } else { None };
+                    return Err(format!("this wallet does not hold that much of that token (at most {held} units on one of its {} addresses){}", p.name, why.map(|w| format!("; {w}")).unwrap_or_default()));
+                }
+            }
         }
-        held = held.max(has);
-    }
-    let (k, sk) = match found {
-        Some(f) => f,
-        None => {
-            // Borrowed: say what the arcade keeping the ledger answered, when it didn't.
-            let why = if crate::borrow::is_borrowed(p.key) { lent_send_holdings(node, p, &node.app.tag_key(p, 0).map_err(|e| e.to_string())?.0.address).err() } else { None };
-            return Err(format!("this wallet does not hold that much of that token (at most {held} units on one of its {} addresses){}", p.name, why.map(|w| format!("; {w}")).unwrap_or_default()));
+        "inscription" => {
+            let i = crate::lentledger::inscription(node, p, &insc).ok_or("no such inscription")?;
+            let owner = i["owner"].as_str().unwrap_or("");
+            slots.into_iter().find(|(k, _)| k.address == owner).ok_or("that inscription is no longer this wallet's")?
         }
+        "coins" => {
+            let from = r["from"].as_str().unwrap_or("");
+            let first = slots[0].clone();
+            slots.into_iter().find(|(k, _)| !from.is_empty() && k.address == from).unwrap_or(first)
+        }
+        _ => return Err("kind is coins, token or inscription".into()),
     };
     let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
     let script = arcade_wallet::keys::p2pkh_script_for(&pk);
@@ -760,13 +828,28 @@ pub fn arc_token_send(node: &Node, p: &'static arcade_chain::params::ChainParams
         c.extend(crate::arcsvc::waiting_outputs(&script).into_iter().map(|(op, value)| arcade_wallet::tx::Utxo { outpoint: op, value, script: script.clone() }));
         c
     };
-    // Omni simple send: version 0, type 0, property, amount; the recipient is the reference output.
-    let mut payload = vec![0, 0, 0, 0];
-    payload.extend_from_slice(&pid.to_be_bytes());
-    payload.extend_from_slice(&units.to_be_bytes());
-    let tx = arcade_wallet::tx::build_arcade_with(p, &payload, vec![arcade_wallet::tx::TxOutSpec { value: arcade_arc::params::DUST, script: to_script }], &sk, &coins,
-        2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST, arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
-        .map_err(|e| format!("could not build the token send: {e}"))?;
+    let (fee_kb, dust, now) = (2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST, arcade_app::now() as u32);
+    let reference = vec![arcade_wallet::tx::TxOutSpec { value: dust, script: to_script.clone() }];
+    let tx = match kind {
+        "coins" => arcade_wallet::tx::build_send(p, &to_script, units, &sk, &coins, fee_kb, dust, now).map_err(|e| format!("could not build the send: {e}"))?,
+        "token" => {
+            // Omni simple send: version 0, type 0, property, amount; the recipient is the reference output.
+            let mut payload = vec![0, 0, 0, 0];
+            payload.extend_from_slice(&pid.to_be_bytes());
+            payload.extend_from_slice(&units.to_be_bytes());
+            arcade_wallet::tx::build_arcade_with(p, &payload, reference, &sk, &coins, fee_kb, dust, now, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
+                .map_err(|e| format!("could not build the token send: {e}"))?
+        }
+        _ => {
+            let i = crate::lentledger::inscription(node, p, &insc).ok_or("no such inscription")?;
+            // INSC transfer (kind 2): the inscription's txid; the recipient is the reference output.
+            let mut d = b"INSC".to_vec();
+            d.extend_from_slice(&[1, 2]);
+            d.extend_from_slice(&hex::decode(i["txid"].as_str().unwrap_or("")).map_err(|e| e.to_string())?);
+            arcade_wallet::tx::build_arcade_with(p, &arcade_wallet::tx::any_data(&d), reference, &sk, &coins, fee_kb, dust, now, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
+                .map_err(|e| format!("could not build the inscription send: {e}"))?
+        }
+    };
     let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
     let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
     let outs: Vec<Value> = tx.outputs.iter().map(|o| {

@@ -386,6 +386,11 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .arcade .top { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .arcade .who { font-weight: 650; font-size: 15px; margin-right: 4px; }
 .arcade .meta { color: var(--muted); font-size: 12px; overflow-wrap: anywhere; }
+.arcade .machine { color: var(--ink); }
+.arcade .pill.ping { font-variant-numeric: tabular-nums; }
+.si-rec td { padding: 3px 10px 3px 0; vertical-align: top; }
+.si-rec td.muted { color: var(--muted); font-size: 12px; }
+.si-json { background: var(--panel-2); border-radius: 9px; padding: 10px; font: 11px/1.45 var(--mono, ui-monospace, monospace); white-space: pre-wrap; overflow-wrap: anywhere; margin: 6px 0; max-height: 18em; overflow: auto; }
 .arcade .lines { display: flex; flex-direction: column; gap: 4px; margin-top: 2px; }
 .arcade .line { display: grid; grid-template-columns: 20px 11em 1fr; align-items: start; gap: 8px; }
 .arcade .logo { width: 20px; height: 20px; border-radius: 50%; display: grid; place-items: center; font-size: 10px; font-weight: 700; color: #fff; flex: none; overflow: hidden; }

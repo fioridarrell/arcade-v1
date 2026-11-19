@@ -501,7 +501,10 @@ pub fn exec_self() -> ! {
             eprintln!("arcaded: couldn't start the new version ({e}); exiting so the service starts it");
             std::process::exit(75)
         }
-        None => std::process::exit(75),
+        None => {
+            eprintln!("arcaded: the update didn't record how this arcaded was started; exiting (75) so the service starts the new one");
+            std::process::exit(75)
+        }
     }
 }
 
@@ -524,12 +527,16 @@ pub fn exec_self() -> ! {
                 }
             }
         }
-        None => std::process::exit(75),
+        None => {
+            eprintln!("arcaded: the update didn't record how this arcaded was started; exiting (75) so the service starts the new one");
+            std::process::exit(75)
+        }
     }
 }
 
 #[cfg(not(any(unix, windows)))]
 pub fn exec_self() -> ! {
+    eprintln!("arcaded: this system can't restart in place; exiting (75) so the service starts the new arcaded");
     std::process::exit(75)
 }
 

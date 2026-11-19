@@ -116,3 +116,17 @@ unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/borrownet.py target
 ```
 
 It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about 10 minutes.
+
+## Shared system info and ping (`sysinfonet.py`)
+
+Three arcades on a closed network, B linked to A and C. A shares its system info (`sysinfo.set`), C doesn't. B's
+`mesh.sysinfo` shows A's signed record and counts 1 of 2 sharing; C gets it too, passed on by B. B's `mesh.overview`
+has a `ping_ms` for both (`ping_via: "link"`) and a `machine` for A only. The switch survives a restart of A; when A
+switches off, B and C drop its machine at once (about a second).
+
+```sh
+cargo build -p arcaded
+unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/sysinfonet.py target/debug/arcaded /tmp/sysinfonet'
+```
+
+It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about a minute.

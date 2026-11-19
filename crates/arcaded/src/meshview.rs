@@ -37,6 +37,23 @@ fn name_of(key: &str) -> String {
     by_key(key).map(|p| p.name.to_string()).unwrap_or_else(|| key.to_string())
 }
 
+/// Every other arcade linked or heard from lately (offers, chain copies, index copies, hold reports): the arcades
+/// `mesh.overview` lists, and `mesh.sysinfo` counts as heard.
+pub fn heard_ids(node: &Node) -> BTreeSet<String> {
+    let now = arcade_app::now();
+    let mut ids: BTreeSet<String> = node.links.lock().unwrap().values().map(|l| l.node_id.clone()).collect();
+    ids.extend(node.offers.lock().unwrap().iter().filter(|(_, o)| o.at + FRESH >= now).map(|(id, _)| id.clone()));
+    ids.extend(crate::coreboot::heard_all().iter().filter(|x| x.1 + FRESH >= now).map(|x| x.0.clone()));
+    #[cfg(feature = "oldimport")]
+    {
+        ids.extend(crate::lxfetch::heard_all().iter().filter(|x| x.1 + FRESH >= now).map(|x| x.0.clone()));
+        ids.extend(crate::dxfetch::heard_all().iter().filter(|x| x.2 + FRESH >= now).map(|x| x.0.clone()));
+    }
+    ids.extend(node.holds.lock().unwrap().iter().filter(|(_, (at, _))| *at + 600 >= now).map(|(id, _)| id.clone()));
+    ids.remove(&node.id_hex());
+    ids
+}
+
 pub fn overview(node: &Node) -> Value {
     let now = arcade_app::now();
     // Links are kept by address; here they're looked up by node.
@@ -84,6 +101,7 @@ pub fn overview(node: &Node) -> Value {
     let mut arcades = Vec::new();
     for id in ids {
         let link = links.get(&id);
+        let ping = link.and_then(|_| crate::linkrtt::get(&id));
         let op = ops.get(&id).map(|x| x.1.clone()).unwrap_or(Value::Null);
         let mut chains: BTreeMap<String, serde_json::Map<String, Value>> = BTreeMap::new();
         let mut put = |key: &str, k: &str, v: Value| {
@@ -163,6 +181,12 @@ pub fn overview(node: &Node) -> Value {
             "linked": link.is_some(),
             "addr": link.map(|l| l.addr.clone()).or_else(|| offers.get(&id).map(|o| o.addr.clone()).filter(|a| !a.is_empty())),
             "since": link.map(|l| l.since),
+            // The link's round trip (crate::linkrtt): the least of its last pongs, so a busy moment doesn't show.
+            // None when not linked (shown "—") or before its first pong.
+            "ping_ms": ping.map(|p| p.0),
+            "ping_via": ping.map(|p| if p.1 { "relay" } else { "link" }),
+            // What it runs on, when its operator shares it (crate::sysinfo): reported by it, rounded.
+            "machine": crate::sysinfo::machine(&id),
             "chains": chains,
         }));
     }

@@ -7,6 +7,13 @@ the blocks, signed on C, sent through A). A sees C's send confirmed in a block a
 borrowed chain says plainly that ARCADE has no ord inscriptions (the ord path is covered by unit tests: no closed
 chain here carries ords).
 
+Batch 7 (swaps on a borrowed chain): A makes a swap order (ARCADE coins for ARCADE coins) and C takes it: C locks on
+the chain it only borrows, A checks that lock on its own copy and locks, C reads A's lock from A (checked against its
+headers) and claims, A reads the secret and claims. Then C makes and A takes: C reads A's claim of its lock (the
+spender A names, read by txid and found in a checked block) and claims A's lock with its secret. Last, a refund: A
+takes its order back before C tells of its lock, and C's lock comes back to it after its time. BORROW_SWAPS=0 skips
+these.
+
 Run inside: unshare -Urn sh -c "ip link set lo up; python3 borrowbuilds.py ARCADED WORKDIR"
 """
 import hashlib, json, os, shutil, socket, subprocess, sys, time
@@ -117,6 +124,63 @@ def tag_status(n, tag):
 
 
 TOKEN = "Borrowtoken"
+# Swap locks this long (s): a maker's lock 1 time, a taker's 4 times on the ARCADE chain (blocks every ~2 s here).
+SWAP_ENV = {"ARCADE_SWAP_TEST_SECS": "120"}
+COIN = 100_000_000
+
+
+def swap_of(n, sid):
+    return next((s for s in call(n, "swap.list") if s["id"] == sid), None)
+
+
+def swap_steps(sid):
+    a, c = swap_of("A", sid) or {}, swap_of("C", sid) or {}
+    return f"A {a.get('step')} / C {c.get('step')} (A: {a.get('last')}; C: {c.get('last')})"
+
+
+def swap_round(maker, taker, maker_id, fails, label):
+    """maker places ARCADE coins for ARCADE coins, taker takes it whole; both sides must end "claimed"."""
+    give = {"chain": "arctest", "kind": "coin", "asset": "", "amount": str(COIN // 2)}
+    get = {"chain": "arctest", "kind": "coin", "asset": "", "amount": str(COIN * 4 // 10)}
+    try:
+        o = call(maker, "swap.place", give=give, get=get)
+        s = call(taker, "swap.take", node=maker_id, order=o["id"], give=o["give"], get=o["get"])
+    except Exception as e:
+        fails.append(f"{label}: {e}")
+        return
+    sid = s["id"]
+    print("   swap", sid[:16], "taken")
+    if not wait(f"{label}: both sides claimed", lambda: (swap_of(maker, sid) or {}).get("step") == "claimed" and (swap_of(taker, sid) or {}).get("step") == "claimed",
+                900, show=lambda: swap_steps(sid)):
+        fails.append(f"{label}: not claimed on both sides: {swap_steps(sid)}")
+        return
+    m, t = swap_of(maker, sid), swap_of(taker, sid)
+    print("   maker claimed", m.get("claim_tx"), "/ taker claimed", t.get("claim_tx"))
+    # Both claims in a block, as the arcade keeping ARCADE (A) reads them.
+    for who, tx in ((maker, m.get("claim_tx")), (taker, t.get("claim_tx"))):
+        if not wait(f"{label}: {who}'s claim in a block", lambda: (call("A", "explorer.tx", chain="arctest", txid=tx, local=True).get("height") or 0) > 0, 300):
+            fails.append(f"{label}: {who}'s claim never confirmed")
+
+
+def swap_refund(fails):
+    """C takes A's order; A takes the order back before C tells of its lock, so A never locks: C's lock on the chain it
+    only borrows comes back to it after its time (built and signed on C, sent through A)."""
+    amt = {"chain": "arctest", "kind": "coin", "asset": "", "amount": str(COIN // 5)}
+    ida = call("A", "status")["node_id"]
+    o = call("A", "swap.place", give=amt, get=amt)
+    s = call("C", "swap.take", node=ida, order=o["id"], give=o["give"], get=o["get"])
+    sid = s["id"]
+    call("A", "swap.release", order=o["id"])
+    if not wait("C's lock is made", lambda: ((swap_of("C", sid) or {}).get("taker_lock") or {}).get("step") == "locked", 300, show=lambda: swap_steps(sid)):
+        fails.append(f"refund: C never locked: {swap_steps(sid)}")
+        return
+    if not wait("C refunds its lock after its time", lambda: (swap_of("C", sid) or {}).get("step") == "refunded", 1500, show=lambda: swap_steps(sid)):
+        fails.append(f"refund: C didn't refund: {swap_steps(sid)}")
+        return
+    tx = swap_of("C", sid).get("refund_tx")
+    print("   refund", tx)
+    if not wait("C's refund in a block", lambda: (call("A", "explorer.tx", chain="arctest", txid=tx, local=True).get("height") or 0) > 0, 300):
+        fails.append("refund: C's refund never confirmed")
 
 
 def issuance(name, amount):
@@ -152,7 +216,7 @@ def main():
     sp = os.path.join(WORK, "settings.json")
     json.dump(settings, open(sp, "w"))
     fails = []
-    start("A", settings=sp)
+    start("A", settings=sp, env=SWAP_ENV)
     call("A", "chains.add", key="arctest")
     h = lambda n: call(n, "arc.status")["height"]
     print("1. A writes until it has ARCADE to spare, claims @alice and issues a token")
@@ -170,7 +234,7 @@ def main():
     pid = [t for t in toks() if t.get("name") == TOKEN][0]["id"]
     print("   token id", pid)
 
-    start("C", peer="A", settings=sp)
+    start("C", peer="A", settings=sp, env=SWAP_ENV)
     call("C", "wallet.create")
     print("2. C (ARCADE not installed) borrows it, gets ARCADE and claims @carol")
     if not wait("C borrows arctest", lambda: borrowed("C")[0] and (borrowed("C")[1].get("tip") or 0) > 0, 300):
@@ -242,6 +306,14 @@ def main():
         print("   ", str(e)[:160])
         if "no ord inscriptions" not in str(e):
             fails.append(f"ord.send on borrowed ARCADE: {e}")
+    if os.environ.get("BORROW_SWAPS", "1") != "0":
+        idc = call("C", "status")["node_id"]
+        print("6. Swap: A (ARCADE installed) makes, C (ARCADE only borrowed) takes: ARCADE coins for ARCADE coins")
+        swap_round("A", "C", ida, fails, "A makes, C takes")
+        print("7. Swap the other way: C makes on the chain it borrows, A takes (C reads A's claim from A's word, checked)")
+        swap_round("C", "A", idc, fails, "C makes, A takes")
+        print("8. A refund on the borrowed chain: C's lock comes back after its time")
+        swap_refund(fails)
     print("RESULT:", "PASS" if not fails else "FAIL", fails)
     return 0 if not fails else 1
 

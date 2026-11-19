@@ -356,6 +356,13 @@ pub fn set_settings(node: &Node, v: &Value) -> Result<Value, String> {
 pub fn post(node: &Node, text: &str, channel: &str, file: Option<arcade_msg::content::File>) -> Result<Value, String> {
     let (_, tag, _) = crate::msgsvc::sender_key(node)?;
     let Some(_tag) = tag else { return Err("claim a @tag first: public posts show your @tag".into()) };
+    let p = make_post(text, channel, file)?;
+    let (txids, fee) = crate::msgsvc::send_payloads(node, &p.payloads())?;
+    Ok(json!({"txid": txids[0], "txids": txids, "fee": fee}))
+}
+
+/// A public post's record, checked as feed.post checks it.
+pub(crate) fn make_post(text: &str, channel: &str, file: Option<arcade_msg::content::File>) -> Result<Post, String> {
     if text.trim().is_empty() && file.is_none() {
         return Err("write something".into());
     }
@@ -366,14 +373,12 @@ pub fn post(node: &Node, text: &str, channel: &str, file: Option<arcade_msg::con
     if ch.len() > 24 {
         return Err("a channel name is at most 24 characters".into());
     }
-    let p = Post { channel: if ch.is_empty() { "main".into() } else { ch }, nick: String::new(), text: text.to_string(), file };
-    let (txids, fee) = crate::msgsvc::send_payloads(node, &p.payloads())?;
-    Ok(json!({"txid": txids[0], "txids": txids, "fee": fee}))
+    Ok(Post { channel: if ch.is_empty() { "main".into() } else { ch }, nick: String::new(), text: text.to_string(), file })
 }
 
-/// A feed act on a post or reply. Tips pay `amount` (satoshis) to the post's author in the same transaction.
-pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Result<Value, String> {
-    let act = match kind {
+/// A feed act's kind by name (feed.act's `kind`).
+pub(crate) fn act_kind(kind: &str) -> Result<Act, String> {
+    Ok(match kind {
         "like" => Act::Like,
         "unlike" => Act::Unlike,
         "dislike" => Act::Dislike,
@@ -384,7 +389,19 @@ pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Re
         "delete" => Act::Delete,
         "tip" => Act::Tip,
         _ => return Err(format!("unknown act {kind}: like, unlike, dislike, undislike, reply, share, edit, delete, tip")),
-    };
+    })
+}
+
+/// Who a tip on `target` pays: the post's sender, or a reply's (the home chain's form).
+pub(crate) fn tip_author(node: &Node, target: &str) -> Result<String, String> {
+    find_post(node, target).and_then(|(_, p)| p["from"].as_str().map(String::from))
+        .or_else(|| ledger_rows(node, m::ACT).into_iter().find(|a| a["txid"] == target).and_then(|a| a["from"].as_str().map(String::from)))
+        .ok_or_else(|| "that post isn't in a block yet; tip it once it is".to_string())
+}
+
+/// A feed act on a post or reply. Tips pay `amount` (satoshis) to the post's author in the same transaction.
+pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Result<Value, String> {
+    let act = act_kind(kind)?;
     if hex::decode(target).map(|b| b.len()) != Ok(32) {
         return Err("target is a post's txid".into());
     }
@@ -393,10 +410,7 @@ pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Re
         if amount == 0 {
             return Err("a tip needs an amount".into());
         }
-        // The author: a post's sender, or a reply's.
-        let author = find_post(node, target).and_then(|(_, p)| p["from"].as_str().map(String::from))
-            .or_else(|| ledger_rows(node, m::ACT).into_iter().find(|a| a["txid"] == target).and_then(|a| a["from"].as_str().map(String::from)))
-            .ok_or("that post isn't in a block yet; tip it once it is")?;
+        let author = tip_author(node, target)?;
         // A tip is a wallet spend: P2PKH of the home chain only.
         let script = arcade_ledger::address::p2pkh_script_for_address(node.ledger_home(), &author).ok_or("bad author address")?;
         extra.push(arcade_wallet::tx::TxOutSpec { value: amount, script });

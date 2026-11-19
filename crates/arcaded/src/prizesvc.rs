@@ -37,21 +37,58 @@ struct Row {
 
 #[derive(Default)]
 struct Scan {
-    chain: u16,
     next: u64,
     rows: Vec<Row>,
 }
 
-static SCAN: Mutex<Option<Scan>> = Mutex::new(None);
+/// The scan of each chain's ledger read so far (the page's chain, and any chain another arcade asks about).
+static SCAN: Mutex<Option<std::collections::HashMap<u16, Scan>>> = Mutex::new(None);
 
 /// Inscriptions whose JSON names a prize pool (or a pool's deletion), in inscription order.
 fn rows(node: &Node) -> Vec<Row> {
-    let c = crate::pagechain::params(node).chain_no;
-    let mut g = SCAN.lock().unwrap();
-    let scan = g.get_or_insert_with(Scan::default);
-    if scan.chain != c {
-        *scan = Scan { chain: c, ..Scan::default() };
+    let p = crate::pagechain::params(node);
+    let mut out = rows_on(node, p.chain_no);
+    // Borrowed (borrowed = installed, batch 7): the pools an arcade keeping the ledger reads, with any our own copy has
+    // (a chain never installed has none). Each is read into a pool here as our own rows are (pool_of: its type, its
+    // creator, a refereed pool's address made from its keys); a claim's lots are asked of a lender, the pool's bytes
+    // checked against their hash and its lots' signatures against the pool's key (claim), and the network checks it.
+    if crate::borrow::is_borrowed(p.key) {
+        let q = json!({"chain": p.key, "local": true});
+        if let Ok((v, _)) = crate::explorer::mesh_ask(node, p, "ledger", "explorer.prize_rows", &q) {
+            for r in lent_rows(&v) {
+                if !out.iter().any(|o| o.txid == r.txid) {
+                    out.push(r);
+                }
+            }
+            out.sort_by_key(|r| r.number);
+        }
     }
+    out
+}
+
+/// An explorer.prize_rows answer as rows.
+fn lent_rows(v: &Value) -> Vec<Row> {
+    v["rows"].as_array().into_iter().flatten().filter_map(|r| {
+        let txid = r["txid"].as_str()?.to_lowercase();
+        (txid.len() == 64 && txid.bytes().all(|b| b.is_ascii_hexdigit())).then_some(())?;
+        Some(Row { txid, number: r["number"].as_u64()?, creator: r["creator"].as_str()?.to_string(), json: r["json"].as_str()?.to_string(),
+                   ctype: r["content_type"].as_str().unwrap_or("").to_string(), height: r["height"].as_u64().unwrap_or(0) })
+    }).take(MAX_LENT_ROWS).collect()
+}
+
+/// Most pool rows one answer carries.
+const MAX_LENT_ROWS: usize = 5000;
+
+/// explorer.prize_rows: the prize rows of chain `p`'s ledger here, for an arcade that only borrows the chain.
+pub fn rows_json(node: &Node, p: &arcade_chain::params::ChainParams) -> Value {
+    json!(rows_on(node, p.chain_no).iter().rev().take(MAX_LENT_ROWS).rev().map(|r| json!({"txid": r.txid, "number": r.number, "creator": r.creator,
+        "json": r.json, "content_type": r.ctype, "height": r.height})).collect::<Vec<_>>())
+}
+
+/// Inscriptions of chain `c`'s ledger here whose JSON names a prize pool (or a pool's deletion), in inscription order.
+fn rows_on(node: &Node, c: u16) -> Vec<Row> {
+    let mut g = SCAN.lock().unwrap();
+    let scan = g.get_or_insert_with(Default::default).entry(c).or_default();
     let mut misses = 0;
     let mut n = scan.next;
     for _ in 0..50_000 {
@@ -643,6 +680,25 @@ fn rand_index(n: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Borrowed = installed, batch 7: the prize rows another arcade sends come back as rows here (read into pools as our
+    /// own are); one without a txid, a number, a creator or its JSON is left out.
+    #[test]
+    fn lent_prize_rows_read_as_our_own() {
+        let t = "ab".repeat(32);
+        let v = json!({"rows": [
+            {"txid": t.to_uppercase(), "number": 7, "creator": "P1", "json": "{\"prizepool\":{}}", "content_type": POOL_TYPE, "height": 12},
+            {"txid": "nothex", "number": 8, "creator": "P1", "json": "{}"},
+            {"txid": t, "creator": "P1", "json": "{}"},
+            {"txid": t, "number": 9, "json": "{}"},
+        ]});
+        let rows = lent_rows(&v);
+        assert_eq!(rows.len(), 1);
+        let r = &rows[0];
+        assert_eq!((r.txid.as_str(), r.number, r.creator.as_str(), r.ctype.as_str(), r.height), (t.as_str(), 7, "P1", POOL_TYPE, 12));
+        assert!(r.json.contains("prizepool"));
+        assert!(lent_rows(&json!({"error": "no"})).is_empty());
+    }
 
     #[test]
     fn the_redeem_script_is_the_originals_shape() {

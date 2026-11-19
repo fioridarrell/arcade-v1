@@ -222,15 +222,23 @@ fn seal_into(node: &Node, p: &ChainParams, family: u8, dir: &std::path::Path, se
                 }
                 let end = (start + CHUNK).min(leaves);
                 let mut out = Vec::with_capacity(((end - start) as usize) * SEALED_LEAF);
+                // This core's time on the seals alone (the seal speed sysinfo.rs reports, measured).
+                let mut busy = std::time::Duration::ZERO;
                 for i in start..end {
                     match leaf_at(i) {
-                        Ok(l) => out.extend_from_slice(&sloth::seal_leaf(&me, &mask, i, &l)),
+                        Ok(l) => {
+                            let t = std::time::Instant::now();
+                            let s = sloth::seal_leaf(&me, &mask, i, &l);
+                            busy += t.elapsed();
+                            out.extend_from_slice(&s);
+                        }
                         Err(e) => {
                             *failed.lock().unwrap() = Some(e.to_string());
                             return;
                         }
                     }
                 }
+                crate::sysinfo::note_seal((end - start) * DATA_LEAF as u64, busy.as_nanos() as u64);
                 if let Err(e) = write_all_at(&sealed, &out, start * SEALED_LEAF as u64) {
                     *failed.lock().unwrap() = Some(e.to_string());
                     return;
@@ -564,6 +572,7 @@ fn seal_run(me: &[u8; 32], mask: &Hash, start: u64, data: &[u8], file: &std::fs:
                 }
                 let b = (a + CHUNK).min(leaves);
                 let mut out = Vec::with_capacity(((b - a) as usize) * SEALED_LEAF);
+                let t = std::time::Instant::now();
                 for k in a..b {
                     let mut l = [0u8; DATA_LEAF];
                     let at = (k as usize) * DATA_LEAF;
@@ -571,6 +580,8 @@ fn seal_run(me: &[u8; 32], mask: &Hash, start: u64, data: &[u8], file: &std::fs:
                     l[..n].copy_from_slice(&data[at..at + n]);
                     out.extend_from_slice(&sloth::seal_leaf(me, mask, start + k, &l));
                 }
+                // This core's time on the seals (the seal speed sysinfo.rs reports, measured).
+                crate::sysinfo::note_seal((b - a) * DATA_LEAF as u64, t.elapsed().as_nanos() as u64);
                 if let Err(e) = write_all_at(&file, &out, (start + a) * SEALED_LEAF as u64) {
                     *failed.lock().unwrap() = Some(e.to_string());
                     return;

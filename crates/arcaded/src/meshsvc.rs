@@ -42,7 +42,7 @@ const HEARD_TRIES: u32 = 3;
 const HEARD_RETRY: u64 = 15 * 60;
 /// A heard name that doesn't resolve is tried less and less often: HEARD_RETRY, doubled each round it still fails to
 /// resolve, at most this long (ARCADE #12: dead trycloudflare names were looked up every 15 minutes for days).
-const NAME_RETRY_MAX: u64 = 4 * 3600;
+const NAME_RETRY_MAX: u64 = 86400;
 const HEARD_KEEP: u64 = 2 * 86400;
 /// Most parked addresses kept (the oldest-failing is let go first).
 const MAX_PARKED: usize = 512;
@@ -189,6 +189,9 @@ pub fn retry_parked(node: &Arc<Node>) {
             for (a, src) in due(now()) {
                 dial_heard(&n, a, src);
             }
+            if let Some(line) = dial_summary(now(), n.links.lock().unwrap().len()) {
+                eprintln!("{line}");
+            }
         })
         .unwrap();
 }
@@ -229,7 +232,19 @@ pub fn dial_heard(node: &Arc<Node>, addr: String, src: &'static str) {
 /// What we share on every link: arcades we know and coin peers that work.
 fn share(node: &Node, link: &mut Link) -> Result<(), LinkError> {
     let peers = node.app.peers().unwrap_or_default();
-    let a: Vec<Value> = peers.iter().take(50).map(|p| json!({"h": p.host, "p": p.port, "id": p.id})).collect();
+    // Each arcade by the address it last linked on and, when that was a bare IP, by its name too: a network that
+    // reaches only names can still find it (ARCADE #12).
+    let a: Vec<Value> = peers
+        .iter()
+        .flat_map(|p| {
+            let mut v = vec![json!({"h": p.host, "p": p.port, "id": p.id})];
+            if let Some((h, port)) = p.name.as_deref().filter(|n| *n != peer_dial(p)).and_then(name_entry) {
+                v.push(json!({"h": h, "p": port, "id": p.id}));
+            }
+            v
+        })
+        .take(50)
+        .collect();
     if !a.is_empty() {
         link.send(&Frame::new(json!({"t": "addrs", "a": a})))?;
     }
@@ -347,7 +362,7 @@ pub fn chain_announced(node: &Arc<Node>) -> usize {
                     None => continue,
                 }
             };
-            let _ = node.app.put_peer(&arcade_app::Peer { id: key.clone(), host, port, source: "chain".into(), last_seen: 0, failures: 0 });
+            let _ = node.app.put_peer(&arcade_app::Peer { id: key.clone(), host, port, source: "chain".into(), last_seen: 0, failures: 0, name: None });
             n += 1;
         }
         dial_heard(node, addr, "chain");
@@ -454,6 +469,156 @@ pub fn set_public_name(node: &Node, name: &str) -> Result<Value, String> {
     Ok(json!({"name": public_name(node)}))
 }
 
+/// Whether a dial address names its host by name (not a bare IP).
+fn is_name(addr: &str) -> bool {
+    let host = addr.strip_prefix("wss://").map(|r| r.split('/').next().unwrap_or("")).unwrap_or(addr);
+    let host = if addr.starts_with("wss://") { host.rsplit_once(':').map(|x| x.0).unwrap_or(host) } else { host.rsplit_once(':').map(|x| x.0).unwrap_or(host) };
+    let host = host.trim_matches(|c| c == '[' || c == ']');
+    !host.is_empty() && host.parse::<std::net::IpAddr>().is_err()
+}
+
+/// The dial address of a peer-book entry's host and port.
+pub fn peer_dial(p: &arcade_app::Peer) -> String {
+    if p.host.starts_with("wss://") {
+        p.host.clone()
+    } else if p.host.contains(':') {
+        format!("[{}]:{}", p.host, p.port)
+    } else {
+        format!("{}:{}", p.host, p.port)
+    }
+}
+
+/// Every address a peer-book entry is dialed by: where it last linked, and its name when that differs (names are an
+/// extra route, looked up on every dial; bare IPs stay the default, ARCADE #12).
+pub fn peer_dials(p: &arcade_app::Peer) -> Vec<String> {
+    let mut v = vec![peer_dial(p)];
+    if let Some(n) = p.name.as_deref().filter(|n| name_entry(n).is_some() && !v.iter().any(|x| x == n)) {
+        v.push(n.to_string());
+    }
+    v
+}
+
+/// A peer-book entry after a link to `addr` worked: the route is `addr`; a name it had is kept (or `addr` itself
+/// when it is a name), so a link by IP never loses the name (ARCADE #12).
+fn linked_entry(old: Option<&arcade_app::Peer>, id: &str, addr: &str, source: &str, at: u64) -> arcade_app::Peer {
+    let (host, port) = if addr.starts_with("wss://") {
+        (addr.to_string(), 443)
+    } else {
+        (
+            addr.rsplit_once(':').map(|x| x.0.trim_matches(|c| c == '[' || c == ']')).unwrap_or(addr).to_string(),
+            addr.rsplit_once(':').and_then(|x| x.1.parse().ok()).unwrap_or(8421),
+        )
+    };
+    let name = if is_name(addr) {
+        Some(addr.to_string())
+    } else {
+        old.and_then(|o| o.name.clone().or_else(|| Some(peer_dial(o)).filter(|d| is_name(d))))
+    };
+    arcade_app::Peer { id: id.to_string(), host, port, source: source.to_string(), last_seen: at, failures: 0, name }
+}
+
+/// Dial the names of the arcades known at `addr` (in the peer book with a name that is another route to them).
+fn dial_names_of(node: &Arc<Node>, addr: &str) {
+    for p in node.app.peers().unwrap_or_default() {
+        if peer_dial(&p) != addr {
+            continue;
+        }
+        if let Some(n) = p.name.clone().filter(|n| n != addr && name_entry(n).is_some()) {
+            dial_heard(node, n, if p.source == "chain" { "chain" } else { "gossip" });
+        }
+    }
+}
+
+/// How a failed dial failed, for the log: a line is written when this changes for an address, not for every dial.
+fn dial_failure_kind(err: &str) -> &'static str {
+    let e = err.to_ascii_lowercase();
+    if lookup_failed(err) {
+        "unresolved"
+    } else if e.contains("refused") {
+        "refused"
+    } else if e.contains("timed out") || e.contains("timeout") || e.contains("would block") {
+        "timed out"
+    } else {
+        "failed"
+    }
+}
+
+/// Per address, how its dials fail now (what the log last said); gone once a dial links.
+fn dial_states() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, &'static str>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, &'static str>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Failed dials since the last summary line: (refused, unresolved, timed out or other, addresses).
+#[derive(Default)]
+struct DialCounts {
+    refused: u64,
+    unresolved: u64,
+    other: u64,
+    addrs: std::collections::BTreeSet<String>,
+    since: u64,
+}
+
+fn dial_counts() -> std::sync::MutexGuard<'static, DialCounts> {
+    static C: std::sync::OnceLock<std::sync::Mutex<DialCounts>> = std::sync::OnceLock::new();
+    C.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Note a failed dial: counted for the summary; whether its state changed (the log says so only then).
+fn dial_failed(addr: &str, kind: &'static str) -> bool {
+    {
+        let mut c = dial_counts();
+        match kind {
+            "refused" => c.refused += 1,
+            "unresolved" => c.unresolved += 1,
+            _ => c.other += 1,
+        }
+        if c.addrs.len() < 4096 {
+            c.addrs.insert(addr.to_string());
+        }
+    }
+    let mut s = dial_states();
+    if s.len() > 4096 {
+        s.clear();
+    }
+    s.insert(addr.to_string(), kind) != Some(kind)
+}
+
+/// Note a dial that linked: how it had been failing, if it had.
+fn dial_linked(addr: &str) -> Option<&'static str> {
+    dial_states().remove(addr)
+}
+
+/// How often the failed dials are summed up in the log.
+const DIAL_SUMMARY_EVERY: u64 = 600;
+
+/// The summary line of failed dials since the last one, if there were any and it is time (`at`).
+fn dial_summary(at: u64, links: usize) -> Option<String> {
+    let mut c = dial_counts();
+    if c.since == 0 {
+        c.since = at;
+    }
+    if at < c.since + DIAL_SUMMARY_EVERY {
+        return None;
+    }
+    let n = c.refused + c.unresolved + c.other;
+    let line = (n > 0).then(|| {
+        format!(
+            "mesh: {n} failed dial{} to {} address{} in the last {} min ({} refused, {} not resolving, {} other); {links} link{} up (mesh.dials for each)",
+            if n == 1 { "" } else { "s" },
+            c.addrs.len(),
+            if c.addrs.len() == 1 { "" } else { "es" },
+            (at - c.since) / 60,
+            c.refused,
+            c.unresolved,
+            c.other,
+            if links == 1 { "" } else { "s" }
+        )
+    });
+    *c = DialCounts { since: at, ..Default::default() };
+    line
+}
+
 fn retry_after(fails: u32, heard: bool) -> Option<Duration> {
     if heard && fails >= HEARD_TRIES {
         return None;
@@ -463,8 +628,9 @@ fn retry_after(fails: u32, heard: bool) -> Option<Duration> {
 
 /// Keep dialing `addr`. `heard`: where we heard of it ("gossip", "chain"); such an address
 /// is dialed only while it resolves to public addresses, and parked after HEARD_TRIES
-/// failures in a row (or let go when the arcade is linked under another address). Every
-/// failed dial is logged.
+/// failures in a row (or let go when the arcade is linked under another address). The log
+/// says when an address starts failing, when the way it fails changes, and when it links
+/// again; the rest is summed up every DIAL_SUMMARY_EVERY (ARCADE #12, #25).
 pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
     let mut fails = 0u32;
     let mut failing_since = 0u64;
@@ -483,12 +649,25 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
                 if fails == 1 {
                     failing_since = now();
                 }
+                if fails == 1 {
+                    // The arcade behind this address may have a name: try that route too (ARCADE #12).
+                    dial_names_of(&node, &addr);
+                }
+                let es = e.to_string();
+                let kind = dial_failure_kind(&es);
+                let say = dial_failed(&addr, kind);
                 let wait = if retrying { None } else { retry_after(fails, heard.is_some()) };
                 match (wait, heard) {
-                    (Some(w), _) => eprintln!("mesh: dial {addr} failed ({fails} in a row): {e}; next try in {} s", w.as_secs()),
+                    (Some(w), _) => {
+                        if say {
+                            eprintln!("mesh: dial {addr}: {es}; retrying (next in {} s), quietly until that changes", w.as_secs());
+                        }
+                    }
                     (None, Some(src)) => {
-                        if let Some(w) = park(&addr, src, failing_since, now(), lookup_failed(&e.to_string())) {
-                            eprintln!("mesh: dial {addr} failed ({fails} in a row): {e}; trying again in {} min", w / 60);
+                        if let Some(w) = park(&addr, src, failing_since, now(), kind == "unresolved") {
+                            if say {
+                                eprintln!("mesh: dial {addr}: {es}; trying again in {} min, then less often, quietly until that changes", w / 60);
+                            }
                         } else {
                             eprintln!("mesh: dial {addr} failed: {e}; failing for {} h, let go", HEARD_KEEP / 3600);
                         }
@@ -502,6 +681,9 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
             Ok(mut link) => {
                 fails = 0;
                 parked().remove(&addr);
+                if let Some(was) = dial_linked(&addr) {
+                    eprintln!("mesh: dial {addr} links again (it was {})", if was == "unresolved" { "not resolving" } else { was });
+                }
                 let id = link.peer_id.clone();
                 // Already linked to this arcade under another address (one arcade, several
                 // names): it keeps one link per node and closes this one, so don't keep
@@ -516,14 +698,8 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
                     continue;
                 }
                 let key = crate::node::link_add(&node.links, &addr, &id, now());
-                let _ = node.app.put_peer(&arcade_app::Peer {
-                    id: id.clone(),
-                    host: if addr.starts_with("wss://") { addr.clone() } else { addr.rsplit_once(':').map(|x| x.0.trim_matches(|c| c == '[' || c == ']')).unwrap_or(&addr).into() },
-                    port: if addr.starts_with("wss://") { 443 } else { addr.rsplit_once(':').and_then(|x| x.1.parse().ok()).unwrap_or(8421) },
-                    source: heard.unwrap_or("seed").into(),
-                    last_seen: now(),
-                    failures: 0,
-                });
+                let old = node.app.peers().unwrap_or_default().into_iter().find(|p| p.id == id);
+                let _ = node.app.put_peer(&linked_entry(old.as_ref(), &id, &addr, heard.unwrap_or("seed"), now()));
                 if heard == Some("gossip") {
                     prune_peers(&node);
                 }
@@ -752,8 +928,13 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     }
     // Who runs this arcade: existing arcades show the operator's @tag from this (operators.py).
     link.send(&Frame::new(operator_me(node)))?;
+    // V1.0: the machine it runs on, when its operator shares it (sysinfo.rs; existing arcades ignore it).
+    if let Some(si) = crate::sysinfo::link_frame() {
+        link.send(&Frame::new(si))?;
+    }
     let mut cr_reqs = crate::coreshare::Requests::default();
-    let mut last_ping = std::time::Instant::now();
+    // The first ping goes at once (then every 15 s), so the Home tab has this link's round trip soon (linkrtt.rs).
+    let mut last_ping = std::time::Instant::now().checked_sub(Duration::from_secs(16)).unwrap_or_else(std::time::Instant::now);
     let mut sent_outbox = 0usize;
     let peer = link.peer_id.clone();
     let conn = crate::realtime::link_up(node, &peer);
@@ -769,6 +950,7 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
+    crate::linkrtt::link_down(&peer);
     crate::svcmesh::link_down(&peer);
     crate::relaysvc::link_ended(link);
     crate::udpsvc::link_down(&peer, link.session_keys());
@@ -848,7 +1030,7 @@ fn serve_loop(
             *last_sz = std::time::Instant::now();
         }
         if last_ping.elapsed() > Duration::from_secs(15) {
-            link.send(&Frame::new(json!({"t": "ping", "n": format!("{:08x}", now() as u32)})))?;
+            link.send(&Frame::new(json!({"t": "ping", "n": crate::linkrtt::ping_n(peer)})))?;
             crate::udpsvc::keepalive(link)?;
             *last_ping = std::time::Instant::now();
         }
@@ -870,6 +1052,8 @@ fn serve_loop(
         heard = std::time::Instant::now();
         match f.kind() {
             "ping" => link.send(&Frame::pong(&f))?,
+            "pong" => crate::linkrtt::on_pong(peer, f.head["n"].as_str().unwrap_or(""), crate::relaysvc::is_relayed(link)),
+            "si" => crate::sysinfo::on_frame(node, peer, &f.head),
             #[cfg(feature = "oldimport")]
             "ix" if f.head["op"] == "a" => crate::lxfetch::on_ix(&link.peer_id, &f.head),
             "ix" if f.head["op"] == "tip" => {
@@ -1026,10 +1210,20 @@ fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), L
                 note_offer(node, &link.peer_id, &dial, "bk", &h["nets"]);
             }
             // Its public name: kept in the peer book as the way to dial it (and shared as such), ARCADE #12.
-            if let Some((host, port)) = h["name"].as_str().filter(|n| n.len() <= 255).and_then(name_entry) {
-                let known = node.app.peers().unwrap_or_default().into_iter().find(|p| p.id == link.peer_id);
-                if known.as_ref().is_none_or(|p| p.host != host || p.port != port) {
-                    let _ = node.app.put_peer(&arcade_app::Peer { id: link.peer_id.clone(), host, port, source: "named".into(), last_seen: now(), failures: 0 });
+            // Beside the address it links on (bare IPs stay the default; the name is an extra route).
+            if let Some(name) = h["name"].as_str().map(str::trim).filter(|n| n.len() <= 255) {
+                if let Some((host, port)) = name_entry(name) {
+                    match node.app.peers().unwrap_or_default().into_iter().find(|p| p.id == link.peer_id) {
+                        Some(mut p) => {
+                            if p.name.as_deref() != Some(name) {
+                                p.name = Some(name.to_string());
+                                let _ = node.app.put_peer(&p);
+                            }
+                        }
+                        None => {
+                            let _ = node.app.put_peer(&arcade_app::Peer { id: link.peer_id.clone(), host, port, source: "named".into(), last_seen: now(), failures: 0, name: Some(name.to_string()) });
+                        }
+                    }
                 }
             }
         }
@@ -1197,6 +1391,52 @@ mod tests {
     /// A heard name that doesn't resolve is tried less often each round, up to NAME_RETRY_MAX; a round that resolves
     /// (refused or linked) goes back to HEARD_RETRY.
     #[test]
+    fn names_stay_beside_the_address_linked_on() {
+        assert!(is_name("wss://ashburn.example.com/mesh") && is_name("host.example.com:8421") && is_name("wss://h.example.com:8443/mesh"));
+        assert!(!is_name("203.0.113.7:8421") && !is_name("[2001:db8::1]:8421"));
+        // Linked by name: the name is the route and is kept as the name.
+        let a = linked_entry(None, "n1", "wss://ashburn.example.com/mesh", "seed", 5);
+        assert_eq!((a.host.as_str(), a.port, a.name.as_deref()), ("wss://ashburn.example.com/mesh", 443, Some("wss://ashburn.example.com/mesh")));
+        // Then by IP: the route is the IP, the name stays.
+        let b = linked_entry(Some(&a), "n1", "203.0.113.7:8421", "gossip", 6);
+        assert_eq!((b.host.as_str(), b.port, b.name.as_deref()), ("203.0.113.7", 8421, Some("wss://ashburn.example.com/mesh")));
+        assert_eq!(peer_dials(&b), vec!["203.0.113.7:8421".to_string(), "wss://ashburn.example.com/mesh".to_string()]);
+        // A record from before names were kept: a host that is a name becomes the name.
+        let old = arcade_app::Peer { id: "n2".into(), host: "host.example.com".into(), port: 8421, source: "gossip".into(), last_seen: 1, failures: 0, name: None };
+        assert_eq!(linked_entry(Some(&old), "n2", "198.51.100.2:8421", "gossip", 2).name.as_deref(), Some("host.example.com:8421"));
+        // Bare IPs only: no name made up.
+        let ip = linked_entry(None, "n3", "198.51.100.3:8421", "gossip", 2);
+        assert_eq!((ip.name.clone(), peer_dials(&ip)), (None, vec!["198.51.100.3:8421".to_string()]));
+        // Records written before the field read back without it, and without one nothing new is written.
+        let p: arcade_app::Peer = serde_json::from_str(r#"{"id":"x","host":"h.example.com","port":8421,"source":"gossip","last_seen":0,"failures":0}"#).unwrap();
+        assert!(p.name.is_none() && !serde_json::to_string(&p).unwrap().contains("name"));
+    }
+
+    #[test]
+    fn dial_failures_are_logged_when_they_change_and_summed_up() {
+        assert_eq!(dial_failure_kind("io: failed to lookup address information: Temporary failure in name resolution"), "unresolved");
+        assert_eq!(dial_failure_kind("io: Connection refused (os error 111)"), "refused");
+        assert_eq!(dial_failure_kind("io: connection timed out"), "timed out");
+        let a = "quiet-test.example:8421";
+        assert!(dial_failed(a, "refused"), "the first failure is said");
+        assert!(!dial_failed(a, "refused") && !dial_failed(a, "refused"), "the same again is quiet");
+        assert!(dial_failed(a, "unresolved"), "a change is said");
+        assert_eq!(dial_linked(a), Some("unresolved"), "linking again says what it was");
+        assert_eq!(dial_linked(a), None);
+        assert!(dial_failed(a, "refused"), "failing again after a link is said again");
+        dial_linked(a);
+        // The summary: none before its time, then one line with the counts, then the counts start over.
+        let t0 = 1_000_000;
+        let _ = dial_summary(t0, 0);
+        let _ = dial_summary(t0 + DIAL_SUMMARY_EVERY, 0);
+        assert!(dial_summary(t0 + DIAL_SUMMARY_EVERY + 1, 1).is_none(), "not yet");
+        dial_failed("quiet-test-2.example:8421", "refused");
+        let line = dial_summary(t0 + 2 * DIAL_SUMMARY_EVERY, 2).expect("a summary");
+        assert!(line.contains("refused") && line.contains("2 links up"), "{line}");
+        dial_linked("quiet-test-2.example:8421");
+    }
+
+    #[test]
     fn dead_names_back_off() {
         assert!(lookup_failed("io: failed to lookup address information: Temporary failure in name resolution"));
         assert!(lookup_failed("handshake: cannot resolve dead.trycloudflare.com:443"));
@@ -1227,7 +1467,7 @@ mod tests {
         assert!(due(u64::MAX).iter().all(|(x, _)| x != a));
         let node = &crate::sitesvc::tests::shared().node;
         let t = now();
-        let peer = |id: String, source: &str, last_seen: u64| arcade_app::Peer { id, host: "8.8.8.8".into(), port: 8421, source: source.into(), last_seen, failures: 0 };
+        let peer = |id: String, source: &str, last_seen: u64| arcade_app::Peer { id, host: "8.8.8.8".into(), port: 8421, source: source.into(), last_seen, failures: 0, name: None };
         for i in 0..MAX_GOSSIP_PEERS + 20 {
             node.app.put_peer(&peer(format!("g{i:04}"), "gossip", t - i as u64)).unwrap();
         }

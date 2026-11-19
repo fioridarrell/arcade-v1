@@ -105,6 +105,7 @@ mod prizesvc;
 mod refereesvc;
 mod tradesvc;
 mod ringsvc;
+mod rtcsvc;
 mod rpc;
 mod sizes;
 mod udpsvc;

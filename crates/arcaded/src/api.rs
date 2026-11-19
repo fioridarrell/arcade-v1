@@ -470,6 +470,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             }
         }
         "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
+        "realtime.rtc" => crate::rtcsvc::api(node, &s("token").ok_or("token required")?, &s("peer").ok_or("peer required")?, &s("op").ok_or("op required")?, &req["signal"]),
+        "realtime.rtc_status" => Ok(crate::rtcsvc::status()),
         "ring.send" => crate::ringsvc::send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &s("line").unwrap_or_default(), &s("link").unwrap_or_default()),
         "ring.waiting" => Ok(crate::ringsvc::waiting(node)),
         "ring.get" => Ok(crate::ringsvc::get(node, &s("id").ok_or("id required")?, &s("page").ok_or("page required")?)),

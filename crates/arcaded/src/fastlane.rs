@@ -185,7 +185,12 @@ pub fn send(node: &Node, tok: &str, data: Option<&str>, b64: Option<&str>, to: &
     if bytes.len() > FX_MAX {
         return Err(format!("a fast message is at most {FX_MAX} bytes"));
     }
-    carry(node, tok, &bytes, bin, to, Some(reliable))
+    // Players on a WebRTC link of this seat (rtcsvc.rs) are reached over it; the rest here.
+    let rest = crate::rtcsvc::take_fast(tok, to, &bytes, bin, reliable);
+    if rest.is_empty() && !to.is_empty() {
+        return Ok(json!({"sent": to.len()}));
+    }
+    carry(node, tok, &bytes, bin, &rest, Some(reliable))
 }
 
 /// realtime.media: a piece of the window's encoded pictures or sound for some players of the room,
@@ -195,7 +200,11 @@ pub fn media(node: &Node, tok: &str, b64: &str, to: &[String]) -> Result<Value, 
     if bytes.is_empty() || bytes.len() > MEDIA_MAX {
         return Err(format!("a piece of media is 1 to {MEDIA_MAX} bytes"));
     }
-    carry(node, tok, &bytes, true, to, None)
+    let rest = crate::rtcsvc::take_media(tok, to, &bytes);
+    if rest.is_empty() && !to.is_empty() {
+        return Ok(json!({"sent": to.len(), "dropped": 0}));
+    }
+    carry(node, tok, &bytes, true, &rest, None)
 }
 
 fn unb64(b: &str) -> Result<Vec<u8>, String> {
@@ -292,6 +301,8 @@ fn fast_event(room: &str, p: Value, bytes: &[u8], bin: bool) -> Value {
 
 /// realtime.lanes: which players of the seat's room the fast lane reaches now.
 pub fn lanes(node: &Node, tok: &str) -> Result<Value, String> {
+    // The seat's WebRTC links (rtcsvc.rs), asked before this module's lock (theirs comes first).
+    let rtc = crate::rtcsvc::states(tok);
     let st = rt().st.lock().unwrap();
     let Some(s) = st.sessions.get(tok) else { return Err("join the room first".into()) };
     let (room, member) = (s.room.clone(), s.member.clone());
@@ -318,7 +329,25 @@ pub fn lanes(node: &Node, tok: &str) -> Result<Value, String> {
                 .collect()
         })
         .unwrap_or_default();
-    Ok(json!({"up": up, "routes": routes}))
+    // A player on a WebRTC link is up while it is (its route the link's), and not on the lane
+    // while it is being made: a viewer that hears a piece takes the player for one without WebRTC.
+    let mut routes = routes;
+    let mut links = serde_json::Map::new();
+    for (id, (state, route)) in &rtc {
+        match *state {
+            "up" => {
+                up.insert(id.clone());
+                routes.insert(id.clone(), json!(route));
+            }
+            "connecting" => {
+                up.remove(id);
+                routes.remove(id);
+            }
+            _ => {}
+        }
+        links.insert(id.clone(), json!(state));
+    }
+    Ok(json!({"up": up, "routes": routes, "rtc": links}))
 }
 
 /// An fx frame from the link to arcade `from`.

@@ -38,6 +38,13 @@ md-5 = "0.10"
 blake2 = "0.10"
 secp256k1 = "0.29"
 
+# WebRTC between app windows and website viewers (rtcsvc.rs): sans-IO ICE, DTLS-SRTP, SCTP and RTP.
+# Its crypto: aws-lc here, Windows' own (CNG) on Windows, so the Windows build needs no C toolchain for it.
+[target.'cfg(not(windows))'.dependencies]
+str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"] }
+[target.'cfg(windows)'.dependencies]
+str0m = { version = "0.25", default-features = false, features = ["wincrypto"] }
+
 [features]
 default = ["oldimport"]
 oldimport = ["dep:arcade-oldimport"]

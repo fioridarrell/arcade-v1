@@ -7,29 +7,72 @@ use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
-pub fn serve(node: Arc<Node>, path: std::path::PathBuf) {
-    if let Err(e) = arcade_local::check_socket_path(&path) {
+/// The API socket, bound (a stale one from an earlier run removed first). Panics when it can't be: the arcade is no use
+/// without it.
+pub fn bind(path: &std::path::Path) -> UnixListener {
+    if let Err(e) = arcade_local::check_socket_path(path) {
         panic!("bind API socket: {e}");
     }
-    let _ = std::fs::remove_file(&path);
-    let l = UnixListener::bind(&path).unwrap_or_else(|e| panic!("bind API socket {}: {e}", path.display()));
+    let _ = std::fs::remove_file(path);
+    let l = UnixListener::bind(path).unwrap_or_else(|e| panic!("bind API socket {}: {e}", path.display()));
     // Group-readable on Linux (the service user and the arcade group). On Windows the
     // socket lives in the user's own local app data, which other users cannot read.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o660));
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
     }
+    l
+}
+
+pub fn serve_on(node: Arc<Node>, l: UnixListener) {
     for s in l.incoming().flatten() {
         let node = node.clone();
         std::thread::spawn(move || handle(node, s));
     }
 }
 
+/// Whether arcaded has finished starting (its chains open, its services running). The socket opens before that (main:
+/// opening the chains can take minutes on a slow disk), so the desktop app and the CLI reach a starting arcade and say
+/// so, instead of "not running" (on Windows the app then tried to start a second one).
+static READY: (std::sync::Mutex<bool>, std::sync::Condvar) = (std::sync::Mutex::new(false), std::sync::Condvar::new());
+/// How long a request that arrives while arcaded is starting waits for it before it is answered "starting".
+const STARTING_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// arcaded has started: every request is answered from now on.
+pub fn set_ready() {
+    *READY.0.lock().unwrap_or_else(|p| p.into_inner()) = true;
+    READY.1.notify_all();
+}
+
+/// Wait up to `limit` for arcaded to finish starting; whether it has.
+fn wait_ready(limit: std::time::Duration) -> bool {
+    let g = READY.0.lock().unwrap_or_else(|p| p.into_inner());
+    let (g, _) = READY.1.wait_timeout_while(g, limit, |ready| !*ready).unwrap_or_else(|p| p.into_inner());
+    *g
+}
+
+/// The answer to a request that came while arcaded is still starting (`starting`, as the desktop app's own answer when
+/// it starts the service: the window says "starting the service").
+fn starting_reply() -> Value {
+    json!({"ok": false, "error": "the arcade service is starting (opening its chains)", "starting": true})
+}
+
 fn handle(node: Arc<Node>, s: UnixStream) {
     let mut w = s.try_clone().unwrap();
     let mut lines = BufReader::new(s).lines();
     while let Some(Ok(line)) = lines.next() {
+        // While arcaded is starting, only a stop is taken (it is acted on once the stop watcher runs); anything else
+        // waits a moment, then is answered "starting".
+        if !wait_ready(std::time::Duration::ZERO) {
+            let stop = serde_json::from_str::<Value>(&line).is_ok_and(|r| r["cmd"] == "service.stop");
+            if !stop && !wait_ready(STARTING_WAIT) {
+                if writeln!(w, "{}", starting_reply()).is_err() {
+                    break;
+                }
+                continue;
+            }
+        }
         // Services over the mesh (crate::svcmesh): a helper keeps this connection; an ask with "stream" answers in
         // several lines, the last the usual {ok, result}.
         if let Ok(req) = serde_json::from_str::<Value>(&line) {
@@ -1048,5 +1091,23 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             Ok(json!(ev.into_iter().filter(|e| kind.as_deref().is_none_or(|k| e.kind == k)).take(n).collect::<Vec<_>>()))
         }
         other => Err(format!("unknown command {other:?}")),
+    }
+}
+
+#[cfg(test)]
+mod start_tests {
+    use super::*;
+
+    #[test]
+    fn requests_wait_for_the_start_then_are_answered() {
+        // Before set_ready a request is told "starting" (the window shows "starting the service"); after it, answered.
+        let r = starting_reply();
+        assert_eq!(r["ok"], false);
+        assert_eq!(r["starting"], true);
+        let t = std::thread::spawn(|| wait_ready(std::time::Duration::from_secs(20)));
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        set_ready();
+        assert!(t.join().unwrap(), "a waiting request goes on once arcaded has started");
+        assert!(wait_ready(std::time::Duration::ZERO));
     }
 }

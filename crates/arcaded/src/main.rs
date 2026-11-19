@@ -488,6 +488,14 @@ fn main() {
     // Pruned blocks of coins held sealed for Earn ARCADE read back from their sealed copies.
     node.chain.set_sealed_reader(arcseal::reader(Arc::downgrade(&node)));
     node.chain.set_sealed_journal_reader(arcseal::journal_reader(Arc::downgrade(&node)));
+    // The API socket opens now, before the chains (which can take minutes on a slow disk): until api::set_ready below,
+    // the desktop app and the CLI are answered "starting" instead of finding no arcade (on Windows the app then tried to
+    // start a second one).
+    {
+        let listener = api::bind(&arcade_local::socket_path(&home));
+        let n = node.clone();
+        std::thread::Builder::new().name("api".into()).spawn(move || api::serve_on(n, listener)).unwrap();
+    }
     chains::start_home(&node).expect("home indexes");
     // A local ARCADE test chain (stand-in rules; closed test networks only), which this
     // arcade can then install in Chains & Coins: crate::arcsvc.
@@ -719,5 +727,9 @@ fn main() {
     }
     stop_cleanly_on_signal(node.clone());
     updater::start(node.clone());
-    api::serve(node, arcade_local::socket_path(&home));
+    api::set_ready();
+    // Everything runs on its own threads now (the API's included); a stop ends the process (stop_cleanly_on_signal).
+    loop {
+        std::thread::park();
+    }
 }

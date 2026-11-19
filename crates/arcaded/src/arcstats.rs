@@ -139,7 +139,12 @@ pub fn summary(node: &Node, _req: &Value) -> R {
             if crate::fogstore::on(net, m.height) {
                 let key = (crate::fogstore::family_label(crate::fogstore::family_of(m.class)).to_string(), m.height - m.height % arcade_arc::params::RANGE);
                 if short_keys.contains(&key) {
-                    short_blobs.entry(key).or_default().push(hex::encode(id));
+                    // A large blob's part is listed once, as its large blob (crate::largeblob).
+                    let name = crate::largeblob::group_of(&id).filter(|g| g.1.large()).map_or(id, |g| g.0);
+                    let list = short_blobs.entry(key).or_default();
+                    if !list.contains(&hex::encode(name)) {
+                        list.push(hex::encode(name));
+                    }
                 }
             }
             let name = match m.class { 0 => "permanent", 1 => "release", 2 => "temporary", 3 => "boost", _ => "other" };
@@ -190,7 +195,9 @@ pub fn summary(node: &Node, _req: &Value) -> R {
             // Fog storage (rules version 5, docs/FOGSTORE.md): each class's copy floor (boost: the copies a boost adds),
             // the segments short of their floor with the blobs in them, and this arcade's settings and share.
             "floors": floors(),
-            "short": short_json(&short_segs, &short_blobs),
+            "short": short_json(&short_segs, &short_blobs, &crate::fogstore::short_large()),
+            // Large blobs (crate::largeblob, up to 100 MB): each one item, with its parts, copies and floor.
+            "large_blobs": large_json(&crate::fogstore::large()),
             "fog": fog_here(node, net, tip.height),
         })
     })
@@ -209,7 +216,7 @@ const SHORT_IDS: usize = 200;
 
 /// The short-of-copies part: how many segments and blobs are below their floor, each segment (as `arc.fog` lists it)
 /// with its blob count, and the blobs' ids (the first SHORT_IDS).
-fn short_json(segs: &[Value], blobs: &BTreeMap<(String, u64), Vec<String>>) -> Value {
+fn short_json(segs: &[Value], blobs: &BTreeMap<(String, u64), Vec<String>>, large: &[Value]) -> Value {
     let key = |v: &Value| (v["family"].as_str().unwrap_or("").to_string(), v["first"].as_u64().unwrap_or(0));
     let list: Vec<Value> = segs.iter().map(|s| {
         let mut s = s.clone();
@@ -217,7 +224,17 @@ fn short_json(segs: &[Value], blobs: &BTreeMap<(String, u64), Vec<String>>) -> V
         s
     }).collect();
     let ids: Vec<&String> = blobs.values().flatten().take(SHORT_IDS).collect();
-    json!({"segments": segs.len(), "blobs": blobs.values().map(|b| b.len()).sum::<usize>(), "list": list, "blob_ids": ids})
+    json!({"segments": segs.len(), "blobs": blobs.values().map(|b| b.len()).sum::<usize>(), "list": list, "blob_ids": ids,
+           "large": large.iter().take(SHORT_IDS).collect::<Vec<_>>()})
+}
+
+/// Most large blobs listed in the summary.
+const LARGE_LISTED: usize = 50;
+
+/// The large blobs known here: how many, their bytes and parts, and the first LARGE_LISTED, each one item.
+fn large_json(large: &[Value]) -> Value {
+    json!({"count": large.len(), "bytes": large.iter().filter_map(|l| l["bytes"].as_u64()).sum::<u64>(),
+           "parts": large.iter().filter_map(|l| l["parts"].as_u64()).sum::<u64>(), "list": large.iter().take(LARGE_LISTED).collect::<Vec<_>>()})
 }
 
 /// This arcade's fog storage settings and share: whether rules version 5 holds at the tip, the grace and idle times, the
@@ -430,13 +447,17 @@ mod tests {
         ];
         let mut blobs = BTreeMap::new();
         blobs.insert(("blobs".to_string(), 0u64), vec!["aa".to_string(), "bb".to_string()]);
-        let v = short_json(&segs, &blobs);
+        let big = vec![json!({"id": "cc", "parts": 26, "bytes": 100_000_000u64, "copies": 1, "floor": 3, "short": true})];
+        let v = short_json(&segs, &blobs, &big);
+        assert_eq!(v["large"][0]["parts"], 26, "a large blob is one item with its part count");
+        assert_eq!(large_json(&big)["count"], 1);
+        assert_eq!(large_json(&big)["parts"], 26);
         assert_eq!((v["segments"].as_u64(), v["blobs"].as_u64()), (Some(2), Some(2)));
         assert_eq!(v["list"][0]["blobs"], 2);
         assert_eq!(v["list"][1]["blobs"], 0);
         assert_eq!(v["list"][0]["floor"], 7, "each segment as arc.fog lists it");
         assert_eq!(v["blob_ids"], json!(["aa", "bb"]));
-        let none = short_json(&[], &BTreeMap::new());
+        let none = short_json(&[], &BTreeMap::new(), &[]);
         assert_eq!((none["segments"].as_u64(), none["blobs"].as_u64()), (Some(0), Some(0)));
     }
 

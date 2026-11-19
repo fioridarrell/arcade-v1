@@ -2522,7 +2522,14 @@ pub fn blob(req: &Value) -> Result<Value, String> {
     let id: arcade_arc::merkle::Hash = req["id"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok()).ok_or("id required (64 hex)")?;
     // Fetched from the arcades this one is linked to when it isn't here (kept in the viewer cache).
     let bytes = crate::arcblob::view(&id).ok_or("no such blob here, nor at the arcades linked to this one")?;
-    Ok(json!({"id": hex::encode(id), "bytes": bytes.len(), "on_chain": holds_blob(&id), "hex": hex::encode(&bytes)}))
+    let mut out = json!({"id": hex::encode(id), "bytes": bytes.len(), "on_chain": holds_blob(&id), "hex": hex::encode(&bytes)});
+    // A large blob's manifest: the whole as /content/<id> serves it (crate::largeblob).
+    if let Some(m) = crate::arcblob::file_manifest(&id).filter(|m| m.large()) {
+        out["large"] = json!({"bytes": m.size, "type": m.kind, "parts": m.parts.len(), "class": m.class, "gzip": m.gzip(),
+                              "root": m.root.map(hex::encode), "parts_here": m.parts.iter().filter(|p| crate::arcblob::bytes_here(&p.0)).count(),
+                              "content": format!("/content/{}", hex::encode(id))});
+    }
+    Ok(out)
 }
 
 /// Whether a coin is unspent on the running ARCADE chain's best branch.

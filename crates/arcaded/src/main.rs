@@ -6,6 +6,7 @@
 //!           [--http-port N|0] [--http-bind ADDR] [--site DIR] [--stun-port N|0]
 
 mod accountsvc;
+mod largeblob;
 mod webui;
 mod rulecheck;
 mod updater;
@@ -500,6 +501,11 @@ fn main() {
         // This arcade's own waiting transactions: put back after a restart, dropped ones shown (ownwait.rs).
         let n = node.clone();
         std::thread::Builder::new().name("own waiting".into()).spawn(move || ownwait::run(n)).unwrap();
+    }
+    {
+        // Large blobs being published from here: parts over successive blocks, resumed after a restart (largeblob.rs).
+        let n = node.clone();
+        std::thread::Builder::new().name("large blobs".into()).spawn(move || largeblob::run(n)).unwrap();
     }
     {
         // "cb" Core-data copies: asking, fetching, taking in, re-checking.

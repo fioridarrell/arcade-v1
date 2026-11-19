@@ -81,6 +81,9 @@ pub struct Meta {
     /// Kept plain until then, whatever the class: boosts (class 3 records) push it 90 days past their block.
     #[serde(default)]
     pub boosted_until: u64,
+    /// The blob's length, as its record says (0 in a meta written before it was kept).
+    #[serde(default)]
+    pub len: u64,
 }
 
 /// How long a boost keeps a blob plain (the Temporary time: 90 days; local test chains less).
@@ -118,6 +121,35 @@ pub fn get(id: &Hash) -> Option<Vec<u8>> {
     let family = if arcade_arc::params::rules_v5(&net, m.height) { crate::fogstore::family_of(m.class) } else { arcade_arc::segment::FAMILY_BLOBS };
     let unit = SEALED.get()?(family, m.height)?;
     split_unit(&unit).into_iter().find(|b| arcade_arc::blob::id_of_bytes(&net, b) == *id)
+}
+
+/// A blob's bytes if they are here in any form (stored, waiting, sealed or cached), never fetched.
+pub fn local(id: &Hash) -> Option<Vec<u8>> {
+    get(id).or_else(|| cached(id))
+}
+
+/// Whether a blob's bytes are here as a file or waiting (stored, or in the viewer cache), without reading them.
+pub fn bytes_here(id: &Hash) -> bool {
+    here(id) || cache_dir().join(hex::encode(id)).exists()
+}
+
+/// Up to `n` bytes of a blob from byte `at`, and its whole length: read from its file alone when it is one (stored or
+/// cached), so serving a 4 MB part 48 kB at a time doesn't read all of it for each piece.
+pub fn read_piece(id: &Hash, at: u64, n: usize) -> Option<(u64, Vec<u8>)> {
+    use std::io::{Read, Seek};
+    for p in [path(id), cache_dir().join(hex::encode(id))] {
+        if let Ok(mut f) = std::fs::File::open(&p) {
+            let len = f.metadata().ok()?.len();
+            let from = at.min(len);
+            f.seek(std::io::SeekFrom::Start(from)).ok()?;
+            let mut out = Vec::with_capacity(n.min((len - from) as usize));
+            f.take(n as u64).read_to_end(&mut out).ok()?;
+            return Some((len, out));
+        }
+    }
+    let b = get(id)?;
+    let from = (at as usize).min(b.len());
+    Some((b.len() as u64, b[from..(from + n).min(b.len())].to_vec()))
 }
 
 /// A blob-family unit's blobs (segment::FAMILY_BLOBS: a varint count, then each varint length + bytes).
@@ -238,6 +270,7 @@ pub fn view(id: &Hash) -> Option<Vec<u8>> {
         if let Ok((b, kind, gz)) = got {
             if arcade_arc::blob::id_of_bytes(&net, &b) == *id {
                 cache_put(id, &b);
+                touch(id);
                 if !kind.is_empty() {
                     let _ = std::fs::write(cache_dir().join(format!("{}.kind", hex::encode(id))), &kind);
                 }
@@ -317,26 +350,23 @@ fn fetch_from(peer: &str, id: &Hash) -> Result<(Vec<u8>, String, bool), String> 
 pub fn serve_piece(link: &mut arcade_mesh::link::Link, head: &serde_json::Value) -> Result<(), arcade_mesh::link::LinkError> {
     let id_n = head["id"].as_u64().unwrap_or(0);
     let at = head["at"].as_u64().unwrap_or(0);
-    let bytes = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).and_then(|id| get(&id).or_else(|| cached(&id)));
-    let kind = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).and_then(|id| kind_of(&id));
+    let id = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok());
+    let piece = id.as_ref().and_then(|id| read_piece(id, at, PIECE as usize));
     let mut f = crate::arcsvc::keeper_frame("a", serde_json::json!({"id": id_n}));
-    match bytes {
-        Some(b) => {
+    match (id, piece) {
+        (Some(id), Some((len, bytes))) => {
             // Asked for: it counts as used here (fog storage keeps what is viewed or served, crate::fogstore).
             if at == 0 {
-                if let Some(id) = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()) {
-                    touch(&id);
-                }
+                touch(&id);
             }
-            f.head["len"] = serde_json::json!(b.len());
-            f.head["kind"] = serde_json::json!(kind.unwrap_or_default());
-            if head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).is_some_and(|id| gzipped(&id)) {
+            f.head["len"] = serde_json::json!(len);
+            f.head["kind"] = serde_json::json!(kind_of(&id).unwrap_or_default());
+            if gzipped(&id) {
                 f.head["gz"] = serde_json::json!(true);
             }
-            let from = (at as usize).min(b.len());
-            f.blob = b[from..(from + PIECE as usize).min(b.len())].to_vec();
+            f.blob = bytes;
         }
-        None => f.head["err"] = serde_json::json!("not here"),
+        _ => f.head["err"] = serde_json::json!("not here"),
     }
     link.send(&f)
 }
@@ -409,7 +439,7 @@ pub fn keep_block(net: &Net, block: &Block) {
             use sha2::Digest;
             let line = hex::encode(&sha2::Sha256::digest([r.kind.as_bytes(), b"\0", publisher].concat())[..16]);
             let boosted_until = if r.class == arcade_arc::blob::Class::Boost { boost_until } else { 0 };
-            let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until };
+            let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until, len: r.len };
             let _ = std::fs::write(meta_path(id), serde_json::to_vec(&m).unwrap_or_default());
         }
     }
@@ -497,52 +527,34 @@ pub const FILE_MANIFEST: &str = "application/vnd.arcade.file+json";
 /// Most bytes of one file (Martin 2026-11-14: up to 1 GB, for whoever pays its blobs).
 pub const MAX_FILE_BYTES: u64 = 1 << 30;
 
-/// A file made of blobs: `{"arcade": "file", "type", "size", "sha256", "parts": [[blob id, length], ...]}`.
-pub struct FileManifest {
-    pub kind: String,
-    pub size: u64,
-    pub parts: Vec<(Hash, u64)>,
-}
+/// A file made of blobs: `{"arcade": "file", "type", "size", "sha256", "parts": [[blob id, length], ...]}`; a large blob
+/// (crate::largeblob) also names its overall root, class and encoding.
+pub type FileManifest = crate::largeblob::Manifest;
 
 /// The file manifest blob `id` is, if it is one (its parts add up to its size, each a blob the chain holds).
 pub fn file_manifest(id: &Hash) -> Option<FileManifest> {
     if kind_of(id).as_deref() != Some(FILE_MANIFEST) {
         return None;
     }
-    let v: serde_json::Value = serde_json::from_slice(&view(id)?).ok()?;
-    if v["arcade"] != "file" {
+    let m = crate::largeblob::Manifest::parse(&view(id)?)?;
+    if m.size > MAX_FILE_BYTES || !m.parts.iter().all(|p| crate::arcsvc::holds_blob(&p.0)) {
         return None;
     }
-    let mut parts = Vec::new();
-    for p in v["parts"].as_array()? {
-        let h: Hash = hex::decode(p[0].as_str()?).ok()?.try_into().ok()?;
-        parts.push((h, p[1].as_u64()?));
-    }
-    let size = v["size"].as_u64()?;
-    if size > MAX_FILE_BYTES || parts.iter().map(|p| p.1).sum::<u64>() != size || !parts.iter().all(|p| crate::arcsvc::holds_blob(&p.0)) {
-        return None;
-    }
-    Some(FileManifest { kind: v["type"].as_str().unwrap_or("application/octet-stream").chars().take(arcade_arc::blob::MAX_TYPE).collect(), size, parts })
+    crate::largeblob::note(*id, m.clone());
+    Some(m)
 }
 
-/// Bytes `from..=to` of a file, part by part, each handed to `out` as it is read (fetched from linked arcades when it
-/// isn't here, and kept in the viewer cache, so a film many watch spreads as any blob does). False when a part can't
-/// be had.
+/// Bytes `from..=to` of a file, part by part, each handed to `out` as it is read (fetched from whoever has it when it
+/// isn't here, checked against its id, and kept in the viewer cache, so a film many watch spreads as any blob does).
+/// One part (4 MB) in memory at a time. False when a part can't be had.
 pub fn file_range(f: &FileManifest, from: u64, to: u64, mut out: impl FnMut(&[u8]) -> bool) -> bool {
-    let mut at = 0u64;
-    for (id, len) in &f.parts {
-        let (start, end) = (at, at + len);
-        at = end;
-        if end <= from || start > to {
-            continue;
-        }
-        let Some(b) = view(id) else { return false };
-        if b.len() as u64 != *len {
+    for (i, a, z) in crate::largeblob::ranges(&f.parts, from, to) {
+        let (id, len) = f.parts[i];
+        let Some(b) = view(&id) else { return false };
+        if b.len() as u64 != len {
             return false;
         }
-        let a = from.saturating_sub(start) as usize;
-        let z = ((to + 1).min(end) - start) as usize;
-        if !out(&b[a..z]) {
+        if !out(&b[a as usize..z as usize]) {
             return false;
         }
     }
@@ -566,8 +578,16 @@ pub fn is_mine(id: &Hash) -> bool {
     mine_path(id).exists()
 }
 
-/// Mark a blob as just used here (viewed or served): its plain copy's or cached copy's time.
+/// Mark a blob as just used here (viewed or served): its plain copy's or cached copy's time. A part of a large blob
+/// (or its manifest) is the whole's: every part here and the manifest are marked with it (crate::largeblob).
 pub fn touch(id: &Hash) {
+    touch_one(id);
+    for s in crate::largeblob::siblings(id) {
+        touch_one(&s);
+    }
+}
+
+fn touch_one(id: &Hash) {
     for p in [path(id), cache_dir().join(hex::encode(id))] {
         if let Ok(f) = std::fs::File::options().append(true).open(&p) {
             let _ = f.set_modified(std::time::SystemTime::now());
@@ -610,7 +630,7 @@ pub fn size_here(id: &Hash) -> u64 {
 
 /// A blob's length as its block's record says (from its meta; else the bytes here).
 pub fn len_of(id: &Hash) -> Option<u64> {
-    Some(size_here(id)).filter(|n| *n > 0)
+    meta(id).map(|m| m.len).filter(|n| *n > 0).or_else(|| Some(size_here(id)).filter(|n| *n > 0))
 }
 
 /// Drop cached copies not viewed or served since `before` (seconds since 1970). Bytes freed.

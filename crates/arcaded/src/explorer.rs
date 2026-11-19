@@ -131,7 +131,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
     "explorer.msg_rows", "explorer.msg_file", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
-    "explorer.arc_ledger",
+    "explorer.arc_ledger", "explorer.token_note", "explorer.prize_rows",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -265,7 +265,7 @@ fn mesh_from(id: &str) -> Value {
 fn needed_index(cmd: &str, req: &Value) -> Option<&'static str> {
     Some(match cmd {
         "explorer.ord_outpoints" | "explorer.inscriptions" | "explorer.inscription" | "explorer.inscription_types" | "explorer.held" => "ord",
-        "explorer.tokens" | "explorer.token" => "tokens",
+        "explorer.tokens" | "explorer.token" | "explorer.token_note" => "tokens",
         "explorer.names" | "explorer.name" | "explorer.site" | "explorer.sites" => "names",
         "explorer.maps" | "explorer.map" => "maps",
         "explorer.collections" | "explorer.collection" | "explorer.collection_of" => "collections",
@@ -277,7 +277,7 @@ fn needed_index(cmd: &str, req: &Value) -> Option<&'static str> {
             _ => "messages",
         },
         "explorer.activity" => "addresses",
-        "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies" => "ledger",
+        "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies" | "explorer.prize_rows" => "ledger",
         c if c.starts_with("explorer.ledger") || c.starts_with("explorer.arc_") => "ledger",
         _ => return None,
     })
@@ -761,6 +761,14 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 Some(v)
             }).collect::<Vec<_>>()}))
         }
+        // A DRC-20 / PRC-20 transfer note by its inscription id (tick, owner, amt) as this tokens index reads it, or
+        // null: what a swap whose chain is only borrowed checks a token lock by (borrowed = installed, batch 7).
+        "explorer.token_note" => {
+            x.need("tokens")?;
+            let id = s("id").ok_or("give an inscription id")?;
+            let iid = ord::parse_iid(id.trim()).ok_or_else(|| format!("{id} is not an inscription id"))?;
+            Ok(json!({"id": ord::iid_str(&iid), "note": tokens::note(&x.node.chain, x.c(), &iid)}))
+        }
         "explorer.token" => {
             x.need("tokens")?;
             let t = s("tick").ok_or("give a tick")?.to_lowercase();
@@ -919,6 +927,12 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let total = ledger_count(&x);
             let before = req["before"].as_u64().unwrap_or(total).min(total);
             Ok(json!({"total": total, "items": ledger_latest(&x, before, n(24, 100))}))
+        }
+        // The inscriptions of this chain that name a prize pool (or a pool's deletion), for an arcade that borrows it
+        // (borrowed = installed, batch 7): it reads the pools from them itself (crate::prizesvc::pools).
+        "explorer.prize_rows" => {
+            x.need("ledger")?;
+            Ok(json!({"rows": crate::prizesvc::rows_json(x.node, x.p)}))
         }
         // The rows of this chain that may be app cards, for an arcade's App Store that borrows it.
         "explorer.app_cards" => {

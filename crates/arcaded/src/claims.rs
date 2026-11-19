@@ -703,9 +703,20 @@ pub fn pending_arcade(node: &Node) -> Vec<(arcade_chain::Tx, arcade_ledger::extr
 pub fn pending_arcade_on(node: &Node, p: &'static ChainParams) -> Vec<(arcade_chain::Tx, arcade_ledger::extract::ArcadeTx)> {
     use arcade_ledger::extract::{class_b_marker, detect_class, extract, Prevout};
     let marker = class_b_marker(p);
-    let raws: Vec<Vec<u8>> = if crate::arcsvc::borrowed(p) {
-        // Borrowed: what this arcade sent that still waits at the lenders.
-        crate::borrow::pool_txs(p).into_iter().map(|t| t.raw).collect()
+    // Borrowed, the ARCADE chain or another (borrowed = installed, batch 7: our own copy's pool, if any, is not where
+    // this arcade's sends wait): what this arcade sent that still waits at the lenders.
+    let lent = crate::arcsvc::borrowed(p) || (crate::borrow::is_borrowed(p.key) && !crate::arcsvc::runs(p));
+    let raws: Vec<Vec<u8>> = if lent {
+        // (A home chain still catching up keeps hearing its peers' waiting transactions too.)
+        let mut r: Vec<Vec<u8>> = crate::borrow::pool_txs(p).into_iter().map(|t| t.raw).collect();
+        if !crate::arcsvc::defines(p.key) {
+            for (_, raw) in node.chain.mempool(p.chain_no).unwrap_or_default() {
+                if !r.contains(&raw) {
+                    r.push(raw);
+                }
+            }
+        }
+        r
     } else if crate::arcsvc::runs(p) {
         crate::arcsvc::waiting(5_000)
     } else {
@@ -724,10 +735,12 @@ pub fn pending_arcade_on(node: &Node, p: &'static ChainParams) -> Vec<(arcade_ch
                 if let Ok(Some(c)) = node.chain.coin(p, &i.prevout) {
                     return Some(Prevout { value: c.value, script: c.script });
                 }
-                pool.iter()
+                let waiting = pool.iter()
                     .find(|t| t.txid == i.prevout.txid)
                     .and_then(|t| t.outputs.get(i.prevout.vout as usize))
-                    .map(|o| Prevout { value: o.value, script: o.script_pubkey.clone() })
+                    .map(|o| Prevout { value: o.value, script: o.script_pubkey.clone() });
+                // Borrowed: a coin our copy doesn't have (older than the borrow floor, or newer than our copy's tip).
+                waiting.or_else(|| lent.then(|| crate::borrow::prevout(node, p, &i.prevout)).flatten().map(|(script, value)| Prevout { value, script }))
             })
             .collect();
         let Some(prev) = prev else { continue };

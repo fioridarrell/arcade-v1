@@ -2904,6 +2904,70 @@ pub fn pool_spender(p: &ChainParams, op: &OutPoint) -> Option<Hash256> {
     pool_txs(p).into_iter().find(|t| t.inputs.iter().any(|i| i.prevout == *op)).map(|t| t.txid)
 }
 
+// ---------------- swaps on a borrowed chain (borrowed = installed, batch 7) ----------------
+
+/// The time of the block at `height` on a borrowed chain, from the headers followed here (None below the floor).
+pub fn header_time(node: &Node, p: &ChainParams, height: u32) -> Option<u32> {
+    stored_header(node, p, height).map(|(_, h)| h.time)
+}
+
+/// What spends `op` on a borrowed chain: None while it is unspent (as a lender says, its mempool included); the
+/// spending transaction once it is known; Err while a lender calls it spent but its spender can't be shown yet.
+///
+/// A transaction this arcade sent and still waits is its own word. Any other spender is named by arcades keeping the
+/// chain (explorer.tx's `spent_by`), read from a lender by its txid, and taken only when it really spends `op` and sits
+/// in a block checked against the headers followed here ([`depth`]): a swap reads a claim's secret from it, or stops
+/// waiting on a refunded lock, so one arcade's word alone never decides it.
+pub fn spender_of(node: &Node, p: &'static ChainParams, op: &OutPoint) -> Result<Option<Tx>, String> {
+    if let Some(t) = pool_txs(p).into_iter().find(|t| t.inputs.iter().any(|i| i.prevout == *op)) {
+        return Ok(Some(t));
+    }
+    if unspent_of(node, p, &[*op])?.contains(op) {
+        return Ok(None);
+    }
+    let q = json!({"chain": p.key, "txid": op.txid.to_hex(), "local": true});
+    let answers = crate::shares::ask_explorer_each(node, p, "", "explorer.tx", &q, 3, 6000);
+    let named = spenders_named(&answers, op.vout);
+    for txid in named {
+        let Ok(t) = raw_tx(node, p, &txid) else { continue };
+        if t.inputs.iter().any(|i| i.prevout == *op) && depth(node, p, &txid) >= 1 {
+            return Ok(Some(t));
+        }
+    }
+    Err(format!("{}:{} is spent at the lenders, but no arcade keeping {} shows its spender in a block yet", op.txid.to_hex(), op.vout, p.name))
+}
+
+/// The spenders of output `vout` that explorer.tx answers name (`outputs[vout].spent_by.txid`), each once.
+fn spenders_named(answers: &[(Value, String)], vout: u32) -> Vec<Hash256> {
+    let mut out: Vec<Hash256> = Vec::new();
+    for (v, _) in answers {
+        let outs = v["outputs"].as_array().or_else(|| v["vout"].as_array());
+        let Some(o) = outs.and_then(|a| a.iter().find(|o| o["vout"].as_u64() == Some(vout as u64))) else { continue };
+        if let Some(h) = o["spent_by"]["txid"].as_str().and_then(|s| Hash256::from_hex(s).ok()) {
+            if !out.contains(&h) {
+                out.push(h);
+            }
+        }
+    }
+    out
+}
+
+/// One output of a transaction on a borrowed chain, spent or not: (script, value). For reading a waiting
+/// transaction's inputs (whose sender and values a ledger record needs): a coin followed here, a transaction waiting
+/// here, else the transaction a lender sends, checked against its txid (the txid commits to every output).
+pub fn prevout(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<(Vec<u8>, u64)> {
+    if let Some(c) = coin(node, p, op) {
+        if let (Some(s), Some(v)) = (c["s"].as_str().and_then(|s| hex::decode(s).ok()), c["v"].as_u64()) {
+            return Some((s, v));
+        }
+    }
+    if let Some((v, s, _)) = CHECKED.lock().unwrap().get(&(p.key.to_string(), *op)).cloned() {
+        return Some((s, v));
+    }
+    let t = pool_txs(p).into_iter().find(|t| t.txid == op.txid).or_else(|| raw_tx(node, p, &op.txid).ok())?;
+    t.outputs.get(op.vout as usize).map(|o| (o.script_pubkey.clone(), o.value))
+}
+
 /// The arcades lending `key` that this one is linked to now (node ids), newest tip first: where an arcade that only
 /// borrows the ARCADE chain fetches its blobs (crate::arcblob::view).
 pub fn linked_lenders(key: &str) -> Vec<String> {
@@ -3011,6 +3075,18 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
 
 #[cfg(test)]
 mod tests {
+    /// Borrowed = installed, batch 7: the spender of one output, as explorer.tx answers name it (each once; another
+    /// output's spender, or an answer without one, names none).
+    #[test]
+    fn spenders_are_read_from_explorer_answers() {
+        let (a, b) = ("aa".repeat(32), "bb".repeat(32));
+        let said = |vout: u32, by: &str| (json!({"outputs": [{"vout": vout, "spent_by": {"txid": by, "vin": 0}}, {"vout": 9, "spent_by": null}]}), "x".to_string());
+        let got = spenders_named(&[said(0, &a), said(0, &a), said(0, &b), said(1, &b), (json!({"error": "no"}), "y".into())], 0);
+        assert_eq!(got, vec![Hash256::from_hex(&a).unwrap(), Hash256::from_hex(&b).unwrap()]);
+        assert!(spenders_named(&[said(0, &a)], 9).is_empty(), "unspent output");
+        assert!(spenders_named(&[said(0, "junk")], 0).is_empty());
+    }
+
     use super::{arc_borrows, home_borrows, stalled, tips_apart, tips_slack, ARC_START_BEHIND};
 
     /// A coin made and spent in one block is spent here too, whichever of the two transactions comes first (the

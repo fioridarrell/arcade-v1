@@ -396,8 +396,27 @@ pub fn items(node: &Node) -> Result<Value, String> {
     let (me, _, _) = crate::msgsvc::sender_key(node)?;
     let q: serde_json::Map<String, Value> = [("pending".to_string(), json!("1"))].into_iter().collect();
     let parse = |(_, body): (u16, String)| serde_json::from_str::<Value>(&body).unwrap_or(json!([]));
-    Ok(json!({"address": me, "inscriptions": parse(crate::walletsvc::route(node, &format!("inscriptions/{me}"), &q)),
-              "balances": parse(crate::walletsvc::route(node, &format!("balances/{me}"), &q))}))
+    // Borrowed home (borrowed = installed, batch 7): what an arcade keeping its ledger says this player holds (asked
+    // now), with this arcade's own sends still waiting at the lenders as leaving or arriving.
+    let p = node.params;
+    if crate::borrow::is_borrowed(p.key) {
+        let balances = crate::walletsvc::balances_json(node, &me, &crate::walletsvc::send_holdings(node, p, &me), true);
+        let inscriptions = lent_inscriptions(node, p, &me).unwrap_or_else(|| parse(crate::walletsvc::route(node, &format!("/r/inscriptions/{me}"), &q)));
+        return Ok(json!({"address": me, "inscriptions": inscriptions, "balances": balances, "borrowed": true}));
+    }
+    Ok(json!({"address": me, "inscriptions": parse(crate::walletsvc::route(node, &format!("/r/inscriptions/{me}"), &q)),
+              "balances": parse(crate::walletsvc::route(node, &format!("/r/balances/{me}"), &q))}))
+}
+
+/// An address's arcade inscriptions on `p`, as the page read /r/inscriptions/<address> of an arcade keeping its ledger
+/// answers (None when none answers).
+fn lent_inscriptions(node: &Node, p: &'static arcade_chain::params::ChainParams, address: &str) -> Option<Value> {
+    let q = json!({"chain": p.key, "path": format!("/r/inscriptions/{address}"), "query": {}, "local": true});
+    let (v, _) = crate::shares::ask_explorer(node, p, "ledger", "explorer.page", &q).ok()?;
+    if v["status"].as_u64().unwrap_or(200) != 200 {
+        return None;
+    }
+    serde_json::from_str::<Value>(v["body"].as_str()?).ok().filter(|b| b.is_array())
 }
 
 /// trade.who: whether a player can be sealed to (has published a messaging key).

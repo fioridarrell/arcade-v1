@@ -213,7 +213,13 @@ pub fn dial(node: &Arc<Node>, addr: String) {
 /// announcement): public addresses only, at most MAX_HEARD_DIALS at once; parked after
 /// HEARD_TRIES failures in a row (see HEARD_RETRY).
 pub fn dial_heard(node: &Arc<Node>, addr: String, src: &'static str) {
-    if !heard_dial_ok(&addr) {
+    dial_heard_as(node, addr, src, false);
+}
+
+/// `dial_heard`, and `redial`: the quick tries come at REDIAL_WAITS (an arcade whose link dropped, see `link_dropped`).
+/// A LAN source dials a private address seen on a direct link of ours (`redial_src`).
+fn dial_heard_as(node: &Arc<Node>, addr: String, src: &'static str, redial: bool) {
+    if !(heard_dial_ok(&addr) || (src == LAN && lan_dial_ok(&addr))) {
         return;
     }
     {
@@ -226,7 +232,173 @@ pub fn dial_heard(node: &Arc<Node>, addr: String, src: &'static str) {
         h.insert(addr.clone());
     }
     let n = node.clone();
-    std::thread::Builder::new().name(format!("mesh {addr}")).spawn(move || run(n, addr, Some(src))).unwrap();
+    std::thread::Builder::new().name(format!("mesh {addr}")).spawn(move || run_as(n, addr, Some(src), redial)).unwrap();
+}
+
+/// The source of a private address an arcade linked to us from directly (a TCP link we accepted or dialed): it is on
+/// our LAN or this machine, so it may be dialed back though no other arcade's word would make us dial it.
+const LAN: &str = "lan";
+
+/// A bare private IP and port a LAN source may dial (never port 0, an unspecified or a multicast address).
+fn lan_dial_ok(addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>().is_ok_and(|a| a.port() != 0 && !a.ip().is_unspecified() && !a.ip().is_multicast())
+}
+
+/// Private IPs each arcade linked to us from directly (node id -> IPs), kept while this arcade runs.
+fn direct_lan() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, std::collections::BTreeSet<std::net::IpAddr>>> {
+    static D: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, std::collections::BTreeSet<std::net::IpAddr>>>> = std::sync::OnceLock::new();
+    D.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Note the IP of a direct link from `id` when it is private (an accepted TCP link: the IP is the socket's; the port it
+/// listens on comes later, in its "hi").
+fn note_direct(id: &str, ip: std::net::IpAddr) {
+    if public_ip(&ip) || ip.is_unspecified() || ip.is_multicast() {
+        return;
+    }
+    let mut d = direct_lan();
+    if d.len() >= 1024 && !d.contains_key(id) {
+        d.clear();
+    }
+    let s = d.entry(id.to_string()).or_default();
+    if s.len() < 8 {
+        s.insert(ip);
+    }
+}
+
+/// Whether `addr` is at a private IP arcade `id` linked to us from directly.
+fn direct_seen(id: &str, addr: &str) -> bool {
+    addr.parse::<std::net::SocketAddr>().is_ok_and(|a| direct_lan().get(id).is_some_and(|s| s.contains(&a.ip())))
+}
+
+/// Whether `addr` waits out a long backoff because its name has not resolved for rounds (ARCADE #12): not dialed
+/// again before then, by an ask or a dropped link either.
+fn in_long_backoff(addr: &str, at: u64) -> bool {
+    parked().get(addr).is_some_and(|p| p.unresolved >= 2 && p.next > at)
+}
+
+/// How a known address of an arcade may be dialed: as `src` when it is public or a name, as LAN when it is a private
+/// IP we trust (`trusted`: from a direct link of ours or our own peer book), or not at all (port 0, a private address
+/// only some relay or other arcade claimed, a name in a long backoff).
+fn redial_src(addr: &str, trusted: bool, src: &'static str, at: u64) -> Option<&'static str> {
+    if addr.is_empty() || addr.ends_with(":0") || in_long_backoff(addr, at) {
+        return None;
+    }
+    if heard_dial_ok(addr) {
+        return Some(src);
+    }
+    (trusted && lan_dial_ok(addr)).then_some(LAN)
+}
+
+/// Every address we know arcade `id` by, with the source to dial it as: its peer-book entries (where it last linked,
+/// its name) and where its last "hi" said it listens (what mesh.overview shows; a private one only at an IP it linked to
+/// us from directly).
+pub fn known_dials(node: &Node, id: &str) -> Vec<(String, &'static str)> {
+    let at = now();
+    let mut all: Vec<(String, bool, &'static str)> = Vec::new();
+    for p in node.app.peers().unwrap_or_default().into_iter().filter(|p| p.id == id) {
+        // Our peer book has private addresses only from our own dials (heard ones must be public).
+        let src = if p.source == "chain" { "chain" } else { "gossip" };
+        all.extend(peer_dials(&p).into_iter().map(|a| (a, true, src)));
+    }
+    let hi = node.offers.lock().unwrap().get(id).map(|o| o.addr.clone());
+    if let Some(a) = hi {
+        let direct = direct_seen(id, &a);
+        all.push((a, direct, "gossip"));
+    }
+    let mut out: Vec<(String, &'static str)> = Vec::new();
+    for (a, trusted, src) in all {
+        if let Some(s) = redial_src(&a, trusted, src, at) {
+            if !out.iter().any(|(x, _)| *x == a) {
+                out.push((a, s));
+            }
+        }
+    }
+    out
+}
+
+/// Dial every known address of arcade `id` (`known_dials`) now: a dial already waiting between its tries is woken; how
+/// many addresses there were.
+pub fn dial_known(node: &Arc<Node>, id: &str) -> usize {
+    let addrs = known_dials(node, id);
+    for (a, src) in &addrs {
+        if node.dialing.lock().unwrap().contains(a) {
+            nudged().insert(a.clone());
+        } else {
+            dial_heard(node, a.clone(), src);
+        }
+    }
+    addrs.len()
+}
+
+/// Addresses whose dial should stop waiting and try again now (an ask for that arcade came, `dial_known`).
+fn nudged() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+    static N: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> = std::sync::OnceLock::new();
+    N.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Wait `wait` before dialing `addr` again, or less if it is nudged meanwhile.
+fn nap(addr: &str, wait: Duration) {
+    let end = std::time::Instant::now() + wait;
+    loop {
+        if nudged().remove(addr) {
+            return;
+        }
+        let left = end.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        std::thread::sleep(left.min(Duration::from_millis(250)));
+    }
+}
+
+/// After a link drops, an arcade is dialed again at these waits (5 s, about 30 s, about 2 min after it dropped), then
+/// parked: tried every HEARD_RETRY for HEARD_KEEP, as the peer book's arcades are.
+const REDIAL_WAITS: [u64; 3] = [5, 25, 90];
+
+/// The wait after the `fails`th failed redial, or None to park the address.
+fn redial_after(fails: u32) -> Option<Duration> {
+    REDIAL_WAITS.get(fails as usize).map(|w| Duration::from_secs(*w))
+}
+
+/// Arcades whose dropped link is waiting for its first redial.
+fn redialing() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<String>> {
+    static R: std::sync::OnceLock<std::sync::Mutex<std::collections::BTreeSet<String>>> = std::sync::OnceLock::new();
+    R.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Whether an arcade whose link dropped should be redialed by us: no other link to it is up, and none of its addresses
+/// is being dialed already (a link we dialed redials itself in `run`).
+fn wants_redial(linked: bool, known: &[(String, &'static str)], dialing: &std::collections::BTreeSet<String>) -> bool {
+    !linked && !known.is_empty() && !known.iter().any(|(a, _)| dialing.contains(a))
+}
+
+/// A link to `peer` (on `addr`) ended: unless another link to it is up or a dial of ours keeps it, its known addresses
+/// are dialed again at REDIAL_WAITS and then parked (an arcade that restarted, whose link came to us or through a
+/// relay, was otherwise dialed again only at our next start). Nothing is logged here; the dials log as they change.
+pub fn link_dropped(node: &Node, peer: &str, addr: &str) {
+    if peer == node.id_hex() || crate::crvia::linked(peer) || node.dialing.lock().unwrap().contains(addr) {
+        return;
+    }
+    let Some(n) = node.me.get().and_then(|w| w.upgrade()) else { return };
+    if !redialing().insert(peer.to_string()) {
+        return;
+    }
+    let (peer, mine) = (peer.to_string(), peer.to_string());
+    let spawned = std::thread::Builder::new().name("mesh redial".into()).spawn(move || {
+        std::thread::sleep(Duration::from_secs(REDIAL_WAITS[0]));
+        let known = known_dials(&n, &peer);
+        let dialing = n.dialing.lock().unwrap().clone();
+        if wants_redial(crate::crvia::linked(&peer), &known, &dialing) {
+            for (a, src) in known {
+                dial_heard_as(&n, a, src, true);
+            }
+        }
+        redialing().remove(&peer);
+    });
+    if spawned.is_err() {
+        redialing().remove(&mine);
+    }
 }
 
 /// What we share on every link: arcades we know and coin peers that work.
@@ -632,13 +804,20 @@ fn retry_after(fails: u32, heard: bool) -> Option<Duration> {
 /// says when an address starts failing, when the way it fails changes, and when it links
 /// again; the rest is summed up every DIAL_SUMMARY_EVERY (ARCADE #12, #25).
 pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
+    run_as(node, addr, heard, false)
+}
+
+/// `run`; `redial`: a heard address whose quick tries come at REDIAL_WAITS (`link_dropped`).
+fn run_as(node: Arc<Node>, addr: String, heard: Option<&'static str>, redial: bool) {
     let mut fails = 0u32;
     let mut failing_since = 0u64;
-    // A parked address gets one dial a round, not another quick series.
-    let retrying = heard.is_some() && parked().contains_key(&addr);
+    // A parked address gets one dial a round, not another quick series (a dropped link's redials get theirs).
+    let retrying = heard.is_some() && !redial && parked().contains_key(&addr);
     loop {
         let began = std::time::Instant::now();
         let dialed = match heard {
+            // A private address one of our own links came from (dial_heard_as checked it is a bare IP).
+            Some(LAN) => Link::dial(&addr, NET, &node.identity, None),
             Some(_) => Link::dial_checked(&addr, NET, &node.identity, None, &public_ip),
             None => Link::dial(&addr, NET, &node.identity, None),
         };
@@ -656,7 +835,13 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
                 let es = e.to_string();
                 let kind = dial_failure_kind(&es);
                 let say = dial_failed(&addr, kind);
-                let wait = if retrying { None } else { retry_after(fails, heard.is_some()) };
+                let wait = if retrying {
+                    None
+                } else if redial {
+                    redial_after(fails)
+                } else {
+                    retry_after(fails, heard.is_some())
+                };
                 match (wait, heard) {
                     (Some(w), _) => {
                         if say {
@@ -675,12 +860,13 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
                     }
                     (None, None) => unreachable!("seeds are tried for ever"),
                 }
-                std::thread::sleep(wait.unwrap());
+                nap(&addr, wait.unwrap());
                 continue;
             }
             Ok(mut link) => {
                 fails = 0;
                 parked().remove(&addr);
+                nudged().remove(&addr);
                 if let Some(was) = dial_linked(&addr) {
                     eprintln!("mesh: dial {addr} links again (it was {})", if was == "unresolved" { "not resolving" } else { was });
                 }
@@ -699,8 +885,10 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
                 }
                 let key = crate::node::link_add(&node.links, &addr, &id, now());
                 let old = node.app.peers().unwrap_or_default().into_iter().find(|p| p.id == id);
-                let _ = node.app.put_peer(&linked_entry(old.as_ref(), &id, &addr, heard.unwrap_or("seed"), now()));
-                if heard == Some("gossip") {
+                // A LAN address is kept as gossip: pruned like one, and (private) not dialed at the next start.
+                let source = heard.map(|s| if s == LAN { "gossip" } else { s }).unwrap_or("seed");
+                let _ = node.app.put_peer(&linked_entry(old.as_ref(), &id, &addr, source, now()));
+                if matches!(heard, Some("gossip") | Some(LAN)) {
                     prune_peers(&node);
                 }
                 let _ = node.app.event("mesh", &format!("linked to {addr} ({})", &id[..16]));
@@ -846,6 +1034,7 @@ fn accept(node: Arc<Node>, l: std::net::TcpListener) {
             let Ok(mut link) = r else { return };
             let Some(_held) = LinkSlot::take(ip) else { return };
             let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
+            note_direct(&link.peer_id, ip);
             let key = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
             let _ = serve(&node, &mut link, &addr);
             crate::node::link_remove(&node.links, &key);
@@ -950,6 +1139,7 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
+    link_dropped(node, &peer, addr);
     crate::linkrtt::link_down(&peer);
     crate::svcmesh::link_down(&peer);
     crate::relaysvc::link_ended(link);
@@ -1525,8 +1715,7 @@ mod tests {
 
 #[cfg(test)]
 mod bk_tests {
-    use super::{note_offer, refresh_bk, room_for_offer, OFFERS_MAX, OFFER_AGE};
-    use serde_json::json;
+    use super::*;
     use crate::sitesvc::tests::setup;
 
     #[test]
@@ -1541,6 +1730,87 @@ mod bk_tests {
         assert_eq!(bk["203.0.113.5:8421"], 25, "the same host, its own announced port");
         assert_eq!(bk["wss://relay.example/mesh"], 30);
         assert_eq!(bk["198.51.100.7:8421"], 10, "another arcade's untouched");
+    }
+
+    /// The addresses an ask or a dropped link dials an arcade by: never port 0, a private address only when we saw it
+    /// on a direct link (or it is in our own peer book), and not a name waiting out a long backoff.
+    #[test]
+    fn known_addresses_are_redialed_by_these_rules() {
+        let at = 1_000_000;
+        assert_eq!(redial_src("1.1.1.40:8421", false, "gossip", at), Some("gossip"));
+        assert_eq!(redial_src("wss://relay.example.com/mesh", false, "chain", at), Some("chain"));
+        assert_eq!(redial_src("1.1.1.40:0", true, "gossip", at), None, "no port");
+        assert_eq!(redial_src("", true, "gossip", at), None);
+        assert_eq!(redial_src("192.168.1.20:8421", false, "gossip", at), None, "a private address another arcade or a relay claimed");
+        assert_eq!(redial_src("192.168.1.20:8421", true, "gossip", at), Some(LAN), "one a direct link came from");
+        assert_eq!(redial_src("127.0.0.1:18421", true, "gossip", at), Some(LAN));
+        assert_eq!(redial_src("0.0.0.0:8421", true, "gossip", at), None);
+        assert_eq!(redial_src("lan-host.local:8421", true, "gossip", at), None, "LAN names are not dialed");
+        // A name that hasn't resolved for rounds waits out its backoff (ARCADE #12); one round is the usual wait.
+        let dead = "known-dead.trycloudflare.example:8421";
+        park(dead, "gossip", at, at, true);
+        assert_eq!(redial_src(dead, false, "gossip", at), Some("gossip"), "one round: the usual 15 minutes, an ask may dial it");
+        park(dead, "gossip", at, at, true);
+        assert_eq!(redial_src(dead, false, "gossip", at), None, "a long backoff");
+        assert_eq!(redial_src(dead, false, "gossip", at + 2 * HEARD_RETRY), Some("gossip"), "once it is due");
+        parked().remove(dead);
+    }
+
+    #[test]
+    fn known_dials_come_from_the_peer_book_hi_and_direct_links() {
+        let t = crate::sitesvc::tests::setup();
+        let id = "c3".repeat(32);
+        assert!(known_dials(&t.node, &id).is_empty(), "nothing known");
+        // Its "hi" over a relayed link, with a private address the relay claimed: not dialed.
+        t.node.offers.lock().unwrap().insert(id.clone(), crate::node::Offer { at: now(), addr: "10.1.2.3:8421".into(), ..Default::default() });
+        assert!(known_dials(&t.node, &id).is_empty(), "a private address no direct link showed");
+        // The same IP on a TCP link it made to us: on our LAN.
+        note_direct(&id, "10.1.2.4".parse().unwrap());
+        assert!(known_dials(&t.node, &id).is_empty(), "another IP of its");
+        note_direct(&id, "10.1.2.3".parse().unwrap());
+        note_direct(&id, "8.8.4.4".parse().unwrap());
+        assert_eq!(known_dials(&t.node, &id), vec![("10.1.2.3:8421".to_string(), LAN)]);
+        assert!(!direct_lan()[&id].contains(&"8.8.4.4".parse::<std::net::IpAddr>().unwrap()), "only private IPs are kept");
+        // Its peer-book entry (where it last linked, its name) comes first.
+        t.node.app.put_peer(&arcade_app::Peer { id: id.clone(), host: "9.9.9.44".into(), port: 8421, source: "chain".into(), last_seen: 1, failures: 0, name: Some("txtok.example.com:8421".into()) }).unwrap();
+        assert_eq!(
+            known_dials(&t.node, &id),
+            vec![("9.9.9.44:8421".to_string(), "chain"), ("txtok.example.com:8421".to_string(), "chain"), ("10.1.2.3:8421".to_string(), LAN)]
+        );
+        // The same address twice is dialed once; port 0 never.
+        t.node.offers.lock().unwrap().get_mut(&id).unwrap().addr = "9.9.9.44:8421".into();
+        assert_eq!(known_dials(&t.node, &id).len(), 2);
+        t.node.offers.lock().unwrap().get_mut(&id).unwrap().addr = "10.1.2.3:0".into();
+        assert_eq!(known_dials(&t.node, &id).len(), 2);
+        direct_lan().remove(&id);
+    }
+
+    /// A dropped link is dialed again at about 5 s, 30 s and 2 min, then parked (the peer book's cadence); not when
+    /// another link is up or a dial of ours keeps that arcade already.
+    #[test]
+    fn dropped_links_are_redialed_with_a_backoff() {
+        let after: Vec<Option<u64>> = (1..=4).map(|f| redial_after(f).map(|d| d.as_secs())).collect();
+        assert_eq!(after, vec![Some(25), Some(90), None, None], "then parked");
+        let mut at = 0;
+        let tries: Vec<u64> = REDIAL_WAITS.iter().map(|w| { at += w; at }).collect();
+        assert_eq!(tries, vec![5, 30, 120]);
+        let known = vec![("1.1.1.40:8421".to_string(), "gossip")];
+        let none = std::collections::BTreeSet::new();
+        assert!(wants_redial(false, &known, &none));
+        assert!(!wants_redial(true, &known, &none), "another link is up");
+        assert!(!wants_redial(false, &[], &none), "no address to dial");
+        let ours: std::collections::BTreeSet<String> = ["1.1.1.40:8421".to_string()].into();
+        assert!(!wants_redial(false, &known, &ours), "our own dial redials it");
+        // An ask wakes a dial waiting between its tries.
+        let a = "nap-test.example:8421";
+        nudged().insert(a.into());
+        let t = std::time::Instant::now();
+        nap(a, Duration::from_secs(30));
+        assert!(t.elapsed() < Duration::from_secs(1) && !nudged().contains(a), "woken at once, and the nudge used up");
+        let t = std::time::Instant::now();
+        nap(a, Duration::from_millis(300));
+        assert!(t.elapsed() >= Duration::from_millis(300), "no nudge: the whole wait");
+        assert!(lan_dial_ok("127.0.0.1:8421") && !lan_dial_ok("127.0.0.1:0") && !lan_dial_ok("host.lan:8421") && !lan_dial_ok("224.0.0.1:8421"));
     }
 
     #[test]

@@ -502,8 +502,8 @@ fn my_grant(node: &Node, service: &str, arcade: &str) -> Option<Value> {
 
 // ---------------------------------------------------------------- asking (from this arcade)
 
-/// Make sure there is a mesh link to `arcade`: its public name from any offer of its, a relay that lists it, a UDP
-/// introduction, all at once, up to REACH_WAIT.
+/// Make sure there is a mesh link to `arcade`: its public name from any offer of its, every address we know it by
+/// (peer book, its "hi"), a relay that lists it, a UDP introduction, all at once, up to REACH_WAIT.
 fn reach(node: &Node, arcade: &str) -> Result<(), String> {
     if crate::crvia::linked(arcade) {
         return Ok(());
@@ -512,6 +512,8 @@ fn reach(node: &Node, arcade: &str) -> Result<(), String> {
     if let Some(n) = &name {
         crate::meshsvc::dial(&node.self_arc(), n.clone());
     }
+    // An arcade that restarted is still where it was: its link dropped, but its address works (seen 2026-11-19).
+    let known = crate::meshsvc::dial_known(&node.self_arc(), arcade);
     let relayed = crate::relaysvc::want(node, arcade);
     crate::udpsvc::want(arcade);
     let end = Instant::now() + REACH_WAIT;
@@ -523,6 +525,7 @@ fn reach(node: &Node, arcade: &str) -> Result<(), String> {
     }
     Err(match (&name, relayed) {
         (Some(n), _) => format!("can't reach that arcade: no link to it at {n} or through a relay yet; try again in a minute"),
+        (None, _) if known > 0 => format!("can't reach that arcade: no link yet at the {} we know it by{}; try again in a minute", if known == 1 { "address" } else { "addresses" }, if relayed { " or through a relay" } else { "" }),
         (None, true) => "can't reach that arcade: a relay is linking us; try again in a minute".to_string(),
         (None, false) => "can't reach that arcade yet: it has no public name, no relay we use lists it, and no link of ours introduced it; try again in a minute".to_string(),
     })

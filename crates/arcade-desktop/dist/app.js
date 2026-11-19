@@ -643,7 +643,7 @@ async function refreshOnce() {
     if (tab === "activity") await refreshActivity();
     if (tab === "options") { await refreshOptions(); refreshWebUi(); drawAccounts($("o-accs"), $("o-acc-msg"), false); }
   } catch (e) {
-    $("conn").textContent = "service not running"; $("conn").className = "pill bad";
+    $("conn").textContent = e && e.starting ? "starting the service…" : "service not running"; $("conn").className = "pill bad";
   }
 }
 

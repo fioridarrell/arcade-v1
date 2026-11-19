@@ -103,7 +103,7 @@ fn st() -> &'static Mutex<St> {
 // ---------------------------------------------------------------- attach (the helper's side)
 
 /// `svc.attach`: the rest of this socket connection is the helper's (see the module doc).
-pub fn attach(node: Arc<Node>, lines: &mut dyn Iterator<Item = std::io::Result<String>>, mut w: std::os::unix::net::UnixStream, req: &Value) {
+pub fn attach(node: Arc<Node>, lines: &mut dyn Iterator<Item = std::io::Result<String>>, mut w: arcade_local::UnixStream, req: &Value) {
     let service = req["service"].as_str().unwrap_or("").to_string();
     if !name_ok(&service) {
         let _ = writeln!(w, "{}", json!({"ok": false, "error": "service: 1-32 of a-z, 0-9 and -"}));

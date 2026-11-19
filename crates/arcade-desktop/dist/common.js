@@ -93,7 +93,7 @@ function api(cmd, args = {}) {
   const key = cmd + " " + JSON.stringify(args);
   if (API_OUT.has(key)) return API_OUT.get(key);
   const p = invoke("api", { req: { cmd, ...args } }).then((r) => {
-    if (!r.ok) throw new Error(r.error || "failed");
+    if (!r.ok) { const e = new Error(r.error || "failed"); e.starting = !!r.starting; throw e; }
     return r.result;
   }).finally(() => API_OUT.delete(key));
   API_OUT.set(key, p);

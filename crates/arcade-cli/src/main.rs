@@ -1,8 +1,8 @@
 //! `arcade`: command line for a running arcaded (whiteboard step 12).
 
+use arcade_local::UnixStream;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 const HELP: &str = "arcade — Arcade V1.0
 
@@ -11,6 +11,7 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade web                     the link that opens the app's window in a browser (here, or through an SSH tunnel)
   arcade peers                   mesh links
   arcade peers dials             the last mesh dials, and whether this network refuses bare IPs
+  arcade stop                    stop arcaded cleanly (writes its caches first)
   arcade wallet create           new wallet; shows the 12-word recovery phrase ONCE
   arcade wallet restore          restore from a recovery phrase (typed at a prompt, not shown)
   arcade wallet phrase           show the recovery phrase
@@ -65,24 +66,13 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade mine start [threads]    mine Pepecoin testnet on this PC (pays your wallet)
   arcade mine stop | status
 
-  --home DIR   arcade data folder (default: $ARCADE_HOME or ~/.local/share/arcade)";
+  --home DIR   arcade data folder (default: $ARCADE_HOME, else %LOCALAPPDATA%\\arcade on Windows, ~/.local/share/arcade on Linux)";
 
 fn home(args: &[String]) -> std::path::PathBuf {
     if let Some(i) = args.iter().position(|a| a == "--home") {
         return args[i + 1].clone().into();
     }
-    if let Some(h) = std::env::var_os("ARCADE_HOME") {
-        return h.into();
-    }
-    // The installed service lives in /var/lib/arcade.
-    let system = std::path::Path::new("/var/lib/arcade");
-    if system.join("arcaded.sock").exists() || system.join("arcade.mdbx").exists() {
-        return system.to_path_buf();
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
-    base.join("arcade")
+    arcade_local::default_home()
 }
 
 fn call(sock: &std::path::Path, req: Value) -> Result<Value, String> {
@@ -157,6 +147,7 @@ fn index_line(s: &Value) -> String {
 }
 
 /// Whether the arcade runs as the .deb's system service (data in /var/lib/arcade) or as this user's.
+#[cfg(not(windows))]
 fn system_service(sock: &std::path::Path) -> bool {
     sock.starts_with("/var/lib/arcade")
 }
@@ -164,13 +155,21 @@ fn system_service(sock: &std::path::Path) -> bool {
 /// How to start the service again: the system one, the user one, or (installed without a systemd user
 /// session) the installer's start script.
 fn start_hint(sock: &std::path::Path) -> String {
-    let script = sock.with_file_name("start-arcaded.sh");
-    if system_service(sock) {
-        "sudo systemctl enable --now arcaded".into()
-    } else if script.exists() {
-        format!("sh {}", script.display())
-    } else {
-        "systemctl --user enable --now arcaded".into()
+    #[cfg(windows)]
+    {
+        let _ = sock;
+        "start it from the Arcade V1.0 login task, or run arcaded".into()
+    }
+    #[cfg(not(windows))]
+    {
+        let script = sock.with_file_name("start-arcaded.sh");
+        if system_service(sock) {
+            "sudo systemctl enable --now arcaded".into()
+        } else if script.exists() {
+            format!("sh {}", script.display())
+        } else {
+            "systemctl --user enable --now arcaded".into()
+        }
     }
 }
 
@@ -200,6 +199,9 @@ fn setup(sock: &std::path::Path) {
     match call(sock, json!({"cmd": "status"})) {
         Ok(_) => println!("      the arcade service is running"),
         Err(e) => {
+            #[cfg(windows)]
+            println!("      {e}\n      start it from the Arcade V1.0 login task, or run arcaded, then run  arcade setup  again");
+            #[cfg(not(windows))]
             println!("      {e}\n      start it with:  {}   then run  arcade setup  again", start_hint(sock));
             std::process::exit(2);
         }
@@ -289,22 +291,37 @@ fn setup(sock: &std::path::Path) {
     }
 
     step(10, "Start at boot");
-    let system = system_service(sock);
-    let mut is_enabled = std::process::Command::new("systemctl");
-    if !system {
-        is_enabled.arg("--user");
+    #[cfg(windows)]
+    {
+        let enabled = std::process::Command::new("schtasks")
+            .args(["/Query", "/TN", "Arcade V1.0"])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        println!(
+            "      {}",
+            if enabled { "arcaded starts at login (Task Scheduler: Arcade V1.0)" } else { "not enabled: run scripts\\install.ps1" }
+        );
     }
-    let enabled = is_enabled.args(["is-enabled", "arcaded"]).output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
-    let user = std::env::var("USER").unwrap_or_default();
-    let linger = system || std::process::Command::new("loginctl").args(["show-user", &user, "-p", "Linger", "--value"]).output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes").unwrap_or(false);
-    println!("      {}", match (enabled, linger) {
-        (true, true) => "arcaded starts at boot".to_string(),
-        (true, false) => format!("arcaded starts when you log in; to start it at boot:  sudo loginctl enable-linger {user}"),
-        (false, _) if system => "not enabled: sudo systemctl enable arcaded".to_string(),
-        (false, _) => format!("not started at boot: after a reboot start it with  {}", start_hint(sock)),
-    });
+    #[cfg(not(windows))]
+    {
+        let system = system_service(sock);
+        let mut is_enabled = std::process::Command::new("systemctl");
+        if !system {
+            is_enabled.arg("--user");
+        }
+        let enabled = is_enabled.args(["is-enabled", "arcaded"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "enabled").unwrap_or(false);
+        let user = std::env::var("USER").unwrap_or_default();
+        let linger = system || std::process::Command::new("loginctl").args(["show-user", &user, "-p", "Linger", "--value"]).output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).trim() == "yes").unwrap_or(false);
+        println!("      {}", match (enabled, linger) {
+            (true, true) => "arcaded starts at boot".to_string(),
+            (true, false) => format!("arcaded starts when you log in; to start it at boot:  sudo loginctl enable-linger {user}"),
+            (false, _) if system => "not enabled: sudo systemctl enable arcaded".to_string(),
+            (false, _) => format!("not started at boot: after a reboot start it with  {}", start_hint(sock)),
+        });
+    }
 
     step(11, "Share bootstraps");
     println!("      your arcade serves its chain to other arcades on the mesh (always on)");
@@ -327,13 +344,43 @@ fn restore_phrase(words: &[&str], typed: impl FnOnce() -> std::io::Result<String
     Ok(phrase)
 }
 
+#[cfg(not(windows))]
 fn stty(tty: &std::fs::File, arg: &str) -> std::io::Result<()> {
     let ok = std::process::Command::new("stty").arg(arg).stdin(tty.try_clone()?).status()?.success();
     if ok { Ok(()) } else { Err(std::io::Error::other("stty failed")) }
 }
 
+/// A line typed at the console without showing it (echo off on the console input handle);
+/// from standard input when there is no console (`arcade wallet restore < file`).
+#[cfg(windows)]
+fn read_hidden(prompt: &str) -> std::io::Result<String> {
+    #[link(name = "kernel32")]
+    extern "system" {
+        fn GetStdHandle(which: u32) -> *mut std::ffi::c_void;
+        fn GetConsoleMode(h: *mut std::ffi::c_void, mode: *mut u32) -> i32;
+        fn SetConsoleMode(h: *mut std::ffi::c_void, mode: u32) -> i32;
+    }
+    const STD_INPUT_HANDLE: u32 = -10i32 as u32;
+    const ENABLE_ECHO_INPUT: u32 = 0x0004;
+    let mut line = String::new();
+    let h = unsafe { GetStdHandle(STD_INPUT_HANDLE) };
+    let mut mode = 0u32;
+    if unsafe { GetConsoleMode(h, &mut mode) } == 0 {
+        std::io::stdin().read_line(&mut line)?;
+        return Ok(line.trim().to_string());
+    }
+    eprint!("{prompt}");
+    let _ = std::io::stderr().flush();
+    unsafe { SetConsoleMode(h, mode & !ENABLE_ECHO_INPUT) };
+    let got = std::io::stdin().read_line(&mut line);
+    unsafe { SetConsoleMode(h, mode) };
+    eprintln!();
+    got.map(|_| line.trim().to_string())
+}
+
 /// A line typed at the terminal without showing it; from standard input when there is no
 /// terminal (`arcade wallet restore < file`).
+#[cfg(not(windows))]
 fn read_hidden(prompt: &str) -> std::io::Result<String> {
     let mut line = String::new();
     let Ok(mut tty) = std::fs::OpenOptions::new().read(true).write(true).open("/dev/tty") else {
@@ -351,7 +398,7 @@ fn read_hidden(prompt: &str) -> std::io::Result<String> {
 
 fn main() {
     let mut args: Vec<String> = std::env::args().skip(1).collect();
-    let sock = home(&args).join("arcaded.sock");
+    let sock = arcade_local::socket_path(&home(&args));
     if let Some(i) = args.iter().position(|a| a == "--home") {
         args.drain(i..i + 2);
     }
@@ -370,6 +417,7 @@ fn main() {
         ["web"] => json!({"cmd": "ui.link"}),
         ["peers"] => json!({"cmd": "peers"}),
         ["peers", "dials"] => json!({"cmd": "mesh.dials"}),
+        ["stop"] => json!({"cmd": "service.stop"}),
         ["wallet", "create"] => json!({"cmd": "wallet.create"}),
         ["wallet", "restore", words @ ..] => match restore_phrase(words, || read_hidden("Your recovery phrase (not shown as you type): ")) {
             Ok(phrase) => json!({"cmd": "wallet.create", "phrase": phrase}),
@@ -606,6 +654,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(windows))]
     fn the_start_hint_matches_how_the_arcade_was_installed() {
         assert_eq!(start_hint(std::path::Path::new("/var/lib/arcade/arcaded.sock")), "sudo systemctl enable --now arcaded");
         let dir = std::env::temp_dir().join(format!("arcade-cli-hint-{}", std::process::id()));
@@ -615,6 +664,15 @@ mod tests {
         std::fs::write(dir.join("start-arcaded.sh"), "").unwrap();
         assert_eq!(start_hint(&sock), format!("sh {}", dir.join("start-arcaded.sh").display()));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn the_start_hint_on_windows_points_at_the_login_task() {
+        assert_eq!(
+            start_hint(std::path::Path::new(r"C:\Users\x\AppData\Local\arcade\arcaded.sock")),
+            "start it from the Arcade V1.0 login task, or run arcaded"
+        );
     }
 
     #[test]

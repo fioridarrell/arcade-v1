@@ -423,7 +423,14 @@ pub fn round(node: &Node, net: &Net, catalog: &Catalog, weight: u64, height: u64
     BUSY.store(more, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// Bytes free on the disk holding `path` (unknown on Windows: sealing doesn't wait for space there yet).
+#[cfg(not(unix))]
+fn free_bytes(_path: &std::path::Path) -> Option<u64> {
+    None
+}
+
 /// Bytes free on the disk holding `path`.
+#[cfg(unix)]
 fn free_bytes(path: &std::path::Path) -> Option<u64> {
     use std::os::unix::ffi::OsStrExt;
     let c = std::ffi::CString::new(path.as_os_str().as_bytes()).ok()?;

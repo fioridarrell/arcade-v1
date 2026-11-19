@@ -18,7 +18,6 @@ use arcade_arc::params::Net;
 use arcade_arc::sloth::{self, DATA_LEAF, SEALED_LEAF};
 use arcade_chain::params::ChainParams;
 use serde_json::{json, Value};
-use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -43,6 +42,52 @@ pub struct Replica {
 
 /// What a sealing run is doing: (segment id hex, leaves done, leaves in all).
 static SEALING: Mutex<Option<(String, u64, u64)>> = Mutex::new(None);
+
+/// Positioned read/write. Linux uses the kernel's `pread`/`pwrite`. Windows has the same
+/// operations under different names (`seek_read` / `seek_write`).
+pub(crate) fn read_exact_at(f: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::read_exact_at(f, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut rest = &mut *buf;
+        let mut at = offset;
+        while !rest.is_empty() {
+            let n = f.seek_read(rest, at)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short read"));
+            }
+            at += n as u64;
+            rest = &mut rest[n..];
+        }
+        Ok(())
+    }
+}
+
+fn write_all_at(f: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::FileExt::write_all_at(f, buf, offset)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        let mut rest = buf;
+        let mut at = offset;
+        while !rest.is_empty() {
+            let n = f.seek_write(rest, at)?;
+            if n == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::WriteZero, "short write"));
+            }
+            at += n as u64;
+            rest = &rest[n..];
+        }
+        Ok(())
+    }
+}
 
 pub fn dir_of(node: &Node, net: &Net, segment: &Hash) -> PathBuf {
     node.home.join("arc").join(net.key).join("sealed").join(hex::encode(segment))
@@ -156,7 +201,7 @@ fn seal_into(node: &Node, p: &ChainParams, family: u8, dir: &std::path::Path, se
         let mut l = [0u8; DATA_LEAF];
         let at = i * DATA_LEAF as u64;
         let n = (bytes - at).min(DATA_LEAF as u64) as usize;
-        data.read_exact_at(&mut l[..n], at)?;
+        read_exact_at(&data, &mut l[..n], at)?;
         Ok(l)
     };
     // 2. Seal every leaf, on every core; each leaf goes to its place in sealed.bin.
@@ -186,7 +231,7 @@ fn seal_into(node: &Node, p: &ChainParams, family: u8, dir: &std::path::Path, se
                         }
                     }
                 }
-                if let Err(e) = sealed.write_all_at(&out, start * SEALED_LEAF as u64) {
+                if let Err(e) = write_all_at(&sealed, &out, start * SEALED_LEAF as u64) {
                     *failed.lock().unwrap() = Some(e.to_string());
                     return;
                 }
@@ -210,7 +255,7 @@ fn seal_into(node: &Node, p: &ChainParams, family: u8, dir: &std::path::Path, se
     let mut s = [0u8; SEALED_LEAF];
     for i in 0..leaves {
         let d = merkle::leaf_hash(&leaf_at(i).map_err(io)?);
-        sealed.read_exact_at(&mut s, i * SEALED_LEAF as u64).map_err(io)?;
+        read_exact_at(&sealed, &mut s, i * SEALED_LEAF as u64).map_err(io)?;
         let h = merkle::leaf_hash(&s);
         data_tree.push_hash(d);
         sealed_tree.push_hash(h);
@@ -257,7 +302,7 @@ impl Replica {
         let (first, count) = arcade_arc::segment::leaves_of(at, len);
         let f = std::fs::File::open(self.dir.join("sealed.bin")).map_err(|e| e.to_string())?;
         let mut sealed = vec![0u8; count as usize * SEALED_LEAF];
-        f.read_exact_at(&mut sealed, first * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+        read_exact_at(&f, &mut sealed, first * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
         let mut out = Vec::with_capacity(count as usize * DATA_LEAF);
         for (k, s) in sealed.chunks_exact(SEALED_LEAF).enumerate() {
             let s: &[u8; SEALED_LEAF] = s.try_into().unwrap();
@@ -322,7 +367,7 @@ impl Replica {
     pub fn data_leaf(&self, owner: &[u8; 32], i: u64) -> Result<[u8; DATA_LEAF], String> {
         let mut s = [0u8; SEALED_LEAF];
         let f = std::fs::File::open(self.dir.join("sealed.bin")).map_err(|e| e.to_string())?;
-        f.read_exact_at(&mut s, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+        read_exact_at(&f, &mut s, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
         sloth::unseal_leaf(owner, &self.mask, i, &s).map_err(|e| format!("leaf {i} doesn't unseal: {e:?}"))
     }
 
@@ -336,7 +381,7 @@ impl Replica {
             .iter()
             .map(|&i| {
                 let mut sealed = [0u8; SEALED_LEAF];
-                f.read_exact_at(&mut sealed, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+                read_exact_at(&f, &mut sealed, i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
                 let data = sloth::unseal_leaf(owner, &self.mask, i, &sealed).map_err(|e| format!("leaf {i} doesn't unseal: {e:?}"))?;
                 Ok(Opened {
                     sealed,
@@ -526,7 +571,7 @@ fn seal_run(me: &[u8; 32], mask: &Hash, start: u64, data: &[u8], file: &std::fs:
                     l[..n].copy_from_slice(&data[at..at + n]);
                     out.extend_from_slice(&sloth::seal_leaf(me, mask, start + k, &l));
                 }
-                if let Err(e) = file.write_all_at(&out, (start + a) * SEALED_LEAF as u64) {
+                if let Err(e) = write_all_at(&file, &out, (start + a) * SEALED_LEAF as u64) {
                     *failed.lock().unwrap() = Some(e.to_string());
                     return;
                 }
@@ -588,7 +633,7 @@ impl Open {
         let (first, count) = arcade_arc::segment::leaves_of(at, len);
         let f = self.file()?;
         let mut sealed = vec![0u8; count as usize * SEALED_LEAF];
-        f.read_exact_at(&mut sealed, first * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+        read_exact_at(&f, &mut sealed, first * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
         let mut out = Vec::with_capacity(count as usize * DATA_LEAF);
         for (k, s) in sealed.chunks_exact(SEALED_LEAF).enumerate() {
             out.extend_from_slice(&sloth::unseal_leaf(owner, &self.mask, first + k as u64, s.try_into().unwrap()).map_err(|e| format!("{e:?}"))?);
@@ -600,7 +645,7 @@ impl Open {
     fn offset(&self, h: u64) -> Result<u64, String> {
         let f = std::fs::File::open(self.dir.join("offsets.bin")).map_err(|e| e.to_string())?;
         let mut b = [0u8; 8];
-        f.read_exact_at(&mut b, (h - self.first) * 8).map_err(|e| e.to_string())?;
+        read_exact_at(&f, &mut b, (h - self.first) * 8).map_err(|e| e.to_string())?;
         Ok(u64::from_le_bytes(b))
     }
 
@@ -639,7 +684,7 @@ impl Open {
         }
         self.seal_on(owner, self.bytes, &units.concat())?;
         let of = std::fs::OpenOptions::new().write(true).create(true).truncate(false).open(self.dir.join("offsets.bin")).map_err(|e| e.to_string())?;
-        of.write_all_at(&offsets, (h0 - self.first) * 8).map_err(|e| e.to_string())?;
+        write_all_at(&of, &offsets, (h0 - self.first) * 8).map_err(|e| e.to_string())?;
         of.sync_data().map_err(|e| e.to_string())?;
         self.bytes = at;
         self.through = Some(h0 + units.len() as u64 - 1);
@@ -692,7 +737,7 @@ impl Open {
         use std::io::Write;
         let mut s = [0u8; SEALED_LEAF];
         for i in 0..leaves {
-            f.read_exact_at(&mut s, i * SEALED_LEAF as u64).map_err(io)?;
+            read_exact_at(&f, &mut s, i * SEALED_LEAF as u64).map_err(io)?;
             let d = merkle::leaf_hash(&sloth::unseal_leaf(owner, &self.mask, i, &s).map_err(|e| format!("leaf {i} doesn't unseal: {e:?}"))?);
             let h = merkle::leaf_hash(&s);
             data_tree.push_hash(d);

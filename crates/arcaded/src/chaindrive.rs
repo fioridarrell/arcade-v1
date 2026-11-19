@@ -18,6 +18,7 @@ pub const DIR: &str = "arcade-chains";
 /// Kept free on the drive a chain is copied to, beyond the copy itself.
 const KEEP_FREE: u64 = 5 << 30;
 
+#[cfg(unix)]
 fn free_bytes(p: &Path) -> Option<(u64, u64)> {
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
@@ -25,6 +26,48 @@ fn free_bytes(p: &Path) -> Option<(u64, u64)> {
         return None;
     }
     Some((s.f_bavail as u64 * s.f_frsize as u64, s.f_blocks as u64 * s.f_frsize as u64))
+}
+
+/// Windows: free and total bytes of the volume that holds `p` (GetDiskFreeSpaceExW).
+#[cfg(windows)]
+fn free_bytes(p: &Path) -> Option<(u64, u64)> {
+    let wide = win::wide(p);
+    let (mut free, mut total) = (0u64, 0u64);
+    let ok = unsafe { win::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
+    if ok == 0 { None } else { Some((free, total)) }
+}
+
+/// The Windows calls the drive list needs (kernel32), as diskfree.rs does: no extra crate.
+#[cfg(windows)]
+mod win {
+    use std::os::windows::ffi::OsStrExt;
+    use std::path::Path;
+    pub const DRIVE_FIXED: u32 = 3;
+    #[link(name = "kernel32")]
+    extern "system" {
+        pub fn GetDiskFreeSpaceExW(dir: *const u16, free_to_caller: *mut u64, total: *mut u64, total_free: *mut u64) -> i32;
+        pub fn GetLogicalDrives() -> u32;
+        pub fn GetDriveTypeW(root: *const u16) -> u32;
+        pub fn GetVolumePathNameW(file: *const u16, volume: *mut u16, len: u32) -> i32;
+        pub fn GetVolumeInformationW(root: *const u16, name: *mut u16, name_len: u32, serial: *mut u32,
+                                     max_component: *mut u32, flags: *mut u32, fs_name: *mut u16, fs_name_len: u32) -> i32;
+    }
+    pub fn wide(p: &Path) -> Vec<u16> {
+        p.as_os_str().encode_wide().chain(std::iter::once(0)).collect()
+    }
+}
+
+/// A path as Windows shows it: canonicalize gives \\?\C:\..., the drive list has C:\.
+fn plain(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = p.to_str().and_then(|s| s.strip_prefix(r"\\?\")) {
+            if rest.as_bytes().get(1) == Some(&b':') {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    p
 }
 
 /// Mounted drives a chain can go on: real disks (/dev/...), not the system's own boot and
@@ -48,6 +91,7 @@ pub fn drives(node: &Node) -> Value {
 
 /// The mount points `drives` lists (not the arcade's own drive): read from /proc/self/mounts,
 /// nothing written or measured.
+#[cfg(unix)]
 fn mount_points(node: &Node) -> Vec<PathBuf> {
     let home_dev = dev_of(&node.home);
     let mut out = vec![];
@@ -75,13 +119,59 @@ fn mount_points(node: &Node) -> Vec<PathBuf> {
     out
 }
 
+/// Windows: the fixed drives (C:\, D:\, ...) other than the arcade's own, from GetLogicalDrives;
+/// nothing written or measured.
+#[cfg(windows)]
+fn mount_points(node: &Node) -> Vec<PathBuf> {
+    let home_dev = dev_of(&node.home);
+    let mask = unsafe { win::GetLogicalDrives() };
+    let mut out = vec![];
+    for i in 0..26u32 {
+        if mask & (1 << i) == 0 {
+            continue;
+        }
+        let p = PathBuf::from(format!("{}:\\", (b'A' + i as u8) as char));
+        if unsafe { win::GetDriveTypeW(win::wide(&p).as_ptr()) } != win::DRIVE_FIXED {
+            continue;
+        }
+        if dev_of(&p).is_none() || dev_of(&p) == home_dev {
+            continue;
+        }
+        out.push(p);
+    }
+    out
+}
+
+#[cfg(unix)]
 fn fix(dir: &Path) -> String {
     format!("sudo mkdir -p {d} && sudo chown $USER: {d}", d = dir.display())
 }
 
+#[cfg(windows)]
+fn fix(dir: &Path) -> String {
+    format!("mkdir \"{}\"  (in a Command Prompt; or give your user write access to that drive)", dir.display())
+}
+
+#[cfg(unix)]
 fn dev_of(p: &Path) -> Option<u64> {
     use std::os::unix::fs::MetadataExt;
     std::fs::metadata(p).ok().map(|m| m.dev())
+}
+
+/// Windows: the serial number of the volume that holds `p` (std's volume_serial_number is unstable).
+#[cfg(windows)]
+fn dev_of(p: &Path) -> Option<u64> {
+    std::fs::metadata(p).ok()?;
+    let wide = win::wide(p);
+    let mut root = [0u16; 512];
+    if unsafe { win::GetVolumePathNameW(wide.as_ptr(), root.as_mut_ptr(), root.len() as u32) } == 0 {
+        return None;
+    }
+    let mut serial = 0u32;
+    let ok = unsafe {
+        win::GetVolumeInformationW(root.as_ptr(), std::ptr::null_mut(), 0, &mut serial, std::ptr::null_mut(), std::ptr::null_mut(), std::ptr::null_mut(), 0)
+    };
+    if ok == 0 { None } else { Some(serial as u64) }
 }
 
 /// Whether the arcade looks able to keep chains on a drive, without writing to it: its
@@ -89,8 +179,16 @@ fn dev_of(p: &Path) -> Option<u64> {
 fn may_write(mnt: &Path) -> bool {
     let d = mnt.join(DIR);
     let at = if d.exists() { d } else { mnt.to_path_buf() };
-    let Ok(c) = std::ffi::CString::new(at.as_os_str().as_encoded_bytes()) else { return false };
-    at.is_dir() && unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0
+    #[cfg(unix)]
+    {
+        let Ok(c) = std::ffi::CString::new(at.as_os_str().as_encoded_bytes()) else { return false };
+        at.is_dir() && unsafe { libc::access(c.as_ptr(), libc::W_OK | libc::X_OK) } == 0
+    }
+    // Windows: a folder that isn't marked read-only; the real write test comes when it is picked (writable).
+    #[cfg(windows)]
+    {
+        at.is_dir() && std::fs::metadata(&at).is_ok_and(|m| !m.permissions().readonly())
+    }
 }
 
 /// Whether the arcade can keep chains on a drive (its arcade-chains folder exists and is
@@ -147,7 +245,7 @@ fn install_at(node: &Node, c: u16, dir: Option<&Path>, add: impl FnOnce() -> Res
 /// Where chain `c`'s file is: its folder, the drive's id, the file's size.
 pub fn place(node: &Node, c: u16) -> Value {
     let dir = node.chain.own_dir(c);
-    let real = std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone());
+    let real = plain(std::fs::canonicalize(&dir).unwrap_or_else(|_| dir.clone()));
     let size = std::fs::metadata(dir.join("chain.mdbx")).map(|m| m.len()).unwrap_or(0);
     let home = dev_of(&real).is_some() && dev_of(&real) == dev_of(&node.home);
     // chains.status polls this: the drive is found in the mount list, no drive is measured or written to.

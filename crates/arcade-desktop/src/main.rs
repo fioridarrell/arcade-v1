@@ -37,12 +37,45 @@ fn window_may(label: &str, cmd: &str) -> bool {
     label == "main" || label.starts_with("app-") && APP_WINDOW_COMMANDS.contains(&cmd)
 }
 
-/// Forward one request to arcaded and return its answer (off the UI thread: some wait, such as
-/// realtime.poll). Only what the asking window may send (window_may).
-#[tauri::command(async)]
-fn api(window: tauri::WebviewWindow, req: Value) -> Value {
+/// How long the window waits for arcaded's answer to one call before it gives up on it (the call's thread is let go and
+/// the page gets an error it can show). realtime.poll gets its own wait plus a margin; SLOW_COMMANDS, which may work
+/// for minutes (installs, moves, imports, inscribing), get longer. dist/common.js has the same list and a little more
+/// time (API_SLOW), so this clearer answer usually arrives first (tests::the_window_and_the_app_agree_on_slow_calls).
+const ANSWER_SECS: u64 = 120;
+const SLOW_ANSWER_SECS: u64 = 600;
+const SLOW_COMMANDS: &[&str] = &[
+    "apps.install", "chains.add", "chains.copy_from_dir", "chains.copy_verify", "chains.index_add", "chains.index_remove",
+    "chains.move", "chains.remove", "inscribe", "share.install", "update.check", "wallet.import",
+];
+/// Sending one request never takes long; a socket that takes none is stuck.
+const SEND_SECS: u64 = 30;
+
+fn answer_limit(cmd: &str, req: &Value) -> std::time::Duration {
+    use std::time::Duration;
+    if cmd == "realtime.poll" {
+        // arcaded waits up to `wait` ms (15 s at most) for an event.
+        return Duration::from_millis(req["wait"].as_u64().unwrap_or(0).min(15_000)) + Duration::from_secs(30);
+    }
+    Duration::from_secs(if SLOW_COMMANDS.contains(&cmd) { SLOW_ANSWER_SECS } else { ANSWER_SECS })
+}
+
+/// Forward one request to arcaded and return its answer. Only what the asking window may send (window_may).
+///
+/// The socket call blocks (some wait on purpose, such as realtime.poll), so it runs on the blocking pool: on the
+/// async runtime's few worker threads (one per core) a handful of waiting calls held every worker, and every later
+/// call from every window, Tauri's own included, waited behind them; on a small Windows PC the window froze. Each
+/// call also has a time limit (answer_limit), so one that is never answered can't hold a thread for good.
+#[tauri::command]
+async fn api(window: tauri::WebviewWindow, req: Value) -> Value {
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || ask(&label, req))
+        .await
+        .unwrap_or_else(|e| json!({"ok": false, "error": format!("the call to the arcade service stopped ({e})")}))
+}
+
+fn ask(label: &str, req: Value) -> Value {
     let cmd = req["cmd"].as_str().unwrap_or("");
-    if !window_may(window.label(), cmd) {
+    if !window_may(label, cmd) {
         return json!({"ok": false, "error": format!("{cmd} is not for this window")});
     }
     let sock = arcade_local::socket_path(&home());
@@ -56,11 +89,19 @@ fn api(window: tauri::WebviewWindow, req: Value) -> Value {
             return json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())});
         }
     };
+    let limit = answer_limit(cmd, &req);
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(SEND_SECS)));
+    let _ = s.set_read_timeout(Some(limit));
     if writeln!(s, "{req}").is_err() {
         return json!({"ok": false, "error": "could not talk to the arcade service"});
     }
     let mut line = String::new();
-    let _ = BufReader::new(s).read_line(&mut line);
+    match BufReader::new(s).read_line(&mut line) {
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            return json!({"ok": false, "error": format!("the arcade service did not answer {cmd} within {} s", limit.as_secs())});
+        }
+        _ => {}
+    }
     serde_json::from_str(&line).unwrap_or(json!({"ok": false, "error": "bad reply from the arcade service"}))
 }
 
@@ -275,6 +316,33 @@ mod tests {
         for label in ["content-00ff", "other", "mainx", "App-00ff"] {
             assert!(!window_may(label, "chains.list"), "{label}");
         }
+    }
+
+    #[test]
+    fn calls_have_a_time_limit() {
+        use std::time::Duration;
+        assert_eq!(answer_limit("status", &json!({})), Duration::from_secs(ANSWER_SECS));
+        assert_eq!(answer_limit("chains.move", &json!({})), Duration::from_secs(SLOW_ANSWER_SECS));
+        assert_eq!(answer_limit("realtime.poll", &json!({"wait": 15000})), Duration::from_secs(45));
+        assert_eq!(answer_limit("realtime.poll", &json!({"wait": 999_999})), Duration::from_secs(45), "arcaded waits 15 s at most");
+        assert_eq!(answer_limit("realtime.poll", &json!({})), Duration::from_secs(30));
+        // Every slow command is one arcaded has.
+        let commands = include_str!("../../arcaded/src/commands.rs");
+        for cmd in SLOW_COMMANDS {
+            assert!(commands.contains(&format!("\"{cmd}\" ")), "{cmd} is not an arcaded command");
+        }
+    }
+
+    #[test]
+    fn the_window_and_the_app_agree_on_slow_calls() {
+        // dist/common.js gives up on the same slow calls a little later than the app (API_SLOW).
+        let js = include_str!("../dist/common.js");
+        let list = js.split("const API_SLOW = [").nth(1).and_then(|r| r.split(']').next()).expect("API_SLOW in common.js");
+        let mut js_slow: Vec<&str> = list.split(',').map(|c| c.trim().trim_matches('"')).filter(|c| !c.is_empty()).collect();
+        let mut rust_slow = SLOW_COMMANDS.to_vec();
+        js_slow.sort();
+        rust_slow.sort();
+        assert_eq!(js_slow, rust_slow);
     }
 
     #[test]

@@ -104,6 +104,28 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `tx.status` | `/api/v1/tx/status` | read | chain, txid \| client_ref | Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding}), signed (signed here moments ago, in no pool or block), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, and code not_found when this arcade never signed it. |
 | `tx.wait` | `/api/v1/tx/wait` | read | chain, txid \| client_ref, until?, timeout? | tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped, or after timeout seconds (default 60, at most 600) with timed_out: true. |
 
+### Psbt
+
+Build-only transactions for an account that signs in the ARCADE app (see "Account sign-in and payments" below). No
+keys and nothing signed or sent: `address` and `pubkey` (hex, compressed) are the paired account's, from the pairing's
+`home` (or its Dogecoin key with `chain: "doge"`); `chain` defaults to this arcade's home chain (ARCADE testnet on the
+test arcades). Coins are the ones `tx.coins` lists (never one carrying an inscription), the fee rate and dust
+`tx.fee`'s, and records are byte for byte what `feed.post` and `feed.act` write. One transaction each; a record too long
+for one is refused. At most 600 builds a minute per arcade, 60 per address.
+
+Every builder answers
+`{psbt, chain, unit, address, what, summary: {inputs: [{coin, value, from}], outputs: [{index, value, to, mine}], fee}}`:
+`psbt` is base64 (each input carries its whole previous transaction), `to` an address or `data (OP_RETURN)`, `mine`
+marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finalize: true}`; its answer's `txHex` (or
+`psbt.finalize` of its `psbtHex`) goes to `tx.broadcast`.
+
+| method | route | needs | params | what |
+|---|---|---|---|---|
+| `psbt.send` | `/api/v1/psbt/send` | public | address, pubkey, chain?, to, amount | A payment: `amount` (smallest units, at least the dust) to `to`, an address of the chain or a @tag (paid where `wallet.send` would pay it), change back. |
+| `psbt.feed_post` | `/api/v1/psbt/feed_post` | public | address, pubkey, chain?, text, channel?, file? | A public post (needs a @tag): `channel` such as `txtok` (default `main`, at most 24 characters), `file` = `{name, type, data}` (base64, at most 1 MB, and the whole record at most 7,646 bytes). |
+| `psbt.feed_act` | `/api/v1/psbt/feed_act` | public | address, pubkey, chain?, kind, target, text?, amount? | A feed act on `target` (a post's or reply's txid): like, unlike, dislike, undislike, reply, share, edit, delete (`text` for reply, share and edit), or tip: `amount` paid to the post's author on that chain in the same transaction (their address there: the same key's on a chain that derives keys as the home chain does, else the one they proved). |
+| `psbt.finalize` | `/api/v1/psbt/finalize` | public | psbt, chain? | A signed PSBT (base64 or hex): every P2PKH signature checked, a partial one finished; `{hex, txid, chain, size, fee}` for `tx.broadcast`. Refused when an input isn't signed or a signature doesn't check. |
+
 ### Id
 
 | method | route | needs | params | what |
@@ -117,11 +139,11 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `id.link_answer` | `/api/v1/id/link_answer` | local | qr, send? | The desktop app as the other device: an arcadelink:// text in. Without send: the site, the number to compare and the @tag that would go. With send: the active account's words sealed to the browser's key and posted to `<via or https://host>/api/v1/id/link_send`. Sealed = {v: 1, kem: "X25519", epk, nonce, ct} (hex): AES-256-GCM under sha256("ARCADE/link\0" + X25519(shared) + epk + the browser's key); inside, {words, tag}. |
 | `id.box_put` | `/api/v1/id/box_put` | public | box, msg | A sealed message for the other end of an ARCADE ID signing pairing (box: 32 hex characters only the two ends know; up to 16 waiting, 1,500,000 characters each, 64 MB in all boxes, ten minutes). The arcade only passes it on. |
 | `id.box_take` | `/api/v1/id/box_take` | public | box | Everything waiting in a box, oldest first; the box is emptied. |
-| `id.sign_pair` | `/api/v1/id/sign_pair` | local | qr, send? | Pair a website with this app so it can ask the app to sign: an `arcadesign://site/<pairbox>?k=<page X25519 key>[&a=<arcade>]` code in. Without send: the site, the 6-digit number to compare and the account and Dogecoin address. With send: the app puts {v: 1, apk, n, c} in the pair box; both ends derive K = sha256("ARCADE/sign\0" + shared + app key + page key), the request box = first 16 bytes of sha256("ARCADE/sign/req\0" + K), the answer box likewise with "res"; {n, c} = AES-256-GCM under K (nonce hex, ciphertext base64). |
+| `id.sign_pair` | `/api/v1/id/sign_pair` | local | qr, send? | Pair a website with this app so it can ask the app to sign: an `arcadesign://site/<pairbox>?k=<page X25519 key>[&a=<arcade>]` code in. Without send: the site, the 6-digit number to compare, the account, its Dogecoin address and `home: {chain, name, address}`. With send: the app puts {v: 1, apk, n, c} in the pair box (inside: `{address, pubkey, tag, chain: "doge", home: {chain, address, pubkey}}`: the Dogecoin key m/44'/3'/0'/0/0 and the home-chain key its @tag names); both ends derive K = sha256("ARCADE/sign\0" + shared + app key + page key), the request box = first 16 bytes of sha256("ARCADE/sign/req\0" + K), the answer box likewise with "res"; {n, c} = AES-256-GCM under K (nonce hex, ciphertext base64). |
 | `id.sign_sites` | `/api/v1/id/sign_sites` | local | — | Websites paired with this app. |
 | `id.sign_forget` | `/api/v1/id/sign_forget` | local | id | Unpair a website. |
-| `id.sign_pending` | `/api/v1/id/sign_pending` | local | — | What paired sites ask this app to sign (taken from their request boxes every 3 s): a message, or a PSBT (each signed input must carry its previous transaction, which must hash to its txid) with the coins it signs, every output, the fee and whether a signed coin carries an inscription (this arcade's ord index, else the mesh's). Requests inside: {id, type: "psbt", psbt, inputToSign?, finalize?, label?}, {id, type: "psbts", psbts: [{psbt, inputToSign?, finalize?, label?}]} (up to 50, signed together on one yes; the answer has `results`) or {id, type: "message", message, label?}. `label` is the site's own name for it, shown as the site's. An inscription reveal is signed only when named in `inputToSign` with sighashType 1 (ALL): its coin is P2SH of the redeem script the PSBT carries (input key 0x04), that script is exactly `6b 6b`, 1–200 × `75`, `6c 6c`, `ab`, then the account's P2PKH; it is signed over that P2PKH (after OP_CODESEPARATOR) and left as a partial signature even with `finalize`, for the site to build the scriptSig. Such inputs show `reveal: true`. |
-| `id.sign_decide` | `/api/v1/id/sign_decide` | local | id, ok | Sign a waiting request (Dogecoin key m/44'/3'/0'/0/0; legacy P2PKH inputs, ALL, ALL\|ANYONECANPAY or SINGLE\|ANYONECANPAY; a named inscription reveal, ALL, partial signature only) or refuse; the answer {id, ok, psbtHex, txHex?} or {id, ok, signature} or {id, ok: false, error} goes to the answer box. |
+| `id.sign_pending` | `/api/v1/id/sign_pending` | local | — | What paired sites ask this app to sign (taken from their request boxes every 3 s): a message, or a PSBT (each signed input must carry its previous transaction, which must hash to its txid) with the coins it signs, every output, the fee and whether a signed coin carries an inscription (this arcade's ord index, else the mesh's). Requests inside: {id, type: "psbt", psbt, inputToSign?, finalize?, label?}, {id, type: "psbts", psbts: [{psbt, inputToSign?, finalize?, label?}]} (up to 50, signed together on one yes; the answer has `results`) or {id, type: "message", message, label?}. `label` is the site's own name for it, shown as the site's. Which key: the Dogecoin key, unless the request has `key: "home"` (a message) or `chain: "<home chain key>"` (a PSBT; `key: "home"` works too): then the home key, a message signed with ARCADE's prefix, a PSBT shown in that chain's addresses and units, and every coin it signs must be an unspent coin of that chain here. Any other chain is refused; a `psbts` batch is on one chain. Each shows `key`, `chain`, `chain_name`, `unit` and `address` (the signing one). An inscription reveal is signed only when named in `inputToSign` with sighashType 1 (ALL): its coin is P2SH of the redeem script the PSBT carries (input key 0x04), that script is exactly `6b 6b`, 1–200 × `75`, `6c 6c`, `ab`, then the account's P2PKH; it is signed over that P2PKH (after OP_CODESEPARATOR) and left as a partial signature even with `finalize`, for the site to build the scriptSig. Such inputs show `reveal: true`. |
+| `id.sign_decide` | `/api/v1/id/sign_decide` | local | id, ok | Sign a waiting request (Dogecoin key m/44'/3'/0'/0/0, or the home key when the request names it; legacy P2PKH inputs of that key's, ALL, ALL\|ANYONECANPAY or SINGLE\|ANYONECANPAY; a named inscription reveal, ALL, partial signature only) or refuse; the answer {id, ok, psbtHex, txHex?} or {id, ok, signature, address} or {id, ok: false, error} goes to the answer box. |
 | `id.answer` | `/api/v1/id/answer` | local | code, chain?, send? | Sign in to a Digi-ID site with this arcade's wallet (the active account), as a phone wallet such as Coinomi does: a digiid:// code in. Without send: the site's name, where the answer goes and this wallet's key for that site (SLIP-0013, never a key that holds coins; the same one the web wallet makes from the same words), to show first. With send: signed and sent to the site. chain: dgb (Digi-ID, the default) or another chain this wallet holds (ARCADE ID). |
 | `id.relay` | `/api/v1/id/relay` | public | uri, address, signature, chain? | A website's user signed a Digi-ID code in the browser; the site's server passes the answer here and the arcade sends it to the code's site (a page may not post to another site; a server may). Only a well-formed code, signed by that address, once, and only to a public internet address (never this computer or its network; no redirects). |
 
@@ -194,6 +216,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `msg.stats` | `/api/v1/msg/stats` | public | — | How many message candidates, posts, acts and machine records the home chain holds. |
 | `msg.scan` | `/api/v1/msg/scan` | message | — | Look for new messages now (it also runs every 15 seconds). |
 | `msg.who` | `/api/v1/msg/who` | public | name | Who a @tag or address is, and their published messaging key. |
+| `msg.verify` | `/api/v1/msg/verify` | public | address, message, signature, prefix?, chain? | Whether `signature` (Core signmessage: 65-byte compact, base64) is `address`'s over `message`, with `prefix`, else `chain`'s message prefix, else ARCADE's (`Pepecoin Signed Message:\n`, what the ARCADE app signs with the home key). Answer `{valid, address, prefix}`. |
 | `msg.conversations` | `/api/v1/msg/conversations` | read | requests? | Conversations, newest first (requests: people not in your contacts). |
 | `msg.thread` | `/api/v1/msg/thread` | read | peer | Every message with one person (their messaging key). |
 | `msg.read` | `/api/v1/msg/read` | message | peer | Mark a conversation read. |
@@ -466,6 +489,19 @@ locked on the device (a passkey, for one). The arcade only passes the sealed mes
 wallet such as Coinomi does. A website's users sign in the browser, and the site's server hands the answer to
 `id.relay`, which sends it on: a page can't post to another site, but the arcade can. Both make the same key for a
 site from the same 12 words.
+
+**Signing in to other Digi-ID sites is a per-site key.** `id.answer` and Digi-ID wallets sign with a key made for that
+one site (SLIP-0013): it proves the same person comes back, but it holds no coins and isn't the account's @tag key, so
+nothing can be paid or posted with it.
+
+**Account sign-in and payments: ARCADE ID signing.** For a site that acts *as* the account (posts, likes, replies,
+tips, payments, as the ARCADE app does), pair it with the app (`id.sign_pair`, an `arcadesign://` code): the app tells
+the page the account's home-chain key (`home: {chain, address, pubkey}`, the one its @tag names) beside its Dogecoin
+key. Sign-in: the page sends `{type: "message", key: "home", message: <the site's nonce>}` and checks the answer with
+`msg.verify {address: home.address, message, signature}` (ARCADE's prefix). Actions: the site's server builds them
+unsigned (`psbt.feed_post`, `psbt.feed_act`, `psbt.send` with the home address and pubkey), the page sends
+`{type: "psbt", chain: home.chain, psbt, finalize: true}`, the user approves it in the app, and the answer's `txHex`
+goes to `tx.broadcast`. The 12 words never leave the app.
 
 **Both.** Offer the password and ARCADE ID side by side. A user who turns the password off: `vault.delete`, signed
 by the @tag's address, drops the sealed record, and the account then opens on the site with ARCADE ID or the 12

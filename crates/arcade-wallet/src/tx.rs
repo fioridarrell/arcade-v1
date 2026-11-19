@@ -552,8 +552,15 @@ pub fn build_arcade_with(
     class_c_max: usize,
 ) -> Result<Tx, BuildError> {
     let pk = PublicKey::from_secret_key(SECP256K1, key);
+    let (chosen, outs) = plan_arcade(p, payload, extra, &pk, coins, fee_per_kb, dust, class_c_max)?;
+    Ok(sign_p2pkh(p, &chosen, &outs, key, time))
+}
+
+/// The outputs that carry an arcade record from `pk`'s P2PKH address: Class C (OP_RETURN "arcd" + payload) when
+/// "arcd" + payload is at most `class_c_max` bytes, else Class B (the marker output, then 1-of-3 bare multisig
+/// outputs with `pk` first and two obfuscated data keys, 0.01 each).
+pub fn arcade_outputs(p: &ChainParams, payload: &[u8], pk: &PublicKey, class_c_max: usize) -> Result<Vec<TxOutSpec>, BuildError> {
     let h = arcade_ledger::address::hash160(&pk.serialize());
-    let change_script = arcade_ledger::address::p2pkh_script(&h);
     let sender = arcade_ledger::address::base58check(p.p2pkh_version, &h);
     let mut outs: Vec<TxOutSpec> = Vec::new();
     if MARKER.len() + payload.len() <= class_c_max {
@@ -574,7 +581,31 @@ pub fn build_arcade_with(
             outs.push(TxOutSpec { value: CLASS_B_OUTPUT, script: multisig(&keys) });
         }
     }
+    Ok(outs)
+}
+
+/// What [`build_arcade_with`] signs, unsigned: the coins it spends and every output (change last, when there is
+/// any), for a key that signs elsewhere (a website user's ARCADE app).
+#[allow(clippy::too_many_arguments)]
+pub fn plan_arcade(
+    p: &ChainParams,
+    payload: &[u8],
+    extra: Vec<TxOutSpec>,
+    pk: &PublicKey,
+    coins: &[Utxo],
+    fee_per_kb: u64,
+    dust: u64,
+    class_c_max: usize,
+) -> Result<(Vec<Utxo>, Vec<TxOutSpec>), BuildError> {
+    let mut outs = arcade_outputs(p, payload, pk, class_c_max)?;
     outs.extend(extra);
+    plan_spend(p, outs, pk, coins, fee_per_kb, dust)
+}
+
+/// Pick `pk`'s P2PKH coins (largest first) to pay `outs` and the fee at `fee_per_kb`; change at or above `dust`
+/// goes back to `pk`'s address as the last output. Unsigned: (coins, outputs).
+pub fn plan_spend(p: &ChainParams, mut outs: Vec<TxOutSpec>, pk: &PublicKey, coins: &[Utxo], fee_per_kb: u64, dust: u64) -> Result<(Vec<Utxo>, Vec<TxOutSpec>), BuildError> {
+    let change_script = arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()));
     let spend = outs.iter().try_fold(0u64, |t, o| add(t, o.value))?;
     let mut sorted: Vec<&Utxo> = coins.iter().filter(|u| u.script == change_script).collect();
     sorted.sort_by(|a, b| b.value.cmp(&a.value));
@@ -598,7 +629,7 @@ pub fn build_arcade_with(
     if change >= dust {
         outs.push(TxOutSpec { value: change, script: change_script });
     }
-    Ok(sign_p2pkh(p, &chosen, &outs, key, time))
+    Ok((chosen, outs))
 }
 
 /// The arcade's own inscription (INSC, docs/compat/INSC.md) as chunk payloads, in sending order:

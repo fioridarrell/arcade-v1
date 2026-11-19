@@ -76,6 +76,11 @@ fn ledger_chains(node: &Node) -> Vec<&'static ChainParams> {
 /// On ARCADE a tag is under the ARCADE address when claimed there, or under the same key's home-chain
 /// address when the testnet's ledger snapshot carried it over; failing both, the home chain's own tag.
 fn creator_tag(node: &Node, p: &ChainParams, creator: &str) -> Option<String> {
+    // (A chain whose tag tables are borrowed here: lenders' rows, by key, crate::hometag.)
+    creator_tag_here(node, p, creator).or_else(|| crate::hometag::of_address(node, creator))
+}
+
+fn creator_tag_here(node: &Node, p: &ChainParams, creator: &str) -> Option<String> {
     use arcade_ledger::index::tag_of;
     let home = node.ledger_home();
     // An app on the old home (Pepecoin testnet) once ARCADE is home: its creator's tag by key hash (crate::hometag).

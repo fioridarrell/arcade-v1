@@ -21,6 +21,13 @@ fn c(node: &Node) -> u16 {
 
 fn tag_of(node: &Node, a: &str) -> Option<String> {
     arcade_ledger::index::tag_of(&node.chain, c(node), a).ok().flatten()
+        .or_else(|| crate::hometag::of_address_on(node, crate::pagechain::params(node), a))
+}
+
+/// The address holding @tag on the page's chain: its own tag row, else (that chain's tags borrowed here) lenders'.
+fn tag_address(node: &Node, t: &str) -> Option<String> {
+    arcade_ledger::index::tag_row(&node.chain, c(node), t).ok().flatten().map(|r| r.address)
+        .or_else(|| crate::hometag::owner_on(node, crate::pagechain::params(node), t).map(|(a, _)| a))
 }
 
 // ---------------- inscriptions as pages see them ----------------
@@ -312,7 +319,7 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
         }
         ["tag", name] => {
             let t = name.trim_start_matches('@').to_lowercase();
-            let a = arcade_ledger::index::tag_row(&node.chain, cc, &t).ok().flatten().map(|r| r.address);
+            let a = if cc == c(node) { tag_address(node, &t) } else { arcade_ledger::index::tag_row(&node.chain, cc, &t).ok().flatten().map(|r| r.address) };
             (200, json!({"tag": t, "address": a}).to_string())
         }
         ["address", a] => (200, json!({"address": a, "tag": tag_of(node, a)}).to_string()),
@@ -333,8 +340,12 @@ pub fn route(node: &Node, path: &str, q: &serde_json::Map<String, Value>) -> (u1
         ["ledgertx", txid] => ledger_tx(node, txid),
         ["profile", tag] => {
             let t = tag.trim_start_matches('@').to_lowercase();
-            let Some(row) = arcade_ledger::index::tag_row(&node.chain, cc, &t).ok().flatten() else { return missing("nobody holds that name") };
-            let prof = arcade_ledger::index::profile(&node.chain, cc, &row.address).ok().flatten().unwrap_or(Value::Null);
+            struct Row { address: String }
+            let found = if cc == c(node) { tag_address(node, &t) } else { arcade_ledger::index::tag_row(&node.chain, cc, &t).ok().flatten().map(|r| r.address) };
+            let Some(row) = found.map(|address| Row { address }) else { return missing("nobody holds that name") };
+            let prof = arcade_ledger::index::profile(&node.chain, cc, &row.address).ok().flatten()
+                .or_else(|| crate::arcsvc::defined().filter(|p| p.chain_no == cc).or_else(|| crate::chains::all().into_iter().find(|p| p.chain_no == cc)).and_then(|p| crate::msgsvc::profile_on(node, p, &row.address)))
+                .unwrap_or(Value::Null);
             let pic = prof["pfp"].as_str().unwrap_or("").to_string();
             let main = prof["linked"].as_array().and_then(|l| l.iter().find(|x| x["chain"] == "main")).and_then(|x| x["address"].as_str()).unwrap_or("").to_string();
             (200, json!({"tag": t, "address": row.address, "pending": false, "mainnet": main, "bio": prof["bio"].as_str().unwrap_or(""),
@@ -447,7 +458,7 @@ pub fn requests(node: &Node, page: Option<&str>) -> Value {
 fn resolve_to(node: &Node, to: &str) -> Result<String, String> {
     let to = to.trim();
     if let Some(t) = to.strip_prefix('@') {
-        return arcade_ledger::index::tag_row(&node.chain, c(node), &t.to_lowercase()).map_err(|e| e.to_string())?.map(|r| r.address).ok_or_else(|| format!("nobody holds @{t}"));
+        return tag_address(node, &t.to_lowercase()).ok_or_else(|| format!("nobody holds @{t}"));
     }
     match arcade_ledger::address::decode_base58check(to) {
         // A key's address or a script's (a refereed prize pool lives at one).

@@ -744,7 +744,9 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 Some("act") => (arcade_ledger::messages::ACT, "messages"),
                 Some("cand") => (arcade_ledger::messages::CAND, "messages"),
                 Some("profile") => (arcade_ledger::index::PROFILE, "profiles"),
-                _ => return Err("table: post, act, cand or profile".into()),
+                // @tags (tag -> {a, t, h, p}): what an arcade whose tag tables are borrowed reads (crate::hometag).
+                Some("tag") => (arcade_ledger::index::TAG, "ledger"),
+                _ => return Err("table: post, act, cand, profile or tag".into()),
             };
             // (ARCADE keeps its posts, messages and profiles with every block, whatever its index list says.)
             if !crate::arcsvc::runs(x.p) {
@@ -762,7 +764,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 }));
                 Some(json!({"k": hex::encode(&k[pre.len()..]), "v": v, "t": t}))
             }).collect();
-            let indexed = x.node.chain.indexed_to(x.c(), if ix == "messages" { "messages.v1" } else { "profiles.v1" }).ok().flatten();
+            let indexed = x.node.chain.indexed_to(x.c(), crate::chains::indexer_name(ix)).ok().flatten();
             Ok(json!({"rows": items, "more": rows.len() == want, "indexed": indexed}))
         }
         // A:// reacts, replies and tips (crate::asocial): the ARCADE chain's ledger.
@@ -1460,9 +1462,15 @@ fn imported_lists(tag: &str) -> Vec<(String, serde_json::Map<String, Value>)> {
 fn tag_page(x: &Ctx, t: &str) -> R {
     let t = t.trim_start_matches('@').to_lowercase();
     // Where the tag is held: ARCADE first, then the ledger home (crate::hometag, docs/HOMECHAIN.md).
-    let (home, _) = crate::hometag::owner(x.node, &t).ok_or_else(|| format!("@{t} is not claimed"))?;
-    let row = arcade_ledger::index::tag_row(&x.node.chain, home.chain_no, &t).map_err(e)?.ok_or_else(|| format!("@{t} is not claimed"))?;
-    let prof = arcade_ledger::index::profile(&x.node.chain, home.chain_no, &row.address).map_err(e)?;
+    // (The holder's address: this arcade's own tag row, or lenders' when the tag tables are borrowed here.)
+    let (home, holder) = crate::hometag::owner(x.node, &t).ok_or_else(|| format!("@{t} is not claimed"))?;
+    struct Row { address: String, block_height: u32 }
+    let row = match crate::hometag::owner_on(x.node, home, &t) {
+        Some((address, block_height)) => Row { address, block_height },
+        None => Row { address: holder, block_height: 0 },
+    };
+    let prof = arcade_ledger::index::profile(&x.node.chain, home.chain_no, &row.address).map_err(e)?
+        .or_else(|| crate::msgsvc::profile_on(x.node, home, &row.address));
     let mut addrs: Vec<(String, &str)> = Vec::new();
     if x.p.chain_no == home.chain_no {
         addrs.push((row.address.clone(), "the @tag's address"));
@@ -1512,7 +1520,8 @@ fn tag_page(x: &Ctx, t: &str) -> R {
         let bal = if x.has("addresses") { address::script_for_address(x.p, a).and_then(|sc| x.node.chain.balance_for_script(x.c(), &sc).ok()) } else { None };
         json!({"address": a, "why": why, "balance": bal})
     }).collect();
-    Ok(json!({"tag": t, "home_address": row.address, "claimed_at": row.block_height, "addresses": list,
+    // "chain": the chain the tag is held on (its namespace), so an arcade asking about one chain's tag can tell.
+    Ok(json!({"tag": t, "chain": home.key, "home_address": row.address, "claimed_at": row.block_height, "addresses": list,
               "profile": prof.map(|v| json!({"name": v["name"], "bio": v["bio"], "url": v["url"]})), "unit": unit(x.p)}))
 }
 

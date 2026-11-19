@@ -255,7 +255,10 @@
     e.preventDefault();
     const text = $("mx-text").value.trim();
     if (!text && !attached) return;
-    const to = composing ? $("mx-to").value.trim() : open;
+    // A plain @name held by different people on several chains: which one (tags per chain).
+    const to = composing ? await pickTag($("mx-to").value.trim()) : open;
+    if (to === null) return;
+    if (composing && to !== $("mx-to").value.trim()) $("mx-to").value = to;
     if (!to) { note("Who to? A @tag, an address or a messaging key.", true); return; }
     const btn = $("mx-send"); btn.disabled = true; note("Sending…");
     if (to.startsWith("g:")) {

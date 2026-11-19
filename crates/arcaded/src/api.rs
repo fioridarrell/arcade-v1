@@ -297,7 +297,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 // authors by key, so the address's chain form doesn't matter.
                 Some(t) => {
                     let t = t.trim_start_matches('@').to_lowercase();
-                    let (_, a) = crate::hometag::owner(node, &t).ok_or_else(|| format!("@{t} is not claimed"))?;
+                    let (_, a) = crate::hometag::owner_or_err(node, &t)?;
                     Some(a)
                 }
                 None => s("author"),
@@ -488,8 +488,32 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "mute.add" => crate::msgsvc::mute(node, &s("address").ok_or("address required")?, true),
         "mute.remove" => crate::msgsvc::mute(node, &s("address").ok_or("address required")?, false),
         // `chain`: the home chain (default) or the ARCADE chain (§15 step 7).
-        "tag.check" => Ok(json!(crate::claims::check_on(node, crate::claims::chain_for(node, s("chain").as_deref())?, &s("tag").ok_or("tag required")?))),
-        "tag.claim" => Ok(json!(crate::claims::start_on(node, crate::claims::chain_for(node, s("chain").as_deref())?, &s("tag").ok_or("tag required")?)?)),
+        // `tag` may name its chain (`alice.doge`), or `chain` does; else where new tags go (ARCADE when usable).
+        "tag.check" | "tag.claim" => {
+            let raw = s("tag").ok_or("tag required")?;
+            let (name, named) = crate::hometag::parse(node, &raw)?;
+            let key = named.map(|p| p.key.to_string()).or(s("chain"));
+            let p = crate::claims::chain_for(node, key.as_deref())?;
+            if req["cmd"] == "tag.check" {
+                let mut v = json!(crate::claims::check_on(node, p, &name));
+                v["chain"] = json!(p.key);
+                v["full"] = json!(crate::hometag::qualified(p, &name));
+                v["label"] = json!(crate::hometag::label(p, &name));
+                Ok(v)
+            } else {
+                Ok(json!(crate::claims::start_on(node, p, &name)?))
+            }
+        }
+        // What an @tag names (tags per chain): one holder, or each chain's when different people hold it (a picker).
+        "tag.resolve" => {
+            let raw = s("tag").ok_or("tag required")?;
+            let (name, _) = crate::hometag::parse(node, &raw)?;
+            Ok(match crate::hometag::find(node, &raw)? {
+                crate::hometag::Found::One(p, a) => json!({"found": "one", "choices": crate::hometag::choices(node, &name, &[(p, a)])}),
+                crate::hometag::Found::Many(rows) => json!({"found": "many", "choices": crate::hometag::choices(node, &name, &rows), "note": crate::hometag::which_text(&name, &rows)}),
+                crate::hometag::Found::None => json!({"found": "none", "choices": []}),
+            })
+        }
         // The ledger on the ARCADE chain (§15 step 7).
         "ledger.announce" => crate::arcledger::announce(node),
         "ledger.profile" => crate::arcledger::profile(node, &req),
@@ -657,13 +681,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             let q = s("who").ok_or("give an @tag or an address")?;
             let address = match q.strip_prefix('@') {
                 Some(t) => {
-                    let t = t.to_lowercase();
-                    // This chain's own ledger first, then the home's; else whoever holds it as hometag finds it (ARCADE
-                    // and the home, read from lenders when their tag tables are borrowed here).
+                    // Tags per chain (Martin 2026-11-18): `@alice.doge`, or a plain `@alice` held on one chain (else the
+                    // answer says which ones there are); read from lenders when their tag tables are borrowed here.
                     struct Row { address: String }
-                    let (l, row) = ledgers.iter().find_map(|&l| Some((l, Row { address: index::tag_row(&node.chain, l, &t).ok().flatten()?.address })))
-                        .or_else(|| crate::hometag::owner(node, &t).map(|(hp, a)| (hp.chain_no, Row { address: a })))
-                        .ok_or_else(|| format!("@{t} is not claimed on {}", pc.name))?;
+                    let (l, row) = crate::hometag::owner_or_err(node, t).map(|(hp, a)| (hp.chain_no, Row { address: a }))?;
                     // Claimed on another chain than the one asked about: the same key, written as that chain's address
                     // (as a send to @name finds it there).
                     match (l != pc.chain_no).then(|| arcade_chain::params::ALL_CHAINS.iter().copied().chain(crate::arcsvc::defined()).find(|x| x.chain_no == l)).flatten() {
@@ -711,7 +732,10 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 (Some(_), None) => Some(false),
                 _ => None,
             };
-            Ok(json!({"chain": pc.key, "address": address, "tag": tag, "balance": balance, "history_rows": history,
+            // Every tag the address's key holds, each with its chain (tags per chain).
+            let tags: Vec<Value> = crate::hometag::all_of_address(node, &address).into_iter()
+                .map(|(tp, t)| json!({"tag": crate::hometag::qualified(tp, &t), "name": t, "chain": tp.key, "label": crate::hometag::label(tp, &t)})).collect();
+            Ok(json!({"chain": pc.key, "address": address, "tag": tag, "tags": tags, "balance": balance, "history_rows": history,
                       "profile": prof, "profile_tag_verified": tag_verified, "stated_by": linked_by, "follows": follow_counts}))
         }
         "ord" | "ord.chunks" | "name" | "map" | "token" | "tokens" => {

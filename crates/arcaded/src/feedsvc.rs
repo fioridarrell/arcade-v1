@@ -132,6 +132,21 @@ fn pending(node: &Node) -> (Vec<Value>, Vec<Value>) {
     (posts, acts)
 }
 
+/// [`author`] for a post written on chain number `c`: the tag shown is the one the author holds on that chain (tags per
+/// chain, Martin 2026-11-18), with its full name (`alice.doge`) and label (`@alice · DOGE`); else the usual one.
+fn author_on(node: &Node, address: &str, c: Option<u64>, cache: &mut BTreeMap<String, Value>) -> Value {
+    let mut v = author(node, address, cache);
+    let on = c.and_then(|c| crate::hometag::tag_chains(node).into_iter().find(|p| p.chain_no as u64 == c));
+    if let Some(p) = on {
+        if let Some(t) = crate::hometag::of_address_on(node, p, address) {
+            v["tag"] = json!(t);
+            v["full"] = json!(crate::hometag::qualified(p, &t));
+            v["label"] = json!(crate::hometag::label(p, &t));
+        }
+    }
+    v
+}
+
 /// Who an address is on the home chain: @tag and published name.
 fn author(node: &Node, address: &str, cache: &mut BTreeMap<String, Value>) -> Value {
     if let Some(v) = cache.get(address) {
@@ -250,7 +265,7 @@ pub fn feed(node: &Node, v: &View) -> Result<Value, String> {
             };
             let is_muted = muted.contains_key(from);
             Some(json!({
-                "txid": txid, "author": author(node, from, cache), "channel": p["channel"], "nick": p["nick"],
+                "txid": txid, "author": author_on(node, from, p["c"].as_u64(), cache), "channel": p["channel"], "nick": p["nick"],
                 "text": if is_muted { Value::Null } else { json!(r.text.clone().unwrap_or_else(|| p["text"].as_str().unwrap_or("").to_string())) },
                 "edited": r.text.is_some(), "muted": is_muted, "file": p["file"], "height": p["h"],
                 // The chain it is written on (a:// ARCADE, p:// Pepecoin testnet), for a badge.

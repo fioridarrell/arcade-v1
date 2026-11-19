@@ -680,3 +680,9 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 [dir="rtl"] #rings { right: auto; left: 16px; }
 [dir="rtl"] :is(.df-ref, .df-text, .df-media, .df-tags, .df-foot) { margin-left: 0; margin-right: 38px; }
 @media (max-width: 640px) { [dir="rtl"] :is(.df-ref, .df-text, .df-media, .df-tags, .df-foot) { margin-right: 0; } }
+
+/* The "which @alice?" picker (tags per chain, common.js pickTag). */
+.tagpick { position: fixed; inset: 0; background: rgba(0,0,0,.45); display: flex; align-items: center; justify-content: center; z-index: 9999; padding: 16px; }
+.tagpick-card { background: var(--panel, #1b1d2a); color: inherit; border-radius: 12px; padding: 16px; max-width: 420px; width: 100%; box-shadow: 0 10px 40px rgba(0,0,0,.4); }
+.tagpick-card h3 { margin: 0 0 6px; }
+.tagpick-row { display: block; width: 100%; text-align: left; margin: 6px 0; padding: 10px; border-radius: 8px; overflow-wrap: anywhere; }

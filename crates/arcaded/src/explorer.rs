@@ -844,7 +844,7 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             if let Some(t) = v["block_height"].as_u64().and_then(|h| block_time(&x, h)) { v["time"] = json!(t); }
             Ok(v)
         }
-        "explorer.tag" => tag_page(&x, &s("tag").ok_or("give an @tag")?),
+        "explorer.tag" => tag_page(&x, &s("tag").ok_or("give an @tag")?, req["own_chain"] == true),
         "explorer.search" => search(&x, &s("q").ok_or("type something to search for")?),
         other => Err(format!("unknown command {other:?}")),
     }
@@ -1479,11 +1479,15 @@ fn imported_lists(tag: &str) -> Vec<(String, serde_json::Map<String, Value>)> {
 
 /// An @tag on the picked chain: the tag lives on Pepecoin testnet; its owner's addresses on
 /// this chain are the ones their published profile lists (there can be several).
-fn tag_page(x: &Ctx, t: &str) -> R {
-    let t = t.trim_start_matches('@').to_lowercase();
-    // Where the tag is held: ARCADE first, then the ledger home (crate::hometag, docs/HOMECHAIN.md).
-    // (The holder's address: this arcade's own tag row, or lenders' when the tag tables are borrowed here.)
-    let (home, holder) = crate::hometag::owner(x.node, &t).ok_or_else(|| format!("@{t} is not claimed"))?;
+fn tag_page(x: &Ctx, t: &str, own_chain: bool) -> R {
+    // Tags per chain (Martin 2026-11-18): `@alice.doge` is Dogecoin's @alice; a plain `@alice` is the one chain's that
+    // has it, or (own_chain, an arcade asking about the picked chain's own tags) the picked chain's.
+    let (t, named) = crate::hometag::parse(x.node, t)?;
+    let (home, holder) = match named {
+        Some(p) => crate::hometag::owner_on(x.node, p, &t).map(|(a, _)| (p, a)).ok_or_else(|| format!("@{} is not claimed", crate::hometag::qualified(p, &t)))?,
+        None if own_chain => crate::hometag::owner_on(x.node, x.p, &t).map(|(a, _)| (x.p, a)).ok_or_else(|| format!("@{t} is not claimed on {}", x.p.name))?,
+        None => crate::hometag::owner_or_err(x.node, &t)?,
+    };
     struct Row { address: String, block_height: u32 }
     let row = match crate::hometag::owner_on(x.node, home, &t) {
         Some((address, block_height)) => Row { address, block_height },
@@ -1541,7 +1545,7 @@ fn tag_page(x: &Ctx, t: &str) -> R {
         json!({"address": a, "why": why, "balance": bal})
     }).collect();
     // "chain": the chain the tag is held on (its namespace), so an arcade asking about one chain's tag can tell.
-    Ok(json!({"tag": t, "chain": home.key, "home_address": row.address, "claimed_at": row.block_height, "addresses": list,
+    Ok(json!({"tag": t, "chain": home.key, "full": crate::hometag::qualified(home, &t), "label": crate::hometag::label(home, &t), "home_address": row.address, "claimed_at": row.block_height, "addresses": list,
               "profile": prof.map(|v| json!({"name": v["name"], "bio": v["bio"], "url": v["url"]})), "unit": unit(x.p)}))
 }
 
@@ -1550,9 +1554,18 @@ fn search(x: &Ctx, q: &str) -> R {
     let q = q.trim();
     let hit = |kind: &str, id: String| Ok(json!({"kind": kind, "id": id}));
     if let Some(t) = q.strip_prefix('@') {
-        // A tag page: every address the tag's owner has on this chain.
-        crate::hometag::owner(x.node, t).ok_or_else(|| format!("@{t} is not claimed"))?;
-        return hit("tag", t.to_lowercase());
+        // A tag page: every address the tag's owner has on this chain. A name held on several chains by different
+        // people: each, chain-qualified (`@alice.doge`), to pick from.
+        return match crate::hometag::find(x.node, t)? {
+            crate::hometag::Found::One(p, _) => hit("tag", crate::hometag::qualified(p, &crate::hometag::parse(x.node, t)?.0)),
+            crate::hometag::Found::Many(rows) => {
+                let name = crate::hometag::parse(x.node, t)?.0;
+                let items: Vec<Value> = crate::hometag::choices(x.node, &name, &rows).into_iter()
+                    .map(|c| json!({"kind": "tag", "id": c["tag"], "label": c["label"], "what": "@tag", "name": c["name"]})).collect();
+                Ok(json!({"kind": "results", "id": q, "items": items}))
+            }
+            crate::hometag::Found::None => Err(format!("@{t} is not claimed")),
+        };
     }
     if let Some(num) = q.strip_prefix('#') {
         return hit("inscription", num.to_string());
@@ -1586,8 +1599,11 @@ fn search(x: &Ctx, q: &str) -> R {
     // A plain word: everything it could be on this chain, as a list.
     let w = q.to_lowercase();
     let mut items: Vec<Value> = Vec::new();
-    if crate::hometag::owner(x.node, &w).is_some() {
-        items.push(json!({"kind": "tag", "id": w, "label": format!("@{w}"), "what": "@tag"}));
+    // Every chain's @w (tags per chain): each chain-qualified.
+    for p in crate::hometag::tag_chains(x.node) {
+        if crate::hometag::owner_on(x.node, p, &w).is_some() {
+            items.push(json!({"kind": "tag", "id": crate::hometag::qualified(p, &w), "label": crate::hometag::label(p, &w), "what": "@tag"}));
+        }
     }
     if x.has("names") {
         let pre = KeyBuf::new().u16(c).u8(0).bytes(w.as_bytes()).done();

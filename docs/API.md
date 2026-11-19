@@ -167,8 +167,9 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `tag.check` | `/api/v1/tag/check` | public | tag | Whether a @tag is free and valid. |
-| `tag.claim` | `/api/v1/tag/claim` | wallet | tag | Claim a @tag on the home chain. |
+| `tag.check` | `/api/v1/tag/check` | public | tag, chain? | Whether a @tag is free and valid on one chain (every chain has its own @tags; see "@tags per chain" below). tag may name the chain (`alice.doge`), or chain does; else where new tags go. Answers chain, full (`alice.doge`) and label (`@alice · DOGE`). |
+| `tag.claim` | `/api/v1/tag/claim` | wallet | tag, chain? | Claim a @tag on one chain: ARCADE, Pepecoin testnet (test coins asked for by themselves), or a mainnet chain tags live on here (pep, doge, dgb: kept with their ledger index or borrowed; the fee is paid in that coin from the claim's key). |
+| `tag.resolve` | `/api/v1/tag/resolve` | public | tag | What an @tag names: {found: one / many / none, choices: [{tag, chain, label, address, name}]}. many = different people hold the name on several chains: show them and let the person pick. |
 | `tag.list` | `/api/v1/tag/list` | read | — | Your tag claims and their progress. |
 
 ### Faucet
@@ -497,3 +498,27 @@ signed release's git bundle, its pack served as is and its index built once besi
 `/r/git/repos` lists it, `/r/git/repo` describes it (`release`, and `log` = the releases), it has no issues, and
 `git clone http://<arcade>/git/@arcade/arcade-v1` clones it. @arcade is a reserved tag, so nobody can take the name;
 a ledger repository of that name would win.
+
+## @tags per chain
+
+Every chain has its own @tags (2026-11-18): @alice on Dogecoin and @alice on ARCADE can be two different people.
+
+- **Full name:** the name and the chain it was claimed on, written `@alice.doge` (the chain's key: `arctest`,
+  `peptest`, `pep`, `doge`, `dgb`). Tags are `[a-z0-9_]`, so the dot can't be part of a name. The app shows the ticker:
+  `@alice · DOGE`.
+- **Claiming:** a tag is free on a chain when nobody holds it on that chain; holders on other chains don't matter.
+  Tags can be claimed on ARCADE, Pepecoin testnet, and the mainnet chains arcades index posts and messages on.
+- **A plain `@alice`** works wherever a tag is taken (`wallet.send` to, `msg.send` to, `follow`, `profile`, the feed's
+  `tag`, `explorer.search`) only when one chain has it, or every chain that has it has it for the same key. Otherwise
+  the call fails with "@alice is claimed on N chains by different people: @alice.arctest, @alice.doge; say which", and
+  `tag.resolve` lists them for a picker.
+- **Paying a tag in any coin:** `wallet.send` to `@alice.doge` on Litecoin pays the address @alice.doge's holder has
+  proven on Litecoin (A:// op 7 wallet proofs on ARCADE). On the tag's own chain it pays the holder's address; on a
+  chain that derives keys the same way (ARCADE testnet beside Pepecoin testnet) it pays the same key there. With no
+  proven address the send is refused, never guessed.
+- **Posts and messages** show the tag the author holds on the chain they're written on (`author.full`, `author.label`
+  in `feed`). `profile` lists every tag the address's key holds, each with its chain (`tags`).
+- **Existing tags** stay valid on the chain they were claimed on. Before, a tag held on ARCADE or Pepecoin testnet
+  counted for its key on both, the earliest claim winning; now each chain's holder owns it there.
+- **Consensus:** unchanged. The ledger has always kept tags per chain (its tag table is keyed by chain); only arcades'
+  own checks treated them as one namespace.

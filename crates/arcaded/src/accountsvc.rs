@@ -254,7 +254,7 @@ fn ask_from(asked: &str, v: &Value) -> String {
 /// (up to 8 asked at once). Its address must be the one the @tag names on chain.
 pub(crate) fn find_vault(node: &Node, tag: &str, from: Option<&str>) -> Result<(String, Value), String> {
     // The @tag's holder (ARCADE first, by key hash); a vault names its address in either chain's form.
-    let owner = crate::hometag::owner(node, tag).map(|(_, a)| node.home_address(&a)).ok_or_else(|| format!("@{tag} is not claimed"))?;
+    let owner = crate::hometag::owner_or_err(node, tag).map(|(_, a)| node.home_address(&a))?;
     let hosts: Vec<String> = match from {
         Some(h) => vec![bare_host(h.trim())],
         None => arcade_hosts(node),

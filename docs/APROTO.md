@@ -113,7 +113,7 @@ ARCADE coins. Each answers `{txid, fee, ...}` as soon as the transaction is sent
 | `a.react` | `chain, txid, kind` | `kind`: `like`, `unlike`, `dislike`, `undislike` |
 | `a.reply` | `chain, txid, text` | 1 to 500 bytes |
 | `a.tip` | `chain, txid, amount, to?, memo?` | `amount` in sats of ARCADE (at least the dust limit). `to`: an ARCADE address; default the target's author. When no author is found, `to` is needed. `memo` up to 100 bytes. |
-| `a.follow` / `a.unfollow` | `tag` | A:// ops 2 and 3 |
+| `a.follow` / `a.unfollow` | `tag` | A:// ops 2 and 3. tag may name its chain (@tags are per chain): `alice.arctest` is ARCADE's @alice; another chain's (`alice.doge`) is followed by its holder's key hash, as op 2/3 allow |
 
 ## In an app: `window.arcade.social`
 

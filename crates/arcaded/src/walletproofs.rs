@@ -151,6 +151,33 @@ pub fn run(node: std::sync::Arc<Node>) {
     });
 }
 
+/// The newest address `owner` (an ARCADE address) has proven it holds on `coin` (a chain key), if any.
+pub fn proven_on(node: &Node, c: u16, owner: &str, coin: &str) -> Option<String> {
+    proven(node, c, owner).into_iter().filter(|(k, ..)| k == coin).max_by_key(|(.., h)| *h).map(|(_, a, _)| a)
+}
+
+/// The ARCADE address (owner) that has proven it holds `address` on `coin`: the person behind another chain's address.
+/// The newest proof's owner when several claim it (each proof is signed by the address's key, so they're one person's).
+pub fn owner_of_proven(node: &Node, c: u16, coin: &str, address: &str) -> Option<String> {
+    let pre = arcade_store::KeyBuf::new().u16(c).done();
+    let mut best: Option<(u64, String)> = None;
+    for (k, v) in node.chain.store(c).read(|r| r.scan_prefix(arcade_ledger::engine::A_WALLET, &pre)).unwrap_or_default() {
+        let rest = &k[pre.len()..];
+        // owner | 00 | coin | 00 | address
+        let Some(i) = rest.iter().position(|b| *b == 0) else { continue };
+        let tail = &rest[i + 1..];
+        let Some(j) = tail.iter().position(|b| *b == 0) else { continue };
+        if &tail[..j] != coin.as_bytes() || &tail[j + 1..] != address.as_bytes() {
+            continue;
+        }
+        let h = serde_json::from_slice::<Value>(&v).ok().and_then(|v| v["h"].as_u64()).unwrap_or(0);
+        if best.as_ref().is_none_or(|(bh, _)| h >= *bh) {
+            best = String::from_utf8(rest[..i].to_vec()).ok().map(|o| (h, o));
+        }
+    }
+    best.map(|(_, o)| o)
+}
+
 /// `a.wallets {tag | address}`: the addresses the chain holds proofs of for someone (this wallet's when neither),
 /// and for this wallet also what would be proven now.
 pub fn a_wallets(node: &Node, req: &Value) -> Result<Value, String> {

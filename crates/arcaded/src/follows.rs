@@ -33,7 +33,7 @@ pub fn address_of(node: &Node, target: &str) -> Option<String> {
 pub fn resolve(node: &Node, who: &str) -> Result<String, String> {
     let who = who.trim();
     match who.strip_prefix('@') {
-        Some(t) => crate::hometag::owner(node, t).map(|(_, a)| node.home_address(&a)).ok_or_else(|| format!("@{t} is not claimed")),
+        Some(t) => crate::hometag::owner_or_err(node, t).map(|(_, a)| node.home_address(&a)),
         None if target_of(who).is_some() => Ok(node.home_address(who)),
         None => Err("give an @tag or an address".into()),
     }

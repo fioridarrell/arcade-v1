@@ -406,7 +406,7 @@ pub fn who(node: &Node, name: &str) -> Result<Value, String> {
     let tag = n.strip_prefix('@').or_else(|| arcade_ledger::address::p2pkh_hash_of(node.ledger_home(), n).is_none().then_some(n));
     let address = match tag {
         // Held on ARCADE or here: the same key's address on this chain, where its messaging key is published.
-        Some(t) => crate::hometag::owner(node, t).and_then(|(_, a)| crate::hometag::address_on(node.ledger_home(), &a)).ok_or_else(|| format!("@{t} is not claimed"))?,
+        Some(t) => crate::hometag::owner_or_err(node, t).and_then(|(_, a)| crate::hometag::address_on(node.ledger_home(), &a).ok_or_else(|| format!("@{t}'s address doesn't read")))?,
         None => n.to_string(),
     };
     // The home chain's profile first, then the older chain's (a key announced there before the switch).

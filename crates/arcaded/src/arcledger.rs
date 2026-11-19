@@ -551,9 +551,13 @@ pub fn repo_manifest(node: &Node, full: &str) -> Option<String> {
 /// floor for a few hundred bytes each, and the dust left as change), kept back before a text is posted.
 const RECORD_FEE_ROOM: u64 = 1_000_000;
 
-/// The blob part of posting `bytes` of text: its bytes at the blob rate.
-fn blob_cost(bytes: usize) -> u64 {
-    arcade_arc::blob::fee_for(bytes as u64)
+/// The blob part of posting `bytes` of text (a Permanent blob): what the next block takes for it (blob::fee_at: the flat
+/// rate before rules version 5, the Permanent rate since).
+fn blob_cost(node: &Node, p: &ChainParams, bytes: usize) -> u64 {
+    let flat = arcade_arc::blob::fee_for(bytes as u64);
+    let Some(net) = crate::arcsvc::svc_net() else { return flat };
+    let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
+    arcade_arc::blob::fee_at(&net, tip as u64 + 1, &[(arcade_arc::blob::Class::Permanent, bytes as u64)])
 }
 
 fn body_blob(node: &Node, v: &Value) -> Result<[u8; 32], String> {
@@ -569,7 +573,7 @@ fn body_blob(node: &Node, v: &Value) -> Result<[u8; 32], String> {
         + crate::arcsvc::waiting_outputs(&script).iter().map(|(_, v)| v).sum::<u64>();
     // What the text costs (blob bytes at the blob rate, rounded up per kB) and about what its record's fee is: refused
     // before anything is paid, so a retry never pays for the blob twice.
-    let need = blob_cost(bytes.len()) + RECORD_FEE_ROOM;
+    let need = blob_cost(node, p, bytes.len()) + RECORD_FEE_ROOM;
     if have < need {
         return Err(format!(
             "not enough ARCADE here: posting this ({} bytes of text) costs about {} ARCADE, and this wallet has {}",

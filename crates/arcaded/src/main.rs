@@ -26,6 +26,7 @@ mod arcfraud;
 mod arcborrow;
 mod arcseal;
 mod arcserve;
+mod arcstats;
 mod arcseg;
 mod arcblob;
 mod arcgit;

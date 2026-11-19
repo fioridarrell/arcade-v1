@@ -268,6 +268,9 @@ pub fn send_parts(node: &Node, key: Option<&str>, to: &str, parts: &[u64], from:
     };
     let warn = warning(p, to);
     if crate::borrow::is_borrowed(p.key) {
+        // An @name: its holder's address on this chain (read from lenders when the tag tables are borrowed too).
+        let named = to_of_tag(node, p, to)?;
+        let to = named.as_deref().unwrap_or(to);
         if parts.len() != 1 {
             return Err(format!("{} is borrowed here: a send in several coins needs the chain kept here", p.name));
         }
@@ -612,7 +615,7 @@ thread_local! {
 /// sender is asked for their address. None when `to` isn't a name.
 fn to_of_tag(node: &Node, p: &ChainParams, to: &str) -> Result<Option<String>, String> {
     let t = to.strip_prefix('@').unwrap_or(to).to_lowercase();
-    if p.chain_no == node.params.chain_no || script_for_address(p, to).is_some() {
+    if script_for_address(p, to).is_some() {
         return Ok(None);
     }
     if !(2..=24).contains(&t.len()) || !t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
@@ -630,11 +633,11 @@ fn to_of_tag(node: &Node, p: &ChainParams, to: &str) -> Result<Option<String>, S
             return Ok(Some(address));
         }
     }
-    let row = arcade_ledger::index::tag_row(&node.chain, node.params.chain_no, &t).map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("@{t} is not claimed"))?;
+    // Who holds it (ARCADE, the ledger home; lenders' tag tables when those are borrowed here).
+    let (_, holder) = crate::hometag::owner_checked(node, &t)?.ok_or_else(|| format!("@{t} is not claimed"))?;
     if p.bip44_coin_type != node.params.bip44_coin_type {
         return Err(format!("@{t}'s {} address can't be worked out from their name here: paste their address", p.name));
     }
-    let (_, hash) = decode_base58check(&row.address).filter(|(_, h)| h.len() == 20).ok_or_else(|| format!("@{t}'s address doesn't read"))?;
+    let (_, hash) = decode_base58check(&holder).filter(|(_, h)| h.len() == 20).ok_or_else(|| format!("@{t}'s address doesn't read"))?;
     Ok(Some(base58check(p.p2pkh_version, &hash)))
 }

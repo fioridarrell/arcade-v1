@@ -216,6 +216,9 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                        // from this wallet, so the key has none recorded).
                        "tag": if cp.chain_no == p.chain_no { k.tag.clone() } else if crate::arcsvc::runs(cp) {
                            k.tag.clone().or_else(|| arcade_ledger::index::tag_of(&node.chain, cp.chain_no, &scripts[0].0).ok().flatten())
+                       } else if crate::arcsvc::usable(cp) {
+                           // ARCADE borrowed: the tag its claim confirmed (recorded on the key), else what keepers say.
+                           k.tag.clone().or_else(|| crate::hometag::of_address(node, &scripts[0].0))
                        } else { None },
                        "balance": balance, "borrowed": !installed && crate::borrow::is_borrowed(cp.key),
                        "kinds": kinds, "kind": if multi { Some(pref.id()) } else { None }})
@@ -290,7 +293,13 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             txid: s("txid"),
             channel: s("channel").filter(|c| !c.is_empty()),
             author: match s("tag") {
-                Some(t) => Some(arcade_ledger::index::tag_row(&node.chain, p.chain_no, &t.trim_start_matches('@').to_lowercase()).map_err(|e| e.to_string())?.ok_or_else(|| format!("@{t} is not claimed"))?.address),
+                // Whoever holds it (ARCADE, the ledger home; read from lenders when those are borrowed). The feed matches
+                // authors by key, so the address's chain form doesn't matter.
+                Some(t) => {
+                    let t = t.trim_start_matches('@').to_lowercase();
+                    let (_, a) = crate::hometag::owner(node, &t).ok_or_else(|| format!("@{t} is not claimed"))?;
+                    Some(a)
+                }
                 None => s("author"),
             },
             limit: req["limit"].as_u64().unwrap_or(30).min(200) as usize,
@@ -649,7 +658,11 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             let address = match q.strip_prefix('@') {
                 Some(t) => {
                     let t = t.to_lowercase();
-                    let (l, row) = ledgers.iter().find_map(|&l| Some((l, index::tag_row(&node.chain, l, &t).ok().flatten()?)))
+                    // This chain's own ledger first, then the home's; else whoever holds it as hometag finds it (ARCADE
+                    // and the home, read from lenders when their tag tables are borrowed here).
+                    struct Row { address: String }
+                    let (l, row) = ledgers.iter().find_map(|&l| Some((l, Row { address: index::tag_row(&node.chain, l, &t).ok().flatten()?.address })))
+                        .or_else(|| crate::hometag::owner(node, &t).map(|(hp, a)| (hp.chain_no, Row { address: a })))
                         .ok_or_else(|| format!("@{t} is not claimed on {}", pc.name))?;
                     // Claimed on another chain than the one asked about: the same key, written as that chain's address
                     // (as a send to @name finds it there).
@@ -663,7 +676,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 }
                 None => q.clone(),
             };
-            let tag = ledgers.iter().find_map(|&l| index::tag_of(&node.chain, l, &address).ok().flatten());
+            let tag = ledgers.iter().find_map(|&l| index::tag_of(&node.chain, l, &address).ok().flatten())
+                .or_else(|| crate::hometag::of_address(node, &address));
             let mut prof = ledgers.iter().find_map(|&l| index::profile(&node.chain, l, &address).ok().flatten())
                 .or_else(|| crate::msgsvc::profile_on(node, node.ledger_home(), &address));
             // A chain this arcade did not know when the profile was indexed is kept as "h160:<hex>": its address is

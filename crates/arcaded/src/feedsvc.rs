@@ -264,7 +264,7 @@ pub fn feed(node: &Node, v: &View) -> Result<Value, String> {
     let mut out: Vec<(f64, u64, Value)> = Vec::new();
     for p in &posts {
         let from = p["from"].as_str().unwrap_or("");
-        if v.channel.as_deref().is_some_and(|ch| p["channel"] != ch) || v.author.as_deref().is_some_and(|a| a != from) || v.txid.as_deref().is_some_and(|t| p["txid"] != t) {
+        if v.channel.as_deref().is_some_and(|ch| p["channel"] != ch) || v.author.as_deref().is_some_and(|a| !crate::hometag::same_key(a, from)) || v.txid.as_deref().is_some_and(|t| p["txid"] != t) {
             continue;
         }
         if (settings["hide_muted"] == true && muted.contains_key(from)) || (settings["contacts_only"] == true && from != me && !friends.contains(from)) {

@@ -586,8 +586,10 @@ fn owner(node: &Node, tag: &str) -> Result<String, String> {
 
 /// The address @tag's holder has (ARCADE first, as `hometag::owner` finds it), in the ledger home's form, or None
 /// while nobody has claimed it.
+/// While the tag tables are borrowed and no keeper could be asked, an error rather than "free": a reservation must
+/// never be made for a tag someone may hold.
 fn chain_owner(node: &Node, tag: &str) -> Result<Option<String>, String> {
-    Ok(crate::hometag::owner(node, tag).map(|(_, a)| node.home_address(&a)))
+    Ok(crate::hometag::owner_checked(node, tag)?.map(|(_, a)| node.home_address(&a)))
 }
 
 /// vault.put: keep @tag's sealed record here ({tag, address, pubkey, blob, signature}):

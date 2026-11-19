@@ -898,6 +898,11 @@ history, the vendored dependencies so it rebuilds with no internet, and the preb
   (ed25519) is over `"ARCADE code release\0" ‖ id` by a trusted release key (`RELEASE_KEYS`: Strawberry's release signing key
   `9c955cd5…008a`, the original arcade's (Martin 2026-11-14); `--code-key` adds one on closed test networks). Vendored crates check against the checksums in `Cargo.lock`, which is
   in the commit; programs rest on the signature (builds aren't reproducible yet).
+- **One commit, every system:** the program archives are the GitHub release's (`.github/workflows/release.yml` builds
+  Linux x86_64/aarch64 and Windows x86_64, macOS optional, from the tag's commit; each archive carries `COMMIT`).
+  `code-publish.py` refuses unless every archive's `COMMIT` is the record's commit and `program-linux-x86_64`,
+  `program-linux-aarch64` and `program-windows-x86_64` are all given (without the Windows one a Windows arcade finds no
+  update, issue #187); the publish command is in the script's header.
 - **Kept by every arcade** in `<home>/code/files/<sha256>`: every release's bundle and dependencies, and the programs of
   the newest 5 releases of each name. Each file is hashed before it is kept.
 - **Over the mesh** ("co" frames): `r` a release record (once per link), `h` the files held, `g {id, f, at}` 48 kB of a

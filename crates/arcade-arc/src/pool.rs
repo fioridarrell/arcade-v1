@@ -53,6 +53,27 @@ pub enum PoolError {
     Refused,
 }
 
+impl PoolError {
+    /// A stable code for a refusal, as a peer reports it back ("txr" in pool gossip) and tx.status shows it. Local
+    /// bookkeeping only: no rule depends on it.
+    pub fn code(&self) -> &'static str {
+        match self {
+            PoolError::Known => "known",
+            PoolError::LowFee | PoolError::LowBlobFee => "fee_too_low",
+            PoolError::Conflict => "conflict",
+            PoolError::Row => "rules",
+            PoolError::BlobMissing => "blob_missing",
+            PoolError::Full => "pool_full",
+            PoolError::Refused => "refused_recently",
+            PoolError::Tx(TxError::MissingCoin) => "missing_coin",
+            PoolError::Tx(TxError::Dust) => "dust",
+            PoolError::Tx(TxError::Locked | TxError::Immature) => "not_yet_valid",
+            PoolError::Tx(TxError::Version | TxError::TooManyChecks | TxError::TooBig) => "rules",
+            PoolError::Tx(_) => "invalid",
+        }
+    }
+}
+
 /// A waiting transaction.
 #[derive(Debug, Clone)]
 pub struct Waiting {
@@ -643,5 +664,16 @@ mod tests {
         assert_eq!(pool.add(locked, &coins, HEIGHT + 6), Ok(COIN));
         pool.retip(&coins, HEIGHT + 5, Vec::new());
         assert!(pool.is_empty());
+    }
+
+    #[test]
+    fn refusals_have_stable_codes() {
+        assert_eq!(PoolError::LowFee.code(), "fee_too_low");
+        assert_eq!(PoolError::LowBlobFee.code(), "fee_too_low");
+        assert_eq!(PoolError::Conflict.code(), "conflict");
+        assert_eq!(PoolError::Tx(TxError::MissingCoin).code(), "missing_coin");
+        assert_eq!(PoolError::Tx(TxError::Overspend).code(), "invalid");
+        assert_eq!(PoolError::Tx(TxError::Immature).code(), "not_yet_valid");
+        assert_eq!(PoolError::Known.code(), "known");
     }
 }

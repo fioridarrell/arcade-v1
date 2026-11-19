@@ -493,7 +493,8 @@ fn query_fields(q: &str) -> Map<String, Value> {
     for kv in q.split('&').filter(|x| !x.is_empty()) {
         let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
         let v = pct_decode(v);
-        let val = if let Ok(n) = v.parse::<u64>() {
+        // A number, unless it has leading zeros (hex such as a txid or a cursor stays text).
+        let val = if let Some(n) = v.parse::<u64>().ok().filter(|_| v == "0" || !v.starts_with('0')) {
             json!(n)
         } else if v == "true" || v == "false" {
             json!(v == "true")
@@ -1112,11 +1113,14 @@ fn site_file(s: &mut TcpStream, dir: &PathBuf, path: &str, head: bool) {
 /// string (GET) or the JSON body (POST).
 fn web_api(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
     if rest == "routes" {
-        let routes: Vec<Value> = crate::commands::COMMANDS
-            .iter()
-            .map(|c| json!({"route": format!("/api/v1/{}", c.name.replace('.', "/")), "method": c.name, "needs": c.perm.name(), "params": c.params, "summary": c.summary}))
-            .collect();
-        return json_out(s, 200, &json!({"ok": true, "result": routes}));
+        return json_out(s, 200, &json!({"ok": true, "result": crate::commands::routes()}));
+    }
+    // The API described for machines and the guide for agents (ARCADE #25 part 2): no key needed, as routes.
+    if rest == "openapi.json" {
+        return respond(s, "200 OK", "application/json", &[("Cache-Control", "no-cache".into())], crate::openapi::document().to_string().as_bytes());
+    }
+    if rest == "agents.md" {
+        return respond(s, "200 OK", "text/markdown; charset=utf-8", &[("Cache-Control", "no-cache".into())], crate::openapi::GUIDE.as_bytes());
     }
     let cmd = rest.trim_matches('/').replace('/', ".");
     if crate::commands::find(&cmd).is_none() {

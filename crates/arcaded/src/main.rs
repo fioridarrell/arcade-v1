@@ -35,6 +35,7 @@ mod arcblob;
 mod fogstore;
 mod arcgit;
 mod receipts;
+mod openapi;
 mod reposvc;
 mod relrepo;
 mod arcledger;

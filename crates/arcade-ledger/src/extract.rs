@@ -111,7 +111,8 @@ fn reference(tx: &Tx, sender: &str, marker: &str, p: &ChainParams) -> Option<Str
     }
 }
 
-fn class_c_payload(tx: &Tx) -> Vec<u8> {
+/// A class C transaction's payload: its OP_RETURN data after the marker (empty when none carries it).
+pub fn class_c_payload(tx: &Tx) -> Vec<u8> {
     let mut out = Vec::new();
     for o in &tx.outputs {
         if let Some(d) = op_return_data(&o.script_pubkey) {

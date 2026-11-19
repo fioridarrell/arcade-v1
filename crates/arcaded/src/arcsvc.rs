@@ -1990,6 +1990,20 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             }
         }
         "txs" => on_txs(svc, link, f)?,
+        // What a peer did with transactions it fetched from us: taken (the blob's ids) or refused (r: [txid, code,
+        // words]). For tx.status (crate::receipts); never a reason to take or drop anything.
+        "txr" => {
+            let peer = &link.peer_id[..link.peer_id.len().min(16)];
+            for id in ids_of(&f.blob, ASK_TXS) {
+                crate::receipts::outcome(&id.to_hex(), peer, true, "");
+            }
+            for r in f.head["r"].as_array().into_iter().flatten().take(ASK_TXS) {
+                if let (Some(id), Some(code)) = (r[0].as_str().filter(|t| t.len() == 64), r[1].as_str()) {
+                    let words = r[2].as_str().unwrap_or("");
+                    crate::receipts::outcome(id, peer, code == "known", &format!("{code}: {}", words.chars().take(200).collect::<String>()));
+                }
+            }
+        }
         // A waiting blob ahead of the transactions that bring it (crate::arcblob).
         "bl" => crate::arcblob::on_piece(&svc.net, &link.peer_id, &f.head, &f.blob),
         // A blob piece asked of this arcade (a viewer's arcade fetching it, crate::arcblob::view).
@@ -2185,8 +2199,22 @@ fn on_txs(svc: &Svc, link: &mut Link, f: &Frame) -> Result<(), LinkError> {
         }
         data
     };
+    // What became of each one, told back to the arcade that served them ("txr", ARCADE #25 part 2): taken, or refused
+    // and why. An older arcade ignores the frame (it drops ops it doesn't know); nothing a block holds depends on it.
+    let mut took = Vec::new();
+    let mut refused = Vec::new();
     for raw in split_blocks(&data).unwrap_or_default().into_iter().take(ASK_TXS) {
-        let _ = take_tx(svc, &raw);
+        let id = Tx::parse_with(&raw, &TX_FORMAT).ok().map(|t| t.txid);
+        match (take_tx(svc, &raw), id) {
+            (Ok(_), Some(id)) | (Err(PoolError::Known), Some(id)) => took.push(id),
+            (Err(e), Some(id)) => refused.push(json!([id.to_hex(), e.code(), e.to_string()])),
+            _ => {}
+        }
+    }
+    if !took.is_empty() || !refused.is_empty() {
+        let mut f = frame(svc, "txr", json!({"r": refused}));
+        f.blob = blob_of(&took);
+        link.send(&f)?;
     }
     ask_txs(svc, link)
 }
@@ -3291,6 +3319,15 @@ pub fn waiting_outputs(script: &[u8]) -> Vec<(OutPoint, u64)> {
         }
     }
     out
+}
+
+/// The ARCADE chain's waiting transactions as this arcade sees them: its own pool, or (borrowed) the ones sent from here
+/// that still wait at the lenders.
+pub fn pool_txs() -> Vec<Tx> {
+    if let Some(p) = defined().filter(|p| borrowed(p)) {
+        return crate::borrow::pool_txs(p);
+    }
+    svc().map(|s| s.st.lock().unwrap().pool.iter().map(|w| w.tx.clone()).collect()).unwrap_or_default()
 }
 
 pub fn waiting(max: usize) -> Vec<Vec<u8>> {

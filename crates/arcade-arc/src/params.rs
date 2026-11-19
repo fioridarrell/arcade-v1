@@ -255,7 +255,7 @@ pub const TESTNET: Net = Net {
     // Restarted 2026-11-15 (Martin: "restart + carry ledger"): version 3 (blobs, the tenth with its challenge window, on
     // top of version 2's time keepers and writer's share) from block 0. The chain before ran 1 from 0 and 2 from 1,065.
     // Version 4 from block 1,000 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20; released in v0.1.106).
-    rules: &[(3, 0), (4, 1_000)],
+    rules: &[(3, 0), (4, 1_000), (5, 2_150)],
     audit_period: AUDIT_PERIOD_BLOCKS,
     blob_window: BLOB_WINDOW,
 };

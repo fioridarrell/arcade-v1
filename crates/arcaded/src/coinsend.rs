@@ -611,35 +611,32 @@ thread_local! {
     pub(crate) static OWNER_CHANGE_OK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-/// `to` as an @name (with or without the @, when it isn't an address of `p`): the claim's address on the home chain,
-/// with its key hash under `p`'s version byte. Only when `p` derives keys as the home chain does (the same BIP44 coin
-/// type: the ARCADE testnet beside Pepecoin testnet), so the address is one the name's own wallet holds; elsewhere the
-/// sender is asked for their address. None when `to` isn't a name.
-fn to_of_tag(node: &Node, p: &ChainParams, to: &str) -> Result<Option<String>, String> {
-    let t = to.strip_prefix('@').unwrap_or(to).to_lowercase();
+/// `to` as an @name (`@alice.doge`, or a plain `@alice` held on one chain; with or without the @, when it isn't an
+/// address of `p`): where a payment on `p` to that tag's holder goes (crate::hometag::pay_address: their address on the
+/// tag's own chain, the same key where `p` derives keys alike, else an address they proved; otherwise refused, never
+/// guessed). None when `to` isn't a name.
+fn to_of_tag(node: &Node, p: &'static ChainParams, to: &str) -> Result<Option<String>, String> {
     if script_for_address(p, to).is_some() {
         return Ok(None);
     }
-    if !(2..=24).contains(&t.len()) || !t.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
+    // `@alice.doge` (the tag claimed on Dogecoin) or a plain `@alice` held on one chain (Martin 2026-11-18: tags per
+    // chain, so the wrong @alice is never paid).
+    let s = to.trim().trim_start_matches('@').to_lowercase();
+    let name = s.rsplit_once('.').map_or(s.as_str(), |(n, _)| n);
+    if !(2..=24).contains(&name.len()) || !name.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_') {
         return Ok(None);
     }
-    // On the ARCADE chain, its own ledger's @tag first (§15 step 7); a released tag that changed hands lately warns,
-    // and the send is refused unless it says it knows (`owner_changed_ok`).
-    if crate::arcsvc::runs(p) {
-        if let Some((address, warn)) = crate::arcledger::tag_owner(node, &t) {
-            if let Some(w) = warn {
-                if !OWNER_CHANGE_OK.with(|c| c.get()) {
-                    return Err(format!("{w}: send again with owner_changed_ok if you mean the new owner"));
-                }
+    let (name, _) = crate::hometag::parse(node, &s)?;
+    // Who holds it, on the chain named or the one chain that has it (lenders' tag tables when those are borrowed here).
+    let (on, holder) = crate::hometag::owner_checked(node, &s)?.ok_or_else(|| format!("@{s} is not claimed"))?;
+    // An ARCADE tag kept here: one released and claimed again lately warns (§15 step 7), and the send is refused
+    // unless it says it knows (`owner_changed_ok`).
+    if crate::arcborrow::is(on) && crate::arcsvc::runs(on) {
+        if let Some((_, Some(w))) = crate::arcledger::tag_owner(node, &name) {
+            if !OWNER_CHANGE_OK.with(|c| c.get()) {
+                return Err(format!("{w}: send again with owner_changed_ok if you mean the new owner"));
             }
-            return Ok(Some(address));
         }
     }
-    // Who holds it (ARCADE, the ledger home; lenders' tag tables when those are borrowed here).
-    let (_, holder) = crate::hometag::owner_checked(node, &t)?.ok_or_else(|| format!("@{t} is not claimed"))?;
-    if p.bip44_coin_type != node.params.bip44_coin_type {
-        return Err(format!("@{t}'s {} address can't be worked out from their name here: paste their address", p.name));
-    }
-    let (_, hash) = decode_base58check(&holder).filter(|(_, h)| h.len() == 20).ok_or_else(|| format!("@{t}'s address doesn't read"))?;
-    Ok(Some(base58check(p.p2pkh_version, &hash)))
+    crate::hometag::pay_address(node, p, on, &name, &holder).map(Some)
 }

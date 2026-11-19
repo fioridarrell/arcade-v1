@@ -932,7 +932,10 @@ const toSats = (t) => {
 };
 $("w-review").addEventListener("click", async () => {
   const ch = picked(), w = cur(), sm = $("w-send-msg");
-  const to = $("w-to").value.trim();
+  // A plain @name held by different people on several chains: which one (tags per chain).
+  const to = await pickTag($("w-to").value.trim());
+  if (to === null) return;
+  if (to !== $("w-to").value.trim()) $("w-to").value = to;
   if ($("w-asset").value === "dd") {
     const m = $("w-amt").value.trim().match(/^(\d+)(?:\.(\d{1,2}))?$/);
     if (!m) { msg(sm, "Enter dollars, for example 12.50", "bad"); return; }

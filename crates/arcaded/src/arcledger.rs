@@ -652,6 +652,17 @@ pub fn a_follow(node: &Node, tag: &str, on: bool) -> Result<Value, String> {
     let t = tag.trim().trim_start_matches('@').to_lowercase();
     // A key hash (someone known by a name on another chain, no ARCADE @tag yet) is followed as #<hex>.
     let t = if t.len() == 40 && t.bytes().all(|b| b.is_ascii_hexdigit()) { format!("#{t}") } else { t };
+    // Tags per chain: `@alice.arctest` is ARCADE's @alice; another chain's (`@alice.doge`) is its holder's key, followed
+    // as #<hex> (the follow op names ARCADE tags or key hashes).
+    let t = match t.contains('.').then(|| crate::hometag::parse(node, &t)).transpose()? {
+        Some((name, Some(tp))) if crate::arcborrow::is(tp) => name,
+        Some((name, Some(tp))) => {
+            let (holder, _) = crate::hometag::owner_on_checked(node, tp, &name)?.ok_or_else(|| format!("@{} is not claimed", crate::hometag::qualified(tp, &name)))?;
+            let (_, h) = arcade_ledger::address::decode_base58check(&holder).filter(|(_, h)| h.len() == 20).ok_or("the tag's address doesn't read")?;
+            format!("#{}", hex::encode(h))
+        }
+        _ => t,
+    };
     let me = sender(node, p)?.0;
     if crate::arcsvc::borrowed(p) {
         // Borrowed: the tables are at the arcades keeping the chain, so they say whether the tag is claimed. Whether

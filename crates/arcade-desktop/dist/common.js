@@ -235,3 +235,35 @@ function vouchLine(level, note) {
   p.append(vouchDot(level, note), document.createTextNode(note || VOUCH_WORD[level] || ""));
   return p;
 }
+
+// Tags per chain: @alice on Dogecoin and @alice on ARCADE can be two people, written @alice.doge and @alice.arctest.
+// A plain "@alice" (or "alice") held by different people on several chains asks which one, so the wrong @alice is
+// never paid or messaged. Resolves to the chosen full tag ("@alice.doge"), the input unchanged when it isn't a plain
+// tag or names one holder, or null when the person closes the picker.
+async function pickTag(input) {
+  const s = String(input || "").trim();
+  const name = s.replace(/^@/, "");
+  if (!/^[a-z0-9_]{2,24}$/i.test(name) || (!s.startsWith("@") && s.length > 24)) return s;
+  let r;
+  try { r = await api("tag.resolve", { tag: name }); } catch (e) { return s; }
+  if (r.found !== "many") return s;
+  return new Promise((resolve) => {
+    const done = (v) => { box.remove(); resolve(v); };
+    const box = h("div", { class: "tagpick", role: "dialog", "aria-label": `Which @${name}?` },
+      h("div", { class: "tagpick-card" },
+        h("h3", {}, `Which @${name}?`),
+        h("p", { class: "s" }, `Different people hold @${name} on ${r.choices.length} chains. Pick the one you mean.`),
+        ...r.choices.map((c) => h("button", { class: "tagpick-row", onclick: () => done("@" + c.tag) },
+          h("b", {}, c.label), " ", h("span", { class: "s" }, `${c.name ? c.name + " · " : ""}${c.address}`))),
+        h("button", { class: "ghost", onclick: () => done(null) }, "Cancel")));
+    document.body.append(box);
+  });
+}
+// A tag as the app shows it: "@alice · DOGE" for "alice.doge"; a plain name stays "@alice".
+function tagLabel(full) {
+  const s = String(full || "").replace(/^@/, "");
+  const i = s.lastIndexOf(".");
+  if (i < 0) return "@" + s;
+  const key = s.slice(i + 1);
+  return `@${s.slice(0, i)} · ${TICKERS[key] || key}`;
+}

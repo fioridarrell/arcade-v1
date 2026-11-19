@@ -51,7 +51,7 @@ fn address_of_pubkey(pk_hex: &str, p: &ChainParams) -> Option<String> {
 pub fn verify(node: &Node, r: &Value) -> Result<(), String> {
     // The @tag's holder on ARCADE or the old home (by key hash), and a record made for either home: arcades on the
     // release before ARCADE became home still make them for Pepecoin testnet (HOMECHAIN.md phase 3).
-    let (_, owner) = crate::hometag::owner(node, s(r, "tag")).ok_or("the @tag is not claimed")?;
+    let (_, owner) = crate::hometag::owner_or_err(node, s(r, "tag"))?;
     let home = [node.ledger_home(), node.params].into_iter().find(|h| h.net == s(r, "home")).ok_or("a link for another home chain")?;
     check(r, home, &crate::hometag::address_on(home, &owner).ok_or("bad owner address")?)
 }
@@ -126,7 +126,7 @@ pub fn for_tag(node: &Node, tag: &str, net: &str) -> Vec<Value> {
 /// Our own tag key for `tag` (the slot whose address the tag row names).
 fn owner_key(node: &Node, tag: &str) -> Result<(String, arcade_wallet::SecretKey), String> {
     let home = node.ledger_home();
-    let (_, owner) = crate::hometag::owner(node, tag).ok_or_else(|| format!("@{tag} is not claimed"))?;
+    let (_, owner) = crate::hometag::owner_or_err(node, tag)?;
     let owner = crate::hometag::address_on(home, &owner).ok_or("bad owner address")?;
     for k in node.app.tag_keys(home.chain_no).map_err(|e| e.to_string())? {
         if k.address == owner {

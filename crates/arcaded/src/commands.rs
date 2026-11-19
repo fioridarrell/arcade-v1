@@ -126,8 +126,9 @@ cmds! {
     "wallet.import" Local "chain, secret, addr_kind?, name?" "Import a wallet: a WIF key, or another wallet's words (one address, index 0); addr_kind legacy (default), p2sh-p2wpkh or p2wpkh. Kept encrypted here; nothing is published.";
     "wallet.imports" Local "" "Imported wallets, with balances on chains this arcade keeps addresses for.";
     "wallet.import_remove" Local "chain, address" "Forget an imported wallet and its key.";
-    "tag.check" Public "tag, chain?" "Whether a @tag is free and valid (chain: the home chain, or the ARCADE chain).";
-    "tag.claim" Wallet "tag, chain?" "Claim a @tag on the home chain (test coins for it are asked for by themselves), or on the ARCADE chain.";
+    "tag.check" Public "tag, chain?" "Whether a @tag is free and valid on one chain (every chain has its own @tags): tag may name it (alice.doge), or chain does; else where new tags go. Answers full (alice.doge) and label (@alice · DOGE).";
+    "tag.claim" Wallet "tag, chain?" "Claim a @tag on one chain: ARCADE, Pepecoin testnet (test coins asked for by themselves), or a mainnet chain tags live on here (pep, doge, dgb: kept with their ledger or borrowed; paid in that coin). tag may name the chain (alice.doge).";
+    "tag.resolve" Public "tag" "What an @tag names: found one (its chain, address, label) or many (different people on several chains: each, to pick from) or none. alice.doge names Dogecoin's.";
     "start.status" Read "" "Getting started: wallet made, handle (claimed or being claimed), test coins asked for or here, synced.";
     "tag.list" Read "" "Your tag claims and their progress.";
     "faucet.ask" Wallet "index?, tag?" "Ask the mesh for test coins.";

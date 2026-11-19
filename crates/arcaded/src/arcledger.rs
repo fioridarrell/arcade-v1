@@ -77,6 +77,22 @@ pub fn send(node: &Node, payload: &[u8]) -> Result<(String, u64), String> {
     Ok((txid.to_hex(), fee))
 }
 
+/// [`send`], also paying `value` to `to` (an ARCADE address) in the same transaction: an A:// tip (crate::asocial).
+pub fn send_paying(node: &Node, payload: &[u8], to: &str, value: u64) -> Result<(String, u64), String> {
+    let p = chain()?;
+    let to_script = arcade_ledger::address::script_for_address(p, to).ok_or_else(|| format!("{to} isn't an ARCADE address"))?;
+    let (_, _, sk) = sender(node, p)?;
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+    let mut coins = crate::claims::arc_coins(node, p, &script);
+    coins.extend(crate::arcsvc::waiting_outputs(&script).into_iter().map(|(op, value)| arcade_wallet::tx::Utxo { outpoint: op, value, script: script.clone() }));
+    let tx = arcade_wallet::tx::build_arcade_with(p, payload, vec![arcade_wallet::tx::TxOutSpec { value, script: to_script }], &sk, &coins,
+        2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST, arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
+        .map_err(|e| format!("could not build the transaction: {e}"))?;
+    let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
+    Ok((txid.to_hex(), fee))
+}
+
 /// This wallet's sending address on ARCADE (its @tag's, else its first): where a relay asks to be paid (relaysvc).
 pub fn own_address(node: &Node) -> Result<String, String> {
     Ok(sender(node, chain()?)?.0)

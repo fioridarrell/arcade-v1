@@ -31,6 +31,8 @@ const APP_WINDOW_COMMANDS: &[&str] = &[
     // arcade.feed (the Feed app): reads, and posts, acts, follows and mutes behind the app's Feed switch (appwindow.js).
     "feed", "feed.act", "feed.channels", "feed.file", "feed.post", "feed.settings", "follow", "follows", "ledger.write_chains",
     "mute.add", "mute.remove", "start.status",
+    // arcade.social (A:// reacts, replies and tips on any transaction): reads, and writes behind the app's Feed switch.
+    "a.follow", "a.react", "a.reactions", "a.replies", "a.reply", "a.tip", "a.unfollow",
     "group.add", "group.app_list", "group.app_read", "group.create", "group.leave", "group.open", "group.say", "group.seal",
     "inscribe", "inscribe.estimate", "prize.claim", "prize.seed",
     "realtime.fast", "realtime.join", "realtime.lanes", "realtime.leave", "realtime.media", "realtime.poll", "realtime.send",

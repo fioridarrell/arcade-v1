@@ -53,6 +53,12 @@ pub const A_FOLLOWER: &str = "ledger.v1.a_follower"; // C|tag|00|follower addres
 pub const A_CONTACT: &str = "ledger.v1.a_contact"; // C|address|00|id (8) -> {"c": sealed hex, "h"}
 pub const A_POST: &str = "ledger.v1.a_post"; // C|address|00|height u32|pos u32 -> {"t", "txid"}
 pub const A_WALLET: &str = "ledger.v1.a_wallet"; // C|address|00|coin|00|wallet address -> {"h", "txid"} (proven, A:// op 7); C|address|01 -> {"set"}
+// A:// ops 8 to 10 on a target (aproto::Target::key: chain|00|txid, 32 bytes):
+pub const A_REACT: &str = "ledger.v1.a_react"; // C|target|00|author address -> {"k": 1 liked | 3 disliked, "h"} (none: no row)
+pub const A_COUNT: &str = "ledger.v1.a_count"; // C|target -> {"l": likes, "d": dislikes, "r": replies}
+pub const A_REPLY: &str = "ledger.v1.a_reply"; // C|target|00|height u32|pos u32 -> {"a": author address, "t", "txid"}
+pub const A_TIP: &str = "ledger.v1.a_tip"; // C|target|00|recipient address -> {"s": sats, "n": tips}
+pub const A_TIPPER: &str = "ledger.v1.a_tipper"; // C|target|00|tipper address -> {"s": sats, "n": tips}
 
 pub const MAX_AMOUNT: u64 = 9_223_372_036_854_775_807;
 const PROPERTY_TYPES: &[u16] = &[1, 2, 65, 66, 129, 130, 5];
@@ -429,6 +435,8 @@ impl Engine<'_, '_, '_> {
         let op = match crate::aproto::parse(&r.atx.payload) {
             // Below its height op 7 is unknown, as it was before (every arcade's ledger reads the same).
             Some(Ok(AOp::Wallets { .. })) if !crate::aproto::wallets_known(self.c, self.h as u64) => return Ok(Err("A:// record not valid: unknown A:// op".into())),
+            // Ops 8 to 10 the same way, below their height.
+            Some(Ok(op)) if crate::aproto::is_social(&op) && !crate::aproto::social_known(self.c, self.h as u64) => return Ok(Err("A:// record not valid: unknown A:// op".into())),
             Some(Ok(op)) => op,
             Some(Err(e)) => return Ok(Err(format!("A:// record not valid: {e}"))),
             None => return Ok(Err("malformed A:// record".into())),
@@ -494,6 +502,65 @@ impl Engine<'_, '_, '_> {
             }
             AOp::Post(t) => {
                 self.jput(A_POST, &k(self.c).bytes(me.as_bytes()).u8(0).u32(self.h).u32(r.pos).done(), &json!({"t": t, "txid": r.txid}))?;
+            }
+            AOp::React(t, kind) => {
+                use crate::aproto::{DISLIKE, LIKE};
+                let tk = t.key();
+                let key = k(self.c).bytes(&tk).u8(0).bytes(me.as_bytes()).done();
+                let was = self.jget(A_REACT, &key)?.and_then(|v| v["k"].as_u64()).unwrap_or(0) as u8;
+                // The newest react wins.
+                let now = crate::aproto::react_next(was, kind);
+                if now != was {
+                    if now == 0 {
+                        self.l.del(A_REACT, &key)?;
+                    } else {
+                        self.jput(A_REACT, &key, &json!({"k": now, "h": self.h}))?;
+                    }
+                    let ck = k(self.c).bytes(&tk).done();
+                    let mut c = self.jget(A_COUNT, &ck)?.unwrap_or_else(|| json!({"l": 0, "d": 0, "r": 0}));
+                    let n = |c: &Value, f: &str| c[f].as_u64().unwrap_or(0);
+                    let (mut l, mut d) = (n(&c, "l"), n(&c, "d"));
+                    match was {
+                        LIKE => l = l.saturating_sub(1),
+                        DISLIKE => d = d.saturating_sub(1),
+                        _ => {}
+                    }
+                    match now {
+                        LIKE => l += 1,
+                        DISLIKE => d += 1,
+                        _ => {}
+                    }
+                    c["l"] = json!(l);
+                    c["d"] = json!(d);
+                    self.jput(A_COUNT, &ck, &c)?;
+                }
+            }
+            AOp::Reply(t, text) => {
+                let tk = t.key();
+                self.jput(A_REPLY, &k(self.c).bytes(&tk).u8(0).u32(self.h).u32(r.pos).done(), &json!({"a": me, "t": text, "txid": r.txid}))?;
+                let ck = k(self.c).bytes(&tk).done();
+                let mut c = self.jget(A_COUNT, &ck)?.unwrap_or_else(|| json!({"l": 0, "d": 0, "r": 0}));
+                c["r"] = json!(c["r"].as_u64().unwrap_or(0) + 1);
+                self.jput(A_COUNT, &ck, &c)?;
+            }
+            AOp::Tip(t, _memo) => {
+                // What it pays: every output to an address other than the sender's (change back to the sender is not tipped).
+                let outs: Vec<(Option<String>, u64)> = r.tx.outputs.iter().map(|o| (address_of(&o.script_pubkey, self.p), o.value)).collect();
+                let paid = crate::aproto::tip_paid(me, outs.iter().map(|(a, v)| (a.as_deref(), *v)));
+                if paid.is_empty() {
+                    return Ok(Err("A:// record not valid: a tip pays someone in the same transaction".into()));
+                }
+                let tk = t.key();
+                let add = |table: &str, who: &str, sats: u64| -> Result<()> {
+                    let key = k(self.c).bytes(&tk).u8(0).bytes(who.as_bytes()).done();
+                    let v = self.jget(table, &key)?.unwrap_or_else(|| json!({"s": 0, "n": 0}));
+                    self.jput(table, &key, &json!({"s": v["s"].as_u64().unwrap_or(0).saturating_add(sats), "n": v["n"].as_u64().unwrap_or(0) + 1}))
+                };
+                let all: u64 = paid.values().sum();
+                for (to, sats) in &paid {
+                    add(A_TIP, to, *sats)?;
+                }
+                add(A_TIPPER, me, all)?;
             }
         }
         Ok(Ok(()))
@@ -1620,7 +1687,7 @@ impl Indexer for LedgerIndexer {
         vec![(arcade_chaindb::journal::LEDGER, self.tables().iter().map(|t| t.name).collect())]
     }
     fn tables(&self) -> Vec<TableDef> {
-        [ROWS, PROPERTY, PROPERTY_BY_BLOCK, BALANCE, BOOK, TAKE, INSCRIPTION, CHUNK, PIECE, OFFER, ASK, COLLECTION, META, BY_NUMBER, TAG, TAG_BY_ADDRESS, TAG_SEEN, TAG_DUE, TAG_REL, TAG_COMMIT, TAG_PEND, TAG_WIN, REPO, REPO_MAINT, REPO_LOG, REPO_ITEM, REPO_EVENT, A_PROFILE, A_FOLLOW, A_FOLLOWER, A_CONTACT, A_POST, A_WALLET]
+        [ROWS, PROPERTY, PROPERTY_BY_BLOCK, BALANCE, BOOK, TAKE, INSCRIPTION, CHUNK, PIECE, OFFER, ASK, COLLECTION, META, BY_NUMBER, TAG, TAG_BY_ADDRESS, TAG_SEEN, TAG_DUE, TAG_REL, TAG_COMMIT, TAG_PEND, TAG_WIN, REPO, REPO_MAINT, REPO_LOG, REPO_ITEM, REPO_EVENT, A_PROFILE, A_FOLLOW, A_FOLLOWER, A_CONTACT, A_POST, A_WALLET, A_REACT, A_COUNT, A_REPLY, A_TIP, A_TIPPER]
             .iter()
             .map(|t| TableDef::plain(t))
             .collect()

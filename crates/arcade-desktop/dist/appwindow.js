@@ -352,6 +352,55 @@
         default: throw new Error("feed ops are read, channels, settings, file, chains, me, follows, post, act, follow and mute");
       }
     },
+    async social(m) {
+      // A:// reacts, replies and tips on any chain's transaction (docs/APROTO.md): reads open, writes behind the Feed switch.
+      if (!["reactions", "replies"].includes(m.op)) {
+        const p = await perms();
+        if (!p.feed) throw new Error("off: turn on Feed on this app's card");
+        if (Date.now() - lastSend < 400) throw new Error("busy: wait a moment");
+        lastSend = Date.now();
+      }
+      const target = (t) => {
+        t = t || {};
+        const chain = String(t.chain || "").toLowerCase(), txid = String(t.txid || "").toLowerCase();
+        if (!/^[a-z0-9]{1,12}$/.test(chain)) throw new Error("target.chain: a chain key");
+        if (!/^[0-9a-f]{64}$/.test(txid)) throw new Error("target.txid: 64 hex");
+        return { chain, txid };
+      };
+      switch (m.op) {
+        case "reactions": {
+          const ts = Array.isArray(m.targets) ? m.targets.slice(0, 100).map(target) : [];
+          if (!ts.length) throw new Error("targets: 1 to 100 {chain, txid}");
+          return { result: await api("a.reactions", { targets: ts, me: true }) };
+        }
+        case "replies": {
+          const t = target(m.target);
+          return { result: await api("a.replies", { ...t, offset: Math.max(0, Number(m.offset) || 0), limit: Math.max(1, Math.min(200, Number(m.limit) || 50)) }) };
+        }
+        case "react": {
+          if (!["like", "unlike", "dislike", "undislike"].includes(m.kind)) throw new Error("kind: like, unlike, dislike or undislike");
+          return { result: await api("a.react", { ...target(m.target), kind: m.kind }) };
+        }
+        case "reply": {
+          const text = String(m.text || "").trim();
+          if (!text || new TextEncoder().encode(text).length > 500) throw new Error("a reply is 1 to 500 bytes");
+          return { result: await api("a.reply", { ...target(m.target), text }) };
+        }
+        case "tip": {
+          const t = target(m.target);
+          const amount = Math.floor(Number(m.amount) || 0);
+          if (amount <= 0) throw new Error("amount: sats of ARCADE");
+          const to = String(m.to || "");
+          const coins = (amount / 1e8).toFixed(8).replace(/0+$/, "").replace(/\.$/, "");
+          // A tip moves coins: shown on its own card first, outside the app's reach.
+          const yes = await oneCard(() => card(`Tip from ${appName}?`, [`Send a tip of ${coins} ARCADE ${to ? "to " + to : "to the author"}?`], "Send tip"));
+          if (!yes) throw new Error("declined");
+          return { result: await api("a.tip", { ...t, amount, to: to || undefined, memo: String(m.memo || "").slice(0, 100) }) };
+        }
+        case "follow": return { result: await api(m.on === false ? "a.unfollow" : "a.follow", { tag: String(m.tag || "").replace(/^@/, "") }) };
+        default: throw new Error("social ops are reactions, replies, react, reply, tip and follow");
+      }
+    },
     async storage(m) {
       const r = await api("apps.storage", { page: here, op: m.op, key: m.key, value: m.value });
       return r;

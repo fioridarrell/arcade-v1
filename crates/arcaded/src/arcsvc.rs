@@ -1428,6 +1428,8 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     arcade_ledger::repos::set_base_check_from(p.chain_no, params::rules_v4_from(&net));
     // A:// op 7, wallet proofs (crate::walletproofs), known from one height on each network.
     arcade_ledger::aproto::set_wallets_from(p.chain_no, crate::walletproofs::known_from(p.net));
+    // A:// ops 8 to 10, reacts, replies and tips (crate::asocial), likewise.
+    arcade_ledger::aproto::set_social_from(p.chain_no, crate::asocial::known_from(p.net));
     // The home chain's ledger, carried in (§15 step 19) right after block 0, before any record (`carry_in`). A store
     // that has blocks but no note of it built its ledger without the snapshot (its copy made again under an old
     // arcade's app-store flag, or from before the note): its ledger rows go and are made again, the snapshot first,

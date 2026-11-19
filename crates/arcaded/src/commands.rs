@@ -206,6 +206,11 @@ cmds! {
     "a.wallets_publish" Wallet "force?" "Publish proofs of this wallet's addresses on every coin and of each imported wallet (each signs with its own key), when they differ from the chain's; done by itself after a profile is published.";
     "a.post" Wallet "text" "Post to your followers on the ARCADE chain.";
     "a.posts" Read "tag? | address? | following?, limit?" "Posts, newest first.";
+    "a.reactions" Public "targets, me?" "Reacts, replies and tips on up to 100 targets (any chain's transactions: {chain, txid}) from the ARCADE chain's ledger (A:// ops 8 to 10, docs/APROTO.md): likes, dislikes, replies, tips (total, count, per recipient, author marked where known); me (true or an ARCADE address): its react and tips.";
+    "a.replies" Public "chain, txid, offset?, limit?" "Replies to a target (any chain's transaction), oldest first, with their authors.";
+    "a.react" Wallet "chain, txid, kind" "Like, unlike, dislike or undislike any chain's transaction, on the ARCADE chain (A:// op 8).";
+    "a.reply" Wallet "chain, txid, text" "Reply to any chain's transaction (1 to 500 bytes), on the ARCADE chain (A:// op 9).";
+    "a.tip" Wallet "chain, txid, amount, to?, memo?" "Tip on any chain's transaction: pay amount (sats of ARCADE) to `to` (an ARCADE address; default the transaction's author where one is found) with the tip record (A:// op 10, memo up to 100 bytes) in the same transaction.";
     "ledger.balances" Read "address" "An address's arcade token balances on the ARCADE chain (free, reserved, offered, accepted).";
     "ledger.tag_commit" Wallet "tag" "Commit ahead to claiming a released @tag on the ARCADE chain.";
     "ledger.tag_checkin" Wallet "" "Keep this wallet's @tag on the ARCADE chain with a check-in (0.1 ARCADE into the pot).";
@@ -245,6 +250,8 @@ cmds! {
     "explorer.dogefeed_address" Public "chain?, address, direction?, type?, cursor?, limit?, counts?" "An address on D://: its counts (posts, likes given and received, followers, following, tips, linked keys) and activity (direction out: what it did; in: what paid it).";
     "explorer.dogefeed_keys" Public "chain?" "The D:// registrars this arcade checks records against: DogeFeed's, this arcade's own, and any the operator added.";
     "explorer.held" Public "chain?, address, offset?, limit?, order?" "The ord inscriptions an address holds, a page at a time by number (order old or new; limit 100, at most 500), without content: {total, items: [{id, n, h, ct, size, at, p}]}.";
+    "explorer.a_reactions" Public "chain (the ARCADE chain), targets, me?" "The ledger's reacts, replies and tips on up to 100 targets ({chain, txid}; A:// ops 8 to 10, docs/APROTO.md), per recipient; what a.reactions reads, from any arcade keeping the ARCADE chain.";
+    "explorer.a_replies" Public "chain (the ARCADE chain), target, offset?, limit?" "The ledger's replies to a target ({chain, txid}), oldest first; what a.replies reads.";
     "explorer.msg_rows" Public "chain?, table (post, act, cand or profile), after?, limit?" "A page of one posts-and-messages table in key order after `after` (hex): {rows: [{k, v, t}], more, indexed}. What an arcade whose own copy is borrowed or catching up reads instead.";
     "explorer.names" Public "chain?" "Names.";
     "explorer.name" Public "chain?, name" "One name.";

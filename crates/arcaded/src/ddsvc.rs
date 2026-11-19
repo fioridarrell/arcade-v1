@@ -2,8 +2,9 @@
 //! Wallet tile does it (digidollar.py, ddlib/ddtx.py): the wallet's DigiByte key (tag slot 0)
 //! tweaked to its Taproot output is the DigiDollar address ("DD..." / "TD..."); its coins are
 //! the zero-value outputs paying that key, worth what each transaction's "DD" record says.
-//! Installed DigiByte: found in our address index, from any height. Borrowed DigiByte: watched
-//! from the borrow floor on (as the old arcade, no coin scan reaches DigiDollar outputs).
+//! Installed DigiByte: found in our address index, from any height. Borrowed DigiByte: this
+//! wallet's own watched from the borrow floor on (as the old arcade); any other key's (dd.coins)
+//! from a V1.0 lender's address index (arcade_coinscan by its bech32m address), from any height.
 //! Minting and redeeming need an own DigiByte Core and stay out of the wallet.
 
 use crate::node::Node;
@@ -51,6 +52,11 @@ pub fn parse_address(p: &ChainParams, a: &str) -> Result<XOnlyPublicKey, String>
     XOnlyPublicKey::from_slice(&body[2..]).map_err(|_| format!("{a} names no key on the curve"))
 }
 
+/// The address a lender's address index knows a DigiDollar output by: its Taproot output as bech32m (dgb1p...).
+fn lent_address(p: &ChainParams, script: &[u8]) -> Option<String> {
+    arcade_ledger::address::wallet_address_of(script, p)
+}
+
 /// Cents of DigiDollar outputs already read (txid, vout) -> cents.
 fn cents_cache() -> std::sync::MutexGuard<'static, HashMap<(Hash256, u32), i64>> {
     static C: OnceLock<Mutex<HashMap<(Hash256, u32), i64>>> = OnceLock::new();
@@ -64,6 +70,8 @@ fn cents_of(tx: &Tx, vout: u32) -> i64 {
 struct Wallet {
     p: &'static ChainParams,
     borrowed: bool,
+    /// Coins from any height (installed, or a lender's address index), not only from the borrow floor on.
+    whole: bool,
     address: String,
     key_index: u32,
     pk: PublicKey,
@@ -98,6 +106,7 @@ fn load_key(node: &Node, p: &'static ChainParams, pk: PublicKey, key_index: u32)
     let borrowed = crate::borrow::is_borrowed(p.key);
     let installed = !borrowed && (p.chain_no == node.params.chain_no || node.extra.lock().unwrap().contains_key(p.key));
     let mut held = Vec::new();
+    let mut whole = installed;
     if installed {
         if !node.chain.addresses_on(p.chain_no).map_err(|e| e.to_string())? {
             return Err(format!("{} keeps no address index here, so DigiDollar coins can't be found", p.name));
@@ -119,6 +128,28 @@ fn load_key(node: &Node, p: &'static ChainParams, pk: PublicKey, key_index: u32)
             };
             if cents > 0 {
                 held.push((Utxo { outpoint: op, value, script: script.clone() }, cents, h));
+            }
+        }
+    } else if borrowed && !crate::borrow::watched(node, p).iter().any(|w| w.script == script) {
+        // Any other key's DigiDollar address on a borrowed DigiByte (dd.coins for a website's account): not watched here,
+        // so its coins come from a lender's address index (each checked against its block), from any height.
+        whole = true;
+        let addr = lent_address(p, &script).ok_or("no address form for this DigiDollar output")?;
+        for c in crate::borrow::lender_coins(node, p, &[addr])? {
+            let op = c.op;
+            let cents = match cents_cache().get(&(op.txid, op.vout)).copied() {
+                Some(x) => x,
+                None => match crate::borrow::raw_tx(node, p, &op.txid) {
+                    Ok(tx) => {
+                        let x = cents_of(&tx, op.vout);
+                        cents_cache().insert((op.txid, op.vout), x);
+                        x
+                    }
+                    Err(_) => continue,
+                },
+            };
+            if cents > 0 {
+                held.push((Utxo { outpoint: op, value: c.value, script: script.clone() }, cents, c.height));
             }
         }
     } else if borrowed {
@@ -145,7 +176,7 @@ fn load_key(node: &Node, p: &'static ChainParams, pk: PublicKey, key_index: u32)
         return Err(format!("{} is neither installed nor borrowed here", p.name));
     }
     held.sort_by(|a, b| b.1.cmp(&a.1));
-    Ok(Wallet { p, borrowed, address, key_index, pk, held })
+    Ok(Wallet { p, borrowed, whole, address, key_index, pk, held })
 }
 
 /// dd.wallet: this wallet's DigiDollar address and coins on a DigiByte chain (the old
@@ -170,8 +201,9 @@ fn shown(w: Wallet) -> R {
         "chain": w.p.key, "address": w.address, "cents": cents,
         "coins": w.held.iter().map(|(u, c, h)| json!({"txid": u.outpoint.txid.to_hex(), "vout": u.outpoint.vout, "cents": c, "height": h})).collect::<Vec<_>>(),
         "borrowed": w.borrowed,
-        // Installed DigiByte finds coins from any height; borrowed ones from the borrow floor on.
-        "whole": !w.borrowed,
+        // Installed DigiByte finds coins from any height; borrowed ones from the borrow floor on (this wallet's own,
+        // watched), or from any height (another key's, from a lender's address index).
+        "whole": w.whole,
     }))
 }
 
@@ -243,6 +275,22 @@ mod tests {
     use arcade_chain::params::{DIGIBYTE_MAIN, DIGIBYTE_TEST, DOGECOIN_MAIN};
 
     /// The old arcade's ddtx.dd_address for BIP341's internal key d6889c...: same strings here.
+    #[test]
+    fn a_lender_knows_dd_outputs_by_their_bech32m_address() {
+        // dd.coins on a borrowed DigiByte asks a lender's address index by this address: it must name exactly the
+        // Taproot output the DigiDollar address pays, or lender_coins drops every coin as not matching its block.
+        for key in ["dgb", "dgbtest"] {
+            let p = by_key(key).unwrap();
+            let sk = arcade_wallet::SecretKey::from_slice(&[7u8; 32]).unwrap();
+            let pk = PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+            let (dd, _, script) = dd_address(p, &pk).unwrap();
+            let a = lent_address(p, &script).unwrap();
+            assert!(a.starts_with(&format!("{}1p", p.bech32_hrp.unwrap())), "{a}");
+            assert_eq!(arcade_ledger::address::script_for_address(p, &a).as_deref(), Some(script.as_slice()), "{key}");
+            assert_eq!(dd_script_of(p, &dd), Some(script));
+        }
+    }
+
     #[test]
     fn addresses_match_the_old_arcade() {
         let x = hex::decode("d6889cb081036e0faefa3a35157ad71086b123b2b144b649798b494c300a961d").unwrap();

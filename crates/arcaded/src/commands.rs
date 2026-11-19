@@ -261,6 +261,7 @@ cmds! {
     "explorer.arc_holders" Public "offset?, limit? (<= 500)" "Every ARCADE earner by pay weight: replica owners (replicas, bytes, pay and draw weight, share, audits passed/missed/running, accrued pay, serving verdicts, turn and next turn, punished, silenced) and genesis earners (address, keys, weight, accrued).";
     "explorer.arc_payouts" Public "blocks? (<= 1152, default 300)" "The last blocks' ARCADE coinbases by epoch: minted, coinbase total, the writer's share, what was released to each earner; with totals per earner and the pot now.";
     "explorer.msg_rows" Public "chain?, table (post, act, cand or profile), after?, limit?" "A page of one posts-and-messages table in key order after `after` (hex): {rows: [{k, v, t}], more, indexed}. What an arcade whose own copy is borrowed or catching up reads instead.";
+    "explorer.msg_file" Public "chain?, txid" "The file a post carries, {txid, name, type, data (base64)}, at most 4 MB: what an arcade whose own copy is borrowed or catching up asks for a lent post's picture.";
     "explorer.names" Public "chain?" "Names.";
     "explorer.name" Public "chain?, name" "One name.";
     "explorer.maps" Public "chain?" "Maps.";

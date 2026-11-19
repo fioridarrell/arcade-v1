@@ -117,6 +117,9 @@ fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
     Ok(Ctx { node, p, indexes, img_links: false })
 }
 
+/// Most bytes of one post's file `explorer.msg_file` hands another arcade (the mesh answer stays well under its frame cap).
+pub const MAX_LENT_FILE: usize = 4 << 20;
+
 /// Explorer questions another arcade may answer for us (all public, read-only).
 pub const FORWARDABLE: &[&str] = &[
     "explorer.summary", "explorer.blocks", "explorer.block", "explorer.tx", "explorer.address", "explorer.inscriptions",
@@ -126,7 +129,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription", "explorer.dogefeed_address",
     "explorer.inscription_types", "explorer.site", "explorer.sites", "explorer.ledger_bytes", "explorer.page", "explorer.app_cards",
     "explorer.ord_outpoints", "explorer.collections", "explorer.collection", "explorer.collection_of", "explorer.held",
-    "explorer.msg_rows", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
+    "explorer.msg_rows", "explorer.msg_file", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
     "explorer.arc_ledger",
 ];
@@ -260,6 +263,9 @@ fn mesh_from(id: &str) -> Value {
 fn needed_index(cmd: &str) -> Option<&'static str> {
     if cmd == "explorer.ord_outpoints" {
         return Some("ord");
+    }
+    if cmd == "explorer.msg_file" {
+        return Some("messages");
     }
     if cmd == "explorer.activity" {
         return Some("addresses");
@@ -755,6 +761,22 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             let mut q = req.clone();
             q["local"] = json!(true);
             crate::sitesvc::activity(x.node, &q)
+        }
+        // The picture (or other file) a post carries, {name, type, data (base64)}: what an arcade whose own copy of the
+        // chain is borrowed or catching up asks for a lent post (crate::feedsvc::file). At most MAX_LENT_FILE bytes.
+        "explorer.msg_file" => {
+            if !crate::arcsvc::runs(x.p) {
+                x.need("messages")?;
+            }
+            let txid = s("txid").filter(|t| t.len() == 64 && t.bytes().all(|b| b.is_ascii_hexdigit())).ok_or("txid: 64 hex")?;
+            let post = arcade_ledger::messages::post(&x.node.chain, x.c(), &txid).ok_or("no such post here")?;
+            let bytes = arcade_ledger::messages::file(&x.node.chain, x.c(), &txid).ok_or("this post has no file")?;
+            if bytes.len() > MAX_LENT_FILE {
+                return Err(format!("that file is {} bytes, more than {MAX_LENT_FILE} lent at once", bytes.len()));
+            }
+            use base64::Engine;
+            Ok(json!({"txid": txid, "name": post["file"]["name"], "type": post["file"]["type"],
+                      "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
         }
         // A page of one posts-and-messages table, rows in key order after `after` (hex, the key past the chain number), each
         // with its key `k` and, where it has a height, its block's time `t`: what an arcade whose own copy of this chain is

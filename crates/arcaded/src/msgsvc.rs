@@ -821,6 +821,11 @@ fn crypto_box_public(b: &[u8; 32]) -> crypto_box::PublicKey {
     crypto_box::PublicKey::from(*b)
 }
 
+/// How long an announcement in flight holds off the next: 30 minutes (ARCADE_ANNOUNCE_AGAIN_SECS: less, on test nets).
+fn announce_again_secs() -> u64 {
+    std::env::var("ARCADE_ANNOUNCE_AGAIN_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(1800)
+}
+
 /// Publish our messaging key (a key announcement from our @tag's address) when we hold a
 /// @tag and no announcement of this key is on chain yet. Returns the txid when one was sent.
 pub fn announce_if_needed(node: &Node) -> Result<Option<String>, String> {
@@ -831,15 +836,16 @@ pub fn announce_if_needed(node: &Node) -> Result<Option<String>, String> {
     let Some(tag) = tag else { return Ok(None) };
     let k = keys(node)?;
     let key = hex::encode(k.public_bytes());
-    let c = node.ledger_home().chain_no;
-    let prof = arcade_ledger::index::profile(&node.chain, c, &address).map_err(|e| e.to_string())?;
+    // This arcade's own profiles index, or lenders' when the ledger home is borrowed (crate::lentrows): an arcade whose
+    // home is borrowed has no local profile rows, and asked again every 30 minutes, paying a fee each time.
+    let prof = profile_on(node, node.ledger_home(), &address);
     if prof.as_ref().is_some_and(|p| p["pubkey"] == key.as_str() && p["stated"] == true) {
         return Ok(None);
     }
     // One in flight at a time (it confirms in a block or two).
     let flag = format!("announce:{key}");
     if let Some(v) = node.app.store.read(|r| r.get(arcade_app::META, flag.as_bytes())).ok().flatten() {
-        if arcade_app::now() < u64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])) + 1800 {
+        if arcade_app::now() < u64::from_be_bytes(v[..8].try_into().unwrap_or([0; 8])) + announce_again_secs() {
             return Ok(None);
         }
     }
@@ -958,14 +964,21 @@ pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
     let (address, tag, sk) = sender_key(node)?;
     let tag = tag.ok_or("claim an @tag first: the addresses go on your @tag's profile")?;
     // The explorer reads a profile where its @tag is held; one held only on ARCADE has its profile there (ledger.announce).
-    if arcade_ledger::index::tag_of(&node.chain, home.chain_no, &address).ok().flatten().as_deref() != Some(tag.as_str()) {
+    // (This arcade's own tag index of the home, else lent rows or a keeper's word when the home is borrowed.)
+    if crate::hometag::of_address_on(node, home, &address).as_deref() != Some(tag.as_str()) {
         return Err(format!("@{tag} is held on the ARCADE chain, so its profile is there: publish it from People (Publish profile), which lists your addresses"));
     }
-    let prof = arcade_ledger::index::profile(&node.chain, home.chain_no, &address).map_err(|e| e.to_string())?;
+    let prof = profile_on(node, home, &address);
     let listed: Vec<(String, String)> = prof.as_ref().and_then(|v| v["linked"].as_array()).into_iter().flatten()
         .filter_map(|l| Some((l["chain"].as_str()?.to_string(), l["address"].as_str()?.to_string()))).collect();
     let mut chains: Vec<&'static arcade_chain::params::ChainParams> = Vec::new();
-    let extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
+    // Installed coins and borrowed ones: a borrowed coin's addresses come from the same 12 words.
+    let mut extra: Vec<String> = node.extra.lock().unwrap().keys().map(|k| k.to_string()).collect();
+    for cp in crate::chains::all() {
+        if crate::borrow::is_borrowed(cp.key) && !extra.iter().any(|k| k == cp.key) {
+            extra.push(cp.key.to_string());
+        }
+    }
     for cp in extra.iter().filter_map(|k| crate::chains::find(k)) {
         let arcade = crate::arcsvc::runs(cp) || crate::arcsvc::defined().is_some_and(|d| d.chain_no == cp.chain_no);
         if !arcade && !chains.iter().any(|c| c.chain_no == cp.chain_no) {
@@ -991,7 +1004,7 @@ pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
         add.push((slot, h));
     }
     if add.is_empty() {
-        return Err("no other coin is installed here, so there is no address to list (add one in Chains & Coins)".into());
+        return Err("no other coin is installed or borrowed here, so there is no address to list (add one in Chains & Coins)".into());
     }
     let k = keys(node)?;
     let h160 = arcade_ledger::address::p2pkh_hash_of(home, &address).ok_or("bad address")?;

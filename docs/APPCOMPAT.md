@@ -263,8 +263,8 @@ system notification, and rings to or from an original arcade.
   the room's route whose media relay is on (as the original's media went through a node's TURN relay);
 - the other window decodes them and draws each picture where its page placed it, and plays each voice
   the page hears.
-- Ops: start, stop, screen, share, hear, volume, place, mute, frames, levels, spatial, shown. Events:
-  media, media-off, state, speaking, frame, levels.
+- Ops: start, stop, screen, share, hear, volume, place, mute, frames, levels, spatial, shown, cutout.
+  Events: media, media-off, state, speaking, frame, levels, cutout.
 - The pill with Stop shows while anything is open. The app's card switches (Camera & microphone,
   Pictures in the app) gate it.
 - App windows of the desktop app turn on WebKitGTK's media capture and allow its camera and microphone
@@ -272,6 +272,51 @@ system notification, and rings to or from an original arcade.
   camera itself.
 - Pictures need `WEBKIT_DISABLE_DMABUF_RENDERER=1`, which the installed launcher already sets: without
   it a `<video>` never plays a camera stream on this machine, so nothing can be encoded.
+
+**A website's viewer in the same room.** A browser on a website in front of a V1.0 arcade (the room door
+on this computer) has WebRTC, but a window has none, so a viewer and a window meet on the window's pieces:
+- the website joins its viewer's seat through the door with `fast: true` (`/realtime/join`); its stream
+  then carries `fast` and `mchunk` events like a window's poll;
+- the website sends the viewer's fast data and pieces with `/rpc`'s `realtime.fast` and `realtime.media`
+  on the door's token (a JSON-RPC batch per viewer request), and asks `realtime.lanes` for which pairs
+  the fast lane reaches;
+- the window answers a viewer's WebRTC offer or "please offer" with the signal `p` ("my pictures go as
+  pieces"), and sends `p` itself to a player it would offer to. The viewer then stops waiting for WebRTC
+  for that pair, puts it on the fast lane, and decodes and encodes the same pieces (VP8, Opus) with
+  WebCodecs. Viewers with each other stay on WebRTC.
+
+**The cutout** (for any app; TxTOK's Screen layout first). The page asks, the window does the work, and
+the page still gets no camera frames:
+- `room.media.start({video: true, audio, cutout})` or, mid-call, `room.media.cutout(mode)`; `mode` is
+  `'blur'` (the background behind the person blurred), `'composite'` (the player's own shared screen,
+  `showScreen`, behind the person), `'transparent'` (the person alone), or `null` (the camera as it is).
+  A second `start` without `cutout` keeps the last one. The answer has `cutout` (what runs) and
+  `cutoutWhy` when that is not what was asked: `composite` with no screen shared runs `blur` until one is;
+  a computer too slow for it, or a window without the model, runs `off`. `on('cutout', fn({mode, want,
+  why}))` says each change. A player whose picture comes transparent comes with `'media'` `{video, audio,
+  transparent: true}`.
+- Where: `dist/cutout.js`, the same file in the website (`/cutout/cutout.js`). The network is MediaPipe's
+  selfie segmenter (landscape, 256x144, Apache-2.0, `dist/cutout-LICENSE.txt`), its float16 weights laid
+  out by `scripts/cutout_model.py` into `dist/cutout-model.bin` (221 KB). It runs in plain JavaScript in
+  a worker (this same file), with the 1x1 convolutions in WebAssembly SIMD (`scripts/cutout_kernels.wat`,
+  704 bytes inside cutout.js) where the window lets it: the window's policy now has `'wasm-unsafe-eval'`
+  (`tauri.conf.json`). Without it, or in a browser without SIMD, the same steps run in JavaScript, about
+  2.5 times slower. A worker the computer starves gives way to the page. Nothing is fetched from anywhere
+  else, and no frame leaves the window except as the call's own encoded picture.
+- The mask comes out at 256x144, a little of the last one kept (no flicker), soft at the edge, and is
+  stretched over the 640-wide picture. Masks are made as fast as the computer allows, at most 20 a second;
+  every picture uses the newest. Below 5 a second for 4 s the cutout turns off and says why.
+- Blur and composite are in the picture itself: every window and viewer, old or new, sees them.
+- Transparent: the picture that goes is the blurred one, and beside it, the mask, small (128x72, a 4-bit
+  run-length code, about 0.5 to 1.5 KB) as a piece of kind 5 with the time of the picture it belongs to.
+  A window of this version draws the person alone over whatever the page put behind the tile (the tile has
+  no black behind it then, and is drawn above the other tiles); a website's viewer does the same (a canvas over its tile); a window or a viewer
+  from before the cutout ignores kind 5 and shows the blurred picture. Between two website viewers the
+  masks go on a WebRTC data channel of their own (negotiated id 3, unordered), only to a viewer that said
+  `{cut: 1}` on the media channel, so an older viewer is never sent one; there the mask is matched to the
+  picture by the video's own buffer delay (its jitter buffer, from `getStats`), not exactly.
+- Nothing goes while a cutout is asked for and not yet drawing (the model loads in well under a second),
+  so the background it hides is never sent.
 
 Findings:
 - **Room frames were lost across a relaying arcade (on main too).** An arcade that borrows blocks or

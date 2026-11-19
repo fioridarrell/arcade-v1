@@ -2666,6 +2666,9 @@ pub struct LentCoin {
     pub height: u32,
     pub address: String,
     pub script: Vec<u8>,
+    /// A coinbase output, and how many confirmations the lender counts for it (0 when it doesn't say).
+    pub coinbase: bool,
+    pub confirmations: u32,
 }
 
 /// The unspent coins of these addresses on a borrowed chain (or one still catching up), from a
@@ -2731,7 +2734,8 @@ pub fn lender_coins(node: &Node, p: &'static ChainParams, addrs: &[String]) -> R
             if r(o).map(|v| v.is_null()).unwrap_or(true) {
                 continue;
             }
-            out.push(LentCoin { op: c.op, value: c.value, height: *h, address: c.address.clone(), script: scripts[&c.address].clone() });
+            let (coinbase, confirmations) = r(o).map(|v| (v["coinbase"] == true, v["confirmations"].as_u64().unwrap_or(0) as u32)).unwrap_or((false, 0));
+            out.push(LentCoin { op: c.op, value: c.value, height: *h, address: c.address.clone(), script: scripts[&c.address].clone(), coinbase, confirmations });
         }
     }
     Ok(out)
@@ -2759,6 +2763,145 @@ pub fn waiting_to(p: &ChainParams, script: &[u8]) -> Vec<(OutPoint, u64, bool)> 
 /// Coins spent by transactions sent from here that are still waiting.
 pub fn waiting_spent(key: &str) -> HashSet<OutPoint> {
     pool_spent(key)
+}
+
+// ---------------- building on a borrowed chain (borrowed = installed, batch 6) ----------------
+
+/// This wallet's coins of one script on a borrowed chain, for a transaction built and signed here: the coins a
+/// lender's address index names (each checked against its block, then asked whether it is still unspent), the coins
+/// this arcade follows itself (from the borrow floor on), and the change of its own transactions still waiting. None
+/// is spent by a waiting transaction sent from here, and no coinbase is spent before it matures. Coins carrying an
+/// inscription are the caller's to leave out (crate::ordsafe::keep_free).
+pub fn own_coins(node: &Node, p: &'static ChainParams, script: &[u8]) -> Vec<Utxo> {
+    let mut out = spendable(node, p, script);
+    let Some(a) = arcade_ledger::address::wallet_address_of(script, p) else { return out };
+    // (No lender with an address index answering: the coins followed here are all there is.)
+    if let Ok(lent) = lender_coins(node, p, &[a]) {
+        merge_lent(&mut out, lent, p.coinbase_maturity);
+    }
+    out
+}
+
+/// Lender coins into `out` (the coins followed here): each once, and a coinbase only once it is mature.
+fn merge_lent(out: &mut Vec<Utxo>, lent: Vec<LentCoin>, maturity: u32) {
+    for c in lent {
+        if c.coinbase && c.confirmations < maturity {
+            continue;
+        }
+        if !out.iter().any(|u| u.outpoint == c.op) {
+            out.push(Utxo { outpoint: c.op, value: c.value, script: c.script });
+        }
+    }
+}
+
+/// One coin on a borrowed chain, unspent now: (script, value, height; 0 while its transaction waits). Its output read
+/// from the transaction a lender sends (checked against its txid) and, once mined, from the block the lender names
+/// (checked against our headers, the transaction found in it); then asked whether it is still unspent. A coin spent
+/// by a transaction waiting here is not unspent; a waiting output of one is (it is our own).
+pub fn checked_coin(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<(Vec<u8>, u64, u32)> {
+    if pool_spent(p.key).contains(op) {
+        return None;
+    }
+    if let Some(o) = pool_txs(p).into_iter().find(|t| t.txid == op.txid).and_then(|t| t.outputs.get(op.vout as usize).cloned()) {
+        return Some((o.script_pubkey, o.value, 0));
+    }
+    let known = CHECKED.lock().unwrap().get(&(p.key.to_string(), *op)).cloned();
+    let (lender, script, value, height) = match known {
+        Some((value, script, height)) => (None, script, value, height),
+        None => {
+            let (addr, a) = call_any(node, p, json!([["getrawtransaction", [op.txid.to_hex(), 1]]])).ok()?;
+            let v = r(&a[0]).ok()?.clone();
+            let tx = Tx::parse_with(&hex::decode(v["hex"].as_str()?).ok()?, &p.format).ok()?;
+            if tx.txid != op.txid {
+                return None;
+            }
+            let o = tx.outputs.get(op.vout as usize)?.clone();
+            let height = match v["blockhash"].as_str().and_then(|s| Hash256::from_hex(s).ok()) {
+                Some(bh) => {
+                    let (b, h, _) = fetch_checked(node, p, &bh).ok()?;
+                    if !b.txs.iter().any(|t| t.txid == op.txid) {
+                        return None;
+                    }
+                    let mut m = CHECKED.lock().unwrap();
+                    if m.len() >= CHECKED_MAX {
+                        m.clear();
+                    }
+                    m.insert((p.key.to_string(), *op), (o.value, o.script_pubkey.clone(), h));
+                    h
+                }
+                None => 0,
+            };
+            (Some(addr), o.script_pubkey, o.value, height)
+        }
+    };
+    let ask = json!([["gettxout", [op.txid.to_hex(), op.vout, true]]]);
+    let a = match lender {
+        Some(addr) => call(node, &addr, p, ask).ok()?,
+        None => call_any(node, p, ask).ok()?.1,
+    };
+    r(a.first()?).ok().filter(|v| !v.is_null())?;
+    Some((script, value, height))
+}
+
+/// Which of `ops` are unspent now on a borrowed chain, as one lender says (its mempool included): gettxout in batches.
+/// Coins spent by a transaction waiting here are not. What a send reads for coins whose values it doesn't take from
+/// the lender (a prize pool's lots: their values are in the pool's record, and the network checks the claim).
+pub fn unspent_of(node: &Node, p: &ChainParams, ops: &[OutPoint]) -> Result<HashSet<OutPoint>, String> {
+    let spent = pool_spent(p.key);
+    let ask: Vec<&OutPoint> = ops.iter().filter(|o| !spent.contains(o)).collect();
+    let mut out = HashSet::new();
+    let mut lender: Option<String> = None;
+    for part in ask.chunks(200) {
+        let calls = json!(part.iter().map(|o| json!(["gettxout", [o.txid.to_hex(), o.vout, true]])).collect::<Vec<_>>());
+        let a = match &lender {
+            Some(l) => call(node, l, p, calls)?,
+            None => {
+                let (l, a) = call_any(node, p, calls)?;
+                lender = Some(l);
+                a
+            }
+        };
+        for (o, x) in part.iter().zip(a.iter()) {
+            if r(x).is_ok_and(|v| !v.is_null()) {
+                out.insert(**o);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Txids found in a checked block, by chain: (height).
+static MINED: LazyLock<Mutex<HashMap<(String, Hash256), u32>>> = LazyLock::new(Default::default);
+
+/// How deep a transaction is on a borrowed chain, counted to the tip followed here: 0 while it waits or nobody knows
+/// it. The block a lender names is fetched and checked against our headers, and the transaction must be in it (one
+/// lender's word alone is not taken).
+pub fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
+    let known = MINED.lock().unwrap().get(&(p.key.to_string(), *txid)).copied();
+    let h = match known {
+        Some(h) => h,
+        None => {
+            let Ok((_, a)) = call_any(node, p, json!([["getrawtransaction", [txid.to_hex(), 1]]])) else { return 0 };
+            let Some(bh) = r(&a[0]).ok().and_then(|v| v["blockhash"].as_str()).and_then(|s| Hash256::from_hex(s).ok()) else { return 0 };
+            match fetch_checked(node, p, &bh) {
+                Ok((b, h, _)) if b.txs.iter().any(|t| t.txid == *txid) => {
+                    let mut m = MINED.lock().unwrap();
+                    if m.len() >= 10_000 {
+                        m.clear();
+                    }
+                    m.insert((p.key.to_string(), *txid), h);
+                    h
+                }
+                _ => return 0,
+            }
+        }
+    };
+    tip_of(node, p.key).max(h).saturating_sub(h) + 1
+}
+
+/// The transaction sent from here, still waiting, that spends `op` on a borrowed chain.
+pub fn pool_spender(p: &ChainParams, op: &OutPoint) -> Option<Hash256> {
+    pool_txs(p).into_iter().find(|t| t.inputs.iter().any(|i| i.prevout == *op)).map(|t| t.txid)
 }
 
 /// The arcades lending `key` that this one is linked to now (node ids), newest tip first: where an arcade that only
@@ -2967,6 +3110,18 @@ mod tests {
         assert_eq!(tips_slack("btc"), 3);
     }
     use super::*;
+
+    /// Borrowed = installed, batch 6: a lender's coins join the ones followed here once each, and a coinbase only once
+    /// it has matured.
+    #[test]
+    fn lent_coins_join_the_followed_ones() {
+        let op = |n: u8| OutPoint { txid: Hash256([n; 32]), vout: 0 };
+        let lent = |n: u8, coinbase: bool, confirmations: u32| LentCoin { op: op(n), value: 1000 + n as u64, height: 5, address: "A".into(), script: vec![0x51], coinbase, confirmations };
+        let mut out = vec![Utxo { outpoint: op(1), value: 1001, script: vec![0x51] }];
+        merge_lent(&mut out, vec![lent(1, false, 3), lent(2, false, 1), lent(3, true, 59), lent(4, true, 60)], 60);
+        let got: Vec<OutPoint> = out.iter().map(|u| u.outpoint).collect();
+        assert_eq!(got, vec![op(1), op(2), op(4)], "followed once, plain coin, mature coinbase; not the young coinbase");
+    }
 
     #[test]
     fn scan_shapes() {

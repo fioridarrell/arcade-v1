@@ -138,6 +138,16 @@ def main():
     print("   summary A:", json.dumps({k: s_a[k] for k in ("height", "segments", "segment_bytes", "replicas", "average_copies", "owners", "genesis_earners", "pot", "issuance_per_month")}))
     if s_a["genesis_earners"] != 1 or not s_a["pot"] or s_a["issuance_per_month"] <= 0 or s_a["height"] < 100:
         fails.append("summary: missing numbers")
+    # Fog storage: the copy floor of each class, what is short of copies, and this arcade's settings.
+    print("   fog parts A:", json.dumps({k: s_a.get(k) for k in ("floors", "short", "fog")})[:400])
+    if s_a.get("floors") != {"permanent": 7, "release": 5, "temporary": 3, "boost": 2}:
+        fails.append(f"summary: floors {s_a.get('floors')}")
+    short = s_a.get("short") or {}
+    if not isinstance(short.get("list"), list) or short.get("segments") != len(short["list"]) or not isinstance(short.get("blobs"), int):
+        fails.append(f"summary: short {short}")
+    fog = s_a.get("fog") or {}
+    if fog.get("grace_secs", 0) <= 0 or fog.get("idle_secs", 0) <= 0 or "keep_mb" not in fog:
+        fails.append(f"summary: fog {fog}")
     segs = call("A", "explorer.arc_segments", limit=50)
     print("   segments A:", segs["total"], "first:", json.dumps(segs["segments"][0] if segs["segments"] else None)[:400])
     if "segments" not in segs or segs["total"] != len(segs["segments"]):

@@ -965,6 +965,41 @@ pub fn send(node: &Node, tok: &str, data: Option<&str>, b64: Option<&str>) -> Re
     Ok(json!({}))
 }
 
+/// For a WebRTC link (rtcsvc.rs): the seat's room as its page names it, the seat's player, and
+/// `peer` as the page knows them, when `peer` plays in that room through another arcade.
+pub(crate) fn rtc_seat(node: &Node, tok: &str, peer: &str) -> Result<(String, String, Value), String> {
+    let mut st = rt().st.lock().unwrap();
+    let s = st.sessions.get(tok).ok_or("join the room first")?;
+    if !s.fast {
+        return Err("this seat did not ask for the fast lane".into());
+    }
+    let (room, member) = (s.room.clone(), s.member.clone());
+    if peer == member {
+        return Err("that is this seat's own player".into());
+    }
+    let found = st.remote.get(&room).and_then(|by| by.iter().find_map(|(o, ms)| ms.get(peer).map(|r| (o.clone(), r.cred.clone()))));
+    let (origin, cred) = found.ok_or("no such player in the room (on another arcade)")?;
+    if !vet(node, &mut st, &origin, peer, cred.as_ref()) {
+        return Err("that player's cert does not check".into());
+    }
+    Ok((short_room(&room), member, who(node, &origin, peer, cred.as_ref())))
+}
+
+/// An event for one window seat from elsewhere (its WebRTC links): false when the seat is gone.
+pub(crate) fn push_event(tok: &str, ev: Value) -> bool {
+    let mut st = rt().st.lock().unwrap();
+    let Some(s) = st.sessions.get_mut(tok) else { return false };
+    if s.events.len() < 1000 {
+        s.events.push_back(ev);
+    }
+    rt().cv.notify_all();
+    true
+}
+
+pub(crate) fn seat_alive(tok: &str) -> bool {
+    rt().st.lock().unwrap().sessions.contains_key(tok)
+}
+
 /// realtime.poll: the events waiting for this window, waiting up to `wait_ms` for one.
 pub fn poll(tok: &str, wait_ms: u64) -> Result<Value, String> {
     let r = rt();

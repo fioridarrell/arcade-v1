@@ -102,6 +102,11 @@ pub fn api_keep(node: &Node, req: &Value) -> Result<Value, String> {
               "used_mb": kept_bytes(node) >> 20}))
 }
 
+/// The family name `arc.fog` lists segments under (for the storage reads).
+pub fn family_label(f: u8) -> &'static str {
+    family_name(f)
+}
+
 fn family_name(f: u8) -> &'static str {
     if f == FAMILY_BLOBS_TEMP { "temporary blobs" } else { "blobs" }
 }
@@ -317,6 +322,15 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let now = arcade_app::now();
     let me = node.id_hex();
     let known: Vec<(Hash, crate::arcblob::Meta)> = crate::arcblob::known().into_iter().filter(|(_, m)| on(net, m.height)).collect();
+    // Large blobs (crate::largeblob): every arcade keeps the small manifests, so it knows which parts go together.
+    let mut got_manifest = 0;
+    for (id, m) in &known {
+        if is_manifest(m) && !crate::arcblob::bytes_here(id) && got_manifest < 16 && crate::arcblob::fetch_keep(node, id) {
+            got_manifest += 1;
+        }
+    }
+    crate::largeblob::refresh();
+    let metas: HashMap<Hash, &crate::arcblob::Meta> = known.iter().map(|(id, m)| (*id, m)).collect();
     let mut by_seg: BTreeMap<(u8, u64), Vec<&crate::arcblob::Meta>> = BTreeMap::new();
     let mut seg_bytes: HashMap<(u8, u64), u64> = HashMap::new();
     for (_, m) in &known {
@@ -332,9 +346,11 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let mut room = room_mb(node) << 20;
     let mut short = Vec::new();
     let mut warnings = Vec::new();
+    let mut seg_info: HashMap<(u8, u64), (usize, usize)> = HashMap::new();
     for (&(family, index), metas) in &by_seg {
         let floor = floor_of(family, metas, now, temporary);
         let (copies, counted, keepers) = copies_of(node, family, index);
+        seg_info.insert((family, index), (copies, floor));
         let mine_kept = segs.contains(&(family, index));
         let mut candidates: Vec<String> = ann.iter().filter(|(_, f)| f["room"].as_u64().unwrap_or(0) > 0).map(|(n, _)| n.clone()).collect();
         let size = seg_bytes.get(&(family, index)).copied().unwrap_or(0);
@@ -359,20 +375,45 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
         }
     }
     save_segs(node, &segs);
-    // Fetch what a kept segment lacks (not a view: it doesn't count as one).
+    // A large blob's parts live and fade together: one kept segment holding a part keeps the whole (its other parts
+    // fetched too, wherever they are), and while any part is the publisher's, new, or viewed or asked for here, none is
+    // dropped.
+    let idle = idle_secs();
+    let grace = grace_secs();
+    let in_kept = |id: &Hash| metas.get(id).is_some_and(|m| segs.contains(&(family_of(m.class), m.height / RANGE)));
+    let alive = |id: &Hash| {
+        crate::arcblob::is_mine(id)
+            || in_kept(id)
+            || metas.get(id).is_some_and(|m| m.time.saturating_add(grace) > now)
+            || crate::arcblob::last_use(id).is_some_and(|t| t.saturating_add(idle) > now)
+    };
+    let mut held_whole: std::collections::HashSet<Hash> = std::collections::HashSet::new();
+    let mut whole_fetch: Vec<Hash> = Vec::new();
+    let groups = crate::largeblob::all();
+    for (mid, man) in &groups {
+        let members: Vec<Hash> = std::iter::once(*mid).chain(man.parts.iter().map(|p| p.0)).collect();
+        if members.iter().any(|m| alive(m)) {
+            held_whole.extend(members.iter().copied());
+        }
+        if man.parts.iter().any(|p| in_kept(&p.0)) {
+            whole_fetch.extend(man.parts.iter().map(|p| p.0).filter(|p| !crate::arcblob::here(p) && !in_kept(p)));
+        }
+    }
+    // Fetch what a kept segment lacks, and the rest of the large blobs it keeps a part of (not a view: it doesn't count
+    // as one).
     let mut fetched = 0;
-    for (id, m) in &known {
-        if segs.contains(&(family_of(m.class), m.height / RANGE)) && !crate::arcblob::here(id) && fetched < 64 {
-            if crate::arcblob::fetch_keep(node, id) {
-                fetched += 1;
-            }
+    let wanted = known.iter().filter(|(id, m)| segs.contains(&(family_of(m.class), m.height / RANGE)) && !crate::arcblob::here(id)).map(|(id, _)| *id).chain(whole_fetch);
+    for id in wanted {
+        if fetched >= 64 {
+            break;
+        }
+        if crate::arcblob::fetch_keep(node, &id) {
+            fetched += 1;
         }
     }
     // Drop the bytes nothing here keeps.
     let (mut dropped, mut freed) = (0, 0u64);
     if !archive {
-        let idle = idle_secs();
-        let grace = grace_secs();
         for (id, m) in &known {
             if crate::arcblob::is_mine(id) {
                 continue;
@@ -381,6 +422,9 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
             if temp_done {
                 freed += crate::arcblob::forget(id);
                 dropped += 1;
+                continue;
+            }
+            if is_manifest(m) || held_whole.contains(id) {
                 continue;
             }
             let kept = segs.contains(&(family_of(m.class), m.height / RANGE));
@@ -401,8 +445,23 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
         .map(|s| json!({"family": family_name(s.family), "first": s.index * RANGE, "last": s.index * RANGE + RANGE - 1, "copies": s.copies, "floor": s.floor,
                         "counted": if s.counted == Counted::Registered { "audited replicas" } else { "announced keepers (not listed yet)" }, "bytes": s.bytes}))
         .collect();
+    // Each large blob as one item: its parts' copies are its segments' (the fewest), its floor its class's.
+    let mut large = Vec::new();
+    for (mid, man) in groups.iter().filter(|g| g.1.large()) {
+        let segs_of: Vec<(u8, u64)> = man.parts.iter().filter_map(|p| metas.get(&p.0).map(|m| (family_of(m.class), m.height / RANGE))).collect();
+        let infos: Vec<(usize, usize)> = segs_of.iter().filter_map(|k| seg_info.get(k).copied()).collect();
+        let copies = infos.iter().map(|i| i.0).min().unwrap_or(0);
+        let floor = infos.iter().map(|i| i.1).max().unwrap_or(0);
+        let here = man.parts.iter().filter(|p| crate::arcblob::bytes_here(&p.0)).count();
+        large.push(json!({"id": hex::encode(mid), "type": man.kind, "bytes": man.size, "parts": man.parts.len(), "parts_here": here,
+                          "class": man.class, "copies": copies, "floor": floor, "short": copies < floor,
+                          "segments": segs_of.iter().collect::<BTreeSet<_>>().len(), "mine": crate::arcblob::is_mine(mid)}));
+    }
+    large.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    let short_large: Vec<Value> = large.iter().filter(|l| l["short"] == true).cloned().collect();
     let held = crate::arcblob::held_ids();
     *STATUS.lock().unwrap() = Some(json!({
+        "large": large.iter().take(200).collect::<Vec<_>>(), "short_large": short_large,
         "on": true, "grace_secs": grace_secs(), "idle_secs": idle_secs(), "keep_mb": keep_mb(node), "archive": archive,
         "kept": segs.iter().map(|(f, i)| json!({"family": family_name(*f), "first": i * RANGE, "last": i * RANGE + RANGE - 1})).collect::<Vec<_>>(),
         "held": held.len(), "held_ids": held.iter().take(200).map(hex::encode).collect::<Vec<_>>(),
@@ -413,16 +472,30 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
 }
 
 /// A blob class's copy floor (for the storage reads, explorer.arc_*).
-#[allow(dead_code)] // for the storage reads (claude/arc-storage-reads)
 pub fn blob_floor(class: Class) -> usize {
     blob::floor(class)
 }
 
 /// The segments short of their copy floor, as the last round saw them (for the storage reads, explorer.arc_*):
 /// [{family, first, last, copies, floor, counted, bytes}].
-#[allow(dead_code)] // for the storage reads (claude/arc-storage-reads)
 pub fn short_of_copies() -> Vec<Value> {
     STATUS.lock().unwrap().as_ref().and_then(|s| s["short"].as_array().cloned()).unwrap_or_default()
+}
+
+/// The large blobs short of their copy floor, each one item, as the last round saw them (for the storage reads):
+/// [{id, type, bytes, parts, parts_here, class, copies, floor, short, segments, mine}].
+pub fn short_large() -> Vec<Value> {
+    STATUS.lock().unwrap().as_ref().and_then(|s| s["short_large"].as_array().cloned()).unwrap_or_default()
+}
+
+/// Every large blob known here as one item (as [`short_large`]), as the last round saw them.
+pub fn large() -> Vec<Value> {
+    STATUS.lock().unwrap().as_ref().and_then(|s| s["large"].as_array().cloned()).unwrap_or_default()
+}
+
+/// A small file manifest (a large blob's, crate::largeblob): every arcade keeps it.
+fn is_manifest(m: &crate::arcblob::Meta) -> bool {
+    m.kind == crate::arcblob::FILE_MANIFEST && m.len > 0 && m.len <= crate::largeblob::MANIFEST_KEEP_MAX
 }
 
 /// `arc.fog`: what fog storage does here (the last round's view).
@@ -459,7 +532,7 @@ mod tests {
         assert_eq!(blob::floor(Class::Temporary), 3);
         assert_eq!(blob::floor(Class::Release), 5);
         assert_eq!(blob::floor(Class::Permanent), 7);
-        let m = |class: Class, time: u64| crate::arcblob::Meta { class: class as u8, kind: String::new(), encoding: 0, height: 1, time, line: String::new(), boosted_until: 0 };
+        let m = |class: Class, time: u64| crate::arcblob::Meta { class: class as u8, kind: String::new(), encoding: 0, height: 1, time, line: String::new(), boosted_until: 0, len: 0 };
         let (p, r, t) = (m(Class::Permanent, 0), m(Class::Release, 0), m(Class::Temporary, 1000));
         assert_eq!(floor_of(FAMILY_BLOBS, &[&r, &p], 0, 90), 7);
         assert_eq!(floor_of(FAMILY_BLOBS, &[&r], 0, 90), 5);

@@ -182,7 +182,7 @@ pub fn pools(node: &Node) -> Vec<Value> {
 /// A pool by txid or number.
 pub fn pool(node: &Node, key: &str) -> Option<Value> {
     let key = key.trim().trim_start_matches('#').to_lowercase();
-    let txid = if key.len() == 64 { key } else { arcade_ledger::content::inscription(&node.chain, crate::pagechain::params(node).chain_no, &key)?["txid"].as_str()?.to_string() };
+    let txid = if key.len() == 64 { key } else { crate::lentledger::inscription(node, crate::pagechain::params(node), &key)?["txid"].as_str()?.to_string() };
     pools(node).into_iter().find(|p| p["txid"].as_str() == Some(txid.as_str()))
 }
 
@@ -201,14 +201,23 @@ pub fn lots(node: &Node, p: &Value) -> (Vec<i64>, u64) {
     let net = crate::pagechain::params(node);
     let (mut free, mut waiting) = (Vec::new(), 0);
     let addr = p["pool"].as_str().unwrap_or("");
-    for n in 0..p["count"].as_i64().unwrap_or(0) {
+    // Borrowed (borrowed = installed, batch 6): which lot coins are unspent, as a lender says in one batch (a lot this
+    // arcade's own waiting claim spends counts as waiting); the claim itself is checked by the network.
+    let count = p["count"].as_i64().unwrap_or(0);
+    let lent = crate::borrow::is_borrowed(net.key).then(|| {
+        let pieces: Vec<OutPoint> = (0..count).filter_map(|n| lot_coins(p, n).map(|c| c.0)).collect();
+        (crate::borrow::unspent_of(node, net, &pieces).unwrap_or_default(), crate::borrow::waiting_spent(net.key))
+    });
+    for n in 0..count {
         let Some((piece, _)) = lot_coins(p, n) else { continue };
-        let confirmed = node.chain.coin(net, &piece).ok().flatten().is_some();
-        let pooled = node.chain.mempool_spender(net.chain_no, &piece).ok().flatten().is_some();
+        let (confirmed, pooled) = match &lent {
+            Some((unspent, waiting)) => (unspent.contains(&piece) || waiting.contains(&piece), waiting.contains(&piece)),
+            None => (node.chain.coin(net, &piece).ok().flatten().is_some(), node.chain.mempool_spender(net.chain_no, &piece).ok().flatten().is_some()),
+        };
         if confirmed && !pooled {
             if p["kind"] == "nft" {
                 let id = p["pieces"][n as usize].as_str().unwrap_or("");
-                if arcade_ledger::content::inscription(&node.chain, net.chain_no, id).is_none_or(|i| i["owner"].as_str() != Some(addr)) {
+                if crate::lentledger::inscription(node, net, id).is_none_or(|i| i["owner"].as_str() != Some(addr)) {
                     continue;
                 }
             }
@@ -228,7 +237,7 @@ pub fn refusal(node: &Node, p: Option<&Value>, page: &str) -> String {
     }
     let game = p["game"].as_str().unwrap_or("");
     if !game.is_empty() {
-        let owner = arcade_ledger::content::inscription(&node.chain, crate::pagechain::params(node).chain_no, game).and_then(|i| i["owner"].as_str().map(String::from));
+        let owner = crate::lentledger::inscription(node, crate::pagechain::params(node), game).and_then(|i| i["owner"].as_str().map(String::from));
         if owner.as_deref() != p["creator"].as_str() {
             return "this prize pays out only while its creator holds the page it belongs to".into();
         }
@@ -523,8 +532,10 @@ pub fn claim(node: &Node, page: &str, m: &Value, send: bool) -> Result<Value, St
     if refereed && replay.is_none() {
         return Err("this prize pays only for a run its referee checks: send the run with the claim".into());
     }
-    let content = arcade_ledger::content::content(&node.chain, crate::pagechain::params(node), p["txid"].as_str().unwrap_or(""))?;
-    let sigs = open_lots(&content.bytes, &secret)?;
+    // (Borrowed: the pool's bytes from an arcade keeping the ledger, checked against their hash; its lots' signatures
+    // are checked below against the pool's key.)
+    let content = crate::lentledger::bytes(node, crate::pagechain::params(node), p["txid"].as_str().unwrap_or(""))?;
+    let sigs = open_lots(&content, &secret)?;
     let (s0, s1) = (sigs.get(2 * n as usize).ok_or("that lot was never signed")?, sigs.get(2 * n as usize + 1).ok_or("that lot was never signed")?);
     let lot = lot_leg(node, &p, n)?;
     let pool_pub = hex::decode(p["pubkey"].as_str().unwrap_or("")).map_err(|_| "bad pool key")?;
@@ -549,7 +560,7 @@ pub fn claim(node: &Node, page: &str, m: &Value, send: bool) -> Result<Value, St
             shape.outputs.push((f.dust, me_script.clone()));
         }
         let need = p["price"].as_u64().unwrap_or(0) + if token { f.dust } else { 0 };
-        let mut coins: Vec<_> = crate::claims::spendable(node, &me_script).into_iter().filter(|u| !shape.inputs.iter().any(|i| i.prevout == u.outpoint)).collect();
+        let mut coins: Vec<_> = crate::claims::send_coins(node, &me_script).into_iter().filter(|u| !shape.inputs.iter().any(|i| i.prevout == u.outpoint)).collect();
         coins.sort_by_key(|c| c.value);
         let mut chosen = Vec::new();
         let mut have = 0u64;

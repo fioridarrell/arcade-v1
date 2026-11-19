@@ -109,7 +109,7 @@ fn genesis_bytes(reg: &Registry) -> u128 {
 }
 
 /// `explorer.arc_storage_summary`.
-pub fn summary(_node: &Node, _req: &Value) -> R {
+pub fn summary(node: &Node, _req: &Value) -> R {
     crate::arcsvc::with_chain(|net, chain| {
         let reg = chain.storage();
         let tip = chain.tip();
@@ -129,7 +129,24 @@ pub fn summary(_node: &Node, _req: &Value) -> R {
         let block_secs = observed_block_secs(chain, net);
         let blocks_month = (30.0 * 86400.0 / block_secs).round() as u64;
         let mut by_class: BTreeMap<&str, (u64, u64, u64)> = BTreeMap::new(); // blobs, bytes known here, plain here
+        // Fog storage (rules version 5): the segments short of their copy floor as the last round saw them, and the
+        // blobs in them.
+        let short_segs = crate::fogstore::short_of_copies();
+        let seg_key = |v: &Value| (v["family"].as_str().unwrap_or("").to_string(), v["first"].as_u64().unwrap_or(0));
+        let short_keys: std::collections::BTreeSet<(String, u64)> = short_segs.iter().map(seg_key).collect();
+        let mut short_blobs: BTreeMap<(String, u64), Vec<String>> = BTreeMap::new();
         for (id, m) in crate::arcblob::known() {
+            if crate::fogstore::on(net, m.height) {
+                let key = (crate::fogstore::family_label(crate::fogstore::family_of(m.class)).to_string(), m.height - m.height % arcade_arc::params::RANGE);
+                if short_keys.contains(&key) {
+                    // A large blob's part is listed once, as its large blob (crate::largeblob).
+                    let name = crate::largeblob::group_of(&id).filter(|g| g.1.large()).map_or(id, |g| g.0);
+                    let list = short_blobs.entry(key).or_default();
+                    if !list.contains(&hex::encode(name)) {
+                        list.push(hex::encode(name));
+                    }
+                }
+            }
             let name = match m.class { 0 => "permanent", 1 => "release", 2 => "temporary", 3 => "boost", _ => "other" };
             let size = std::fs::metadata(crate::arcblob::dir().join(hex::encode(id))).map(|x| x.len()).unwrap_or(0);
             let e = by_class.entry(name).or_default();
@@ -175,12 +192,58 @@ pub fn summary(_node: &Node, _req: &Value) -> R {
             "blob_fee_per_kb": arcade_arc::blob::BLOB_FEE_PER_KB,
             "blobs_here": blobs_here,
             "viewer_cache": {"files": cache_files, "bytes": cache_bytes, "limit": crate::arcblob::cache_limit()},
-            // FOGSTORE: per-class copy floors and the short-of-copies count, once they are rules.
-            "floors": Value::Null,
-            "short": Value::Null,
+            // Fog storage (rules version 5, docs/FOGSTORE.md): each class's copy floor (boost: the copies a boost adds),
+            // the segments short of their floor with the blobs in them, and this arcade's settings and share.
+            "floors": floors(),
+            "short": short_json(&short_segs, &short_blobs, &crate::fogstore::short_large()),
+            // Large blobs (crate::largeblob, up to 100 MB): each one item, with its parts, copies and floor.
+            "large_blobs": large_json(&crate::fogstore::large()),
+            "fog": fog_here(node, net, tip.height),
         })
     })
     .ok_or_else(not_here)
+}
+
+/// Each blob class's copy floor (Permanent 7, Release 5, Temporary 3; a boost adds 2).
+fn floors() -> Value {
+    use arcade_arc::blob::Class;
+    let f = crate::fogstore::blob_floor;
+    json!({"permanent": f(Class::Permanent), "release": f(Class::Release), "temporary": f(Class::Temporary), "boost": f(Class::Boost)})
+}
+
+/// Most blob ids listed in the short-of-copies part.
+const SHORT_IDS: usize = 200;
+
+/// The short-of-copies part: how many segments and blobs are below their floor, each segment (as `arc.fog` lists it)
+/// with its blob count, and the blobs' ids (the first SHORT_IDS).
+fn short_json(segs: &[Value], blobs: &BTreeMap<(String, u64), Vec<String>>, large: &[Value]) -> Value {
+    let key = |v: &Value| (v["family"].as_str().unwrap_or("").to_string(), v["first"].as_u64().unwrap_or(0));
+    let list: Vec<Value> = segs.iter().map(|s| {
+        let mut s = s.clone();
+        s["blobs"] = json!(blobs.get(&key(&s)).map_or(0, |b| b.len()));
+        s
+    }).collect();
+    let ids: Vec<&String> = blobs.values().flatten().take(SHORT_IDS).collect();
+    json!({"segments": segs.len(), "blobs": blobs.values().map(|b| b.len()).sum::<usize>(), "list": list, "blob_ids": ids,
+           "large": large.iter().take(SHORT_IDS).collect::<Vec<_>>()})
+}
+
+/// Most large blobs listed in the summary.
+const LARGE_LISTED: usize = 50;
+
+/// The large blobs known here: how many, their bytes and parts, and the first LARGE_LISTED, each one item.
+fn large_json(large: &[Value]) -> Value {
+    json!({"count": large.len(), "bytes": large.iter().filter_map(|l| l["bytes"].as_u64()).sum::<u64>(),
+           "parts": large.iter().filter_map(|l| l["parts"].as_u64()).sum::<u64>(), "list": large.iter().take(LARGE_LISTED).collect::<Vec<_>>()})
+}
+
+/// This arcade's fog storage settings and share: whether rules version 5 holds at the tip, the grace and idle times, the
+/// keep share and segments kept by choice, and the blobs held here (and how many are its own).
+fn fog_here(node: &Node, net: &Net, height: u64) -> Value {
+    let st = crate::fogstore::status();
+    json!({"on": crate::fogstore::on(net, height), "grace_secs": crate::fogstore::grace_secs(), "idle_secs": crate::fogstore::idle_secs(),
+           "keep_mb": crate::fogstore::keep_mb(node), "kept_segments": crate::fogstore::kept_segs(node).len(),
+           "held": st["held"], "mine": st["mine"], "last_round": st["at"]})
 }
 
 fn chain_key() -> Option<&'static str> {
@@ -373,6 +436,30 @@ pub fn payouts(_node: &Node, req: &Value) -> R {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The storage summary's fog part: the floors by class, and the short segments with their blobs.
+    #[test]
+    fn floors_and_short_blobs() {
+        assert_eq!(floors(), json!({"permanent": 7, "release": 5, "temporary": 3, "boost": 2}));
+        let segs = vec![
+            json!({"family": "blobs", "first": 0, "last": 9999, "copies": 2, "floor": 7, "counted": "audited replicas", "bytes": 10}),
+            json!({"family": "temporary blobs", "first": 10000, "last": 19999, "copies": 0, "floor": 3, "counted": "announced keepers (not listed yet)", "bytes": 4}),
+        ];
+        let mut blobs = BTreeMap::new();
+        blobs.insert(("blobs".to_string(), 0u64), vec!["aa".to_string(), "bb".to_string()]);
+        let big = vec![json!({"id": "cc", "parts": 26, "bytes": 100_000_000u64, "copies": 1, "floor": 3, "short": true})];
+        let v = short_json(&segs, &blobs, &big);
+        assert_eq!(v["large"][0]["parts"], 26, "a large blob is one item with its part count");
+        assert_eq!(large_json(&big)["count"], 1);
+        assert_eq!(large_json(&big)["parts"], 26);
+        assert_eq!((v["segments"].as_u64(), v["blobs"].as_u64()), (Some(2), Some(2)));
+        assert_eq!(v["list"][0]["blobs"], 2);
+        assert_eq!(v["list"][1]["blobs"], 0);
+        assert_eq!(v["list"][0]["floor"], 7, "each segment as arc.fog lists it");
+        assert_eq!(v["blob_ids"], json!(["aa", "bb"]));
+        let none = short_json(&[], &BTreeMap::new(), &[]);
+        assert_eq!((none["segments"].as_u64(), none["blobs"].as_u64()), (Some(0), Some(0)));
+    }
 
     #[test]
     fn family_names_round_trip() {

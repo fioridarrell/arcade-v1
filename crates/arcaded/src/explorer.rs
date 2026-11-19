@@ -257,20 +257,115 @@ fn mesh_from(id: &str) -> Value {
     json!({"node": &id[..id.len().min(16)], "tag": crate::meshview::tag_of(id)})
 }
 
-/// The index an error says is missing here ("the ord index is not on ...").
-/// The index a question needs, whatever the error says: a borrowed chain answers "borrowed",
-/// which names no index, and these must go to an arcade keeping the chain's arcade ledger.
-fn needed_index(cmd: &str) -> Option<&'static str> {
-    if cmd == "explorer.ord_outpoints" {
-        return Some("ord");
+/// The index a question needs, whatever the error says: a borrowed chain (or one not kept here) answers "borrowed" or
+/// "not installed", which names no index, and the question must go to an arcade keeping that index, not to any arcade
+/// keeping the chain (borrowed = installed, batch 5). None: chain data, which every keeper has (blocks, transactions,
+/// the mempool, an address's coins), or a read that gathers its parts itself (explorer.address, explorer.search,
+/// explorer.summary, explorer.tag).
+fn needed_index(cmd: &str, req: &Value) -> Option<&'static str> {
+    Some(match cmd {
+        "explorer.ord_outpoints" | "explorer.inscriptions" | "explorer.inscription" | "explorer.inscription_types" | "explorer.held" => "ord",
+        "explorer.tokens" | "explorer.token" => "tokens",
+        "explorer.names" | "explorer.name" | "explorer.site" | "explorer.sites" => "names",
+        "explorer.maps" | "explorer.map" => "maps",
+        "explorer.collections" | "explorer.collection" | "explorer.collection_of" => "collections",
+        "explorer.dogefeed" | "explorer.dogefeed_tx" | "explorer.dogefeed_inscription" | "explorer.dogefeed_address" => "dogefeed",
+        "explorer.msg_file" => "messages",
+        "explorer.msg_rows" => match req["table"].as_str() {
+            Some("profile") => "profiles",
+            Some("tag") => "ledger",
+            _ => "messages",
+        },
+        "explorer.activity" => "addresses",
+        "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies" => "ledger",
+        c if c.starts_with("explorer.ledger") || c.starts_with("explorer.arc_") => "ledger",
+        _ => return None,
+    })
+}
+
+/// Whether an error says an index is missing here ("the ord index is not on ...").
+pub fn names_missing_index(e: &str) -> bool {
+    missing_index(e).is_some()
+}
+
+/// The protocol index commands (`ord`, `name`, `map`, `token`, `tokens`) for a chain or an index this arcade doesn't
+/// keep (borrowed = installed, batch 5): asked of an arcade keeping the index, through the Explorer read holding the
+/// same data, and given back in the command's own shape ([`index_shape`]).
+pub fn index_read_elsewhere(node: &Node, cmd: &str, p: &'static ChainParams, req: &Value) -> R {
+    let s = |k: &str| req[k].as_str().map(String::from);
+    let ask = |ix: &str, c: &str, mut q: Value| -> R {
+        if crate::shares::index_holders(node, p.net, ix).is_empty() {
+            return Err(format!("no arcade on the mesh keeps the {ix} index of {}", p.name));
+        }
+        q["chain"] = json!(p.key);
+        q["local"] = json!(true);
+        let (mut v, id) = mesh_ask(node, p, ix, c, &q)?;
+        if v.is_object() {
+            v["_mesh"] = mesh_from(&id);
+        }
+        Ok(v)
+    };
+    let (ix, read, q, extra) = match (cmd, s("id"), s("name"), s("claim"), s("tick")) {
+        ("ord", Some(id), ..) => ("ord", "explorer.inscription", json!({"id": id}), None),
+        ("ord", None, ..) => ("ord", "explorer.inscription_types", json!({}), None),
+        ("name", _, Some(n), ..) => ("names", "explorer.name", json!({"name": n}), Some(("explorer.names", json!({"n": 1})))),
+        ("name", ..) => return Err("give a name".into()),
+        ("map", _, _, Some(c), _) => ("maps", "explorer.map", json!({"claim": c}), None),
+        ("map", ..) => ("maps", "explorer.maps", json!({"n": 1}), None),
+        ("token", .., Some(t)) => ("tokens", "explorer.token", json!({"tick": t, "n": 1}), None),
+        ("token", ..) => ("tokens", "explorer.tokens", json!({"n": 1}), None),
+        ("tokens", ..) => ("tokens", "explorer.address", json!({"address": s("owner").ok_or("give an address")?, "history": false, "inscriptions": false}), None),
+        _ => return Err(format!("{cmd} is not an index read")),
+    };
+    let main = match ask(ix, read, q) {
+        // A name nobody claimed: no readings (as this arcade's own index answers), not an error.
+        Err(e) if cmd == "name" && e.contains("is not claimed") => Ok(json!({"readings": []})),
+        r => r,
+    }?;
+    let counts = extra.and_then(|(c, q)| ask(ix, c, q).ok()).map(|v| v["counts"].clone()).unwrap_or(Value::Null);
+    index_shape(cmd, p, req, main, counts)
+}
+
+/// An Explorer answer from another arcade in the shape the protocol index command gives here (`cmd`, asked with `req`
+/// on `p`); `counts`: explorer.names's, for `name`.
+fn index_shape(cmd: &str, p: &ChainParams, req: &Value, mut v: Value, counts: Value) -> R {
+    let from = v["_mesh"].clone();
+    let s = |k: &str| req[k].as_str().map(String::from);
+    let mut out = match cmd {
+        "ord" if s("id").is_some() => {
+            // The record as ord::inscription gives it: without the preview and the Explorer's extras.
+            if let Some(o) = v.as_object_mut() {
+                for k in ["content", "owner_tag", "time", "from_arcade", "_mesh"] {
+                    o.remove(k);
+                }
+            }
+            v
+        }
+        "ord" => json!({"chain": p.key, "inscriptions": v["total"], "indexed_to": null, "start": ord::ord_start(p)}),
+        "name" => json!({"name": s("name"), "readings": v["readings"].as_array().into_iter().flatten()
+            .map(|r| json!({"rule": r["rule"], "number": r["number"], "id": r["id"], "owner": r["owner"]})).collect::<Vec<_>>(), "counts": counts}),
+        "map" if s("claim").is_some() => json!({"claim": s("claim"), "number": v["number"], "id": v["id"], "owner": v["owner"]}),
+        // Claims per namespace (an arcade from before batch 5 doesn't give them).
+        "map" => return v.get("counts").filter(|c| c.is_array()).cloned().ok_or_else(|| "the arcade keeping the maps index gives no counts (an older version)".to_string()),
+        "token" if s("tick").is_some() => {
+            if let Some(o) = v.as_object_mut() {
+                for k in ["top", "offset", "n", "total", "from_arcade", "_mesh"] {
+                    o.remove(k);
+                }
+            }
+            v
+        }
+        "token" => json!({"ticks": v["total"]}),
+        "tokens" => {
+            let rows = v["tokens"].as_array().ok_or("the arcade asked gave no token balances")?;
+            return Ok(json!(rows.iter().map(|t| json!({"tick": t["tick"], "overall": t["overall"], "transferable": t["transferable"]})).collect::<Vec<_>>()));
+        }
+        _ => return Err(format!("{cmd} is not an index read")),
+    };
+    if out.is_object() && !from.is_null() {
+        out["_mesh"] = from;
     }
-    if cmd == "explorer.msg_file" {
-        return Some("messages");
-    }
-    if cmd == "explorer.activity" {
-        return Some("addresses");
-    }
-    (cmd.starts_with("explorer.ledger") || matches!(cmd, "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies" | "explorer.arc_ledger") || cmd.starts_with("explorer.arc_")).then_some("ledger")
+    Ok(out)
 }
 
 fn missing_index(e: &str) -> Option<String> {
@@ -425,14 +520,9 @@ fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             Ok(v)
         }
         Err(e) => {
-            // A missing index, or a chain not kept here at all.
-            // (Any other failure, e.g. a chain only borrowed here or not kept at all: any
-            // arcade keeping the chain may know.)
-            // (A site is read from the names index, whatever else is missing here.)
-            let ix = missing_index(&e)
-                .or_else(|| needed_index(cmd).map(String::from))
-                .or_else(|| matches!(cmd, "explorer.site" | "explorer.sites").then(|| "names".to_string()))
-                .unwrap_or_default();
+            // A missing index, or a chain only borrowed here or not kept at all: asked of an arcade keeping the index
+            // the question needs (any arcade keeping the chain for chain data).
+            let ix = missing_index(&e).or_else(|| needed_index(cmd, req).map(String::from)).unwrap_or_default();
             if crate::shares::index_holders(node, p.net, &ix).is_empty() {
                 return Err(e);
             }
@@ -734,7 +824,8 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
         "explorer.maps" => {
             x.need("maps")?;
             let pre = KeyBuf::new().u16(x.c()).done();
-            let total: u64 = maps::counts(&x.node.chain, x.c()).iter().map(|c| c.1).sum();
+            let counts = maps::counts(&x.node.chain, x.c());
+            let total: u64 = counts.iter().map(|c| c.1).sum();
             let (off, want) = (req["offset"].as_u64().unwrap_or(0) as usize, n(50, 200) as usize);
             // Newest first (by inscription number); order "name" (or an `after` cursor) pages by claim.
             let rows = match s("after") {
@@ -742,7 +833,8 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 None if req["order"] != "name" => newest_page(&x, maps::MAP, pre, num_first8, off, want),
                 None => x.node.chain.store(x.c()).read(|r| r.scan_prefix_limit(maps::MAP, &pre, off + want)).map_err(e)?.into_iter().skip(off).collect(),
             };
-            Ok(json!({"total": total, "offset": off, "items": rows.iter().map(|(k, v)| map_row(k, v)).collect::<Vec<_>>()}))
+            // (counts: claims per namespace, as the `map` command gives them, for an arcade asking for them.)
+            Ok(json!({"total": total, "counts": counts, "offset": off, "items": rows.iter().map(|(k, v)| map_row(k, v)).collect::<Vec<_>>()}))
         }
         "explorer.map" => {
             x.need("maps")?;
@@ -1573,6 +1665,47 @@ fn tag_page(x: &Ctx, t: &str, own_chain: bool) -> R {
               "profile": prof.map(|v| json!({"name": v["name"], "bio": v["bio"], "url": v["url"]})), "unit": unit(x.p)}))
 }
 
+/// The kind of search hit each index gives.
+const SEARCH_KINDS: &[(&str, &str)] = &[("names", "name"), ("maps", "map"), ("tokens", "token"), ("ledger", "ltoken")];
+
+/// The search hits from `indexes` this arcade doesn't keep for `x.p` (a borrowed chain, or an index not added here), from
+/// arcades keeping each one: explorer.search answered from their own indexes only, all asked at once and waited on
+/// briefly. (The indexes asked, the hits of their kinds.)
+fn search_elsewhere(x: &Ctx, q: &str, indexes: &[&'static str]) -> (Vec<&'static str>, Vec<Value>) {
+    let lacking: Vec<&'static str> = indexes.iter().copied()
+        .filter(|ix| !x.has(ix) && !crate::shares::index_holders(x.node, x.p.net, ix).is_empty()).collect();
+    if lacking.is_empty() {
+        return (lacking, Vec::new());
+    }
+    let req = json!({"chain": x.p.key, "q": q, "local": true});
+    let (tx, rx) = std::sync::mpsc::channel();
+    for ix in &lacking {
+        let (tx, n, p, ix, req) = (tx.clone(), x.node.self_arc(), x.p, *ix, req.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((ix, mesh_ask(&n, p, ix, "explorer.search", &req)));
+        });
+    }
+    drop(tx);
+    let until = std::time::Instant::now() + std::time::Duration::from_millis(3000);
+    let mut hits = Vec::new();
+    for _ in 0..lacking.len() {
+        let Some(left) = until.checked_duration_since(std::time::Instant::now()) else { break };
+        let Ok((ix, Ok((v, id)))) = rx.recv_timeout(left) else { continue };
+        hits.extend(search_hits(ix, &v).into_iter().map(|mut h| {
+            h["_mesh"] = mesh_from(&id);
+            h
+        }));
+    }
+    (lacking, hits)
+}
+
+/// The hits of index `ix`'s kind in a search answer (one hit, or a list of results).
+fn search_hits(ix: &str, v: &Value) -> Vec<Value> {
+    let Some(kind) = SEARCH_KINDS.iter().find(|(i, _)| *i == ix).map(|(_, k)| *k) else { return Vec::new() };
+    let all: Vec<Value> = if v["kind"] == "results" { v["items"].as_array().cloned().unwrap_or_default() } else { vec![v.clone()] };
+    all.into_iter().filter(|h| h["kind"] == kind && h["id"].is_string()).collect()
+}
+
 fn search(x: &Ctx, q: &str) -> R {
     let c = x.c();
     let q = q.trim();
@@ -1602,6 +1735,10 @@ fn search(x: &Ctx, q: &str) -> R {
         if x.node.chain.header(c, &h).ok().flatten().is_some() {
             return hit("block", q.to_lowercase());
         }
+        // A borrowed chain (or one catching up): our copy may not have that header; a lender knows the block.
+        if crate::borrow::is_borrowed(x.p.key) && crate::borrow::ask_lender(x.node, x.p, "getblockheader", json!([q.to_lowercase(), true])).is_ok_and(|v| v.is_object()) {
+            return hit("block", q.to_lowercase());
+        }
         return hit("tx", q.to_lowercase());
     }
     let digits = q.replace(',', "");
@@ -1615,9 +1752,18 @@ fn search(x: &Ctx, q: &str) -> R {
         if x.has("maps") && maps::lookup(&x.node.chain, c, q).is_some() {
             return hit("map", q.to_string());
         }
+        // Maps not kept here (a borrowed chain): an arcade keeping them says whether it's a map claim.
+        if search_elsewhere(x, q, &["maps"]).1.iter().any(|i| i["kind"] == "map" && i["id"] == q) {
+            return hit("map", q.to_string());
+        }
         return hit("name", q.to_string());
     }
+    // What arcades keeping the indexes this arcade lacks for this chain find (borrowed = installed, batch 5).
+    let (asked, remote) = search_elsewhere(x, q, &["names", "tokens", "ledger"]);
     if x.has("tokens") && tokens::tick(&x.node.chain, c, q).is_some() {
+        return hit("token", q.to_lowercase());
+    }
+    if remote.iter().any(|i| i["kind"] == "token" && i["id"] == q.to_lowercase().as_str()) {
         return hit("token", q.to_lowercase());
     }
     // A plain word: everything it could be on this chain, as a list.
@@ -1653,10 +1799,15 @@ fn search(x: &Ctx, q: &str) -> R {
             }
         }
     }
+    for r in remote {
+        if !items.iter().any(|i| i["kind"] == r["kind"] && i["id"] == r["id"]) {
+            items.push(r);
+        }
+    }
     if items.is_empty() {
         let mut looked = vec!["blocks", "transactions", "addresses", "@tags"];
         for (ix, what) in [("names", "names"), ("maps", "maps"), ("tokens", "tokens"), ("ledger", "arcade tokens")] {
-            if x.has(ix) { looked.push(what); }
+            if x.has(ix) || asked.contains(&ix) { looked.push(what); }
         }
         return Err(format!("nothing matches \"{q}\" (looked in {})", looked.join(", ")));
     }
@@ -1731,11 +1882,40 @@ fn only_public_page_reads_are_answered_for_another_arcade() {
 #[test]
 fn ledger_questions_go_to_arcades_keeping_the_ledger() {
     for c in ["explorer.ledger_bytes", "explorer.page", "explorer.app_cards", "explorer.ledger_inscription", "explorer.arc_ledger"] {
-        assert_eq!(needed_index(c), Some("ledger"), "{c}");
+        assert_eq!(needed_index(c, &json!({})), Some("ledger"), "{c}");
     }
     // ARCADE ledger reads from arcades that only borrow ARCADE are asked of keepers (borrowed = installed, batch 4).
     assert!(FORWARDABLE.contains(&"explorer.arc_ledger"));
-    assert_eq!(needed_index("explorer.tx"), None);
+    assert_eq!(needed_index("explorer.tx", &json!({})), None);
+}
+
+/// Borrowed = installed, batch 5: every forwardable read that shows index data names the index it needs, so on a
+/// borrowed chain (whose local answer names no index) it goes to an arcade keeping that index, not to any arcade
+/// keeping the chain.
+#[cfg(test)]
+#[test]
+fn every_index_read_names_its_index() {
+    let q = json!({});
+    for (c, ix) in [
+        ("explorer.inscriptions", "ord"), ("explorer.inscription", "ord"), ("explorer.inscription_types", "ord"), ("explorer.held", "ord"),
+        ("explorer.ord_outpoints", "ord"), ("explorer.tokens", "tokens"), ("explorer.token", "tokens"), ("explorer.names", "names"),
+        ("explorer.name", "names"), ("explorer.site", "names"), ("explorer.sites", "names"), ("explorer.maps", "maps"), ("explorer.map", "maps"),
+        ("explorer.collections", "collections"), ("explorer.collection", "collections"), ("explorer.collection_of", "collections"),
+        ("explorer.dogefeed", "dogefeed"), ("explorer.dogefeed_address", "dogefeed"), ("explorer.msg_file", "messages"),
+        ("explorer.activity", "addresses"), ("explorer.ledger_tokens", "ledger"), ("explorer.arc_storage_summary", "ledger"),
+    ] {
+        assert_eq!(needed_index(c, &q), Some(ix), "{c}");
+    }
+    assert_eq!(needed_index("explorer.msg_rows", &json!({"table": "post"})), Some("messages"));
+    assert_eq!(needed_index("explorer.msg_rows", &json!({"table": "profile"})), Some("profiles"));
+    assert_eq!(needed_index("explorer.msg_rows", &json!({"table": "tag"})), Some("ledger"));
+    // Every gated read (index data) declares its index, but search, which gathers its parts itself.
+    for c in crate::handlegate::GATED_READS {
+        assert!(*c == "explorer.search" || needed_index(c, &q).is_some(), "{c} names no index");
+    }
+    for c in ["explorer.summary", "explorer.blocks", "explorer.block", "explorer.tx", "explorer.address", "explorer.mempool", "explorer.search", "explorer.tag"] {
+        assert_eq!(needed_index(c, &q), None, "{c} is chain data, or gathers its own parts");
+    }
 }
 
 #[cfg(test)]
@@ -1878,4 +2058,57 @@ mod tests {
         assert_eq!(&seen[57..], &["addr00", "addr01", "addr02"], "the same balance by address, smallest last");
         assert!(holder_page(&rows, pre.len(), 60, 25).1.is_empty());
     }
+}
+
+/// Borrowed = installed, batch 5: the protocol index commands asked of another arcade come back in their own shape.
+#[cfg(test)]
+#[test]
+fn index_reads_from_elsewhere_keep_their_shape() {
+    let p = arcade_chain::params::by_key("pep").unwrap();
+    let from = json!({"node": "abcd", "tag": null});
+    let id = format!("{}i0", "ab".repeat(32));
+    // ord {id}: the record, without the Explorer's preview.
+    let v = index_shape("ord", p, &json!({"id": id}), json!({"id": id, "n": 7, "owner": "P1", "content": {"kind": "image"}, "owner_tag": "x", "time": 1, "_mesh": from}), Value::Null).unwrap();
+    assert_eq!((v["id"].as_str(), v["n"].as_u64(), v["owner"].as_str()), (Some(id.as_str()), Some(7), Some("P1")));
+    assert!(v.get("content").is_none() && v.get("owner_tag").is_none() && v.get("time").is_none());
+    assert_eq!(v["_mesh"], from, "who answered stays told");
+    // ord: counts.
+    let v = index_shape("ord", p, &json!({}), json!({"total": 42, "types": {}}), Value::Null).unwrap();
+    assert_eq!((v["chain"].as_str(), v["inscriptions"].as_u64()), (Some("pep"), Some(42)));
+    assert!(v.get("start").is_some() && v.get("indexed_to").is_some());
+    // name: readings without the Explorer's tag, with the counts.
+    let v = index_shape("name", p, &json!({"name": "bob.pep"}), json!({"readings": [{"rule": 0, "number": 3, "id": id, "owner": "P1", "owner_tag": "z"}]}), json!([1, 2, 3])).unwrap();
+    assert_eq!(v["name"], "bob.pep");
+    assert_eq!(v["readings"], json!([{"rule": 0, "number": 3, "id": id, "owner": "P1"}]));
+    assert_eq!(v["counts"], json!([1, 2, 3]));
+    let none = index_shape("name", p, &json!({"name": "nobody"}), json!({"readings": []}), Value::Null).unwrap();
+    assert_eq!(none["readings"], json!([]), "a name nobody claimed: no readings, as here");
+    // map {claim} and the counts; an older keeper without counts is said so.
+    let v = index_shape("map", p, &json!({"claim": "1.pepemap"}), json!({"claim": "1.pepemap", "number": 9, "id": id, "owner": "P2", "owner_tag": null}), Value::Null).unwrap();
+    assert_eq!((v["claim"].as_str(), v["number"].as_u64(), v["owner"].as_str()), (Some("1.pepemap"), Some(9), Some("P2")));
+    assert_eq!(index_shape("map", p, &json!({}), json!({"total": 3, "counts": [["pepemap", 3]]}), Value::Null).unwrap(), json!([["pepemap", 3]]));
+    assert!(index_shape("map", p, &json!({}), json!({"total": 3}), Value::Null).is_err());
+    // token {tick}: the tick's record, without the holder page; token: how many.
+    let v = index_shape("token", p, &json!({"tick": "pepe"}), json!({"tick": "pepe", "supply": "21", "dec": 18, "top": [], "offset": 0, "n": 1, "total": 5, "holders": "5"}), Value::Null).unwrap();
+    assert_eq!((v["tick"].as_str(), v["supply"].as_str()), (Some("pepe"), Some("21")));
+    assert!(v.get("top").is_none() && v.get("offset").is_none() && v.get("n").is_none());
+    assert_eq!(index_shape("token", p, &json!({}), json!({"total": 12, "items": []}), Value::Null).unwrap(), json!({"ticks": 12}));
+    // tokens {owner}: balances as tokens::balances gives them.
+    let v = index_shape("tokens", p, &json!({"owner": "P1"}), json!({"address": "P1", "tokens": [{"tick": "pepe", "overall": "10", "transferable": "0", "dec": 18}]}), Value::Null).unwrap();
+    assert_eq!(v, json!([{"tick": "pepe", "overall": "10", "transferable": "0"}]));
+    assert!(index_shape("tokens", p, &json!({"owner": "P1"}), json!({"address": "P1"}), Value::Null).is_err(), "no tokens index there");
+}
+
+/// Search hits from another arcade: only the kinds of the index asked of it (the rest this arcade finds itself).
+#[cfg(test)]
+#[test]
+fn search_hits_from_elsewhere() {
+    let list = json!({"kind": "results", "id": "pe", "items": [
+        {"kind": "tag", "id": "pe.pep"}, {"kind": "name", "id": "pe.pep"}, {"kind": "token", "id": "pepe"}, {"kind": "ltoken", "id": "3"}]});
+    assert_eq!(search_hits("tokens", &list), vec![json!({"kind": "token", "id": "pepe"})]);
+    assert_eq!(search_hits("names", &list), vec![json!({"kind": "name", "id": "pe.pep"})]);
+    assert_eq!(search_hits("ledger", &list), vec![json!({"kind": "ltoken", "id": "3"})]);
+    assert_eq!(search_hits("tokens", &json!({"kind": "token", "id": "pepe"})), vec![json!({"kind": "token", "id": "pepe"})], "one hit");
+    assert!(search_hits("maps", &json!({"kind": "name", "id": "1.pepemap"})).is_empty(), "a dotted word is a name unless the maps keeper finds it");
+    assert!(search_hits("ord", &list).is_empty());
 }

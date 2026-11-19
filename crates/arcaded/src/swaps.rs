@@ -200,6 +200,10 @@ pub(crate) fn p2pkh_of(pk: &PublicKey) -> Vec<u8> {
     arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk.serialize()))
 }
 pub(crate) fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
+    // Borrowed (not installed, or catching up): from the block a lender names, checked against our headers.
+    if crate::borrow::is_borrowed(p.key) && !crate::arcsvc::runs(p) {
+        return crate::borrow::depth(node, p, txid);
+    }
     let Ok(Some((b, _))) = node.chain.tx_location(p, txid) else { return 0 };
     let Some((_, h, _)) = node.chain.block_at(p, b).ok().flatten() else { return 0 };
     node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0).saturating_sub(h) + 1
@@ -242,6 +246,10 @@ fn tx_of(node: &Node, p: &ChainParams, txid: &Hash256) -> Option<Tx> {
 pub(crate) fn pool_spender(node: &Node, p: &ChainParams, op: &OutPoint) -> Option<Hash256> {
     if crate::arcsvc::runs(p) {
         return crate::arcsvc::spender(op);
+    }
+    // Borrowed: what this arcade sent through the lenders and still waits.
+    if crate::borrow::is_borrowed(p.key) {
+        return crate::borrow::pool_spender(p, op);
     }
     node.chain.mempool_spender(p.chain_no, op).ok().flatten()
 }
@@ -345,9 +353,12 @@ fn relay(node: &Node) {
             if crate::arcsvc::runs(p) {
                 // Its own pool hands it on; one it holds already is refused, which is fine.
                 let _ = crate::ownwait::send_arc(node, &tx);
-            } else if p.chain_no == node.params.chain_no && crate::borrow::is_borrowed(p.key) {
-                // Borrowed: its lenders hold its parents already (they were sent through them too).
-                let _ = crate::ownwait::send_own(node, node.params, &tx);
+            } else if crate::borrow::is_borrowed(p.key) {
+                // Borrowed: its lenders hold its parents already (they were sent through them too). One still waiting
+                // there is left be; one that dropped out is sent again (crate::ownwait puts it back too).
+                if !crate::borrow::pooled(p, &h) {
+                    let _ = crate::ownwait::send_own(node, p, &tx);
+                }
             } else if p.chain_no == node.params.chain_no {
                 // Its unconfirmed parents first, oldest first: a peer drops a child whose parent it hasn't seen.
                 for parent in ancestors(node, p, &tx) {
@@ -386,6 +397,13 @@ fn relay_once(node: &Node, p: &ChainParams, tx: &Tx) -> Result<String, String> {
     if crate::arcsvc::runs(p) {
         return Ok(crate::ownwait::send_arc(node, &tx)?.0.to_hex());
     }
+    // Borrowed, the home chain or another (borrowed = installed, batch 6): through the lenders, remembered until a
+    // block has it (crate::ownwait puts it back if it drops out).
+    if crate::borrow::is_borrowed(p.key) {
+        let p = crate::chains::find(p.key).ok_or_else(|| format!("unknown chain {}", p.key))?;
+        crate::ownwait::send_own(node, p, tx).map_err(|e| e.replace("the transaction was refused", "refused"))?;
+        return Ok(tx.txid.to_hex());
+    }
     if p.chain_no == node.params.chain_no {
         crate::ownwait::send_own(node, node.params, tx).map_err(|e| e.replace("the transaction was refused", "refused"))?;
         return Ok(tx.txid.to_hex());
@@ -402,7 +420,13 @@ pub(crate) fn send_raw(node: &Node, p: &ChainParams, raw: &[u8]) -> Result<Strin
 pub(crate) fn coins(node: &Node, p: &'static ChainParams, pk: &PublicKey) -> Vec<Utxo> {
     let mut out = Vec::new();
     for (_, script) in crate::coinsend::key_scripts(p, pk) {
-        let list: Vec<Utxo> = if p.chain_no == node.params.chain_no && script == p2pkh_of(pk) {
+        let list: Vec<Utxo> = if crate::borrow::is_borrowed(p.key) && !crate::arcsvc::runs(p) {
+            // Borrowed (borrowed = installed, batch 6): the coins a lender's address index names, each checked
+            // against its block, with the ones followed here and our own waiting change.
+            let mut l = crate::borrow::own_coins(node, p, &script);
+            l.retain(|u| !node.pending_spent.lock().unwrap().contains(&u.outpoint));
+            l
+        } else if p.chain_no == node.params.chain_no && script == p2pkh_of(pk) {
             crate::claims::spendable(node, &script)
         } else {
             node.chain

@@ -161,8 +161,10 @@ fn all_inscriptions(node: &Node) -> Vec<Value> {
 
 // ---------------- tokens ----------------
 
+/// A token's property record on the page's chain: its own ledger, or, while that chain is borrowed here, an arcade
+/// keeping its ledger (crate::lentledger).
 fn prop(node: &Node, pid: u32) -> Option<Value> {
-    led::property(&node.chain, c(node), pid).ok().flatten()
+    crate::lentledger::property(node, crate::pagechain::params(node), pid)
 }
 
 use arcade_ledger::engine::divisible;
@@ -174,6 +176,41 @@ fn shown(p: &Value, units: u64) -> String {
 /// Token holdings of an address: (propertyid, units).
 fn holdings(node: &Node, address: &str) -> Vec<(u32, u64)> {
     led::holdings(&node.chain, c(node), address)
+}
+
+/// Token holdings a send from `address` on `p` may spend: this arcade's own ledger, or, while `p` is borrowed here (not
+/// installed, or still catching up, so our copy may lack the newest moves), an arcade keeping its ledger (its
+/// explorer.address, answered from its own tables). Our own copy when no such arcade answers.
+pub(crate) fn send_holdings(node: &Node, p: &'static arcade_chain::params::ChainParams, address: &str) -> Vec<(u32, u64)> {
+    if crate::borrow::is_borrowed(p.key) {
+        if let Ok(rows) = lent_send_holdings(node, p, address) {
+            return rows;
+        }
+    }
+    led::holdings(&node.chain, p.chain_no, address)
+}
+
+/// What an arcade keeping `p`'s ledger says `address` holds: asked now, not from the explorer's half-minute cache (a
+/// send must not miss tokens that just arrived), and asked once more when the first answer gives none.
+fn lent_send_holdings(node: &Node, p: &'static arcade_chain::params::ChainParams, address: &str) -> Result<Vec<(u32, u64)>, String> {
+    let q = json!({"chain": p.key, "address": address, "history": false, "inscriptions": false, "local": true});
+    let mut last = String::new();
+    for _ in 0..2 {
+        match crate::shares::ask_explorer(node, p, "ledger", "explorer.address", &q) {
+            Ok((v, _)) => match lent_holdings(&v) {
+                Some(rows) => return Ok(rows),
+                None => last = "the arcade asked lists no arcade tokens (no ledger there)".into(),
+            },
+            Err(e) => last = e,
+        }
+    }
+    Err(last)
+}
+
+/// (propertyid, units) of an explorer.address answer's arcade tokens; None when it has none listed (no ledger there).
+fn lent_holdings(v: &Value) -> Option<Vec<(u32, u64)>> {
+    let rows = v["ledger_tokens"].as_array()?;
+    Some(rows.iter().filter_map(|t| Some((t["propertyid"].as_u64()? as u32, t["units"].as_u64()?))).collect())
 }
 
 fn balance_rows(node: &Node, list: &[(u32, u64)]) -> Value {
@@ -537,7 +574,7 @@ pub fn file(node: &Node, page: &str, body: &Value) -> (u16, Value) {
         }
         _ => {
             let id = body["inscription"].as_str().map(String::from).or_else(|| body["inscription"].as_u64().map(|n| n.to_string())).unwrap_or_default();
-            let Some(i) = arcade_ledger::content::inscription(&node.chain, c(node), &id) else { return refuse("no such inscription".into()) };
+            let Some(i) = crate::lentledger::inscription(node, crate::pagechain::params(node), &id) else { return refuse("no such inscription".into()) };
             if !ours(node).iter().any(|a| i["owner"] == a.as_str()) {
                 return refuse("that inscription is not this wallet's".into());
             }
@@ -625,11 +662,11 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
     let from = match r["kind"].as_str().unwrap_or("") {
         "token" => {
             let pid = r["propertyid"].as_u64().or_else(|| r["propertyid"].as_str().and_then(|s| s.parse().ok())).unwrap_or(0) as u32;
-            ours(node).into_iter().find(|a| holdings(node, a).iter().any(|(x, u)| *x == pid && *u >= units)).ok_or("this wallet does not hold that much of that token")?
+            ours(node).into_iter().find(|a| send_holdings(node, crate::pagechain::params(node), a).iter().any(|(x, u)| *x == pid && *u >= units)).ok_or("this wallet does not hold that much of that token")?
         }
         "inscription" => {
             let id = r["inscription"].as_str().map(String::from).or_else(|| r["inscription"].as_u64().map(|n| n.to_string())).unwrap_or_default();
-            let i = arcade_ledger::content::inscription(&node.chain, p.chain_no, &id).ok_or("no such inscription")?;
+            let i = crate::lentledger::inscription(node, p, &id).ok_or("no such inscription")?;
             i["owner"].as_str().filter(|o| ours(node).iter().any(|a| a == o)).map(String::from).ok_or("that inscription is no longer this wallet's")?
         }
         _ => match r["from"].as_str().filter(|f| ours(node).iter().any(|a| a == f)) {
@@ -639,7 +676,8 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
     };
     let sk = key_for(node, &from)?;
     let from_script = arcade_ledger::address::p2pkh_script_for_address(p, &from).ok_or("bad address")?;
-    let coins = crate::claims::spendable(node, &from_script);
+    // (Borrowed: a lender's coins too, each checked against its block; the key never leaves.)
+    let coins = crate::claims::send_coins(node, &from_script);
     let now = arcade_app::now() as u32;
     let tx = match r["kind"].as_str().unwrap_or("") {
         "coins" => arcade_wallet::tx::build_send(p, &to_script, units, &sk, &coins, crate::claims::FEE_PER_KB, crate::claims::DUST, now),
@@ -653,7 +691,7 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
         }
         _ => {
             let id = r["inscription"].as_str().map(String::from).or_else(|| r["inscription"].as_u64().map(|n| n.to_string())).unwrap_or_default();
-            let i = arcade_ledger::content::inscription(&node.chain, p.chain_no, &id).ok_or("no such inscription")?;
+            let i = crate::lentledger::inscription(node, p, &id).ok_or("no such inscription")?;
             // INSC transfer (kind 2): the inscription's txid; the recipient is the reference output.
             let mut d = b"INSC".to_vec();
             d.extend_from_slice(&[1, 2]);
@@ -684,6 +722,61 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
 /// and broadcast when `send`. (txid, fee, outputs).
 pub fn token_send(node: &Node, pid: u32, units: u64, to: &str, send: bool) -> Result<(String, u64, Vec<Value>), String> {
     build(node, &json!({"kind": "token", "propertyid": pid, "units": units, "to": to}), send)
+}
+
+/// [`token_send`] on the ARCADE chain's ledger (installed, or borrowed: holdings from an arcade keeping its ledger,
+/// coins from a lender too, each checked against its block): the key on ARCADE that holds the units signs, here.
+pub fn arc_token_send(node: &Node, p: &'static arcade_chain::params::ChainParams, pid: u32, units: u64, to: &str, send: bool) -> Result<(String, u64, Vec<Value>), String> {
+    let to_script = arcade_ledger::address::script_for_address(p, to.trim()).ok_or_else(|| format!("{to} isn't an ARCADE address"))?;
+    // The wallet's tag keys on ARCADE, its first key too (wallet.keys's: no tag key listed yet on a chain only borrowed).
+    let mut slots: Vec<u32> = node.app.tag_keys(p.chain_no).map_err(|e| e.to_string())?.into_iter().map(|k| k.index).collect();
+    if !slots.contains(&0) {
+        slots.push(0);
+    }
+    let (mut found, mut held) = (None, 0u64);
+    for i in slots {
+        let (k, sk) = node.app.tag_key(p, i).map_err(|e| e.to_string())?;
+        let has = send_holdings(node, p, &k.address).iter().find(|(x, _)| *x == pid).map(|(_, u)| *u).unwrap_or(0);
+        if has >= units {
+            found = Some((k, sk));
+            break;
+        }
+        held = held.max(has);
+    }
+    let (k, sk) = match found {
+        Some(f) => f,
+        None => {
+            // Borrowed: say what the arcade keeping the ledger answered, when it didn't.
+            let why = if crate::borrow::is_borrowed(p.key) { lent_send_holdings(node, p, &node.app.tag_key(p, 0).map_err(|e| e.to_string())?.0.address).err() } else { None };
+            return Err(format!("this wallet does not hold that much of that token (at most {held} units on one of its {} addresses){}", p.name, why.map(|w| format!("; {w}")).unwrap_or_default()));
+        }
+    };
+    let pk = arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+    let script = arcade_wallet::keys::p2pkh_script_for(&pk);
+    let coins = if crate::arcsvc::borrowed(p) {
+        crate::ordsafe::keep_free(node, p, crate::borrow::own_coins(node, p, &script))
+    } else {
+        let mut c = crate::claims::arc_coins(node, p, &script);
+        c.extend(crate::arcsvc::waiting_outputs(&script).into_iter().map(|(op, value)| arcade_wallet::tx::Utxo { outpoint: op, value, script: script.clone() }));
+        c
+    };
+    // Omni simple send: version 0, type 0, property, amount; the recipient is the reference output.
+    let mut payload = vec![0, 0, 0, 0];
+    payload.extend_from_slice(&pid.to_be_bytes());
+    payload.extend_from_slice(&units.to_be_bytes());
+    let tx = arcade_wallet::tx::build_arcade_with(p, &payload, vec![arcade_wallet::tx::TxOutSpec { value: arcade_arc::params::DUST, script: to_script }], &sk, &coins,
+        2 * arcade_arc::params::MIN_FEE_PER_KB, arcade_arc::params::DUST, arcade_app::now() as u32, arcade_wallet::tx::ARCADE_CLASS_C_MAX)
+        .map_err(|e| format!("could not build the token send: {e}"))?;
+    let ins: u64 = tx.inputs.iter().filter_map(|i| coins.iter().find(|c| c.outpoint == i.prevout).map(|c| c.value)).sum();
+    let fee = ins.saturating_sub(tx.outputs.iter().map(|o| o.value).sum());
+    let outs: Vec<Value> = tx.outputs.iter().map(|o| {
+        let a = arcade_ledger::address::address_of(&o.script_pubkey, p);
+        json!({"address": a, "value": o.value, "mine": a.as_deref() == Some(k.address.as_str()), "data": a.is_none()})
+    }).collect();
+    if send {
+        crate::ownwait::send_own(node, p, &tx)?;
+    }
+    Ok((tx.txid.to_hex(), fee, outs))
 }
 
 /// What a request would send, as built now (for the approval card).
@@ -963,6 +1056,16 @@ fn ledger_tx(node: &Node, txid: &str) -> (u16, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// token.send on a borrowed chain: what a keeper's explorer.address lists, as (propertyid, units).
+    #[test]
+    fn lent_token_holdings() {
+        let v = json!({"address": "P1", "ledger_tokens": [{"propertyid": 3, "name": "X", "units": 500, "divisible": false, "balance": "500"},
+                                                          {"propertyid": 7, "units": 1}]});
+        assert_eq!(lent_holdings(&v), Some(vec![(3, 500), (7, 1)]));
+        assert_eq!(lent_holdings(&json!({"ledger_tokens": []})), Some(vec![]), "holds none");
+        assert_eq!(lent_holdings(&json!({"address": "P1"})), None, "no ledger there: our own copy is read instead");
+    }
 
     /// An INSC transfer's payload names the inscription it moves; anything else isn't one.
     #[test]

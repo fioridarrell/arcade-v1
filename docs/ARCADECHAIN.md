@@ -1076,3 +1076,46 @@ after its block-1,100 retarget.
   weight (the first offer of an arcade over 10% lists it) and replicas of them register only after
   `CHALLENGE_WINDOW` = 100 blocks; fraud proofs and reveal demands reach them meanwhile (the watcher asks the poster
   too, since no replica is registered yet). Index families still need more than half.
+
+### 15.6 Large blobs, up to 100 MB (Martin 2026-11-18: "can we make it so that a single arcade blob can be as large as 100 MB?")
+
+Built with **no consensus change** (`crates/arcaded/src/largeblob.rs`). A block still carries at most 4 MB of new blob
+bytes and a blob record still names at most 4 MB; a large blob is made of ordinary blobs:
+
+- **A manifest names the parts.** An ordinary blob of type `application/vnd.arcade.file+json` (the file manifest
+  `scripts/file-publish.py` already made) whose JSON body gives `type`, `size`, `class`, `encoding`, `sha256`, the
+  overall `root` (the RFC 6962 root over all the bytes in the same 127-byte leaves a small blob's root uses) and the
+  ordered `parts` `[[blob id, length], ...]`. Each part is an ordinary blob of type `application/vnd.arcade.part`, of
+  the same class, 3,999,992 bytes (31,496 whole leaves, so a part's leaves are the whole's) but the last. At most
+  `MAX_LARGE_BYTES` = 100,000,000 bytes, so at most 26 parts. The id people use is the manifest's blob id; it names
+  the root and every part. A manifest without `root` is an older file (up to 1 GB) and is served as before.
+- **Publishing:** `arc.blob_publish_large {path | hex, type, class, gzip?, name?, send?}`, and `arc.blob_publish`
+  switches to it above 4 MB. Without `send` it quotes the id, the parts, the fee (parts, manifest and transactions)
+  and the blocks and seconds it takes. With `send` a job starts: one transaction a part, at most 3 waiting at once
+  (a block takes one 4 MB part; the pool's 64 MB of waiting blobs at every arcade is everyone's), each spending the
+  change of the one before while it waits; the manifest last, once every part is in a block or waiting. Rules
+  version 5 only; Permanent, Release or Temporary.
+- **Resuming without paying twice:** the journal is `<home>/arc/<net>/large/<id>.json` with the parts' bytes beside
+  it until the job is done. Each part's transaction is signed and written to the journal before it is sent. After a
+  restart (which empties the pool and its blob bytes) the same transaction is sent again with its bytes. Only when it
+  can't go in (a coin it spends is spent by another, or its parent can never come) is it rebuilt, spending every coin
+  of the old one still here, so the old one can never also go in a block. A part the chain holds already isn't paid
+  for again. `arc.blob_publish_status {id?}` shows each job: parts in blocks and waiting, the manifest, what was paid,
+  resends and rebuilds.
+- **Reading:** `/content/<manifest id>` serves the whole with `Accept-Ranges` and `Range` (a video seeks), one part
+  (4 MB) in memory at a time; a part not here is fetched over the mesh from whoever has it, checked against its id and
+  kept as any viewed blob. The whole is checked against the root once all its parts are here (or while a full read
+  streams); a manifest whose parts don't make its root is refused (502). `arc.blob` on a manifest says `large`. A
+  `bq` answer reads only the piece asked for from the part's file.
+- **Fog (§ FOGSTORE):** a view or serve of any part touches every part here and the manifest, so they fade
+  together; while any part is the publisher's, new, kept, or used, none is dropped; a keeper of a segment holding one
+  part fetches the others. Every arcade keeps the small manifests (up to 64 kB) so it knows which parts belong
+  together. `arc.fog` lists `large` (each large blob: bytes, parts, parts here, copies, floor) and `short_large`;
+  `explorer.arc_storage_summary` gives `large_blobs` and `short.large`, and lists a short large blob's id once instead
+  of its parts'. A large blob's copies are the fewest of its parts' segments'.
+- **Cost at rules version 5** (per started kB of each blob): 100 MB Temporary about 42.30 ARCADE of blob fees,
+  Permanent about 394.82 ARCADE, Release about 282.01, plus 27 transaction fees (about 0.015 ARCADE in all); 27 blocks (26 parts and the
+  manifest), about 68 minutes at 150-second blocks when no other blobs compete for the blocks' 4 MB.
+- **Pass test** (passes, 2026-11-19): `tests/regtest/largenet.py` (two arcades, 2-second blocks): a 100 MB blob published in about 40 s, the publisher
+  stopped and started midway, one mined record for each part and the manifest; fog lists it once; a second arcade
+  holding none of the parts serves a range from the middle, a range across a part boundary and the whole.

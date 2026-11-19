@@ -527,6 +527,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
             }
         }
         "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
+        "realtime.rtc" => crate::rtcsvc::api(node, &s("token").ok_or("token required")?, &s("peer").ok_or("peer required")?, &s("op").ok_or("op required")?, &req["signal"]),
+        "realtime.rtc_status" => Ok(crate::rtcsvc::status()),
         "ring.send" => crate::ringsvc::send(node, &s("page").ok_or("page required")?, &s("to").unwrap_or_default(), &s("line").unwrap_or_default(), &s("link").unwrap_or_default()),
         "ring.waiting" => Ok(crate::ringsvc::waiting(node)),
         "ring.get" => Ok(crate::ringsvc::get(node, &s("id").ok_or("id required")?, &s("page").ok_or("page required")?)),
@@ -822,7 +824,8 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                 }
             };
             use arcade_ledger::{maps, names, ord, tokens};
-            match req["cmd"].as_str().unwrap() {
+            let cmd = req["cmd"].as_str().unwrap();
+            let local = (|| match cmd {
                 "ord" => {
                     need("ord")?;
                     match s("id") {
@@ -867,6 +870,15 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
                     let a = s("owner").ok_or("give an address")?;
                     Ok(json!(tokens::balances(&node.chain, cc, &a).into_iter().map(|(t, o, tr)| json!({"tick": t, "overall": o, "transferable": tr})).collect::<Vec<_>>()))
                 }
+            })();
+            // Borrowed = installed (batch 5): the index not added here, or the chain only borrowed here (where a claim
+            // newer than our copy isn't found yet): read from an arcade keeping the index. (ord.chunks are this
+            // arcade's own fingerprints, never asked elsewhere.)
+            match local {
+                Err(e) if cmd != "ord.chunks" && (crate::explorer::names_missing_index(&e) || crate::borrow::is_borrowed(cp.key)) => {
+                    crate::explorer::index_read_elsewhere(node, cmd, cp, &req).map_err(|why| format!("{e} (asked the mesh too: {why})"))
+                }
+                r => r,
             }
         }
         // This arcade's ARCADE pay and Earn progress, read only (arc.earn without the switch).
@@ -875,7 +887,7 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
         // Token sends from this wallet (tokensend.rs): arcade tokens in one transaction; PRC-20 / DRC-20 as a job.
         "token.send" => crate::tokensend::ledger_send(node, req["propertyid"].as_u64().or_else(|| s("propertyid").and_then(|x| x.parse().ok())).ok_or("propertyid required")? as u32,
-            req["units"].as_u64().or_else(|| s("units").and_then(|x| x.parse().ok())).ok_or("units required (base units)")?, &s("to").ok_or("to required")?, req["send"] == true),
+            req["units"].as_u64().or_else(|| s("units").and_then(|x| x.parse().ok())).ok_or("units required (base units)")?, &s("to").ok_or("to required")?, req["send"] == true, s("chain").as_deref()),
         "token20.send" => crate::tokensend::t20_send(node, &s("chain").ok_or("chain required")?, &s("tick").ok_or("tick required")?, &s("amount").ok_or("amount required")?, &s("to").ok_or("to required")?, req["send"] == true),
         "token20.sends" => Ok(crate::tokensend::t20_sends(node)),
         "ord.send" => crate::ordsend::send(node, s("chain").as_deref(), &s("inscription").ok_or("inscription required")?, &s("to").ok_or("to required")?, req["send"] == true),
@@ -987,7 +999,19 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         }
         // A blob from this arcade's wallet: `path` (a file here) or `hex`, its `type`, `class` (0 permanent, 1 release,
         // 2 temporary), `gzip`; `send` to put it in the pool (without: only what it would cost).
+        // A large blob (crate::largeblob, up to 100 MB): parts over several blocks, then its manifest.
+        "arc.blob_publish_large" => crate::largeblob::api_publish(node, req),
+        "arc.blob_publish_status" => crate::largeblob::api_status(req),
         "arc.blob_publish" => {
+            // Over one block's 4 MB: a large blob.
+            let big = match (s("path"), s("hex")) {
+                (Some(path), _) => std::fs::metadata(&path).map(|m| m.len() > arcade_arc::blob::MAX_BLOB_BYTES as u64).unwrap_or(false),
+                (None, Some(h)) => h.trim().len() / 2 > arcade_arc::blob::MAX_BLOB_BYTES,
+                _ => false,
+            };
+            if big {
+                return crate::largeblob::api_publish(node, req);
+            }
             let bytes = match (s("path"), s("hex")) {
                 (Some(path), _) => std::fs::read(&path).map_err(|e| format!("{path}: {e}"))?,
                 (None, Some(h)) => hex::decode(h.trim()).map_err(|_| "hex is not hex".to_string())?,

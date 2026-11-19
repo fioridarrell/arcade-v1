@@ -53,26 +53,26 @@ const HOST_SHARE: f64 = 0.1;
 /// Hosts whose month's use is kept at most; past it, those with no live login go.
 const HOSTS_KEPT: usize = 4096;
 
-const MAGIC: u32 = 0x2112_A442;
-const ALLOCATE: u16 = 0x003;
-const REFRESH: u16 = 0x004;
-const SEND: u16 = 0x006;
-const DATA: u16 = 0x007;
-const PERMISSION: u16 = 0x008;
+pub(crate) const MAGIC: u32 = 0x2112_A442;
+pub(crate) const ALLOCATE: u16 = 0x003;
+pub(crate) const REFRESH: u16 = 0x004;
+pub(crate) const SEND: u16 = 0x006;
+pub(crate) const DATA: u16 = 0x007;
+pub(crate) const PERMISSION: u16 = 0x008;
 const BIND: u16 = 0x009;
-const A_MAPPED: u16 = 0x0020;
+pub(crate) const A_MAPPED: u16 = 0x0020;
 const A_CHANNEL: u16 = 0x000C;
-const A_LIFETIME: u16 = 0x000D;
-const A_PEER: u16 = 0x0012;
-const A_DATA: u16 = 0x0013;
-const A_RELAYED: u16 = 0x0016;
-const A_TRANSPORT: u16 = 0x0019;
-const A_USERNAME: u16 = 0x0006;
+pub(crate) const A_LIFETIME: u16 = 0x000D;
+pub(crate) const A_PEER: u16 = 0x0012;
+pub(crate) const A_DATA: u16 = 0x0013;
+pub(crate) const A_RELAYED: u16 = 0x0016;
+pub(crate) const A_TRANSPORT: u16 = 0x0019;
+pub(crate) const A_USERNAME: u16 = 0x0006;
 const A_INTEGRITY: u16 = 0x0008;
-const A_ERROR: u16 = 0x0009;
-const A_REALM: u16 = 0x0014;
-const A_NONCE: u16 = 0x0015;
-const UDP: u8 = 17;
+pub(crate) const A_ERROR: u16 = 0x0009;
+pub(crate) const A_REALM: u16 = 0x0014;
+pub(crate) const A_NONCE: u16 = 0x0015;
+pub(crate) const UDP: u8 = 17;
 
 // ---------------------------------------------------------------- hashes
 
@@ -95,7 +95,7 @@ fn sha1(d: &[u8]) -> Vec<u8> {
     sha1::Sha1::digest(d).to_vec()
 }
 
-fn md5(d: &[u8]) -> Vec<u8> {
+pub(crate) fn md5(d: &[u8]) -> Vec<u8> {
     use md5::Digest;
     md5::Md5::digest(d).to_vec()
 }
@@ -128,15 +128,15 @@ pub fn login_with(secret: &[u8], tag: &str, ttl: u64) -> (String, String) {
 
 // ---------------------------------------------------------------- the wire
 
-struct Msg {
-    kind: u16,
-    tid: [u8; 12],
-    attrs: HashMap<u16, Vec<u8>>,
+pub(crate) struct Msg {
+    pub(crate) kind: u16,
+    pub(crate) tid: [u8; 12],
+    pub(crate) attrs: HashMap<u16, Vec<u8>>,
     /// Where MESSAGE-INTEGRITY starts.
     integrity: Option<usize>,
 }
 
-fn parse(p: &[u8]) -> Option<Msg> {
+pub(crate) fn parse(p: &[u8]) -> Option<Msg> {
     if p.len() < 20 {
         return None;
     }
@@ -165,7 +165,7 @@ fn parse(p: &[u8]) -> Option<Msg> {
     Some(Msg { kind, tid, attrs, integrity })
 }
 
-fn build(kind: u16, tid: &[u8; 12], attrs: &[(u16, Vec<u8>)], key: Option<&[u8]>) -> Vec<u8> {
+pub(crate) fn build(kind: u16, tid: &[u8; 12], attrs: &[(u16, Vec<u8>)], key: Option<&[u8]>) -> Vec<u8> {
     let mut body = Vec::new();
     for (t, v) in attrs {
         body.extend_from_slice(&t.to_be_bytes());
@@ -190,7 +190,7 @@ fn build(kind: u16, tid: &[u8; 12], attrs: &[(u16, Vec<u8>)], key: Option<&[u8]>
 }
 
 /// An XOR-address attribute (XOR-MAPPED / XOR-RELAYED / XOR-PEER).
-fn xor_addr(a: SocketAddr, tid: &[u8; 12]) -> Vec<u8> {
+pub(crate) fn xor_addr(a: SocketAddr, tid: &[u8; 12]) -> Vec<u8> {
     let port = a.port() ^ (MAGIC >> 16) as u16;
     match plain(a.ip()) {
         IpAddr::V4(ip) => {
@@ -211,7 +211,7 @@ fn xor_addr(a: SocketAddr, tid: &[u8; 12]) -> Vec<u8> {
 }
 
 /// An XOR-PEER-ADDRESS; IPv4 only, as the relay's sockets are.
-fn peer_addr(v: &[u8]) -> Option<SocketAddrV4> {
+pub(crate) fn peer_addr(v: &[u8]) -> Option<SocketAddrV4> {
     if v.len() != 8 || v[1] != 1 {
         return None;
     }

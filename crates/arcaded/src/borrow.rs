@@ -1268,21 +1268,12 @@ enum Add {
 fn connect(node: &Node, p: &ChainParams, height: u32, b: &Block, watch: &HashSet<Vec<u8>>, add: Add) -> Result<(), String> {
     let key = p.key;
     let mut undo: Vec<Value> = Vec::new();
-    let mut puts: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+    // The wallet's coins this block adds, then the spends, against the store and those: a transaction that spends a
+    // coin made in the same block marks it spent (the ARCADE chain orders a block's transactions by its seed, so a
+    // spender may even come before the coin's own transaction). Before, such a coin stayed unspent here and a later
+    // send picked it again ("an input names a coin that doesn't exist or is spent").
+    let mut rows: Vec<(OutPoint, Value)> = Vec::new();
     for tx in &b.txs {
-        if !tx.is_coinbase() {
-            for (vin, i) in tx.inputs.iter().enumerate() {
-                if let Some(mut c) = coin(node, p, &i.prevout) {
-                    if c["sp"].is_null() {
-                        c["sp"] = json!(tx.txid.to_hex());
-                        c["sh"] = json!(height);
-                        c["vin"] = json!(vin);
-                        undo.push(json!({"spend": [i.prevout.txid.to_hex(), i.prevout.vout]}));
-                        puts.push((k_c(key, &i.prevout), c.to_string().into_bytes()));
-                    }
-                }
-            }
-        }
         for (vout, o) in tx.outputs.iter().enumerate() {
             if watch.contains(&o.script_pubkey) {
                 let op = OutPoint { txid: tx.txid, vout: vout as u32 };
@@ -1293,10 +1284,35 @@ fn connect(node: &Node, p: &ChainParams, height: u32, b: &Block, watch: &HashSet
                 let a = arcade_ledger::address::wallet_address_of(&o.script_pubkey, p);
                 let row = json!({"v": o.value, "s": hex::encode(&o.script_pubkey), "a": a, "h": height, "cb": tx.is_coinbase(), "sp": null, "sh": null, "src": "block"});
                 undo.push(json!({"add": [tx.txid.to_hex(), vout]}));
-                puts.push((k_c(key, &op), row.to_string().into_bytes()));
+                rows.push((op, row));
             }
         }
     }
+    for tx in &b.txs {
+        if tx.is_coinbase() {
+            continue;
+        }
+        for (vin, i) in tx.inputs.iter().enumerate() {
+            let spend = |c: &mut Value| {
+                c["sp"] = json!(tx.txid.to_hex());
+                c["sh"] = json!(height);
+                c["vin"] = json!(vin);
+            };
+            if let Some((_, c)) = rows.iter_mut().find(|(op, _)| *op == i.prevout) {
+                // Made and spent in this block: the "add" undo takes it away whole on a reorg.
+                if c["sp"].is_null() {
+                    spend(c);
+                }
+            } else if let Some(mut c) = coin(node, p, &i.prevout) {
+                if c["sp"].is_null() {
+                    spend(&mut c);
+                    undo.push(json!({"spend": [i.prevout.txid.to_hex(), i.prevout.vout]}));
+                    rows.push((i.prevout, c));
+                }
+            }
+        }
+    }
+    let puts: Vec<(Vec<u8>, Vec<u8>)> = rows.into_iter().map(|(op, c)| (k_c(key, &op), c.to_string().into_bytes())).collect();
     let mut hv = b.id.0.to_vec();
     hv.extend_from_slice(&b.header.encode());
     let mut st = state(node, key).unwrap_or(json!({}));
@@ -2745,6 +2761,13 @@ pub fn waiting_spent(key: &str) -> HashSet<OutPoint> {
     pool_spent(key)
 }
 
+/// The arcades lending `key` that this one is linked to now (node ids), newest tip first: where an arcade that only
+/// borrows the ARCADE chain fetches its blobs (crate::arcblob::view).
+pub fn linked_lenders(key: &str) -> Vec<String> {
+    let Some(node) = NODE.get().and_then(|w| w.upgrade()) else { return Vec::new() };
+    node.cr_offerers(key).into_iter().map(|(id, _)| id).filter(|id| crate::crvia::linked(id)).collect()
+}
+
 /// The time of the newest block a borrowed chain is followed to (None while it isn't borrowed, or before its first).
 pub fn tip_time(key: &str) -> Option<u64> {
     if !is_borrowed(key) {
@@ -2846,6 +2869,35 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
 #[cfg(test)]
 mod tests {
     use super::{arc_borrows, home_borrows, stalled, tips_apart, tips_slack, ARC_START_BEHIND};
+
+    /// A coin made and spent in one block is spent here too, whichever of the two transactions comes first (the
+    /// ARCADE chain orders a block's transactions by its seed); before, it stayed unspent and was picked again.
+    #[test]
+    fn a_coin_made_and_spent_in_one_block_is_spent() {
+        use arcade_chain::{Block, Hash256, Header, OutPoint, Tx, TxIn, TxOut};
+        let t = crate::sitesvc::tests::setup();
+        let p = t.node.params;
+        let mine = vec![0x76, 0xa9, 0x14, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 0x88, 0xac];
+        let tx = |id: u8, ins: Vec<OutPoint>, value: u64| Tx {
+            version: 1, time: None, lock_time: 0, txid: Hash256([id; 32]), raw: vec![id], hogex: false,
+            inputs: ins.into_iter().map(|prevout| TxIn { prevout, script_sig: vec![1], sequence: 0xffff_ffff, witness: vec![] }).collect(),
+            outputs: vec![TxOut { value, script_pubkey: mine.clone() }],
+        };
+        let outside = OutPoint { txid: Hash256([9; 32]), vout: 0 };
+        let made = tx(1, vec![outside], 5_000);
+        let spender = tx(2, vec![OutPoint { txid: made.txid, vout: 0 }], 4_000);
+        for order in [vec![made.clone(), spender.clone()], vec![spender.clone(), made.clone()]] {
+            super::clear(&t.node, p.key);
+            let b = Block { id: Hash256([3; 32]), header: Header::parse(&[0u8; 80]), auxpow: None, txs: order, sig: None, extra: vec![] };
+            let watch: std::collections::HashSet<Vec<u8>> = [mine.clone()].into_iter().collect();
+            super::connect(&t.node, p, 10, &b, &watch, super::Add::Floor).unwrap();
+            let first = super::coin(&t.node, p, &OutPoint { txid: made.txid, vout: 0 }).unwrap();
+            assert_eq!(first["sp"], serde_json::json!(spender.txid.to_hex()), "the coin made in the block is spent by the other");
+            assert!(super::unspent_coin(&t.node, p, &OutPoint { txid: spender.txid, vout: 0 }).is_some(), "the spender's own coin stays");
+            // A reorg takes both away.
+            assert!(super::disconnect(&t.node, p).is_ok());
+        }
+    }
 
     #[test]
     fn the_home_chain_is_borrowed_until_installed_and_while_its_copy_is_far_behind() {

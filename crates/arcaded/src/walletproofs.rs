@@ -82,8 +82,8 @@ pub fn proven(node: &Node, c: u16, owner: &str) -> Vec<(String, String, u64)> {
 /// Publish this wallet's proofs when they differ from what the chain holds (or always, with `force`). The records'
 /// txids, or why nothing was sent.
 pub fn publish(node: &Node, force: bool) -> Result<Value, String> {
-    let p = crate::arcledger::chain()?;
-    let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
+    let p = crate::arcledger::write_chain()?;
+    let tip = crate::arcledger::tip_height(node, p);
     if !aproto::wallets_known(p.chain_no, tip + 1) {
         let from = known_from(p.net).map_or("never on this network".to_string(), |h| format!("from block {h}"));
         return Ok(json!({"sent": false, "why": format!("wallet proofs are known {from}; the chain is at {tip}")}));

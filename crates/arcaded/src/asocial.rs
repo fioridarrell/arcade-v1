@@ -171,8 +171,9 @@ pub fn replies(node: &Node, req: &Value) -> Result<Value, String> {
 
 /// Ops 8 to 10 are written only once the next block knows them.
 fn known_now(node: &Node) -> Result<&'static arcade_chain::params::ChainParams, String> {
-    let p = crate::arcledger::chain()?;
-    let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
+    let p = crate::arcledger::write_chain()?;
+    // The height of whichever copy stands in: a borrowed copy's, while ARCADE is borrowed here.
+    let tip = crate::arcledger::tip_height(node, p);
     if !aproto::social_known(p.chain_no, tip + 1) {
         let from = known_from(p.net).map_or("not yet on this network".to_string(), |h| format!("from block {h}"));
         return Err(format!("reacts, replies and tips on {} are known {from}; the chain is at {tip}", p.name));

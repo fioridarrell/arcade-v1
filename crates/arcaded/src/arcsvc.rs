@@ -1302,6 +1302,10 @@ pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
     let def = DEF.get_or_init(|| def);
+    // The A:// ops' heights, known whether the chain runs here or is borrowed: an arcade that only borrows it writes
+    // records too, and checks them against these (`run` sets them again, the same).
+    arcade_ledger::aproto::set_wallets_from(def.params.chain_no, crate::walletproofs::known_from(def.params.net));
+    arcade_ledger::aproto::set_social_from(def.params.chain_no, crate::asocial::known_from(def.params.net));
     let installed = node.app.store.read(|r| r.get(arcade_app::META, &installed_key(&net))).map_err(db_err)?.is_some();
     if installed {
         let _changing = CHANGING.lock().unwrap();

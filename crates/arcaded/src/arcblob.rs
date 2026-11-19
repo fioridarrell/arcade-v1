@@ -203,8 +203,15 @@ pub fn view(id: &Hash) -> Option<Vec<u8>> {
     if let Some(b) = get(id).or_else(|| cached(id)) {
         return Some(b);
     }
-    let net = crate::arcsvc::svc_net()?;
-    for peer in crate::arcsvc::linked_peers() {
+    // Installed: the arcades its chain is linked to. Only borrowed (no chain running here): the arcades lending it.
+    let (net, peers) = match crate::arcsvc::svc_net() {
+        Some(net) => (net, crate::arcsvc::linked_peers()),
+        None => {
+            let (net, ..) = crate::arcsvc::defined_net()?;
+            (net, crate::arcsvc::defined().map(|p| crate::borrow::linked_lenders(p.key)).unwrap_or_default())
+        }
+    };
+    for peer in peers {
         if let Ok((b, kind, gz)) = fetch_from(&peer, id) {
             if arcade_arc::blob::id_of_bytes(&net, &b) == *id {
                 cache_put(id, &b);

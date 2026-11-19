@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Arcade V1.0 one-line installer for Linux:
+# Arcade V1.0 one-line installer for Linux and macOS:
 #
 #   curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.sh | bash
 #
@@ -26,8 +26,17 @@ say() { printf '\033[1m%s\033[0m\n' "$*"; }
 TTY=/dev/null
 if [ -r /dev/tty ] && (exec </dev/tty) 2>/dev/null; then TTY=/dev/tty; fi
 
+if [ "$(uname -s)" = "Darwin" ]; then
+  # macOS: the same one-line command hands over to install-macos.sh (prebuilt only; options go along).
+  # A script fetched by curl carries no quarantine flag, so Gatekeeper doesn't stop the programs it installs.
+  say "macOS: handing over to the macOS installer..."
+  mac="$(mktemp -t arcade-install-macos)"
+  ref="${BRANCH:-main}"
+  curl -fsSL "https://raw.githubusercontent.com/$OWNER_REPO/$ref/scripts/install-macos.sh" -o "$mac"
+  exec bash "$mac" "$@" <"$TTY"
+fi
 if [ "$(uname -s)" != "Linux" ]; then
-  echo "This installer is for Linux." >&2
+  echo "This installer is for Linux and macOS (Windows: the Setup.exe on the release page)." >&2
   exit 1
 fi
 

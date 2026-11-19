@@ -1394,7 +1394,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
     {
         // A dropped plain copy is read back from this arcade's sealed replica of the blob family.
         let (n, net2) = (Arc::downgrade(node), net);
-        crate::arcblob::set_sealed_reader(Box::new(move |h| { let node = n.upgrade()?; crate::arcseal::sealed_unit(&node, &net2, net2.key, arcade_arc::segment::FAMILY_BLOBS, h) }));
+        crate::arcblob::set_sealed_reader(Box::new(move |family, h| { let node = n.upgrade()?; crate::arcseal::sealed_unit(&node, &net2, net2.key, family, h) }));
     }
     let t0 = Instant::now();
     let mut refused = 0;
@@ -2608,10 +2608,16 @@ pub fn raw_block_at(h: u64) -> Option<Vec<u8>> {
     st.chain.block(&id).map(Block::encode)
 }
 
-/// Height `h`'s unit of the ARCADE chain's blob family (segment::FAMILY_BLOBS): the blobs that block brought, from the
-/// blob store. None while one isn't here.
-pub fn blobs_unit_at(h: u64) -> Option<Vec<u8>> {
+/// Height `h`'s unit of one of the ARCADE chain's blob families: [`FAMILY_BLOBS`](arcade_arc::segment::FAMILY_BLOBS)
+/// (Permanent and Release blobs), or from rules version 5 [`FAMILY_BLOBS_TEMP`](arcade_arc::segment::FAMILY_BLOBS_TEMP)
+/// (Temporary ones, and those a boost brought). None while one isn't here.
+pub fn blobs_unit_of(family: u8, h: u64) -> Option<Vec<u8>> {
     let svc = svc()?;
+    let temp = family == arcade_arc::segment::FAMILY_BLOBS_TEMP;
+    // Before rules version 5 Temporary blobs aren't sealed: the family's units there are empty.
+    if temp && !params::rules_v5(&svc.net, h) {
+        return Some(vec![0]);
+    }
     let ids = {
         let st = svc.st.lock().unwrap();
         if h == 0 {
@@ -2626,7 +2632,7 @@ pub fn blobs_unit_at(h: u64) -> Option<Vec<u8>> {
                 class.entry(r.id(&svc.net)).or_insert(r.class);
             }
             use arcade_arc::blob::Class;
-            b.blob_ids.iter().filter(|i| !matches!(class.get(*i), Some(Class::Temporary | Class::Boost))).copied().collect()
+            b.blob_ids.iter().filter(|i| matches!(class.get(*i), Some(Class::Temporary | Class::Boost)) == temp).copied().collect()
         }
     };
     let mut out = Vec::new();
@@ -2655,6 +2661,16 @@ fn blob_copies(node: &Node, svc: &Svc, h: u64) -> (u64, bool) {
     (copies, here)
 }
 
+/// The audited replicas the registry counts of the ARCADE blob-family segment of `family` covering height `h`: None
+/// while no listed segment covers it (crate::fogstore).
+pub fn segment_replicas(family: u8, h: u64) -> Option<u64> {
+    let svc = svc()?;
+    let st = svc.st.lock().unwrap();
+    let reg = st.chain.storage();
+    let n = reg.catalog().spans(svc.net.key, family).filter(|(first, last, _)| *first <= h && h <= *last).find_map(|(_, _, listed)| listed.map(|l| reg.holders_of(&l.id)));
+    n
+}
+
 /// Whether this arcade keeps every blob's plain copy (`arc.archive`).
 pub fn archive(node: &Node) -> bool {
     node.app.store.read(|r| r.get(arcade_app::META, b"arc_archive")).ok().flatten().is_some_and(|v| v == b"1")
@@ -2665,6 +2681,7 @@ pub fn archive(node: &Node) -> bool {
 /// replicas, or one here: reads unseal it), but the newest 5 of each release line stay plain.
 fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
     if archive(node) {
+        crate::fogstore::round(node, &svc.net, temporary);
         return;
     }
     use arcade_arc::blob::Class;
@@ -2683,6 +2700,10 @@ fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
     }
     let (mut dropped, mut freed) = (0, 0u64);
     for (id, m) in known {
+        // From rules version 5 the fog's rules hold (crate::fogstore::round, below).
+        if params::rules_v5(&svc.net, m.height) {
+            continue;
+        }
         // Boosted (§15 step 4): kept plain until the boost runs out, whatever the class.
         if m.boosted_until > now {
             continue;
@@ -2706,6 +2727,7 @@ fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
     if dropped > 0 {
         eprintln!("arc: blob classes: {dropped} plain copies dropped ({freed} bytes)");
     }
+    crate::fogstore::round(node, &svc.net, temporary);
 }
 
 /// The ARCADE chain's height here.

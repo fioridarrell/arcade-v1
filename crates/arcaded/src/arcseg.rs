@@ -168,8 +168,8 @@ pub fn unit_bytes(node: &Node, p: &ChainParams, family: u8, h: u32) -> Option<Ve
     if family == segment::FAMILY_COINS {
         return coins_record(node, p, h);
     }
-    if family == segment::FAMILY_BLOBS {
-        return crate::arcsvc::runs(p).then(|| crate::arcsvc::blobs_unit_at(h as u64)).flatten();
+    if family == segment::FAMILY_BLOBS || family == segment::FAMILY_BLOBS_TEMP {
+        return crate::arcsvc::runs(p).then(|| crate::arcsvc::blobs_unit_of(family, h as u64)).flatten();
     }
     let (start, _) = journal_span(node, p, family)?;
     if h < start {
@@ -244,6 +244,10 @@ fn journal_span(node: &Node, p: &ChainParams, family: u8) -> Option<(u32, u32)> 
 
 /// The ARCADE network, and the height of its next block: what [`families`] is asked with (which families the catalog
 /// takes, segment::family_at). None while no ARCADE chain is defined here. Never call it holding the chain's lock.
+fn params_v5(net: &Net, at: u64) -> bool {
+    arcade_arc::params::rules_v5(net, at)
+}
+
 pub fn listing_at() -> Option<(Net, u64)> {
     let net = crate::arcsvc::svc_net().or_else(|| crate::arcsvc::defined_net().map(|d| d.0))?;
     Some((net, crate::arcsvc::height().map_or(0, |h| h + 1)))
@@ -254,8 +258,14 @@ pub fn listing_at() -> Option<(Net, u64)> {
 pub fn families(node: &Node, p: &ChainParams, net: &Net, at: u64) -> Vec<u8> {
     let mut v = vec![segment::FAMILY_BLOCKS];
     if crate::arcsvc::runs(p) {
-        // The ARCADE chain's blobs, sealed and paid as its blocks are.
-        v.push(segment::FAMILY_BLOBS);
+        // The ARCADE chain's blobs, sealed and paid as its blocks are. From rules version 5 only the segments this
+        // arcade keeps by choice (crate::fogstore), and Temporary blobs in their own family.
+        if !params_v5(net, at) || crate::fogstore::keeps_any(node, segment::FAMILY_BLOBS) {
+            v.push(segment::FAMILY_BLOBS);
+        }
+        if segment::family_at(net, segment::FAMILY_BLOBS_TEMP, at) && crate::fogstore::keeps_any(node, segment::FAMILY_BLOBS_TEMP) {
+            v.push(segment::FAMILY_BLOBS_TEMP);
+        }
     } else {
         // The coins each block spends: from the blocks, on every coin kept here.
         v.push(segment::FAMILY_COINS);
@@ -280,6 +290,7 @@ pub fn family_name(family: u8) -> &'static str {
         DOGEFEED => "dogefeed",
         segment::FAMILY_COINS => "coins",
         segment::FAMILY_BLOBS => "blobs",
+        segment::FAMILY_BLOBS_TEMP => "temporary blobs",
         _ => "index",
     }
 }
@@ -301,7 +312,7 @@ fn measure(node: &Node, p: &ChainParams, family: u8, most: usize) -> bool {
     // Blocks, the coins they spend and the ARCADE chain's blobs are made from the chain itself: as far as it is settled.
     // An index journal no further than the index has journaled. (Until 2026-11-14 the coins family was measured as a
     // journal, found none, and was never cut.)
-    if !matches!(family, segment::FAMILY_BLOCKS | segment::FAMILY_COINS | segment::FAMILY_BLOBS) {
+    if !matches!(family, segment::FAMILY_BLOCKS | segment::FAMILY_COINS | segment::FAMILY_BLOBS | segment::FAMILY_BLOBS_TEMP) {
         let Some((_, to)) = journal_span(node, p, family) else { return false };
         settled = settled.min(to as u64);
     }
@@ -502,7 +513,7 @@ fn seal_work(node: &Node, net: &Net, p: &ChainParams, family: u8) -> Option<(u64
     let mut settled = tip.checked_sub(SETTLED as u64)?;
     // An index family no further than its index has journaled; blocks and the coins they spend (made from the blocks)
     // as far as the chain is settled.
-    if !matches!(family, segment::FAMILY_BLOCKS | segment::FAMILY_COINS | segment::FAMILY_BLOBS) {
+    if !matches!(family, segment::FAMILY_BLOCKS | segment::FAMILY_COINS | segment::FAMILY_BLOBS | segment::FAMILY_BLOBS_TEMP) {
         settled = settled.min(journal_span(node, p, family)?.1 as u64);
     }
     Some((next, settled))
@@ -566,7 +577,7 @@ fn close_then_prune(open: crate::arcseal::Open, full: u64, range_ended: bool, cl
 /// One copy on disk once a segment is closed: the sealed one (the ARCADE chain keeps its own blocks as it writes them).
 fn prune_closed(node: &Node, p: &'static ChainParams, family: u8, first: u64, last: u64) -> u64 {
     // Blobs keep their plain copies here: which may go, and when, is their class's (§15 step 3).
-    if family == segment::FAMILY_BLOBS {
+    if family == segment::FAMILY_BLOBS || family == segment::FAMILY_BLOBS_TEMP {
         return 0;
     }
     if family == segment::FAMILY_BLOCKS {

@@ -99,7 +99,7 @@ pub fn meta(id: &Hash) -> Option<Meta> {
 }
 
 /// Reads a sealed blob-family unit at a height (this arcade's own replica), set when the chain starts.
-type SealedUnit = Box<dyn Fn(u64) -> Option<Vec<u8>> + Send + Sync>;
+type SealedUnit = Box<dyn Fn(u8, u64) -> Option<Vec<u8>> + Send + Sync>;
 static SEALED: std::sync::OnceLock<SealedUnit> = std::sync::OnceLock::new();
 
 pub fn set_sealed_reader(f: SealedUnit) {
@@ -113,8 +113,10 @@ pub fn get(id: &Hash) -> Option<Vec<u8>> {
         return Some(b);
     }
     let m = meta(id)?;
-    let unit = SEALED.get()?(m.height)?;
     let net = crate::arcsvc::svc_net()?;
+    // From rules version 5 a Temporary blob is sealed in its own family (crate::fogstore::family_of).
+    let family = if arcade_arc::params::rules_v5(&net, m.height) { crate::fogstore::family_of(m.class) } else { arcade_arc::segment::FAMILY_BLOBS };
+    let unit = SEALED.get()?(family, m.height)?;
     split_unit(&unit).into_iter().find(|b| arcade_arc::blob::id_of_bytes(&net, b) == *id)
 }
 
@@ -201,9 +203,9 @@ fn cache_put(id: &Hash, bytes: &[u8]) {
 /// kept in the cache, so a blob many view spreads to many arcades and leaves them when nobody views it any more.
 pub fn view(id: &Hash) -> Option<Vec<u8>> {
     if let Some(b) = get(id).or_else(|| cached(id)) {
+        touch(id);
         return Some(b);
     }
-    // Installed: the arcades its chain is linked to. Only borrowed (no chain running here): the arcades lending it.
     // Installed: the arcades its chain is linked to. Only borrowed (no chain running here): the arcades lending it.
     // Then any other arcade linked now (one that viewed the blob keeps it and serves it, borrowing or not).
     let (net, mut peers) = match crate::arcsvc::svc_net() {
@@ -216,6 +218,18 @@ pub fn view(id: &Hash) -> Option<Vec<u8>> {
     // At most a few of those: each that has no answer costs its wait.
     let extra: Vec<String> = crate::crvia::linked_ids().into_iter().filter(|id| !peers.contains(id)).take(OTHER_PEERS).collect();
     peers.extend(extra);
+    // First, the arcades that announce holding it (crate::fogstore), linked or not yet (asked for a link).
+    let mut holders: Vec<String> = Vec::new();
+    for h in crate::fogstore::holders_now(id) {
+        if crate::crvia::linked(&h) {
+            holders.push(h);
+        } else {
+            crate::fogstore::want_link(&h);
+        }
+    }
+    peers.retain(|p| !holders.contains(p));
+    holders.extend(peers);
+    let peers = holders;
     for peer in peers {
         let got = fetch_from(&peer, id);
         if let Err(e) = &got {
@@ -308,6 +322,12 @@ pub fn serve_piece(link: &mut arcade_mesh::link::Link, head: &serde_json::Value)
     let mut f = crate::arcsvc::keeper_frame("a", serde_json::json!({"id": id_n}));
     match bytes {
         Some(b) => {
+            // Asked for: it counts as used here (fog storage keeps what is viewed or served, crate::fogstore).
+            if at == 0 {
+                if let Some(id) = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()) {
+                    touch(&id);
+                }
+            }
             f.head["len"] = serde_json::json!(b.len());
             f.head["kind"] = serde_json::json!(kind.unwrap_or_default());
             if head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok()).is_some_and(|id| gzipped(&id)) {
@@ -417,7 +437,8 @@ pub fn keep_block(net: &Net, block: &Block) {
 pub fn attach(block: &Block) -> Option<Block> {
     let mut b = block.clone();
     if b.blobs.is_empty() && !b.blob_ids.is_empty() {
-        let old = crate::arcsvc::svc_net().is_some_and(|n| b.header.time.saturating_add(n.blob_window) <= arcade_app::now());
+        // From rules version 5 any block may go without bytes this arcade doesn't keep (crate::fogstore).
+        let old = crate::arcsvc::svc_net().is_some_and(|n| b.header.time.saturating_add(n.blob_window) <= arcade_app::now() || arcade_arc::params::rules_v5(&n, b.header.height));
         let mut blobs = Vec::with_capacity(b.blob_ids.len());
         for id in &b.blob_ids {
             match get(id) {
@@ -524,6 +545,129 @@ pub fn file_range(f: &FileManifest, from: u64, to: u64, mut out: impl FnMut(&[u8
         if !out(&b[a..z]) {
             return false;
         }
+    }
+    true
+}
+
+// ---------------- fog storage's view of the store (crate::fogstore) ----------------
+
+fn mine_path(id: &Hash) -> PathBuf {
+    dir().join(format!("{}.mine", hex::encode(id)))
+}
+
+/// Mark a blob as published by this arcade: it keeps it for good (crate::fogstore).
+pub fn mark_mine(id: &Hash) {
+    let _ = std::fs::create_dir_all(dir());
+    let _ = std::fs::write(mine_path(id), b"");
+}
+
+/// Whether this arcade published the blob.
+pub fn is_mine(id: &Hash) -> bool {
+    mine_path(id).exists()
+}
+
+/// Mark a blob as just used here (viewed or served): its plain copy's or cached copy's time.
+pub fn touch(id: &Hash) {
+    for p in [path(id), cache_dir().join(hex::encode(id))] {
+        if let Ok(f) = std::fs::File::options().append(true).open(&p) {
+            let _ = f.set_modified(std::time::SystemTime::now());
+        }
+    }
+}
+
+fn mtime(p: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(p).ok()?.modified().ok()?.duration_since(std::time::UNIX_EPOCH).ok().map(|d| d.as_secs())
+}
+
+/// When the blob was last viewed or served here (its plain copy's time; one fetched to keep a segment says 0).
+pub fn last_use(id: &Hash) -> Option<u64> {
+    mtime(&path(id))
+}
+
+/// The ids whose bytes are here: plain copies and the cache.
+pub fn held_ids() -> Vec<Hash> {
+    let mut out = Vec::new();
+    for d in [dir(), cache_dir()] {
+        let Ok(rd) = std::fs::read_dir(d) else { continue };
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.len() == 64 && e.metadata().is_ok_and(|m| m.is_file()) {
+                if let Ok(Ok(id)) = hex::decode(&n).map(<Hash>::try_from) {
+                    if !out.contains(&id) {
+                        out.push(id);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Bytes of the blob here (plain or cached), 0 when it isn't.
+pub fn size_here(id: &Hash) -> u64 {
+    std::fs::metadata(path(id)).or_else(|_| std::fs::metadata(cache_dir().join(hex::encode(id)))).map(|m| m.len()).unwrap_or(0)
+}
+
+/// A blob's length as its block's record says (from its meta; else the bytes here).
+pub fn len_of(id: &Hash) -> Option<u64> {
+    Some(size_here(id)).filter(|n| *n > 0)
+}
+
+/// Drop cached copies not viewed or served since `before` (seconds since 1970). Bytes freed.
+pub fn cache_drop_idle(before: u64) -> u64 {
+    let Ok(rd) = std::fs::read_dir(cache_dir()) else { return 0 };
+    let mut freed = 0;
+    for e in rd.flatten() {
+        let n = e.file_name().to_string_lossy().to_string();
+        if n.len() != 64 {
+            continue;
+        }
+        if mtime(&e.path()).is_some_and(|t| t < before) {
+            freed += e.metadata().map(|m| m.len()).unwrap_or(0);
+            let _ = std::fs::remove_file(e.path());
+            let _ = std::fs::remove_file(cache_dir().join(format!("{n}.kind")));
+            let _ = std::fs::remove_file(cache_dir().join(format!("{n}.gz")));
+        }
+    }
+    freed
+}
+
+/// Fetch a blob from whoever has it: the arcades announcing they hold it (crate::fogstore::holders), then the arcades
+/// this one is linked to. An announcing arcade without a link yet is asked for one (through a relay, or UDP), for a
+/// later round. The bytes, checked against the id.
+pub fn fetch_any(node: &crate::node::Node, id: &Hash) -> Option<(Vec<u8>, String, bool)> {
+    let net = crate::arcsvc::svc_net().or_else(|| crate::arcsvc::defined_net().map(|d| d.0))?;
+    let mut peers = crate::fogstore::holders(node, id);
+    for p in crate::arcsvc::linked_peers() {
+        if !peers.contains(&p) {
+            peers.push(p);
+        }
+    }
+    for peer in &peers {
+        if !crate::crvia::linked(peer) {
+            crate::udpsvc::want(peer);
+            let _ = crate::relaysvc::want(node, peer);
+            continue;
+        }
+        if let Ok((b, kind, gz)) = fetch_from(peer, id) {
+            if arcade_arc::blob::id_of_bytes(&net, &b) == *id {
+                return Some((b, kind, gz));
+            }
+        }
+    }
+    None
+}
+
+/// Fetch a blob a kept segment lacks and keep it in the store (not counted as viewed). Whether it's here now.
+pub fn fetch_keep(node: &crate::node::Node, id: &Hash) -> bool {
+    let Some((b, ..)) = fetch_any(node, id) else { return false };
+    let p = path(id);
+    let tmp = p.with_extension("in");
+    if std::fs::write(&tmp, &b).and_then(|_| std::fs::rename(&tmp, &p)).is_err() {
+        return false;
+    }
+    if let Ok(f) = std::fs::File::options().append(true).open(&p) {
+        let _ = f.set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(1));
     }
     true
 }

@@ -31,7 +31,7 @@ pub const FAMILY_ORD: u8 = 1;
 /// The families (2 to 8: the other indexes in the same layout, arcade_chaindb::journal: ledger,
 /// profiles, messages, names, tokens, maps, tags; 12 dogefeed from rules version 4) the catalog
 /// lists. Which of them it takes at a height: [`family_at`].
-pub const FAMILIES: &[u8] = &[FAMILY_BLOCKS, FAMILY_ORD, 2, 3, 4, 5, 6, 7, 8, FAMILY_COINS, FAMILY_BLOBS, FAMILY_DOGEFEED];
+pub const FAMILIES: &[u8] = &[FAMILY_BLOCKS, FAMILY_ORD, 2, 3, 4, 5, 6, 7, 8, FAMILY_COINS, FAMILY_BLOBS, FAMILY_DOGEFEED, FAMILY_BLOBS_TEMP];
 /// The coins each block spends (Martin 2026-11-12): with the blocks, everything the coin tables and the address index
 /// are rebuilt from. Per height: u32 count, then per input of every transaction but the coinbase, in block order: the
 /// coin's txid (32), vout (u32), value (u64), the height it was made at (u32), 1 if a coinbase made it else 0, its
@@ -47,11 +47,17 @@ pub const FAMILY_COLLECTIONS: u8 = 11;
 /// The dogefeed (D://) index's journals (arcade_chaindb::journal::DOGEFEED), in the same layout as ord's: listed from
 /// rules version 4 (ARCADE issue #6, testnet only so far).
 pub const FAMILY_DOGEFEED: u8 = 12;
+/// The ARCADE chain's Temporary blobs (rules version 5, docs/FOGSTORE.md): per height, the blobs of class Temporary (and
+/// those a boost brought first) that block brought, in the layout of [`FAMILY_BLOBS`]. Sealed, audited and paid as any
+/// family, so a Temporary blob's copies count for its floor; its keepers drop it after its time. From rules version 5
+/// on, [`FAMILY_BLOBS`] holds only Permanent and Release blobs, as before.
+pub const FAMILY_BLOBS_TEMP: u8 = 13;
 
 /// Whether the catalog takes entries of `family` in the ARCADE block at `height`: one of [`FAMILIES`], and dogefeed
-/// only from rules version 4 ([`params::rules_v4`]); before that it is refused as an unknown family is.
+/// only from rules version 4 ([`params::rules_v4`]), Temporary blobs only from rules version 5 ([`params::rules_v5`]);
+/// before that it is refused as an unknown family is.
 pub fn family_at(net: &params::Net, family: u8, height: u64) -> bool {
-    FAMILIES.contains(&family) && (family != FAMILY_DOGEFEED || params::rules_v4(net, height))
+    FAMILIES.contains(&family) && (family != FAMILY_DOGEFEED || params::rules_v4(net, height)) && (family != FAMILY_BLOBS_TEMP || params::rules_v5(net, height))
 }
 
 /// Bytes of one table row.

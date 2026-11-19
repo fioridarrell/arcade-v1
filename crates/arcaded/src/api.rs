@@ -861,6 +861,9 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.keeper" => crate::arckeep::api(node, req),
         "arc.genesis" => crate::arcgenesis::status(node),
         "arc.blob" => crate::arcsvc::blob(req),
+        // Fog storage (rules version 5, crate::fogstore): the share kept by choice, and what the fog keeps here.
+        "arc.keep" => crate::fogstore::api_keep(node, req),
+        "arc.fog" => Ok(crate::fogstore::status()),
         // The viewer cache (§15 step 4): its size in MB (0: off; on by default at 2,048) and what it holds.
         "arc.cache" => {
             if let Some(mb) = req["mb"].as_u64() {

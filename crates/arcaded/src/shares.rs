@@ -339,7 +339,8 @@ pub fn hold_frame(node: &Node) -> Frame {
             if node.chain.addresses_on(p.chain_no).unwrap_or(false) {
                 ix.push("addresses");
             }
-            chains.insert(p.net.into(), json!({"mode": "full", "h": h, "blocks": "all", "ord": "all", "tok": "all", "ix": ix}));
+            // (And which blobs it holds, the segments it keeps and its room: crate::fogstore.)
+            chains.insert(p.net.into(), json!({"mode": "full", "h": h, "blocks": "all", "ord": "all", "tok": "all", "ix": ix, "fog": crate::fogstore::announce(node)}));
         }
     }
     // o/at/sig: whose hold this is and when, signed, so it can be passed on across the mesh
@@ -807,6 +808,9 @@ pub fn on_hold(node: &Node, from: &str, h: &Value) {
             let mut e = json!({"mode": mode, "h": v["h"].as_u64(), "blocks": blocks, "ord": clean_groups(&v["ord"]), "tok": clean_groups(&v["tok"]), "lane": lane, "pos": pos, "ix": ix});
             if let Some(rw) = crate::rulecheck::clean_watch(&v["rw"]) {
                 e["rw"] = rw;
+            }
+            if let Some(fog) = crate::fogstore::clean(&v["fog"]) {
+                e["fog"] = fog;
             }
             clean.insert(k.clone(), e);
         }

@@ -66,13 +66,17 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
         if arc {
             return Ok(crate::arcsvc::waiting(5_000).into_iter().map(|raw| (0, raw)).collect());
         }
-        db.mempool(c).map_err(e)
+        // With the transactions passed on to the coin's peers unpooled (an inscription's reveals,
+        // crate::mempoolshare): they wait as much as pooled ones do.
+        let mut all = db.mempool(c).map_err(e)?;
+        all.extend(crate::mempoolshare::passed_pool(node, p));
+        Ok(all)
     };
     let spender = |op: &OutPoint| -> Result<Option<Hash256>, (i64, String)> {
         if arc {
             return Ok(crate::arcsvc::spender(op));
         }
-        db.mempool_spender(c, op).map_err(e)
+        Ok(db.mempool_spender(c, op).map_err(e)?.or_else(|| crate::mempoolshare::passed_spender_of(p, op)))
     };
     let header_json = |hash: &Hash256| -> RpcResult {
         let rec = db.header(c, hash).map_err(e)?.ok_or_else(|| err(-5, "Block not found"))?;
@@ -188,6 +192,23 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
                 return Ok(Value::Null);
             }
             match db.coin(p, &op).map_err(e)? {
+                // An output of a waiting transaction (pooled or passed on): Core answers it with
+                // include_mempool (the default) at 0 confirmations.
+                None if param(2) != Value::Bool(false) => {
+                    let waiting = pool()?.into_iter().find_map(|(_, r)| Tx::parse_with(&r, &p.format).ok().filter(|t| t.txid == txid));
+                    Ok(match waiting.and_then(|t| t.outputs.get(n as usize).cloned()) {
+                        Some(o) => json!({
+                            "bestblock": tip.hash.to_hex(),
+                            "confirmations": 0,
+                            "value": coins(o.value),
+                            "scriptPubKey": {"hex": hex::encode(&o.script_pubkey)},
+                            "coinbase": false,
+                            "checked": false,
+                            "from": "own copy",
+                        }),
+                        None => Value::Null,
+                    })
+                }
                 None => Ok(Value::Null),
                 Some(coin) => Ok(json!({
                     "bestblock": tip.hash.to_hex(),
@@ -213,7 +234,7 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
             for (seen, r) in pool()? {
                 if let Ok(t) = Tx::parse_with(&r, &p.format) {
                     if t.txid == txid {
-                        return Ok(json!({"size": r.len(), "vsize": r.len(), "time": seen, "height": tip.height}));
+                        return Ok(json!({"size": r.len(), "vsize": crate::mempoolshare::vbytes(&t), "time": seen, "height": tip.height}));
                     }
                 }
             }
@@ -564,6 +585,47 @@ mod tests {
             prev = tx.txid;
         }
         assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 20, "all on their way to the coin's peers, in order");
+    }
+
+    /// The reads see passed-on transactions too (TxTOK 2026-11-18: getrawtransaction answered -5 for the
+    /// last, still waiting reveals of a chain that explorer.tx found at 0 confirmations).
+    #[test]
+    fn waiting_reveals_answer_the_reads() {
+        use crate::mempoolshare::tests::{p2sh_funded, raw_spend};
+        let (t, fund, sh, sig) = p2sh_funded(21);
+        let call = |m: &str, a: &[Value]| call_on(&t.node, t.p, m, a);
+        let mut ids = Vec::new();
+        let mut prev = fund;
+        let mut value = 100_021u64;
+        for _ in 0..3 {
+            value -= 100;
+            let raw = raw_spend(&prev, &sig, value, &sh, 0);
+            let tx = Tx::parse_with(&raw, &t.p.format).unwrap();
+            assert_eq!(call("sendrawtransaction", &[json!(hex::encode(&raw))]), Ok(json!(tx.txid.to_hex())));
+            ids.push((tx.txid, raw));
+            prev = tx.txid;
+        }
+        assert!(t.node.chain.mempool(t.p.chain_no).unwrap().is_empty(), "passed on, not pooled");
+        let (last, last_raw) = ids.last().unwrap().clone();
+        // getrawtransaction, raw and verbose.
+        assert_eq!(call("getrawtransaction", &[json!(last.to_hex())]), Ok(json!(hex::encode(&last_raw))));
+        let v = call("getrawtransaction", &[json!(last.to_hex()), json!(1)]).unwrap();
+        assert_eq!(v["txid"], json!(last.to_hex()));
+        assert_eq!(v["confirmations"], json!(0));
+        // getrawmempool and getmempoolentry.
+        let pool = call("getrawmempool", &[]).unwrap();
+        for (id, _) in &ids {
+            assert!(pool.as_array().unwrap().contains(&json!(id.to_hex())), "{pool}");
+        }
+        assert_eq!(call("getmempoolentry", &[json!(last.to_hex())]).unwrap()["size"], json!(last_raw.len()));
+        // gettxout: the last reveal's output is there (include_mempool, the default) at 0 confirmations, not
+        // with include_mempool false; an output a later reveal spends is gone.
+        let out = call("gettxout", &[json!(last.to_hex()), json!(0)]).unwrap();
+        assert_eq!(out["confirmations"], json!(0));
+        assert_eq!(out["scriptPubKey"]["hex"], json!(hex::encode(&sh)));
+        assert_eq!(call("gettxout", &[json!(last.to_hex()), json!(0), json!(false)]), Ok(Value::Null));
+        assert_eq!(call("gettxout", &[json!(ids[0].0.to_hex()), json!(0)]), Ok(Value::Null));
+        assert_eq!(call("gettxout", &[json!(fund.to_hex()), json!(0)]), Ok(Value::Null), "the funding coin is spent by reveal 1");
     }
 
     #[test]

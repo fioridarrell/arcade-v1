@@ -1294,6 +1294,21 @@ pub fn on_coin(db: &ChainDb, p: &ChainParams, op: &arcade_chain::OutPoint) -> Ve
         .collect()
 }
 
+/// The inscriptions on an output with where each sits in it: (id, offset, number).
+pub fn on_coin_at(db: &ChainDb, p: &ChainParams, op: &arcade_chain::OutPoint) -> Vec<(String, u64, Option<u64>)> {
+    let c = p.chain_no;
+    db.store(c)
+        .read(|r| r.scan_prefix(LOC, &loc_prefix(c, &op.txid, op.vout)))
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|(key, _)| key.len() >= 36 + 8)
+        .map(|(key, _)| {
+            let iid: [u8; 36] = key[key.len() - 36..].try_into().unwrap();
+            (iid_str(&iid), be_u64(&key, key.len() - 44), number_of(db, c, &iid))
+        })
+        .collect()
+}
+
 /// Where an inscription is now: (its coin, its offset in the coin).
 pub fn location(db: &ChainDb, p: &ChainParams, id: &str) -> Option<(arcade_chain::OutPoint, u64)> {
     let c = p.chain_no;

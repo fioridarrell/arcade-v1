@@ -1385,8 +1385,10 @@ pub fn sign_action(node: &Node, req: &Value) -> Result<Value, String> {
 /// This wallet's Dogecoin P2PKH coins and key (every input of a D:// action comes from one address).
 fn wallet(node: &Node) -> Result<(arcade_wallet::SecretKey, arcade_wallet::secp256k1::PublicKey, String, Vec<arcade_wallet::tx::Utxo>), String> {
     let p = doge();
-    if crate::borrow::is_borrowed(p.key) || !crate::chains::kept(node, p) {
-        return Err("Dogecoin is not installed here: a D:// record spends this arcade's own DOGE".into());
+    // Installed, or borrowed (borrowed = installed, batch 6): crate::swaps::coins reads a borrowed chain's coins from a
+    // lender (each checked against its block) and crate::swaps::send sends through the lenders.
+    if !crate::borrow::is_borrowed(p.key) && !crate::chains::kept(node, p) {
+        return Err("Dogecoin is neither installed nor borrowed here: a D:// record spends this arcade's own DOGE".into());
     }
     let (sk, pk) = crate::swaps::wallet_key(node, p)?;
     let own = crate::swaps::p2pkh_of(&pk);

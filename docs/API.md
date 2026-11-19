@@ -92,6 +92,7 @@ Files are `{"name": "...", "type": "image/png", "data": "<base64>"}`. Amounts ar
 | `sysinfo.status` | `/api/v1/sysinfo/status` | read | — | Whether this arcade shares its system info, and the exact record it sends or would send (`record`), its size, the seal measurement (`sealed_bytes` of the 64 MiB needed) and what is never shared. |
 | `sysinfo.set` | `/api/v1/sysinfo/set` | admin | on | Share this arcade's system info with the mesh (`on: true`) or stop (`on: false`: an off record goes out and every arcade drops the machine at once). Off by default; kept across restarts and updates. |
 | `explorer.arc_machines` | `/api/v1/explorer/arc_machines` | public | — | The same as `mesh.sysinfo`, for apps (also `/r/explorer/arc_machines`). A record's `node` is the key an earner has in `explorer.arc_holders`. |
+| `explorer.arc_nodes` | `/api/v1/explorer/arc_nodes` | public | — | The Storage app's Nodes and Coins (also `/r/explorer/arc_nodes`): per arcade on the mesh and this one, its chains (mode, indexes, bytes with `size` measured / estimated / unknown), sealed and ready-to-seal bytes, `beta` for old arcades (they can't seal), its machine line when shared; `offmesh` owners of sealed copies not heard lately; per chain keepers, size, listed, segments, replicas, unheld; `totals`. Matched by node id only. Cached 10 s, at most 500 arcades. |
 
 ### Tx
 

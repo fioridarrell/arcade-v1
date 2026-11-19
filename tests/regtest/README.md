@@ -130,3 +130,18 @@ unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/sysinfonet.py targe
 ```
 
 It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about a minute.
+
+## Nodes and sizes for the Storage app (`arcnodesnet.py`)
+
+Three arcades on a closed network with a closed ARCADE chain: A writes it, B links to A and shares its system info,
+C links to B only. A's `explorer.arc_nodes` lists itself, B (linked, with its machine line) and C (heard through B's
+passed-on hold report), each V1.0 (not beta) with Pepecoin testnet kept in full and listed; the chain row counts the
+three keepers; `/r/explorer/arc_nodes` and `/r/explorer/arc_machines` answer. Sizes stay unknown (nothing to measure
+offline); the hold report's `sz` part is checked by `shares::tests::a_hold_carries_its_measured_size_and_passes_it_on`.
+
+```sh
+cargo build -p arcaded
+unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/arcnodesnet.py target/debug/arcaded /tmp/arcnodesnet'
+```
+
+It prints `RESULT: PASS` (exit 0) or the failed steps. It takes a few minutes.

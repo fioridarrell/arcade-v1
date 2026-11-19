@@ -29,6 +29,7 @@ mod arcborrow;
 mod arcseal;
 mod arcserve;
 mod arcstats;
+mod arcnodes;
 mod arcseg;
 mod arcblob;
 mod fogstore;

@@ -408,7 +408,41 @@ pub fn act(node: &Node, kind: &str, target: &str, text: &str, amount: u64) -> Re
 
 pub fn file(node: &Node, txid: &str) -> Result<Value, String> {
     let (c, p) = find_post(node, txid).ok_or("no such post")?;
-    let bytes = m::file(&node.chain, c, txid).ok_or("this post has no file")?;
     use base64::Engine;
-    Ok(json!({"name": p["file"]["name"], "type": p["file"]["type"], "data": base64::engine::general_purpose::STANDARD.encode(bytes)}))
+    if let Some(bytes) = m::file(&node.chain, c, txid) {
+        return Ok(json!({"name": p["file"]["name"], "type": p["file"]["type"], "data": base64::engine::general_purpose::STANDARD.encode(bytes)}));
+    }
+    if p["file"].is_null() {
+        return Err("this post has no file".into());
+    }
+    // A lent post (this arcade's own copy of its chain is borrowed or still catching up): its file from an arcade that
+    // keeps the chain's messages index, checked against the post's own record of it where that names a size.
+    let chain = crate::chains::all().into_iter().find(|q| q.chain_no == c).ok_or("no such post")?;
+    lent_file(node, chain, txid, &p)
+}
+
+/// Files fetched from lenders, kept a while: a feed shows the same pictures again on every refresh.
+static LENT_FILES: std::sync::Mutex<Vec<(String, Value)>> = std::sync::Mutex::new(Vec::new());
+/// Lent files kept in memory at most (oldest out first).
+const LENT_FILES_KEPT: usize = 32;
+
+fn lent_file(node: &Node, p: &'static arcade_chain::params::ChainParams, txid: &str, post: &Value) -> Result<Value, String> {
+    if let Some(v) = LENT_FILES.lock().unwrap().iter().find(|(t, _)| t == txid).map(|(_, v)| v.clone()) {
+        return Ok(v);
+    }
+    let (v, _) = crate::shares::ask_explorer(node, p, crate::lentrows::index_of(p, "post"), "explorer.msg_file", &json!({"chain": p.key, "txid": txid}))?;
+    use base64::Engine;
+    let bytes = v["data"].as_str().and_then(|d| base64::engine::general_purpose::STANDARD.decode(d).ok()).ok_or("the lender's answer has no file")?;
+    if let Some(size) = post["file"]["size"].as_u64() {
+        if size != bytes.len() as u64 {
+            return Err(format!("the lender's file is {} bytes, the post says {size}", bytes.len()));
+        }
+    }
+    let out = json!({"name": post["file"]["name"], "type": post["file"]["type"], "data": base64::engine::general_purpose::STANDARD.encode(&bytes), "lent": true});
+    let mut kept = LENT_FILES.lock().unwrap();
+    kept.push((txid.to_string(), out.clone()));
+    if kept.len() > LENT_FILES_KEPT {
+        kept.remove(0);
+    }
+    Ok(out)
 }

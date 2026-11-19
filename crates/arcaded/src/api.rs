@@ -269,7 +269,19 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "ledger.write_chains" => Ok(crate::msgsvc::write_chains_status(node)),
         // Posts, acts, message candidates and profiles read from lenders for chains this arcade can't read itself yet.
         "ledger.lent" => Ok(crate::lentrows::status(node)),
-        "msg.stats" => Ok(arcade_ledger::messages::counts(&node.chain, node.ledger_home().chain_no)),
+        "msg.stats" => {
+            let home = node.ledger_home();
+            let mut v = arcade_ledger::messages::counts(&node.chain, home.chain_no);
+            // The ledger home borrowed or catching up: the rows read from lenders too, marked as lent (crate::lentrows).
+            if crate::lentrows::lent(node, home) {
+                let lent: serde_json::Map<String, Value> = ["post", "act", "cand", "profile"].iter()
+                    .map(|t| (t.to_string(), json!(crate::lentrows::rows(node, home, *t).len()))).collect();
+                if let Some(o) = v.as_object_mut() {
+                    o.insert("lent".into(), Value::Object(lent));
+                }
+            }
+            Ok(v)
+        }
         "msg.scan" => Ok(json!({"opened": crate::msgsvc::scan(node)?})),
         "msg.who" => crate::msgsvc::who(node, &s("name").ok_or("name required (@tag or address)")?),
         "msg.conversations" => crate::msgsvc::conversations(node, req["requests"] == true),

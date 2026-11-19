@@ -38,7 +38,7 @@ pub const GATED_READS: &[&str] = &[
     "explorer.search", "explorer.collections", "explorer.collection", "explorer.collection_of",
     "explorer.held",
     // Posts, acts, message candidates and profiles, read by an arcade whose own copy is borrowed or catching up.
-    "explorer.msg_rows",
+    "explorer.msg_rows", "explorer.msg_file",
     // DogeFeed's D:// records (the dogefeed index), as the other indexes; its registrar keys are public setup, not
     // index data, and stay open.
     "explorer.dogefeed", "explorer.dogefeed_tx", "explorer.dogefeed_inscription", "explorer.dogefeed_address",

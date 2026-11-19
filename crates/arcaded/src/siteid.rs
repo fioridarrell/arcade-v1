@@ -47,7 +47,7 @@ const MAX_RESERVED: usize = 50_000;
 /// Digi-ID wallets sign with DigiByte's prefix (BitID ones with Bitcoin's).
 const DIGIID_MAGICS: [&str; 2] = ["DigiByte Signed Message:\n", "Bitcoin Signed Message:\n"];
 /// ARCADE's own prefix, which any chain's answer may use (arcade/llm.py MAGIC).
-const ARCADE_MAGIC: &str = arcade_wallet::keys::PEPECOIN_MAGIC;
+pub(crate) const ARCADE_MAGIC: &str = arcade_wallet::keys::PEPECOIN_MAGIC;
 /// Chains an ARCADE ID never answers with (kept out of everything published).
 const NEVER: [&str; 2] = ["kot", "wjk"];
 
@@ -62,9 +62,9 @@ pub(crate) fn random_hex(n: usize) -> String {
 }
 
 /// A chain's own Core message prefix, where it is known.
-fn chain_magic(chain: &str) -> Option<&'static str> {
+pub(crate) fn chain_magic(chain: &str) -> Option<&'static str> {
     Some(match chain {
-        "pep" | "peptest" | "pepregtest" | "arc" | "main" | "test" => ARCADE_MAGIC,
+        "pep" | "peptest" | "pepregtest" | "arc" | "arctest" | "main" | "test" => ARCADE_MAGIC,
         "doge" => "Dogecoin Signed Message:\n",
         "dgb" | "dgbtest" => "DigiByte Signed Message:\n",
         "ltc" | "ltctest" | "ltcregtest" => "Litecoin Signed Message:\n",

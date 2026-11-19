@@ -90,6 +90,7 @@ mod staker;
 mod sitesvc;
 mod siteid;
 mod sitesign;
+mod psbtbuild;
 mod psbt;
 mod grpsvc;
 mod feedsvc;

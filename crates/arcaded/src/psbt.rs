@@ -237,6 +237,72 @@ impl Psbt {
         Ok(())
     }
 
+    /// An unsigned PSBT (version 1, lock time 0, every sequence final) spending `coins`, each with its whole
+    /// previous transaction, to `outputs`: what a wallet that signs elsewhere is handed.
+    pub fn unsigned(coins: &[(OutPoint, Vec<u8>)], outputs: &[(u64, Vec<u8>)]) -> Result<Psbt, String> {
+        if coins.is_empty() {
+            return Err("a transaction spends at least one coin".into());
+        }
+        let shape = legacy::Shape {
+            version: 1,
+            time: None,
+            inputs: coins.iter().map(|(op, _)| legacy::In { prevout: *op, sequence: u32::MAX }).collect(),
+            outputs: outputs.to_vec(),
+            lock_time: 0,
+        };
+        let raw = legacy::serialize(&shape, &[]);
+        let tx = Tx::parse(&raw).map_err(|e| format!("the transaction: {e:?}"))?;
+        let inputs = coins.iter().map(|(_, prev)| vec![(vec![IN_NON_WITNESS_UTXO], prev.clone())]).collect();
+        Ok(Psbt { tx, global: vec![(vec![0x00], raw)], inputs, outputs: vec![Map::new(); outputs.len()] })
+    }
+
+    /// Finish what a wallet signed: an input not final yet whose P2PKH coin's key left a partial signature gets its
+    /// final scriptSig, and every P2PKH input's signature is checked (a bad one is refused, not sent). The whole
+    /// transaction once every input is final.
+    pub fn finalize_p2pkh(&mut self) -> Result<Vec<u8>, String> {
+        let shape = self.shape();
+        let checked = |i: usize, script: &[u8], pk: &[u8], sig: &[u8]| -> Result<(), String> {
+            if p2pkh(pk) != script {
+                return Err(format!("input {i} is signed by a key its coin isn't locked to"));
+            }
+            let ht = *sig.last().ok_or(format!("input {i}'s signature is empty"))? as u32;
+            let digest = legacy::sighash(&shape, i, script, ht)?;
+            if !legacy::verify(pk, sig, &digest, ht) {
+                return Err(format!("input {i}'s signature doesn't check"));
+            }
+            Ok(())
+        };
+        for i in 0..self.inputs.len() {
+            let v = self.input(i);
+            let p2pkh_coin = v.coin.as_ref().map(|(_, s)| s.clone()).filter(|s| s.len() == 25 && s[..3] == [0x76, 0xa9, 0x14] && s[23..] == [0x88, 0xac]);
+            if v.finalized {
+                if let Some(script) = p2pkh_coin {
+                    let ss = get(&self.inputs[i], &[IN_FINAL_SCRIPTSIG]).unwrap_or_default();
+                    let pushes = arcade_ledger::script::pushes(ss);
+                    if pushes.len() != 2 {
+                        return Err(format!("input {i}'s scriptSig isn't a P2PKH signature and key"));
+                    }
+                    checked(i, &script, pushes[1], pushes[0])?;
+                }
+                continue;
+            }
+            let script = p2pkh_coin.ok_or(format!("input {i} isn't signed yet (and isn't a P2PKH coin this can finish, or doesn't carry its previous transaction)"))?;
+            let (pk, sig) = self.inputs[i]
+                .iter()
+                .find(|(k, _)| k.len() == 34 && k[0] == IN_PARTIAL_SIG && p2pkh(&k[1..]) == script)
+                .map(|(k, v)| (k[1..].to_vec(), v.clone()))
+                .ok_or(format!("input {i} isn't signed yet"))?;
+            checked(i, &script, &pk, &sig)?;
+            let m = &mut self.inputs[i];
+            m.retain(|(k, _)| !IN_DROPPED_ON_FINAL.contains(&k[0]));
+            let mut ss = Vec::new();
+            push(&mut ss, &sig);
+            push(&mut ss, &pk);
+            m.push((vec![IN_FINAL_SCRIPTSIG], ss));
+        }
+        self.extract().ok_or_else(|| "not every input is signed".into())
+    }
+
     /// The whole signed transaction, when every input has its final scriptSig.
     pub fn extract(&self) -> Option<Vec<u8>> {
         let sigs: Option<Vec<Vec<u8>>> = self.inputs.iter().map(|m| get(m, &[IN_FINAL_SCRIPTSIG]).map(<[u8]>::to_vec)).collect();

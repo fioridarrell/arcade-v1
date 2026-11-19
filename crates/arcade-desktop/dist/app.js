@@ -718,7 +718,8 @@ $("w-pubaddr-send").addEventListener("click", async () => {
 // it would do first (no send), and goes on only on a second click. Paired sites' requests wait in id.sign_pending,
 // each shown with what it does, signed or refused with id.sign_decide.
 const aidKind = () => { const c = $("w-aid-code").value.trim(); return c.startsWith("arcadelink://") ? "link" : c.startsWith("arcadesign://") ? "sign" : "digiid"; };
-const aidDoge = (k) => (k == null ? "?" : (Number(k) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })) + " DOGE";
+// Amounts in the unit of the chain a request is on (Dogecoin, or the home chain when it names the home key).
+const aidAmt = (k, unit) => (k == null ? "?" : (Number(k) / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })) + " " + (unit || "DOGE");
 $("w-aid-code").addEventListener("input", () => { $("w-aid-chain").hidden = aidKind() !== "digiid"; $("w-aid-confirm").hidden = true; });
 $("w-aid-check").addEventListener("click", async () => {
   const b = $("w-aid-check");
@@ -731,7 +732,8 @@ $("w-aid-check").addEventListener("click", async () => {
       $("w-aid-send").textContent = `The number is ${r.number}: send`;
     } else if (kind === "sign") {
       const r = await api("id.sign_pair", { qr: code });
-      $("w-aid-text").textContent = `Let ${r.host} ask this app to sign, as ${r.tag ? "@" + r.tag : "this account"} (Dogecoin ${r.address})? Only if that screen shows ${r.number}. Your words stay here: the site only gets your address, and you approve every signature in this app.`;
+      const home = r.home && r.home.address ? `${r.home.name || r.home.chain} ${r.home.address} and ` : "";
+      $("w-aid-text").textContent = `Let ${r.host} ask this app to sign, as ${r.tag ? "@" + r.tag : "this account"} (${home}Dogecoin ${r.address})? Only if that screen shows ${r.number}. Your words stay here: the site only gets your addresses, and you approve every signature in this app.`;
       $("w-aid-send").textContent = `The number is ${r.number}: pair`;
     } else {
       const r = await api("id.answer", { code, chain: $("w-aid-chain").value });
@@ -801,32 +803,35 @@ $("w-aid-scan").addEventListener("click", async () => {
 // What paired sites ask: one card each, with what it does, and Sign / Refuse.
 const aidShown = new Set();
 // One PSBT's lines: what it spends and returns, any inscription, every output, the coins it signs.
-function aidPsbtLines(r) {
+function aidPsbtLines(r, unit) {
   const body = [];
+  const amt = (k) => aidAmt(k, r.unit || unit);
   if (r.label) body.push(h("div", { class: "aid-sub" }, `The site calls it: “${r.label}”`));
   const net = Number(r.to_you || 0) - Number(r.from_you || 0);
-  body.push(h("div", {}, `Spends ${aidDoge(r.from_you)} of your coins; ${aidDoge(r.to_you)} comes back to you; fee ${r.fee == null ? "unknown (not every coin's transaction is given)" : aidDoge(r.fee)}. You ${net < 0 ? "pay " + aidDoge(-net) : "receive " + aidDoge(net)} in all.`));
+  body.push(h("div", {}, `Spends ${amt(r.from_you)} of your coins; ${amt(r.to_you)} comes back to you; fee ${r.fee == null ? "unknown (not every coin's transaction is given)" : amt(r.fee)}. You ${net < 0 ? "pay " + amt(-net) : "receive " + amt(net)} in all.`));
   if (r.inscriptions) body.push(h("div", { class: "msg bad" }, `${r.inscriptions} of the coins you sign carries an inscription (or no arcade could tell it doesn't). Only go on if this is meant to move or list it: a name or Doginal sent by mistake can't be taken back.`));
-  const rows = r.outputs.map((o) => h("tr", {}, h("td", {}, String(o.index)), h("td", { class: "mono" }, o.to + (o.mine ? " (you)" : "")), h("td", { class: "num" }, aidDoge(o.value))));
+  const rows = r.outputs.map((o) => h("tr", {}, h("td", {}, String(o.index)), h("td", { class: "mono" }, o.to + (o.mine ? " (you)" : "")), h("td", { class: "num" }, amt(o.value))));
   body.push(h("table", { class: "aid-outs" }, h("thead", {}, h("tr", {}, h("th", {}, "#"), h("th", {}, "Pays to"), h("th", { class: "num" }, "Amount"))), h("tbody", {}, rows)));
-  const signs = r.inputs.filter((i) => i.sign).map((i) => `#${i.index} ${aidDoge(i.value)} (${i.hash_type})`).join(", ");
+  const signs = r.inputs.filter((i) => i.sign).map((i) => `#${i.index} ${amt(i.value)} (${i.hash_type})`).join(", ");
   body.push(h("div", { class: "aid-sub" }, `Signs your coin${r.inputs.filter((i) => i.sign).length === 1 ? "" : "s"} ${signs}.${r.finalize ? "" : " The site finishes the transaction."}`));
   r.inputs.filter((i) => i.reveal).forEach((i) => body.push(h("div", { class: "aid-sub" }, `Input #${i.index} reveals an inscription you committed: its coin is locked to your key (D:// style); the site writes the inscription itself.`)));
   return body;
 }
 function aidCard(r) {
-  const head = h("div", { class: "aid-req-head" }, h("b", {}, r.site), ` asks ${r.account ? "@" + r.account : "this account"} to sign`);
+  const amt = (k) => aidAmt(k, r.unit);
+  const on = r.key === "home" ? ` with its ${r.chain_name || r.chain} key (${r.address})` : "";
+  const head = h("div", { class: "aid-req-head" }, h("b", {}, r.site), ` asks ${r.account ? "@" + r.account : "this account"} to sign${on}`);
   const body = [];
   if (r.kind === "message") {
     if (r.label) body.push(h("div", { class: "aid-sub" }, `The site calls it: “${r.label}”`));
     body.push(h("div", { class: "aid-sub" }, "A message (it proves you hold this address; it moves no coins):"), h("pre", { class: "aid-msgtext" }, r.message));
   } else if (r.kind === "psbts") {
     const net = Number(r.to_you || 0) - Number(r.from_you || 0);
-    body.push(h("div", {}, `${r.items.length} transactions, signed together with one yes. In all: spends ${aidDoge(r.from_you)} of your coins; ${aidDoge(r.to_you)} comes back to you; fees ${r.fee == null ? "unknown" : aidDoge(r.fee)}. You ${net < 0 ? "pay " + aidDoge(-net) : "receive " + aidDoge(net)} in all.`));
+    body.push(h("div", {}, `${r.items.length} transactions, signed together with one yes. In all: spends ${amt(r.from_you)} of your coins; ${amt(r.to_you)} comes back to you; fees ${r.fee == null ? "unknown" : amt(r.fee)}. You ${net < 0 ? "pay " + amt(-net) : "receive " + amt(net)} in all.`));
     if (r.inscriptions) body.push(h("div", { class: "msg bad" }, `${r.inscriptions} of the coins you sign carry an inscription. Only go on if these are meant to move or be listed.`));
-    r.items.forEach((it, n) => body.push(h("details", { class: "aid-item" }, h("summary", {}, `${n + 1}. ${it.label || "Transaction " + (n + 1)}${it.inscriptions ? " · inscription" : ""}`), aidPsbtLines(it))));
+    r.items.forEach((it, n) => body.push(h("details", { class: "aid-item" }, h("summary", {}, `${n + 1}. ${it.label || "Transaction " + (n + 1)}${it.inscriptions ? " · inscription" : ""}`), aidPsbtLines(it, r.unit))));
   } else {
-    body.push(...aidPsbtLines(r));
+    body.push(...aidPsbtLines(r, r.unit));
   }
   const out = h("p", { class: "msg" });
   const go = (ok) => async (ev) => {

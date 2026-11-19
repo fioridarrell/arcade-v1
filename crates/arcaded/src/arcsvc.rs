@@ -2537,6 +2537,16 @@ pub fn unspent(op: &OutPoint) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().chain.coins().contains_key(op))
 }
 
+/// An unspent coin of the running ARCADE chain's best branch, (script, value), and the transaction that made it, read
+/// from its block (the store copy follows a block a moment later; a website's PSBT needs it at once).
+pub fn coin_and_tx(op: &OutPoint) -> Option<(Vec<u8>, u64, Option<Vec<u8>>)> {
+    let svc = svc()?;
+    let st = svc.st.lock().unwrap();
+    let c = st.chain.coins().get(op)?;
+    let tx = st.chain.id_at(c.height).and_then(|id| st.chain.block(&id)).and_then(|b| b.txs.iter().find(|t| t.txid == op.txid).map(|t| t.raw.clone()));
+    Some((c.script.clone(), c.value, tx))
+}
+
 /// How many blocks in a row up to the tip `me` wrote (at most `max`).
 fn alone_streak<T: arcade_arc::time::TimeProofs, S: arcade_arc::chain::Storage>(chain: &Chain<T, S>, me: &[u8; 32], max: u64) -> u64 {
     alone_streak_from(chain, me, max, chain.tip().height)

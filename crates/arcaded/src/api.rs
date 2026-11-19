@@ -487,6 +487,9 @@ fn dispatch_inner(node: &Node, req: &Value) -> Result<Value, String> {
         "tx.activity" => crate::sitesvc::activity(node, req),
         "tx.fee" => crate::sitesvc::fee(node, req),
         "tx.broadcast" => crate::sitesvc::broadcast(node, req),
+        // Build-only transactions for a key that signs in the ARCADE app (crate::psbtbuild; ARCADE Git #23).
+        "psbt.send" | "psbt.feed_post" | "psbt.feed_act" | "psbt.finalize" => crate::psbtbuild::dispatch(node, req),
+        "msg.verify" => crate::psbtbuild::verify(req),
         "realtime.send" => crate::realtime::send(node, &s("token").ok_or("token required")?, req["data"].as_str(), req["b64"].as_str()),
         "realtime.leave" => crate::realtime::leave(node, &s("token").ok_or("token required")?),
         "realtime.poll" => crate::realtime::poll(&s("token").ok_or("token required")?, req["wait"].as_u64().unwrap_or(0)),

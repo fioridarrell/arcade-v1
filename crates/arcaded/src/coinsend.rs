@@ -468,7 +468,9 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
     let mut out = json!({"blobs": blobs, "blob_fee": blob_fee, "fee": fee, "txid": tx.txid.to_hex(), "hex": hex::encode(&tx.raw), "size": tx.raw.len(), "sent": false});
     if send {
         for (bytes, ..) in items {
-            crate::arcblob::hold(&net, bytes.clone()).ok_or("no room for more waiting blobs")?;
+            let id = crate::arcblob::hold(&net, bytes.clone()).ok_or("no room for more waiting blobs")?;
+            // This arcade's own: it keeps them for good (crate::fogstore).
+            crate::arcblob::mark_mine(&id);
         }
         let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
         out["sent"] = json!(true);

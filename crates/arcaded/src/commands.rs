@@ -190,6 +190,8 @@ cmds! {
     "ledger.announce" Wallet "" "Publish this wallet's profile (messaging key under its @tag) on the ARCADE chain.";
     "ledger.profile" Read "address | tag" "A profile and @tag as the ARCADE chain's ledger holds them.";
     "ledger.send" Wallet "hex" "Send one arcade record (the whole payload after the marker) on the ARCADE chain.";
+    "arc.keep" Admin "mb?" "Keep a share of the ARCADE chain's blobs by choice (rules version 5): whole segments, sealed and paid; segments short of copies first. mb: the share in MB (0 or \"off\": none).";
+    "arc.fog" Read "" "Fog storage here: what it holds (own, kept, viewed), the segments it keeps, those short of copies on the network, warnings.";
     "arc.blob" Read "id" "A blob of the ARCADE chain (hex), fetched from linked arcades when it isn't here.";
     "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?" "Put a file on the ARCADE chain as a blob (0.01 ARCADE a kB).";
     "a.profile" Read "tag? | address?" "A profile card on the ARCADE chain (yours when neither), with follower counts.";

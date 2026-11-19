@@ -28,6 +28,7 @@ mod arcseal;
 mod arcserve;
 mod arcseg;
 mod arcblob;
+mod fogstore;
 mod arcgit;
 mod reposvc;
 mod relrepo;

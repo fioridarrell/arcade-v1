@@ -130,3 +130,21 @@ unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/sysinfonet.py targe
 ```
 
 It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about a minute.
+
+## Keep shares by machine and a lost keeper replaced (`keepernet.py`)
+
+Six arcades on a closed ARCADE chain (rules version 5 from height 2, copy floor capped at 2 with
+`ARCADE_FOG_FLOOR_MAX`), each with its own made-up disk budget (`ARCADE_DISK_BUDGET_TEST`): A publishes, T is tiny and
+borrows everything, M is medium (a 3 MB share), L is a frontier machine (25% of its free space), X and Y are in between
+(50 MB). It checks each machine's suggestion and that nothing is set by itself; T works and reads the fog map through
+the mesh; the segments fill from whoever has room, the large machine first, M never taking the 6 MB segment; the
+short list counts only registered, audited replicas; `explorer.arc_blobs` and `explorer.arc_fog_nodes` (roles, the
+large blob as one item, the per-node panel, a blob's journey). Then L is killed for good and the next with room takes
+its segments once its announcement is past the stale time (about a minute); the timeline is printed.
+
+```sh
+cargo build --release -p arcaded
+unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/keepernet.py target/release/arcaded /tmp/keepernet'
+```
+
+It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about 8 minutes.

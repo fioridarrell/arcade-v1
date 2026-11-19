@@ -106,6 +106,7 @@ I18N.add("ar", {
 "Arcade Git (by @strawberry) isn't installed here. Install it from the App Store to read the code?": "Arcade Git (من @strawberry) غير مثبّت هنا. هل تثبّته من متجر التطبيقات لقراءة الشيفرة؟",
 "Arcade Git isn't in the App Store on this arcade yet: the code is also at /git/@arcade/arcade-v1 for git clone": "Arcade Git غير موجود في متجر التطبيقات على هذا الـ arcade بعد: الشيفرة متاحة أيضًا على ‎/git/@arcade/arcade-v1‎ عبر git clone",
 "Arcade V1.0": "Arcade V1.0",
+"Arcade V1.0 is in beta: testing is happening now, and things can change or break. Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com": "Arcade V1.0 في مرحلة تجريبية (بيتا): الاختبار جارٍ الآن، وقد تتغير بعض الأشياء أو تتعطل. شكرًا لتجربتك! للأسئلة أو المشكلات أو الأفكار: team@arcade-nodes.com",
 "Arcade inscription #{0}": "نقش Arcade رقم {0}",
 "Arcade inscriptions": "نقوش Arcade",
 "Arcade inscriptions ({0})": "نقوش Arcade ‏({0})",

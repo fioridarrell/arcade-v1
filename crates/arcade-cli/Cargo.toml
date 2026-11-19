@@ -9,4 +9,5 @@ name = "arcade"
 path = "src/main.rs"
 
 [dependencies]
+arcade-local = { version = "0.1.0", path = "../arcade-local" }
 serde_json = "1.0.154"

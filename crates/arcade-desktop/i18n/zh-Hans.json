@@ -1412,5 +1412,6 @@
  "🔑 revoked key": "🔑 撤销的密钥",
  "🔓 revealed": "🔓 已揭示",
  "🪙 tipped": "🪙 已打赏",
- "Borrowed until ticked · ticked, it syncs here": "勾选前为借用 · 勾选后在此同步"
+ "Borrowed until ticked · ticked, it syncs here": "勾选前为借用 · 勾选后在此同步",
+ "Arcade V1.0 is in beta: testing is happening now, and things can change or break. Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com": "Arcade V1.0 目前是测试版：正在测试中，功能可能会变化或出错。感谢你的试用！有问题、故障或想法，请联系 team@arcade-nodes.com"
 }

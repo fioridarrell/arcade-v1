@@ -88,14 +88,29 @@ async function webInvoke(name, args = {}) {
 // Everything goes through arcaded's local API (one JSON request each). A call still out is
 // never sent again: the same call (same command and arguments) shares its answer, so polls
 // don't pile up behind a slow one (ARCADE #16).
+// Each call has a time limit: one never answered would otherwise keep its place in API_OUT, and
+// every later poll of it would wait on it too (that part of the window froze for good). The app
+// (crates/arcade-desktop/src/main.rs, answer_limit) gives up a little sooner with a clearer
+// message; API_SLOW is the same list as its SLOW_COMMANDS (a test there checks).
 const API_OUT = new Map();
+const API_SLOW = ["apps.install", "chains.add", "chains.copy_from_dir", "chains.copy_verify", "chains.index_add", "chains.index_remove", "chains.move", "chains.remove", "inscribe", "share.install", "update.check", "wallet.import"];
+function apiLimitMs(cmd, args) {
+  if (cmd === "realtime.poll") return Math.min(Number(args.wait) || 0, 15000) + 45000;
+  return API_SLOW.includes(cmd) ? 630000 : 135000;
+}
 function api(cmd, args = {}) {
   const key = cmd + " " + JSON.stringify(args);
   if (API_OUT.has(key)) return API_OUT.get(key);
-  const p = invoke("api", { req: { cmd, ...args } }).then((r) => {
-    if (!r.ok) throw new Error(r.error || "failed");
+  const limit = apiLimitMs(cmd, args);
+  let timer;
+  const late = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`no answer from the arcade service in ${Math.round(limit / 1000)} s (${cmd})`)), limit);
+  });
+  const call = invoke("api", { req: { cmd, ...args } }).then((r) => {
+    if (!r.ok) { const e = new Error(r.error || "failed"); e.starting = !!r.starting; throw e; }
     return r.result;
-  }).finally(() => API_OUT.delete(key));
+  });
+  const p = Promise.race([call, late]).finally(() => { clearTimeout(timer); API_OUT.delete(key); });
   API_OUT.set(key, p);
   return p;
 }

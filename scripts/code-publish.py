@@ -3,7 +3,22 @@
 
   code-publish.py --new-key KEYFILE                       make a release key (prints its public key)
   code-publish.py --repo DIR --ref main --version v1.0.0 --key KEYFILE --out DIR \\
-                  [--name @arcade/arcade-v1] [--program linux-x86_64=PATH ...] [--allow-leaks]
+                  [--name @arcade/arcade-v1] --program PLATFORM=ARCHIVE ... [--allow-leaks] [--source-only]
+
+A release carries the program archives the GitHub release workflow (.github/workflows/release.yml) built from the
+same commit, one per system, so every arcade (Linux, Windows, and later macOS) updates to the same code:
+
+  gh release download vX.Y.Z -R martinseeger2002/arcade-v1 -p 'arcade-v1-*' -D rel
+  code-publish.py --repo . --ref vX.Y.Z --version vX.Y.Z --key KEYFILE --out out \\
+      --program linux-x86_64=rel/arcade-v1-linux-x86_64.tar.gz \\
+      --program linux-aarch64=rel/arcade-v1-linux-aarch64.tar.gz \\
+      --program windows-x86_64=rel/arcade-v1-windows-x86_64.zip \\
+      [--program macos-aarch64=rel/arcade-v1-macos-aarch64.tar.gz --program macos-x86_64=rel/arcade-v1-macos-x86_64.tar.gz]
+
+It refuses unless every archive's COMMIT file is the release's commit (--ref) and every required platform
+(linux-x86_64, linux-aarch64, windows-x86_64) is given; an ARCHIVE.sha256 beside an archive is checked too. Without
+program-windows-x86_64 a Windows arcade finds no update in the release (issue #187). --source-only (test networks)
+publishes the code with no programs at all.
 
 It writes into --out: arcade-v1.bundle (the repo's history up to the commit: `git clone arcade-v1.bundle`),
 vendor.tar.zst (every dependency, so `cargo build --offline` works: see BUILD.txt), program-<platform> files, and
@@ -12,7 +27,7 @@ release.json ({record, sig, files}), which `code.add` on an arcade takes as it i
 Everything published is public forever, so the whole history up to the commit is scanned for things that must never be
 published (private keys, wallet phrases, home paths, private addresses) first; any hit stops it unless --allow-leaks.
 """
-import argparse, hashlib, json, os, re, subprocess, sys, tempfile, time
+import argparse, hashlib, json, os, re, subprocess, sys, tarfile, tempfile, time, zipfile
 
 def sh(*a, cwd=None, capture=True):
     r = subprocess.run(a, cwd=cwd, capture_output=capture, text=capture)
@@ -35,6 +50,65 @@ LEAKS = [
     (r"\b(xprv|tprv)[1-9A-HJ-NP-Za-km-z]{100,}", "an extended private key"),
 ]
 
+# The systems a release carries a program archive for (`program-<platform>`, crates/arcaded/src/updater.rs asset_for).
+REQUIRED_PLATFORMS = ["linux-x86_64", "linux-aarch64", "windows-x86_64"]
+OPTIONAL_PLATFORMS = ["macos-aarch64", "macos-x86_64"]
+
+def archive_name(plat):
+    return f"arcade-v1-{plat}.zip" if plat.startswith("windows-") else f"arcade-v1-{plat}.tar.gz"
+
+def archive_commit(path, plat):
+    """The COMMIT file inside a release archive (arcade-v1-<platform>/COMMIT), or None."""
+    want = f"arcade-v1-{plat}/COMMIT"
+    try:
+        if zipfile.is_zipfile(path):
+            with zipfile.ZipFile(path) as z:
+                for i in z.infolist():
+                    # Compress-Archive may write Windows separators.
+                    if i.filename.replace("\\", "/").lstrip("./") == want:
+                        return z.read(i).decode("ascii", "replace").strip()
+        else:
+            with tarfile.open(path, "r:*") as t:
+                for m in t:
+                    if m.isfile() and m.name.lstrip("./") == want:
+                        return t.extractfile(m).read().decode("ascii", "replace").strip()
+    except (OSError, tarfile.TarError, zipfile.BadZipFile) as e:
+        sys.exit(f"--program {plat}: {path} is not a readable release archive ({e})")
+    return None
+
+def check_programs(programs, commit, source_only):
+    """Refuse a release whose programs are not all built from `commit`, or that leaves a required system out."""
+    seen = {}
+    for p in programs:
+        if "=" not in p:
+            sys.exit(f"--program {p}: give PLATFORM=ARCHIVE")
+        plat, path = p.split("=", 1)
+        if plat not in REQUIRED_PLATFORMS + OPTIONAL_PLATFORMS:
+            sys.exit(f"--program {plat}: unknown platform (one of {', '.join(REQUIRED_PLATFORMS + OPTIONAL_PLATFORMS)})")
+        if plat in seen:
+            sys.exit(f"--program {plat} given twice")
+        if os.path.basename(path) != archive_name(plat):
+            sys.exit(f"--program {plat}: expected {archive_name(plat)}, got {os.path.basename(path)}")
+        if not os.path.isfile(path):
+            sys.exit(f"--program {plat}: {path} not found")
+        if os.path.isfile(path + ".sha256"):
+            want = open(path + ".sha256").read().split()[0].lower()
+            if sha256(path) != want:
+                sys.exit(f"--program {plat}: {path} does not match {path}.sha256")
+        c = archive_commit(path, plat)
+        if c != commit:
+            sys.exit(f"--program {plat}: {path} was built from {c or 'an unknown commit (no COMMIT file)'}, not {commit}")
+        seen[plat] = path
+    if source_only:
+        if seen:
+            sys.exit("--source-only publishes no programs; leave out --program")
+        return seen
+    missing = [p for p in REQUIRED_PLATFORMS if p not in seen]
+    if missing:
+        sys.exit(f"missing --program for {', '.join(missing)}: every release carries every required system, built from "
+                 f"{commit} (--source-only for a release with no programs)")
+    return seen
+
 def leak_scan(repo, ref):
     """Every line ever added in the history up to `ref` (what a bundle of it carries)."""
     out = subprocess.run(["git", "-C", repo, "log", "-p", "--no-color", "--format=commit %H", ref], capture_output=True, text=True, errors="replace").stdout
@@ -55,6 +129,7 @@ def main():
     ap.add_argument("--name", default="@arcade/arcade-v1"); ap.add_argument("--key"); ap.add_argument("--out")
     ap.add_argument("--program", action="append", default=[]); ap.add_argument("--allow-leaks", action="store_true")
     ap.add_argument("--no-vendor", action="store_true", help="tests only: leave the dependencies out")
+    ap.add_argument("--source-only", action="store_true", help="test networks: the code with no program archives")
     a = ap.parse_args()
     from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
     from cryptography.hazmat.primitives import serialization as ser
@@ -67,6 +142,7 @@ def main():
     for need in ("repo", "version", "key", "out"):
         if not getattr(a, need): sys.exit(f"--{need} is needed")
     commit = sh("git", "-C", a.repo, "rev-parse", f"{a.ref}^{{commit}}")
+    programs = check_programs(a.program, commit, a.source_only)
     hits = leak_scan(a.repo, commit)
     if hits:
         for c, what, line in hits[:40]: print(f"LEAK? {c} {what}: {line}", file=sys.stderr)
@@ -93,8 +169,7 @@ def main():
             vend = os.path.join(a.out, "vendor.tar.zst")
             subprocess.run(f"tar --sort=name --mtime=@0 --owner=0 --group=0 --numeric-owner -C '{tmp}' -cf - cargo-deps | zstd -19 -T0 -q -f -o '{vend}'", shell=True, check=True)
             files["vendor.tar.zst"] = vend
-    for p in a.program:
-        plat, path = p.split("=", 1)
+    for plat, path in programs.items():
         files[f"program-{plat}"] = path
     build = os.path.join(a.out, "BUILD.txt")
     with open(build, "w") as f:

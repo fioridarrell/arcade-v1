@@ -84,6 +84,34 @@ pub struct Schema {
 pub const ADDON_TABLE_SLOTS: u64 = 256;
 pub const ADDON_PREFIXES: &[&str] = &["ord.", "tok.", "names.", "sites.", "maps.", "ledger.", "msg.", "coll.", "dproto.", "addon."];
 
+/// Upper bound passed to libmdbx. On Linux this is only a ceiling. On Windows this
+/// build of libmdbx reserves the whole bound with one `NtMapViewOfSection`, so a
+/// multi-terabyte ceiling (fine on Linux) exhausts the process once a few databases
+/// are open. 512 GiB is still room for a large chain; the file grows up to that.
+fn geometry_max(requested: isize) -> isize {
+    #[cfg(windows)]
+    {
+        const CAP: isize = 512 << 30;
+        if requested > CAP { CAP } else { requested }
+    }
+    #[cfg(not(windows))]
+    {
+        requested
+    }
+}
+
+/// When libmdbx gives free space at the end of the file back (MDBX shrink_threshold; None = its default, twice the
+/// growth step). On Windows a shrink remaps the file, and to do that libmdbx suspends every thread that has it mapped
+/// (SuspendThread); a suspended thread holding a lock the shrinking one then needs (the allocator's, a reader's) stops
+/// both, and the arcade hung. 0 turns shrinking off there: the file keeps its size and reuses its free pages.
+fn shrink_threshold() -> Option<isize> {
+    if cfg!(windows) {
+        Some(0)
+    } else {
+        None
+    }
+}
+
 pub struct Store {
     db: Database<NoWriteMap>,
     schema: &'static Schema,
@@ -122,8 +150,9 @@ impl Store {
             mode: Mode::ReadWrite(ReadWriteOptions {
                 sync_mode: if durable { SyncMode::Durable } else { SyncMode::SafeNoSync },
                 min_size: None,
-                max_size: Some(schema.max_size),
+                max_size: Some(geometry_max(schema.max_size)),
                 growth_step: Some(64 << 20),
+                shrink_threshold: shrink_threshold(),
                 ..Default::default()
             }),
             ..Default::default()

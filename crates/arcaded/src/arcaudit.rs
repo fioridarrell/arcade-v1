@@ -13,7 +13,6 @@ use arcade_arc::params::{self, Net};
 use arcade_arc::registry::{self, Registry};
 use arcade_arc::sloth::SEALED_LEAF;
 use std::collections::BTreeMap;
-use std::os::unix::fs::FileExt;
 use std::sync::Mutex;
 
 /// The audit leaves of each pick answered here, (replica, picking block) -> leaf hashes, kept
@@ -40,7 +39,7 @@ pub(crate) fn audit_leaves(net: &Net, r: &crate::arcseal::Replica, seed: &Hash) 
     let mut i = 0u64;
     while i < r.leaves {
         let n = (r.leaves - i).min(8192) as usize;
-        f.read_exact_at(&mut buf[..n * SEALED_LEAF], i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
+        crate::arcseal::read_exact_at(&f, &mut buf[..n * SEALED_LEAF], i * SEALED_LEAF as u64).map_err(|e| e.to_string())?;
         for s in buf[..n * SEALED_LEAF].chunks(SEALED_LEAF) {
             out.push(registry::audit_leaf(net, seed, i, s));
             i += 1;

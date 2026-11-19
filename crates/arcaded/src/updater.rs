@@ -9,8 +9,16 @@
 //! (the old ones kept as `<name>.prev`), and restarts: the same clean stop as `systemctl stop` (coin
 //! caches written), then this process starts the new arcaded in its place with the same options.
 //!
-//! "Check now" and "Update now" do the same by hand. Linux only for now (the Windows build
-//! updates with its installer). A local build (no release version) never updates itself.
+//! "Check now" and "Update now" do the same by hand. A local build (no release version) never updates itself.
+//!
+//! **Windows** (the windows branch): the same signed releases, the same checks. Its program archive is
+//! `program-windows-x86_64` (the release's `arcade-v1-windows-x86_64.zip`), carried either by the release itself
+//! (`vX.Y.Z`) or by a Windows release of its own (`vX.Y.Z-windows`, the windows branch's commit); a Windows build's
+//! version `vX.Y.Z-windows` is compared as `vX.Y.Z`. A running program can't be replaced on Windows but can be
+//! renamed, so each one is renamed to `<name>.prev` and the new one put in its place (all put back if any fails); the
+//! MPIR DLLs beside arcaded are swapped the same way. After the clean stop the new arcaded is started in its own
+//! process with the same options (the old one leaves once it has started; the new one waits for the old one's
+//! `arcaded.lock`). An open window keeps running the old Arcade V1.0 until it is reopened.
 
 use crate::node::Node;
 use serde_json::{json, Value};
@@ -44,20 +52,53 @@ fn parse(v: &str) -> Option<(u64, u64, u64)> {
     it.next().is_none().then_some(t)
 }
 
-/// The release archive built for this machine (the folder inside it is named the same, without .tar.gz).
-fn asset_name() -> Option<String> {
-    if !cfg!(target_os = "linux") {
-        return None;
-    }
-    match std::env::consts::ARCH {
-        a @ ("x86_64" | "aarch64") => Some(format!("arcade-v1-linux-{a}.tar.gz")),
+/// A Windows build's version is its release's with "-windows" after it (the windows branch's tags).
+const WINDOWS_SUFFIX: &str = "-windows";
+
+/// A release version for comparing: `vX.Y.Z`, and on Windows `vX.Y.Z-windows` too (as `vX.Y.Z`).
+fn release_version(v: &str, windows: bool) -> Option<(u64, u64, u64)> {
+    parse(v).or_else(|| if windows { parse(v.strip_suffix(WINDOWS_SUFFIX)?) } else { None })
+}
+
+fn rel(v: &str) -> Option<(u64, u64, u64)> {
+    release_version(v, cfg!(windows))
+}
+
+/// Whether `arcaded --version`'s output names release `tag` (on Windows, `vX.Y.Z` and `vX.Y.Z-windows` name the same
+/// release).
+fn says_version(said: &str, tag: &str, windows: bool) -> bool {
+    let base = |v: &str| v.strip_suffix(WINDOWS_SUFFIX).unwrap_or(v).to_string();
+    said.split_whitespace().any(|w| w == tag || (windows && parse(&base(w)).is_some() && base(w) == base(tag)))
+}
+
+/// The release archive built for a system (the folder inside it is named the same, without .tar.gz / .zip).
+fn asset_for(os: &str, arch: &str) -> Option<String> {
+    match (os, arch) {
+        ("linux", a @ ("x86_64" | "aarch64")) => Some(format!("arcade-v1-linux-{a}.tar.gz")),
+        ("windows", "x86_64") => Some("arcade-v1-windows-x86_64.zip".into()),
+        ("macos", a @ ("x86_64" | "aarch64")) => Some(format!("arcade-v1-macos-{a}.tar.gz")),
         _ => None,
     }
 }
 
-/// The release file that holds that archive (`program-<platform>`, crate::arccode).
+/// The release archive built for this machine.
+fn asset_name() -> Option<String> {
+    asset_for(std::env::consts::OS, std::env::consts::ARCH)
+}
+
+/// The folder inside a release archive.
+fn archive_folder(asset: &str) -> &str {
+    asset.trim_end_matches(".tar.gz").trim_end_matches(".zip")
+}
+
+/// The release file that holds an archive (`program-<platform>`, crate::arccode).
+fn program_file_for(asset: &str) -> String {
+    format!("program-{}", archive_folder(asset).trim_start_matches("arcade-v1-"))
+}
+
+/// The release file that holds this machine's archive.
 fn program_file() -> Option<String> {
-    asset_name().map(|a| format!("program-{}", a.trim_start_matches("arcade-v1-").trim_end_matches(".tar.gz")))
+    asset_name().map(|a| program_file_for(&a))
 }
 
 #[derive(Default, Clone)]
@@ -112,7 +153,7 @@ fn unsupported() -> Option<String> {
 
 pub fn status(node: &Node) -> Value {
     let s = st().lock().unwrap().clone();
-    let newer = match (s.newest.as_deref().and_then(parse), version().and_then(parse)) {
+    let newer = match (s.newest.as_deref().and_then(rel), version().and_then(rel)) {
         (Some(n), Some(c)) => n > c,
         _ => false,
     };
@@ -129,7 +170,7 @@ fn newest_release() -> Result<Option<(String, String, String)>, String> {
     let file = program_file().ok_or("no release build for this system")?;
     let best = crate::arccode::held_programs(crate::arccode::ARCADE_V1, &file)
         .into_iter()
-        .filter_map(|(v, path, sha)| Some((parse(&v)?, v, path, sha)))
+        .filter_map(|(v, path, sha)| Some((rel(&v)?, v, path, sha)))
         .max_by(|a, b| a.0.cmp(&b.0));
     Ok(best.map(|(_, v, path, sha)| (v, path.to_string_lossy().into_owned(), sha)))
 }
@@ -145,8 +186,8 @@ pub fn check() -> Result<Option<(String, String, String)>, String> {
         Ok(rel) => {
             s.error = None;
             s.newest = rel.as_ref().map(|r| r.0.clone());
-            let cur = version().and_then(parse);
-            Ok(rel.filter(|r| matches!((parse(&r.0), cur), (Some(n), Some(c)) if n > c)))
+            let cur = version().and_then(self::rel);
+            Ok(rel.filter(|r| matches!((self::rel(&r.0), cur), (Some(n), Some(c)) if n > c)))
         }
         Err(e) => {
             s.error = Some(format!("couldn't look for a release: {e}"));
@@ -181,7 +222,8 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
     let work = work_dir(&node.home)?;
     let result = (|| -> Result<(), String> {
         st().lock().unwrap().doing = "checking the release";
-        let tarball = work.join("release.tar.gz");
+        // (named as its kind: Expand-Archive, the Windows fallback, takes only a .zip)
+        let tarball = work.join(if cfg!(windows) { "release.zip" } else { "release.tar.gz" });
         std::fs::copy(archive, &tarball).map_err(|e| format!("the release archive: {e}"))?;
         // Checked when it was kept; once more, as it is what runs next.
         let got = hex::encode(Sha256::digest(std::fs::read(&tarball).map_err(|e| e.to_string())?));
@@ -189,19 +231,19 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
             return Err(format!("the release archive doesn't match its record ({got} is not {want})"));
         }
         st().lock().unwrap().doing = "installing";
-        let out = std::process::Command::new("tar").arg("--no-same-owner").arg("-xzf").arg(&tarball).arg("-C").arg(&work).output().map_err(|e| format!("tar: {e}"))?;
-        if !out.status.success() {
-            return Err(format!("tar: {}", String::from_utf8_lossy(&out.stderr).trim()));
-        }
-        let bin = work.join(asset_name().unwrap().trim_end_matches(".tar.gz")).join("bin");
+        unpack(&tarball, &work)?;
+        let bin = work.join(archive_folder(&asset_name().unwrap())).join("bin");
         // The new arcaded must run here and be the release it says it is.
-        let v = std::process::Command::new(bin.join("arcaded")).arg("--version").output().map_err(|e| format!("the new arcaded doesn't run here: {e}"))?;
+        let v = quiet(std::process::Command::new(bin.join(format!("arcaded{}", std::env::consts::EXE_SUFFIX))).arg("--version")).output().map_err(|e| format!("the new arcaded doesn't run here: {e}"))?;
         let said = String::from_utf8_lossy(&v.stdout);
-        if !said.split_whitespace().any(|w| w == tag) {
+        if !says_version(&said, tag, cfg!(windows)) {
             return Err(format!("the new arcaded says it is {:?}, not {tag}", said.trim()));
         }
+        #[cfg(windows)]
+        return swap_windows(&bin, &dir);
         // Each program beside arcaded: in place under a temporary name, then renamed over it
         // (a running program keeps the file it started from); the old one kept as .prev.
+        #[allow(unreachable_code)]
         for name in PROGRAMS {
             let (new, at) = (bin.join(name), dir.join(name));
             if !new.exists() || !(at.exists() || *name == "arcaded") {
@@ -269,6 +311,138 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
     }
 }
 
+/// Unpack a release archive into `work`: tar.gz with tar (Linux, as before); on Windows the zip with Windows' own
+/// tar.exe (bsdtar reads zip), else PowerShell's Expand-Archive (as install.ps1 does).
+fn unpack(archive: &std::path::Path, work: &std::path::Path) -> Result<(), String> {
+    #[cfg(not(windows))]
+    {
+        let out = std::process::Command::new("tar").arg("--no-same-owner").arg("-xzf").arg(archive).arg("-C").arg(work).output().map_err(|e| format!("tar: {e}"))?;
+        if !out.status.success() {
+            return Err(format!("tar: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(())
+    }
+    #[cfg(windows)]
+    {
+        let root = std::env::var_os("SystemRoot").map(PathBuf::from).unwrap_or_else(|| PathBuf::from(r"C:\Windows"));
+        let tar = root.join("System32").join("tar.exe");
+        let first = quiet(std::process::Command::new(&tar).arg("-xf").arg(archive).arg("-C").arg(work)).output();
+        if matches!(&first, Ok(o) if o.status.success()) {
+            return Ok(());
+        }
+        let ps = root.join("System32").join("WindowsPowerShell").join("v1.0").join("powershell.exe");
+        let q = |p: &std::path::Path| p.display().to_string().replace('\'', "''");
+        let cmd = format!("$ErrorActionPreference='Stop'; Expand-Archive -LiteralPath '{}' -DestinationPath '{}' -Force", q(archive), q(work));
+        let out = quiet(std::process::Command::new(ps).args(["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &cmd])).output().map_err(|e| format!("Expand-Archive: {e}"))?;
+        if !out.status.success() {
+            let tar_err = match first {
+                Ok(o) => String::from_utf8_lossy(&o.stderr).trim().to_string(),
+                Err(e) => e.to_string(),
+            };
+            return Err(format!("unzip: tar: {tar_err}; Expand-Archive: {}", String::from_utf8_lossy(&out.stderr).trim()));
+        }
+        Ok(())
+    }
+}
+
+/// A helper program started with no console window (Windows); as it is elsewhere.
+fn quiet(c: &mut std::process::Command) -> &mut std::process::Command {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        c.creation_flags(CREATE_NO_WINDOW);
+    }
+    c
+}
+
+#[cfg(windows)]
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// The files of a Windows release put beside arcaded: the programs (when present there, arcaded always) and the
+/// MPIR DLLs chiavdf links. Each running one is renamed to `<name>.prev` (Windows lets a running program or loaded
+/// DLL be renamed, not replaced) and the new one renamed into its place; if any step fails, every file done so far
+/// is put back as it was.
+#[cfg(windows)]
+fn swap_windows(bin: &std::path::Path, dir: &std::path::Path) -> Result<(), String> {
+    let mut names: Vec<String> = PROGRAMS
+        .iter()
+        .map(|n| format!("{n}{}", std::env::consts::EXE_SUFFIX))
+        .filter(|n| bin.join(n).exists() && (dir.join(n).exists() || n.starts_with("arcaded.")))
+        .collect();
+    if let Ok(rd) = std::fs::read_dir(bin) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.to_ascii_lowercase().ends_with(".dll") {
+                names.push(n);
+            }
+        }
+    }
+    // (name, whether an old one was moved to .prev)
+    let mut done: Vec<(String, bool)> = Vec::new();
+    let undo = |done: &[(String, bool)]| {
+        for (n, had) in done.iter().rev() {
+            let (at, prev) = (dir.join(n), dir.join(format!("{n}.prev")));
+            let _ = std::fs::rename(&at, dir.join(format!(".{n}.failed")));
+            let _ = std::fs::remove_file(dir.join(format!(".{n}.failed")));
+            if *had {
+                let _ = std::fs::rename(&prev, &at);
+            }
+        }
+    };
+    for n in &names {
+        let (new, at, prev, tmp) = (bin.join(n), dir.join(n), dir.join(format!("{n}.prev")), dir.join(format!(".{n}.update")));
+        let step = (|| -> Result<bool, String> {
+            std::fs::copy(&new, &tmp).map_err(|e| format!("{n}: {e}"))?;
+            let had = at.exists();
+            if had {
+                clear_prev(dir, n);
+                std::fs::rename(&at, &prev).map_err(|e| format!("{n}: {e}"))?;
+            }
+            if let Err(e) = std::fs::rename(&tmp, &at) {
+                if had {
+                    let _ = std::fs::rename(&prev, &at);
+                }
+                return Err(format!("{n}: {e}"));
+            }
+            Ok(had)
+        })();
+        match step {
+            Ok(had) => done.push((n.clone(), had)),
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp);
+                undo(&done);
+                return Err(e);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Make room for `<name>.prev`: removed, or (a program from the update before still running, e.g. a window not
+/// reopened since) renamed aside to be removed at a later start.
+#[cfg(windows)]
+fn clear_prev(dir: &std::path::Path, n: &str) {
+    let prev = dir.join(format!("{n}.prev"));
+    if !prev.exists() || std::fs::remove_file(&prev).is_ok() {
+        return;
+    }
+    let aside = dir.join(format!(".{n}.old-{}-{}", std::process::id(), arcade_app::now()));
+    let _ = std::fs::rename(&prev, &aside);
+}
+
+/// At start (Windows): the old programs set aside by an earlier update, removed now that nothing runs them.
+#[cfg(windows)]
+fn clean_aside(dir: &std::path::Path) {
+    if let Ok(rd) = std::fs::read_dir(dir) {
+        for e in rd.flatten() {
+            let n = e.file_name().to_string_lossy().into_owned();
+            if n.starts_with('.') && (n.contains(".old-") || n.ends_with(".failed")) {
+                let _ = std::fs::remove_file(e.path());
+            }
+        }
+    }
+}
+
 /// "Update now": install the newest release if it is newer (in the background).
 pub fn update_now(node: Arc<Node>) -> Result<Value, String> {
     if let Some(why) = unsupported() {
@@ -291,6 +465,10 @@ pub fn update_now(node: Arc<Node>) -> Result<Value, String> {
 /// update is installed only while the operator has them on).
 pub fn start(node: Arc<Node>) {
     if let Ok(exe) = std::env::current_exe() {
+        #[cfg(windows)]
+        if let Some(d) = exe.parent() {
+            clean_aside(d);
+        }
         let _ = SELF.set((exe, std::env::args_os().skip(1).collect()));
     }
     let _ = std::thread::Builder::new().name("updates".into()).spawn(move || {
@@ -327,10 +505,37 @@ pub fn exec_self() -> ! {
     }
 }
 
-#[cfg(not(unix))]
+/// Windows has no exec: the new arcaded is started in a process of its own, with the same options, folder and
+/// environment, and [`RESTARTED`] set so it waits for this one's `arcaded.lock`; then this one leaves. (wscript and
+/// the logon task don't start arcaded again by themselves.)
+#[cfg(windows)]
+pub fn exec_self() -> ! {
+    use std::os::windows::process::CommandExt;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    match SELF.get() {
+        Some((exe, args)) => {
+            let start = |flags: u32| std::process::Command::new(exe).args(args).env(RESTARTED, "1").creation_flags(flags).spawn();
+            // Out of the logon task's job if it allows that (so the task ending can't take it along), else in it.
+            match start(CREATE_NO_WINDOW | CREATE_BREAKAWAY_FROM_JOB).or_else(|_| start(CREATE_NO_WINDOW)) {
+                Ok(_) => std::process::exit(0),
+                Err(e) => {
+                    eprintln!("arcaded: couldn't start the new version ({e}); exiting so the service starts it");
+                    std::process::exit(75)
+                }
+            }
+        }
+        None => std::process::exit(75),
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
 pub fn exec_self() -> ! {
     std::process::exit(75)
 }
+
+/// Set in the environment of an arcaded started by an update (Windows): it waits for the old one to let go of
+/// `arcaded.lock` before taking it.
+pub const RESTARTED: &str = "ARCADE_UPDATE_RESTARTED";
 
 #[cfg(test)]
 mod tests {
@@ -359,5 +564,46 @@ mod tests {
         assert!(parse("0.1.63").is_none());
         assert!(parse("v0.1.100") > parse("v0.1.99"));
         assert!(parse("v0.2.0") > parse("v0.1.99"));
+    }
+
+    #[test]
+    fn windows_versions() {
+        // Linux: as before, only vX.Y.Z.
+        assert_eq!(release_version("v0.1.71", false), Some((0, 1, 71)));
+        assert!(release_version("v0.1.71-windows", false).is_none());
+        // Windows: its own builds' versions compare as the release's.
+        assert_eq!(release_version("v0.1.71-windows", true), Some((0, 1, 71)));
+        assert_eq!(release_version("v0.1.72", true), Some((0, 1, 72)));
+        assert!(release_version("v0.1.72-windows", true) > release_version("v0.1.71-windows", true));
+        assert!(release_version("v0.1.71-linux", true).is_none());
+        assert!(release_version("v0.1.71-windows-windows", true).is_none());
+    }
+
+    #[test]
+    fn says_its_version() {
+        assert!(says_version("arcaded v0.1.72\n", "v0.1.72", false));
+        assert!(!says_version("arcaded v0.1.72-windows\n", "v0.1.72", false));
+        assert!(says_version("arcaded v0.1.72-windows\r\n", "v0.1.72", true));
+        assert!(says_version("arcaded v0.1.72-windows\r\n", "v0.1.72-windows", true));
+        assert!(says_version("arcaded v0.1.72\r\n", "v0.1.72-windows", true));
+        assert!(!says_version("arcaded v0.1.71-windows\r\n", "v0.1.72", true));
+        assert!(!says_version("arcaded 0.1.0 (local build)", "v0.1.72", true));
+    }
+
+    #[test]
+    fn archives() {
+        assert_eq!(asset_for("linux", "x86_64").as_deref(), Some("arcade-v1-linux-x86_64.tar.gz"));
+        assert_eq!(asset_for("linux", "aarch64").as_deref(), Some("arcade-v1-linux-aarch64.tar.gz"));
+        assert_eq!(asset_for("windows", "x86_64").as_deref(), Some("arcade-v1-windows-x86_64.zip"));
+        assert!(asset_for("windows", "aarch64").is_none());
+        assert_eq!(asset_for("macos", "aarch64").as_deref(), Some("arcade-v1-macos-aarch64.tar.gz"));
+        assert_eq!(asset_for("macos", "x86_64").as_deref(), Some("arcade-v1-macos-x86_64.tar.gz"));
+        assert_eq!(program_file_for("arcade-v1-macos-aarch64.tar.gz"), "program-macos-aarch64");
+        assert!(asset_for("macos", "riscv64").is_none());
+        assert_eq!(program_file_for("arcade-v1-linux-x86_64.tar.gz"), "program-linux-x86_64");
+        assert_eq!(program_file_for("arcade-v1-linux-aarch64.tar.gz"), "program-linux-aarch64");
+        assert_eq!(program_file_for("arcade-v1-windows-x86_64.zip"), "program-windows-x86_64");
+        assert_eq!(archive_folder("arcade-v1-windows-x86_64.zip"), "arcade-v1-windows-x86_64");
+        assert_eq!(archive_folder("arcade-v1-linux-x86_64.tar.gz"), "arcade-v1-linux-x86_64");
     }
 }

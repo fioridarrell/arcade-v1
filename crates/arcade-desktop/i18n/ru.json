@@ -1412,5 +1412,6 @@
  "🔑 revoked key": "🔑 отозванный ключ",
  "🔓 revealed": "🔓 раскрыто",
  "🪙 tipped": "🪙 чаевые",
- "Borrowed until ticked · ticked, it syncs here": "Заимствуется, пока не отмечена · отмеченная, синхронизируется здесь"
+ "Borrowed until ticked · ticked, it syncs here": "Заимствуется, пока не отмечена · отмеченная, синхронизируется здесь",
+ "Arcade V1.0 is in beta: testing is happening now, and things can change or break. Thank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com": "Arcade V1.0 в бета-версии: сейчас идёт тестирование, и что-то может измениться или сломаться. Спасибо, что попробовали! Вопросы, проблемы или идеи: team@arcade-nodes.com"
 }

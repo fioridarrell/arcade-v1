@@ -1,0 +1,11 @@
+[package]
+name = "arcade-local"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-user data folder and the local API socket shared by arcaded, arcade, and the desktop app."
+
+[dependencies]
+
+[target.'cfg(windows)'.dependencies]
+uds_windows = "1.1"

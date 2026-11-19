@@ -255,34 +255,75 @@ fn queue_all(node: &Node, st: &mut G, f: &Frame) {
 // ---------------- start: sockets ----------------
 
 fn set_bufs(s: &UdpSocket) {
-    use std::os::fd::AsRawFd;
-    let v: libc::c_int = 4 << 20;
-    for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
-        unsafe {
-            libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, std::mem::size_of_val(&v) as u32);
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        let v: libc::c_int = 4 << 20;
+        for opt in [libc::SO_RCVBUF, libc::SO_SNDBUF] {
+            unsafe {
+                libc::setsockopt(s.as_raw_fd(), libc::SOL_SOCKET, opt, &v as *const _ as *const libc::c_void, std::mem::size_of_val(&v) as u32);
+            }
         }
+    }
+    #[cfg(windows)]
+    {
+        // libc's Windows bindings do not carry the Winsock buffer constants. 4 MiB, same as Linux.
+        let sock = socket2::SockRef::from(s);
+        let _ = sock.set_recv_buffer_size(4 << 20);
+        let _ = sock.set_send_buffer_size(4 << 20);
     }
 }
 
 /// "::" with IPV6_V6ONLY off, so IPv4 askers reach it too (stun.py:45-58).
 fn bind_dual(port: u16) -> std::io::Result<UdpSocket> {
-    use std::os::fd::FromRawFd;
-    unsafe {
-        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
+    #[cfg(unix)]
+    {
+        use std::os::fd::FromRawFd;
+        unsafe {
+            // Closed on exec (an update starts the new arcaded): SOCK_CLOEXEC on Linux, FD_CLOEXEC set after on the
+            // other Unixes (macOS has no SOCK_CLOEXEC).
+            #[cfg(target_os = "linux")]
+            let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM | libc::SOCK_CLOEXEC, 0);
+            #[cfg(not(target_os = "linux"))]
+            let fd = {
+                let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
+                if fd >= 0 {
+                    libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC);
+                }
+                fd
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            let off: libc::c_int = 0;
+            libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &off as *const _ as *const libc::c_void, 4);
+            let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
+            sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            sa.sin6_port = port.to_be();
+            #[cfg(any(target_os = "macos", target_os = "ios", target_os = "freebsd", target_os = "openbsd", target_os = "netbsd"))]
+            {
+                sa.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            }
+            if libc::bind(fd, &sa as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as u32) != 0 {
+                let e = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(e);
+            }
+            Ok(UdpSocket::from_raw_fd(fd))
         }
-        let off: libc::c_int = 0;
-        libc::setsockopt(fd, libc::IPPROTO_IPV6, libc::IPV6_V6ONLY, &off as *const _ as *const libc::c_void, 4);
-        let mut sa: libc::sockaddr_in6 = std::mem::zeroed();
-        sa.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-        sa.sin6_port = port.to_be();
-        if libc::bind(fd, &sa as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_in6>() as u32) != 0 {
-            let e = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
-        }
-        Ok(UdpSocket::from_raw_fd(fd))
+    }
+    #[cfg(windows)]
+    {
+        // No SOCK_CLOEXEC on Windows (processes are not forked). IPV6_V6ONLY defaults to on
+        // there, so it is turned off before bind, same as the Linux socket.
+        use socket2::{Domain, Protocol, Socket, Type};
+        use std::net::{Ipv6Addr, SocketAddrV6};
+        let s = Socket::new(Domain::IPV6, Type::DGRAM, Some(Protocol::UDP))?;
+        s.set_only_v6(false)?;
+        s.bind(&SocketAddrV6::new(Ipv6Addr::UNSPECIFIED, port, 0, 0).into())?;
+        let _ = s.set_recv_buffer_size(4 << 20);
+        let _ = s.set_send_buffer_size(4 << 20);
+        Ok(UdpSocket::from(s))
     }
 }
 

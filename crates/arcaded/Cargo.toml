@@ -7,6 +7,7 @@ license.workspace = true
 [dependencies]
 arcade-app = { version = "0.1.0", path = "../arcade-app" }
 arcade-arc = { version = "0.1.0", path = "../arcade-arc", features = ["vdf"] }
+arcade-local = { version = "0.1.0", path = "../arcade-local" }
 arcade-chain = { version = "0.1.0", path = "../arcade-chain" }
 arcade-chaindb = { version = "0.1.0", path = "../arcade-chaindb" }
 arcade-ledger = { version = "0.1.0", path = "../arcade-ledger" }
@@ -43,6 +44,7 @@ secp256k1 = "0.29"
 [target.'cfg(not(windows))'.dependencies]
 str0m = { version = "0.25", default-features = false, features = ["aws-lc-rs"] }
 [target.'cfg(windows)'.dependencies]
+socket2 = "0.5"
 str0m = { version = "0.25", default-features = false, features = ["wincrypto"] }
 
 [features]

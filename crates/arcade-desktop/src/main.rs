@@ -1,22 +1,12 @@
 //! Arcade V1.0 desktop app: a window over the local arcaded API (same socket as the CLI).
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+use arcade_local::UnixStream;
 use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::UnixStream;
 
 fn home() -> std::path::PathBuf {
-    if let Some(h) = std::env::var_os("ARCADE_HOME") {
-        return h.into();
-    }
-    let system = std::path::Path::new("/var/lib/arcade");
-    if system.join("arcaded.sock").exists() {
-        return system.to_path_buf();
-    }
-    let base = std::env::var_os("XDG_DATA_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| std::path::PathBuf::from(std::env::var_os("HOME").unwrap_or_default()).join(".local/share"));
-    base.join("arcade")
+    arcade_local::default_home_for_app()
 }
 
 /// What an app window's own code (appwindow.js, and the trade.js and media.js it loads) asks the arcade: the doors it
@@ -47,25 +37,168 @@ fn window_may(label: &str, cmd: &str) -> bool {
     label == "main" || label.starts_with("app-") && APP_WINDOW_COMMANDS.contains(&cmd)
 }
 
-/// Forward one request to arcaded and return its answer (off the UI thread: some wait, such as
-/// realtime.poll). Only what the asking window may send (window_may).
-#[tauri::command(async)]
-fn api(window: tauri::WebviewWindow, req: Value) -> Value {
+/// How long the window waits for arcaded's answer to one call before it gives up on it (the call's thread is let go and
+/// the page gets an error it can show). realtime.poll gets its own wait plus a margin; SLOW_COMMANDS, which may work
+/// for minutes (installs, moves, imports, inscribing), get longer. dist/common.js has the same list and a little more
+/// time (API_SLOW), so this clearer answer usually arrives first (tests::the_window_and_the_app_agree_on_slow_calls).
+const ANSWER_SECS: u64 = 120;
+const SLOW_ANSWER_SECS: u64 = 600;
+const SLOW_COMMANDS: &[&str] = &[
+    "apps.install", "chains.add", "chains.copy_from_dir", "chains.copy_verify", "chains.index_add", "chains.index_remove",
+    "chains.move", "chains.remove", "inscribe", "share.install", "update.check", "wallet.import",
+];
+/// Sending one request never takes long; a socket that takes none is stuck.
+const SEND_SECS: u64 = 30;
+
+fn answer_limit(cmd: &str, req: &Value) -> std::time::Duration {
+    use std::time::Duration;
+    if cmd == "realtime.poll" {
+        // arcaded waits up to `wait` ms (15 s at most) for an event.
+        return Duration::from_millis(req["wait"].as_u64().unwrap_or(0).min(15_000)) + Duration::from_secs(30);
+    }
+    Duration::from_secs(if SLOW_COMMANDS.contains(&cmd) { SLOW_ANSWER_SECS } else { ANSWER_SECS })
+}
+
+/// Forward one request to arcaded and return its answer. Only what the asking window may send (window_may).
+///
+/// The socket call blocks (some wait on purpose, such as realtime.poll), so it runs on the blocking pool: on the
+/// async runtime's few worker threads (one per core) a handful of waiting calls held every worker, and every later
+/// call from every window, Tauri's own included, waited behind them; on a small Windows PC the window froze. Each
+/// call also has a time limit (answer_limit), so one that is never answered can't hold a thread for good.
+#[tauri::command]
+async fn api(window: tauri::WebviewWindow, req: Value) -> Value {
+    let label = window.label().to_string();
+    tauri::async_runtime::spawn_blocking(move || ask(&label, req))
+        .await
+        .unwrap_or_else(|e| json!({"ok": false, "error": format!("the call to the arcade service stopped ({e})")}))
+}
+
+fn ask(label: &str, req: Value) -> Value {
     let cmd = req["cmd"].as_str().unwrap_or("");
-    if !window_may(window.label(), cmd) {
+    if !window_may(label, cmd) {
         return json!({"ok": false, "error": format!("{cmd} is not for this window")});
     }
-    let sock = home().join("arcaded.sock");
+    let sock = arcade_local::socket_path(&home());
     let mut s = match UnixStream::connect(&sock) {
         Ok(s) => s,
-        Err(e) => return json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())}),
+        Err(e) => {
+            #[cfg(any(windows, target_os = "macos"))]
+            if start_service() {
+                return json!({"ok": false, "error": "starting the arcade service", "starting": true});
+            }
+            return json!({"ok": false, "error": format!("the arcade service is not running ({}: {e})", sock.display())});
+        }
     };
+    let limit = answer_limit(cmd, &req);
+    let _ = s.set_write_timeout(Some(std::time::Duration::from_secs(SEND_SECS)));
+    let _ = s.set_read_timeout(Some(limit));
     if writeln!(s, "{req}").is_err() {
         return json!({"ok": false, "error": "could not talk to the arcade service"});
     }
     let mut line = String::new();
-    let _ = BufReader::new(s).read_line(&mut line);
+    match BufReader::new(s).read_line(&mut line) {
+        Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {
+            return json!({"ok": false, "error": format!("the arcade service did not answer {cmd} within {} s", limit.as_secs())});
+        }
+        _ => {}
+    }
     serde_json::from_str(&line).unwrap_or(json!({"ok": false, "error": "bad reply from the arcade service"}))
+}
+
+/// Windows: the window opened but arcaded isn't running (stopped, not started yet after login,
+/// or the app was opened straight from the unzipped download). Start it, at most once a minute:
+/// the installer's login task first, then its hidden starter, then arcaded.exe beside this
+/// program with the app's own data folder. True while a start is under way (90 s), so the window
+/// says "starting" instead of "not running".
+#[cfg(windows)]
+fn start_service() -> bool {
+    use std::os::windows::process::CommandExt;
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(t) = *last {
+        if t.elapsed() < Duration::from_secs(60) {
+            return t.elapsed() < Duration::from_secs(90);
+        }
+    }
+    let quiet = |c: &mut Command| {
+        c.creation_flags(CREATE_NO_WINDOW).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    };
+    let mut task = Command::new("schtasks");
+    task.args(["/Run", "/TN", "Arcade V1.0"]);
+    quiet(&mut task);
+    let started = task.status().is_ok_and(|s| s.success()) || {
+        let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        let windir = std::env::var_os("SystemRoot").map(std::path::PathBuf::from).unwrap_or_else(|| "C:\\Windows".into());
+        match dir {
+            Some(d) if d.join("arcaded-hidden.vbs").exists() => {
+                let mut c = Command::new(windir.join("System32").join("wscript.exe"));
+                c.arg("//B").arg(d.join("arcaded-hidden.vbs"));
+                quiet(&mut c);
+                c.spawn().is_ok()
+            }
+            Some(d) if d.join("arcaded.exe").exists() => {
+                let home = home();
+                let _ = std::fs::create_dir_all(&home);
+                let mut c = Command::new(d.join("arcaded.exe"));
+                c.arg("--home").arg(&home).current_dir(&home);
+                // Below normal, as the installer's login task starts it (install.ps1), unless set otherwise.
+                if std::env::var_os("ARCADE_NICE").is_none() {
+                    c.env("ARCADE_NICE", "10");
+                }
+                quiet(&mut c);
+                c.spawn().is_ok()
+            }
+            _ => false,
+        }
+    };
+    *last = Some(Instant::now());
+    started
+}
+
+/// macOS: the window opened but arcaded isn't running. Start it, at most once a minute: the installer's launchd agent
+/// (scripts/install-macos.sh) first, else arcaded beside this program with the app's own data folder. True while a
+/// start is under way (90 s), so the window says "starting" instead of "not running".
+#[cfg(target_os = "macos")]
+fn start_service() -> bool {
+    use std::process::{Command, Stdio};
+    use std::sync::Mutex;
+    use std::time::{Duration, Instant};
+    static LAST: Mutex<Option<Instant>> = Mutex::new(None);
+    let mut last = LAST.lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(t) = *last {
+        if t.elapsed() < Duration::from_secs(60) {
+            return t.elapsed() < Duration::from_secs(90);
+        }
+    }
+    let quiet = |c: &mut Command| {
+        c.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
+    };
+    let mut agent = Command::new("/bin/launchctl");
+    agent.args(["start", "com.dogecoinarcade.arcaded"]);
+    quiet(&mut agent);
+    let started = agent.status().is_ok_and(|s| s.success()) || {
+        let dir = std::env::current_exe().ok().and_then(|p| p.parent().map(|d| d.to_path_buf()));
+        match dir {
+            Some(d) if d.join("arcaded").exists() => {
+                let home = home();
+                let _ = std::fs::create_dir_all(&home);
+                let mut c = Command::new(d.join("arcaded"));
+                c.arg("--home").arg(&home).current_dir(&home);
+                if std::env::var_os("ARCADE_NICE").is_none() {
+                    c.env("ARCADE_NICE", "10");
+                }
+                quiet(&mut c);
+                c.spawn().is_ok()
+            }
+            _ => false,
+        }
+    };
+    *last = Some(Instant::now());
+    started
 }
 
 fn pct(s: &str) -> String {
@@ -229,6 +362,33 @@ mod tests {
         for label in ["content-00ff", "other", "mainx", "App-00ff"] {
             assert!(!window_may(label, "chains.list"), "{label}");
         }
+    }
+
+    #[test]
+    fn calls_have_a_time_limit() {
+        use std::time::Duration;
+        assert_eq!(answer_limit("status", &json!({})), Duration::from_secs(ANSWER_SECS));
+        assert_eq!(answer_limit("chains.move", &json!({})), Duration::from_secs(SLOW_ANSWER_SECS));
+        assert_eq!(answer_limit("realtime.poll", &json!({"wait": 15000})), Duration::from_secs(45));
+        assert_eq!(answer_limit("realtime.poll", &json!({"wait": 999_999})), Duration::from_secs(45), "arcaded waits 15 s at most");
+        assert_eq!(answer_limit("realtime.poll", &json!({})), Duration::from_secs(30));
+        // Every slow command is one arcaded has.
+        let commands = include_str!("../../arcaded/src/commands.rs");
+        for cmd in SLOW_COMMANDS {
+            assert!(commands.contains(&format!("\"{cmd}\" ")), "{cmd} is not an arcaded command");
+        }
+    }
+
+    #[test]
+    fn the_window_and_the_app_agree_on_slow_calls() {
+        // dist/common.js gives up on the same slow calls a little later than the app (API_SLOW).
+        let js = include_str!("../dist/common.js");
+        let list = js.split("const API_SLOW = [").nth(1).and_then(|r| r.split(']').next()).expect("API_SLOW in common.js");
+        let mut js_slow: Vec<&str> = list.split(',').map(|c| c.trim().trim_matches('"')).filter(|c| !c.is_empty()).collect();
+        let mut rust_slow = SLOW_COMMANDS.to_vec();
+        js_slow.sort();
+        rust_slow.sort();
+        assert_eq!(js_slow, rust_slow);
     }
 
     #[test]

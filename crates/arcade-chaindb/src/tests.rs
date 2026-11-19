@@ -1125,6 +1125,30 @@ fn a_chain_moves_to_another_drive_and_back() {
     assert!(to.join("chain.mdbx").is_file(), "its first write is on the chosen drive");
 }
 
+/// Windows (PR #160): a chain's old folder can outlive a move away while a reader still holds
+/// its file. Nothing uses it (the place file names the chain's folder), and a move home clears
+/// it instead of failing on it.
+#[test]
+fn a_home_folder_left_by_a_move_away_does_not_stop_the_move_home() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    let blocks = busy_chain(&f.g, 10);
+    f.db.connect_blocks(f.p, &blocks).unwrap();
+    let before = dump_chain(&f.db, c);
+    let home = f.db.own_dir(c);
+    let drive = tempfile::tempdir().unwrap();
+    let to = drive.path().join("arcade-chains").join("x");
+    f.db.relocate(c, Some(&to), |_| {}).unwrap();
+    // As left on Windows when the old file was still open: the folder and a stale file in it.
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(home.join("chain.mdbx"), b"stale").unwrap();
+    assert_eq!(f.db.own_dir(c), to, "the place file wins over a folder left at home");
+    assert_eq!(dump_chain(&f.db, c), before);
+    assert_eq!(f.db.relocate(c, None, |_| {}).unwrap(), home);
+    assert!(!f.db.placed_elsewhere(c) && !to.exists());
+    assert_eq!(dump_chain(&f.db, c), before, "the moved copy came home, not the stale file");
+}
+
 /// One chain's damaged own file doesn't stop the databases opening (ARCADE issue #18): it is set aside as
 /// chain.mdbx.corrupt-<time>, the chain reads as empty, and it can be written again.
 #[test]

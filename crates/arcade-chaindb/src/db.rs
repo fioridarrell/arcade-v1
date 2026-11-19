@@ -760,7 +760,7 @@ impl ChainDb {
         std::fs::create_dir_all(&staging).map_err(|e| other(format!("{}: {e}", staging.display())))?;
         let part = staging.join("chain.mdbx.part");
         let _ = std::fs::remove_file(&part);
-        // Left by a move cut short after its switch: a copy already replaced.
+        // Left by an older arcade's move cut short after its switch: a copy already replaced.
         let _ = std::fs::remove_dir_all(self.dir.join(format!(".{name}.old")));
         let lock = self.batch_of(&src);
         let _batch = lock.lock().unwrap_or_else(|e| e.into_inner());
@@ -787,30 +787,36 @@ impl ChainDb {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(other("the copy's tip differs from the chain's; nothing was moved"));
         }
-        new.read(|r| crate::txruns::load(r, new.id(), &[c]))?;
         // Switch. The new place is written down first, so a stop at any point leaves a whole
-        // copy where the place says; `.<key>.old` only ever holds a copy already replaced.
-        let from_home = from == home_dir;
-        let aside = self.dir.join(format!(".{name}.old"));
-        {
-            let mut files = self.files.write().unwrap();
-            match to {
-                Some(d) => {
-                    write_place(&self.dir, &self.place_file(c), d)?;
-                    if from_home {
-                        std::fs::rename(&home_dir, &aside).map_err(other)?;
-                    }
-                }
-                None => {
-                    std::fs::rename(&staging, &home_dir).map_err(other)?;
-                    let _ = std::fs::remove_file(self.place_file(c));
-                }
+        // copy where the place says. No folder holding an open file is renamed: Windows refuses
+        // that ("Access is denied"), so the old folder is deleted only after the switch, and a
+        // copy coming home is closed for its rename and opened again there.
+        match to {
+            Some(d) => {
+                new.read(|r| crate::txruns::load(r, new.id(), &[c]))?;
+                let mut files = self.files.write().unwrap();
+                write_place(&self.dir, &self.place_file(c), d)?;
+                files.insert(c, new);
             }
-            files.insert(c, new);
+            None => {
+                drop(new);
+                // A home folder left by an earlier move away that couldn't delete it (a reader
+                // still had the file open on Windows): unused, the place file names the chain's.
+                if home_dir.exists() {
+                    std::fs::remove_dir_all(&home_dir).map_err(|e| other(format!("{}: {e}", home_dir.display())))?;
+                }
+                std::fs::rename(&staging, &home_dir).map_err(other)?;
+                let new = Arc::new(Store::open_sync(&home_dir.join("chain.mdbx"), &CHAIN_SCHEMA, false)?);
+                new.read(|r| crate::txruns::load(r, new.id(), &[c]))?;
+                let mut files = self.files.write().unwrap();
+                let _ = std::fs::remove_file(self.place_file(c));
+                files.insert(c, new);
+            }
         }
         drop(src);
-        // A reader still holding the old file keeps it until it closes.
-        let gone = if from_home { aside } else { from };
+        // A reader still holding the old file keeps it until it closes (on Windows its folder
+        // stays until then; nothing uses it, and a move home clears a home folder left so).
+        let gone = from;
         if std::fs::symlink_metadata(&gone).is_ok_and(|m| m.file_type().is_symlink()) {
             let real = canon(&gone);
             let _ = std::fs::remove_file(&gone);

@@ -66,7 +66,7 @@ pub fn locked(f: &Path) -> Result<bool, String> {
         fl.l_type = libc::F_WRLCK as _;
         fl.l_whence = libc::SEEK_SET as _;
         let r = unsafe { libc::fcntl(fh.as_raw_fd(), libc::F_GETLK, &mut fl) };
-        if r == 0 && fl.l_type as i32 != libc::F_UNLCK {
+        if r == 0 && fl.l_type as i32 != libc::F_UNLCK as i32 {
             return Ok(true);
         }
     }

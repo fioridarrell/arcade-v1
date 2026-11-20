@@ -49,6 +49,11 @@ const OPEN_WAIT: Duration = Duration::from_secs(20);
 const ROUND_EVERY: Duration = Duration::from_secs(30);
 /// An arcade a relay couldn't reach is asked for again after this.
 const COOL: u64 = 30 * 60;
+/// An arcade this one needs (a lender of a chain it borrows) is asked for again through the same relay after this
+/// when that relay couldn't link it (another relay that lists it is asked meanwhile), or its link through it ended
+/// within NEED_SHORT.
+const NEED_COOL: u64 = 120;
+const NEED_SHORT: u64 = 60;
 /// Bytes an arcade may send past what it paid for before its relayed links end (time for its payment to confirm).
 const GRACE_BYTES: u64 = 20_000_000;
 /// One payment covers this much traffic (at least MIN_PAY).
@@ -227,6 +232,15 @@ struct G {
     /// Links that have said "hi" to (peer ids), so it is said once a link.
     said_hi: BTreeSet<String>,
     last_round: Option<Instant>,
+    /// Links to each arcade, by session keys, with whether each is UDP only. All of what this arcade sends that
+    /// arcade here (control frames and relayed bytes, either way) goes on one of them, the first: pieces of one relayed
+    /// link split over two links arrive out of order ("decryption failed"), and one of two links ending took every
+    /// relayed link through that arcade with it (GX10 and the JB20B, 2026-11-20).
+    carriers: HashMap<String, Vec<(Keys, bool)>>,
+    /// (relay, arcade) pairs not to ask a needed arcade through before a time.
+    pair_cool: HashMap<(String, String), u64>,
+    /// When each relayed link came up (peer -> unix time), for NEED_SHORT.
+    up_at: HashMap<String, u64>,
     // The fee, as the relay.
     fee: Fees,
     last_bill: HashMap<String, Instant>,
@@ -272,6 +286,8 @@ struct Paid {
     #[serde(skip)]
     loaded: bool,
 }
+
+type Keys = ([u8; 32], [u8; 32]);
 
 fn g() -> &'static Mutex<G> {
     static S: std::sync::OnceLock<Mutex<G>> = std::sync::OnceLock::new();
@@ -334,6 +350,11 @@ pub(crate) fn is_relayed(link: &Link) -> bool {
 /// Each pass of a link's loop: what waits for this link goes out.
 pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
     if is_relayed(link) {
+        // A link of its own to that arcade is up (at its home address, say): this one ends, so the relay isn't paid
+        // to carry what the other link carries for free.
+        if crate::meshsvc::direct_up(&link.peer_id) {
+            return Err(LinkError::Io(io::Error::other("a direct link took over")));
+        }
         return Ok(());
     }
     round(node);
@@ -341,6 +362,9 @@ pub fn tick(node: &Node, link: &mut Link) -> Result<(), LinkError> {
     let mut out: Vec<Frame> = Vec::new();
     {
         let mut st = g().lock().unwrap();
+        if !carrier(&mut st, &peer, link.session_keys(), link.describe().starts_with("udp")) {
+            return Ok(());
+        }
         if st.said_hi.insert(peer.clone()) {
             out.push(rl(json!({"op": "hi"})));
         }
@@ -485,6 +509,7 @@ pub fn on_frame(node: &Node, link: &mut Link, f: &Frame) -> Result<(), LinkError
             let mut st = g().lock().unwrap();
             if let Some((_, target, _)) = h["n"].as_str().and_then(|n| st.asking.remove(n)) {
                 st.cooling.insert(target.clone(), now_s() + COOL);
+                st.pair_cool.insert((from.clone(), target.clone()), now_s() + NEED_COOL);
                 let _ = node.app.event("mesh", &format!("relay {} can't link us to {}: {}", short(&from), short(&target), h["why"].as_str().unwrap_or("")));
             }
         }
@@ -607,11 +632,97 @@ fn close_chan(st: &mut G, ch: u64, tell: &str, why: &str) {
     }
 }
 
-/// A link went down (its serve is over): as for `link_down`, unless it was itself relayed.
-pub fn link_ended(link: &Link) {
+/// A link came up (not a relayed one): it may carry relay frames for its arcade (`carrier`).
+pub fn link_up(link: &Link) {
     if !is_relayed(link) {
-        link_down(&link.peer_id);
+        carrier(&mut g().lock().unwrap(), &link.peer_id, link.session_keys(), link.describe().starts_with("udp"));
     }
+}
+
+/// Whether this link (by its session keys; `udp`: UDP only) is the one relay frames for `peer` go on, noting it among
+/// that arcade's links. The first link up carries them; a TCP link takes over from a UDP-only one while nothing is
+/// relayed between the two arcades (a switch in the middle would reorder a relayed link's bytes).
+fn carrier(st: &mut G, peer: &str, keys: Keys, udp: bool) -> bool {
+    let busy = in_flight(st, peer);
+    let v = st.carriers.entry(peer.to_string()).or_default();
+    if !v.iter().any(|(k, _)| *k == keys) {
+        v.push((keys, udp));
+    }
+    if !udp && v.first().is_some_and(|(k, u)| *u && *k != keys) && !busy {
+        let i = v.iter().position(|(k, _)| *k == keys).unwrap();
+        let me = v.remove(i);
+        v.insert(0, me);
+    }
+    v.first().is_some_and(|(k, _)| *k == keys)
+}
+
+/// Whether anything relayed goes between this arcade and `peer` now (either as the relay or through it as a relay).
+fn in_flight(st: &G, peer: &str) -> bool {
+    st.chans.values().any(|c| c.a == peer || c.b == peer)
+        || st.ends.values().any(|e| e.relay == peer)
+        || st.asking.values().any(|a| a.0 == peer)
+        || st.to.get(peer).is_some_and(|q| !q.is_empty())
+        || st.ctl.get(peer).is_some_and(|q| !q.is_empty())
+}
+
+/// A link went down (its serve is over), unless it was itself relayed: with the arcade's last link, as for
+/// `link_down`; when it carried the relay frames and another link to that arcade is still up, `carrier_lost`; else
+/// nothing (the other link carried them).
+pub fn link_ended(node: &Node, link: &Link) {
+    if is_relayed(link) {
+        return;
+    }
+    let peer = &link.peer_id;
+    let keys = link.session_keys();
+    let mut st = g().lock().unwrap();
+    let (was_first, left) = match st.carriers.get_mut(peer) {
+        Some(v) => {
+            let first = v.first().is_some_and(|(k, _)| *k == keys);
+            v.retain(|(k, _)| *k != keys);
+            (first, v.len())
+        }
+        None => (true, 0),
+    };
+    if left == 0 {
+        st.carriers.remove(peer);
+        drop(st);
+        link_down(peer);
+    } else if was_first {
+        carrier_lost(&mut st, peer);
+        drop(st);
+        let _ = node.app.event("mesh", &format!("a link to {} ended; its other link carries relay frames now", short(peer)));
+    }
+}
+
+/// The link that carried relay frames to `peer` ended while another is up: what was relayed over it lost its bytes in
+/// flight, so those relayed links end, and both sides hear it on the link that carries them now (the other side may
+/// have kept sending on the link that is still up). What `peer` offered and took stays: it is still linked.
+fn carrier_lost(st: &mut G, peer: &str) {
+    let why = "the other side's link to the relay went down";
+    // As the relay: links passed for `peer`.
+    let gone: Vec<(u64, String)> = st.chans.iter().filter(|(_, c)| c.a == peer || c.b == peer).map(|(ch, c)| (*ch, if c.a == peer { c.b.clone() } else { c.a.clone() })).collect();
+    let chs: BTreeSet<u64> = gone.iter().map(|x| x.0).collect();
+    if let Some(q) = st.to.get_mut(peer) {
+        q.retain(|f| !(f.head["op"] == "rd" && chs.contains(&f.head["ch"].as_u64().unwrap_or(0))));
+    }
+    for (ch, other) in gone {
+        close_chan(st, ch, &other, why);
+        st.to.entry(peer.to_string()).or_default().push_back(rl(json!({"op": "end", "ch": ch, "why": "the link to the relay went down"})));
+    }
+    // As a user of relay `peer`: our links through it.
+    let ends: Vec<Arc<End>> = st.ends.values().filter(|e| e.relay == peer).cloned().collect();
+    for e in ends {
+        {
+            let mut p = e.p.lock().unwrap();
+            p.out.clear();
+            p.out_bytes = 0;
+            p.closed = Some("the link to the relay went down".into());
+        }
+        e.cv.notify_all();
+        st.ctl.entry(peer.to_string()).or_default().push_back(rl(json!({"op": "close", "ch": e.ch})));
+    }
+    // Opens asked over the lost link may never be answered: asked again at the next round.
+    st.asking.retain(|_, a| a.0 != peer);
 }
 
 /// A link to the relay `peer` went down: what passed through it ends, and so do our links through it.
@@ -677,7 +788,11 @@ fn run_end(node: Arc<Node>, e: Arc<End>, ip: String, dialer: bool) {
     let how = match r {
         Ok(mut link) if link.peer_id == e.peer && !linked(&node, &e.peer) => {
             let addr = format!("{ip}:{}", link.peer_listen.unwrap_or(0));
-            g().lock().unwrap().up.insert(e.peer.clone(), e.relay.clone());
+            {
+                let mut st = g().lock().unwrap();
+                st.up.insert(e.peer.clone(), e.relay.clone());
+                st.up_at.insert(e.peer.clone(), now_s());
+            }
             let key = crate::node::link_add(&node.links, &addr, &e.peer, now_s());
             let _ = node.app.event("mesh", &format!("relayed link to {} through {}", short(&e.peer), short(&e.relay)));
             let r = crate::meshsvc::serve(&node, &mut link, &addr);
@@ -690,7 +805,14 @@ fn run_end(node: Arc<Node>, e: Arc<End>, ip: String, dialer: bool) {
     let _ = node.app.event("mesh", &format!("relayed link to {} through {}: {how}", short(&e.peer), short(&e.relay)));
     let mut st = g().lock().unwrap();
     st.ends.remove(&(e.relay.clone(), e.ch));
-    st.up.remove(&e.peer);
+    if st.up.get(&e.peer) == Some(&e.relay) {
+        st.up.remove(&e.peer);
+    }
+    // Up only a moment (or never): this relay is asked for that arcade again later; another may be asked sooner.
+    let lasted = st.up_at.remove(&e.peer).map(|t| now_s().saturating_sub(t));
+    if lasted.is_none_or(|s| s < NEED_SHORT) {
+        st.pair_cool.insert((e.relay.clone(), e.peer.clone()), now_s() + NEED_COOL);
+    }
     st.cooling.insert(e.peer.clone(), now_s() + 120);
     if e.p.lock().unwrap().closed.is_none() {
         st.ctl.entry(e.relay.clone()).or_default().push_back(rl(json!({"op": "close", "ch": e.ch})));
@@ -708,7 +830,7 @@ pub fn want(node: &Node, peer: &str) -> bool {
     if st.ends.len() + st.asking.len() >= MAX_OWN {
         return false;
     }
-    let Some(relay) = st.relays.iter().find(|(_, ids)| ids.iter().any(|i| i == peer)).map(|(r, _)| r.clone()) else { return false };
+    let Some(relay) = pick_relay(&st, peer, now_s()) else { return false };
     // Asked for by hand: a cooling-off from an earlier try doesn't stop this one.
     st.cooling.remove(peer);
     let n = format!("{:016x}", rand_core::RngCore::next_u64(&mut rand_core::OsRng));
@@ -719,19 +841,66 @@ pub fn want(node: &Node, peer: &str) -> bool {
     true
 }
 
+/// The relay to ask for a link to `peer`: one that lists it, not cooling for that pair if any is not, the one we
+/// already pay or use first (lowest id among equals, so a choice holds from one round to the next).
+fn pick_relay(st: &G, peer: &str, now: u64) -> Option<String> {
+    let mut v: Vec<&String> = st.relays.iter().filter(|(_, ids)| ids.iter().any(|i| i == peer)).map(|(r, _)| r).collect();
+    v.sort_by_key(|r| (st.pair_cool.get(&((*r).clone(), peer.to_string())).is_some_and(|u| *u > now), (*r).clone()));
+    v.first().map(|r| (*r).clone())
+}
+
+/// Arcades this one needs a link to: those lending a chain it borrows (their offer heard within 3 hours), unlinked.
+fn needed(node: &Node) -> BTreeSet<String> {
+    let me = node.id_hex();
+    let mut out = BTreeSet::new();
+    for key in crate::borrow::borrowed_keys() {
+        for (id, _) in node.cr_offerers(&key) {
+            if id != me && !linked(node, &id) {
+                out.insert(id);
+            }
+        }
+    }
+    out
+}
+
+/// Which of `needed` to ask a relay for now, and through which relay: not linked or relayed already, not being asked
+/// for, the pair not cooling (`pick_relay` passes over a cooling pair when another relay lists the arcade). The lower
+/// id's rule and the long cooling-off are not for these: an arcade that needs a lender asks for it itself, whichever
+/// id is lower, and again once a relayed link to it ends (the relay refuses a second link between one pair).
+fn needed_asks(st: &G, needed: &BTreeSet<String>, now: u64) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for id in needed {
+        if st.up.contains_key(id) || st.asking.values().any(|a| a.1 == *id) {
+            continue;
+        }
+        let Some(relay) = pick_relay(st, id, now) else { continue };
+        if st.pair_cool.get(&(relay.clone(), id.clone())).is_some_and(|u| *u > now) {
+            continue;
+        }
+        out.push((relay, id.clone()));
+    }
+    out
+}
+
 /// Every so often: ask our relays for links to arcades we can't otherwise reach.
 pub fn round(node: &Node) {
-    let mut st = g().lock().unwrap();
-    if st.last_round.is_some_and(|t| t.elapsed() < ROUND_EVERY) {
-        return;
+    {
+        let mut st = g().lock().unwrap();
+        if st.last_round.is_some_and(|t| t.elapsed() < ROUND_EVERY) {
+            return;
+        }
+        st.last_round = Some(Instant::now());
     }
-    st.last_round = Some(Instant::now());
+    let needed = needed(node);
+    let mut st = g().lock().unwrap();
     let now = now_s();
     st.cooling.retain(|_, until| *until > now);
+    st.pair_cool.retain(|_, until| *until > now);
     // Opens with no answer: given up.
     let stale: Vec<String> = st.asking.iter().filter(|(_, a)| a.2.elapsed() > OPEN_WAIT).map(|(n, _)| n.clone()).collect();
     for n in stale {
-        if let Some((_, target, _)) = st.asking.remove(&n) {
+        if let Some((relay, target, _)) = st.asking.remove(&n) {
+            st.pair_cool.insert((relay, target.clone()), now + NEED_COOL);
             st.cooling.insert(target, now + COOL);
         }
     }
@@ -758,10 +927,24 @@ pub fn round(node: &Node) {
     }
     let me = node.id_hex();
     let mut room = MAX_OWN.saturating_sub(st.ends.len() + st.asking.len());
+    // Arcades we need first (lenders), through the relay `pick_relay` chooses.
+    for (relay, id) in needed_asks(&st, &needed, now) {
+        if room == 0 {
+            return;
+        }
+        if owing_unpaid(node, &st, &relay) {
+            continue;
+        }
+        let n = format!("{:016x}", rand_core::RngCore::next_u64(&mut rand_core::OsRng));
+        st.asking.insert(n.clone(), (relay.clone(), id.clone(), Instant::now()));
+        st.ctl.entry(relay.clone()).or_default().push_back(rl(json!({"op": "open", "n": n, "to": id})));
+        let _ = node.app.event("mesh", &format!("asked relay {} for a link to {} (a lender we need)", short(&relay), short(&id)));
+        room -= 1;
+    }
     let relays: Vec<(String, Vec<String>)> = st.relays.iter().map(|(r, ids)| (r.clone(), ids.clone())).collect();
     for (relay, ids) in relays {
         // A relay we owe and won't pay (paying off here): no new links through it.
-        if st.bills.get(&relay).is_some_and(|b| b["price"].as_u64().unwrap_or(0) > 0 && b["charged"].as_u64().unwrap_or(0) > b["credit"].as_u64().unwrap_or(0)) && !pay_on(node) {
+        if owing_unpaid(node, &st, &relay) {
             continue;
         }
         for id in ids {
@@ -778,6 +961,11 @@ pub fn round(node: &Node) {
             room -= 1;
         }
     }
+}
+
+/// A relay we owe and won't pay (paying off here): no new links through it.
+fn owing_unpaid(node: &Node, st: &G, relay: &str) -> bool {
+    st.bills.get(relay).is_some_and(|b| b["price"].as_u64().unwrap_or(0) > 0 && b["charged"].as_u64().unwrap_or(0) > b["credit"].as_u64().unwrap_or(0)) && !pay_on(node)
 }
 
 // ---------------------------------------------------------------- the fee
@@ -1227,6 +1415,82 @@ mod tests {
         // Free relay: never owes.
         charge(&mut f, "d", 5_000_000_000, 0, 0);
         assert!(!owes(&mut f, "d", 0));
+    }
+
+    /// Relay frames for one arcade go on one of its links: the first up, a TCP link taking over from a UDP-only one
+    /// only while nothing is relayed (GX10 and the JB20B, 2026-11-20: pieces split over two links, "decryption failed").
+    #[test]
+    fn one_link_per_arcade_carries_its_relay_frames() {
+        let mut st = G::default();
+        let p = "p".repeat(64);
+        let (udp, tcp, tcp2) = (([1; 32], [2; 32]), ([3; 32], [4; 32]), ([5; 32], [6; 32]));
+        assert!(carrier(&mut st, &p, udp, true), "the first link up carries");
+        assert!(carrier(&mut st, &p, tcp, false), "a TCP link takes over from a UDP-only one while nothing is relayed");
+        assert!(!carrier(&mut st, &p, udp, true));
+        assert!(!carrier(&mut st, &p, tcp2, false), "a second TCP link doesn't");
+        assert!(carrier(&mut st, &p, tcp, false), "and the first keeps carrying");
+        // While a link through `p` is up, no switch.
+        let mut st = G::default();
+        assert!(carrier(&mut st, &p, udp, true));
+        let e = Arc::new(End { relay: p.clone(), ch: 9, peer: "q".repeat(64), p: Mutex::new(EndState::default()), cv: Condvar::new() });
+        st.ends.insert((p.clone(), 9), e);
+        assert!(!carrier(&mut st, &p, tcp, false), "not in the middle of a relayed link");
+        assert!(carrier(&mut st, &p, udp, true));
+    }
+
+    /// The carrying link ended while another is up: links relayed over it end, both sides hear it over the other link,
+    /// and what the arcade offered and takes stays.
+    #[test]
+    fn a_lost_carrier_ends_what_it_carried_and_keeps_the_arcade() {
+        let mut st = G::default();
+        let (r, a, b) = ("r".repeat(64), "a".repeat(64), "b".repeat(64));
+        // As the relay: a link between `a` and `b`, with bytes waiting for `a`.
+        st.chans.insert(1, Chan { a: a.clone(), b: b.clone(), n: None, accepted: true, asked: Instant::now(), since: 0, bytes: 0 });
+        st.to.entry(a.clone()).or_default().push_back(Frame { head: json!({"t": "rl", "op": "rd", "ch": 1}), blob: vec![1, 2, 3] });
+        st.capable.insert(a.clone());
+        carrier_lost(&mut st, &a);
+        assert!(st.chans.is_empty());
+        let to_a: Vec<Value> = st.to[&a].iter().map(|f| f.head.clone()).collect();
+        assert_eq!(to_a.len(), 1, "the waiting bytes are dropped: {to_a:?}");
+        assert_eq!(to_a[0]["op"], "end");
+        assert_eq!(st.to[&b].back().unwrap().head["op"], "end", "the other side hears it");
+        assert!(st.capable.contains(&a), "still linked: still takes relayed links");
+        // As a user of relay `r`: our link through it ends, and the relay hears so over the link that is left.
+        let e = Arc::new(End { relay: r.clone(), ch: 4, peer: b.clone(), p: Mutex::new(EndState::default()), cv: Condvar::new() });
+        e.p.lock().unwrap().out.push_back(vec![0; 10]);
+        st.ends.insert((r.clone(), 4), e.clone());
+        st.relays.insert(r.clone(), vec![b.clone()]);
+        st.asking.insert("n1".into(), (r.clone(), b.clone(), Instant::now()));
+        carrier_lost(&mut st, &r);
+        assert!(e.p.lock().unwrap().closed.is_some() && e.p.lock().unwrap().out.is_empty());
+        assert_eq!(st.ctl[&r].back().unwrap().head, json!({"t": "rl", "op": "close", "ch": 4}));
+        assert!(st.asking.is_empty(), "an open asked over the lost link is asked again");
+        assert!(st.relays.contains_key(&r), "the relay's offer stays");
+    }
+
+    /// A lender we need is asked for whichever id is lower and past the long cooling-off, through a relay not cooling
+    /// for it when there is one; not while it is relayed or asked for already.
+    #[test]
+    fn a_needed_arcade_is_asked_for_through_a_relay_that_lists_it() {
+        let mut st = G::default();
+        let (r1, r2, x, y) = ("1".repeat(64), "2".repeat(64), "x".repeat(64), "y".repeat(64));
+        st.relays.insert(r1.clone(), vec![x.clone()]);
+        st.relays.insert(r2.clone(), vec![x.clone(), y.clone()]);
+        st.cooling.insert(x.clone(), 10_000);
+        let need: BTreeSet<String> = [x.clone(), y.clone(), "z".repeat(64)].into_iter().collect();
+        let asks = needed_asks(&st, &need, 100);
+        assert_eq!(asks, vec![(r1.clone(), x.clone()), (r2.clone(), y.clone())], "z: no relay lists it");
+        // r1 couldn't link x lately: r2 is asked.
+        st.pair_cool.insert((r1.clone(), x.clone()), 200);
+        assert_eq!(needed_asks(&st, &need, 100)[0], (r2.clone(), x.clone()));
+        // Both cooling: nobody asked for x until one is past it.
+        st.pair_cool.insert((r2.clone(), x.clone()), 300);
+        assert!(!needed_asks(&st, &need, 100).iter().any(|(_, i)| *i == x));
+        assert_eq!(needed_asks(&st, &need, 250)[0], (r1.clone(), x.clone()));
+        // Relayed already, or being asked for: not again.
+        st.up.insert(y.clone(), r2.clone());
+        st.asking.insert("n".into(), (r1.clone(), x.clone(), Instant::now()));
+        assert!(needed_asks(&st, &need, 400).is_empty());
     }
 
     /// A payment's memo names the payer and travels whole in the transaction's data, where the relay finds it.

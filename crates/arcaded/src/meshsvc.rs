@@ -235,6 +235,11 @@ fn dial_heard_as(node: &Arc<Node>, addr: String, src: &'static str, redial: bool
     std::thread::Builder::new().name(format!("mesh {addr}")).spawn(move || run_as(n, addr, Some(src), redial)).unwrap();
 }
 
+/// Dial the home address of an arcade behind our router (samerouter checked it): a heard dial under the LAN source.
+pub fn dial_lan(node: &Arc<Node>, addr: String) {
+    dial_heard_as(node, addr, LAN, false);
+}
+
 /// The source of a private address an arcade linked to us from directly (a TCP link we accepted or dialed): it is on
 /// our LAN or this machine, so it may be dialed back though no other arcade's word would make us dial it.
 const LAN: &str = "lan";
@@ -305,6 +310,10 @@ pub fn known_dials(node: &Node, id: &str) -> Vec<(String, &'static str)> {
     if let Some(a) = hi {
         let direct = direct_seen(id, &a);
         all.push((a, direct, "gossip"));
+    }
+    // Its home address, while it is behind our router (it told us over a link; samerouter).
+    if let Some(a) = crate::samerouter::hint_for(id) {
+        all.push((a, true, "gossip"));
     }
     let mut out: Vec<(String, &'static str)> = Vec::new();
     for (a, trusted, src) in all {
@@ -874,7 +883,10 @@ fn run_as(node: Arc<Node>, addr: String, heard: Option<&'static str>, redial: bo
                 // Already linked to this arcade under another address (one arcade, several
                 // names): it keeps one link per node and closes this one, so don't keep
                 // redialling; look again in half an hour.
-                if node.links.lock().unwrap().values().any(|l| l.node_id == id && l.addr != addr) {
+                // A link at an arcade's home address (behind our router) stays beside one through a relay or over UDP
+                // only: it is the better way, and the relayed one ends itself once this is up (relaysvc).
+                let only_indirect = heard == Some(LAN) && !direct_up(&id);
+                if !only_indirect && node.links.lock().unwrap().values().any(|l| l.node_id == id && l.addr != addr) {
                     drop(link);
                     if heard.is_some() {
                         parked().remove(&addr);
@@ -1083,6 +1095,23 @@ fn our_tip(node: &Node) -> u64 {
 /// A link that has heard nothing for this long has ended (pings go both ways every 15 s).
 const LINK_SILENT: Duration = Duration::from_secs(120);
 
+/// A link of its own to the other arcade: TCP or a WebSocket, not a relayed pipe nor a UDP-only path.
+fn is_direct(link: &Link) -> bool {
+    let d = link.describe();
+    !d.starts_with("relay:") && !d.starts_with("udp")
+}
+
+/// Links of their own (`is_direct`) up now, per arcade.
+fn direct_links() -> std::sync::MutexGuard<'static, std::collections::HashMap<String, usize>> {
+    static D: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> = std::sync::OnceLock::new();
+    D.get_or_init(Default::default).lock().unwrap()
+}
+
+/// Whether a link of its own to arcade `id` is up (not only one through a relay or over UDP).
+pub fn direct_up(id: &str) -> bool {
+    direct_links().get(id).is_some_and(|n| *n > 0)
+}
+
 pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> {
     link.set_read_timeout(Duration::from_secs(5))?;
     // Tell V1.0 peers what we can serve (existing arcades ignore this kind).
@@ -1126,9 +1155,15 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     let mut last_ping = std::time::Instant::now().checked_sub(Duration::from_secs(16)).unwrap_or_else(std::time::Instant::now);
     let mut sent_outbox = 0usize;
     let peer = link.peer_id.clone();
+    // A link of its own (TCP or WebSocket; not through a relay, not UDP only), counted while it is up.
+    let own = is_direct(link);
+    if own {
+        *direct_links().entry(peer.clone()).or_default() += 1;
+    }
     let conn = crate::realtime::link_up(node, &peer);
     // UDP beside this link (docs/compat/UDP.md); nothing changes while it is off.
     crate::udpsvc::link_up(node, link);
+    crate::relaysvc::link_up(link);
     // Borrowers here may send their batches over this link (a lender they can't dial).
     crate::crvia::up(&peer);
     let mut last_me = std::time::Instant::now();
@@ -1139,10 +1174,19 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
         serve_loop(node, link, addr, &peer, conn, &mut cr_reqs, &mut last_ping, &mut sent_outbox, &mut last_sz, &mut last_hold, &mut last_me, &mut last_offer)
     });
     crate::crvia::down(&peer);
+    if own {
+        let mut d = direct_links();
+        if let Some(n) = d.get_mut(&peer) {
+            *n = n.saturating_sub(1);
+            if *n == 0 {
+                d.remove(&peer);
+            }
+        }
+    }
     link_dropped(node, &peer, addr);
     crate::linkrtt::link_down(&peer);
     crate::svcmesh::link_down(&peer);
-    crate::relaysvc::link_ended(link);
+    crate::relaysvc::link_ended(node, link);
     crate::udpsvc::link_down(&peer, link.session_keys());
     crate::realtime::link_down(&peer, conn);
     r
@@ -1176,6 +1220,10 @@ fn serve_loop(
     // (up to READ_RUN): two arcades that each sent before reading, with a large backlog for the other, both blocked in
     // their writes and every link timed out (GX10 and txtok.app, 2026-11-19).
     let mut run = 0usize;
+    // Our home address, told once to an arcade behind our router (samerouter); looked at again each minute, as our
+    // public address comes from STUN after the link is up.
+    let mut told_lan = false;
+    crate::samerouter::tell(node, link, addr, &mut told_lan)?;
     loop {
         if run == 0 || run >= READ_RUN {
             run = 0;
@@ -1209,6 +1257,7 @@ fn serve_loop(
             crate::dxfetch::tick(link)?;
             if last_me.elapsed() > Duration::from_secs(60) {
                 link.send(&Frame::new(operator_me(node)))?;
+                crate::samerouter::tell(node, link, addr, &mut told_lan)?;
                 // The chains we lend, again when they change (a chain finishing its sync, say).
                 if let Some(o) = crate::coreshare::offer(node) {
                     if *last_offer != o.head["nets"] {
@@ -1299,6 +1348,8 @@ fn serve_loop(
             "pub" | "sub" | "fx" => crate::realtime::on_frame(node, peer, conn, &f),
             "ud" | "st" | "ui" => crate::udpsvc::on_frame(node, link, &f)?,
             "ka" => {} // TCP keepalive while frames go over UDP
+            // Its home address: dialed when it is behind our router (crate::samerouter).
+            "lan" => crate::samerouter::on_frame(node, peer, addr, &f.head),
             // Relayed links (crate::relaysvc): as the relay, or as one side.
             "rl" => crate::relaysvc::on_frame(node, link, &f)?,
             // Services over the mesh (crate::svcmesh): an answer to our ask (crvia), else an offer or an ask.

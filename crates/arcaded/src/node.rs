@@ -131,6 +131,49 @@ impl Outbox {
     pub fn since(&self, from: usize) -> (Vec<Value>, usize) {
         (self.frames.iter().skip(from.saturating_sub(self.start)).cloned().collect(), self.start + self.frames.len())
     }
+
+    /// The frames numbered `from` on, up to about `budget` bytes (at least one), and the number after the last taken.
+    /// A new link starts at the oldest kept: the whole ring at once (2,000 frames, ~650 KB on 2026-11-19) was more
+    /// than two arcades' starting receive windows hold, and both blocked writing it (see serve_loop's read runs).
+    pub fn since_budget(&self, from: usize, budget: usize) -> (Vec<Value>, usize) {
+        let first = from.max(self.start);
+        let mut out = Vec::new();
+        let mut bytes = 0usize;
+        for f in self.frames.iter().skip(first - self.start) {
+            let n = f.to_string().len();
+            if !out.is_empty() && bytes + n > budget {
+                break;
+            }
+            bytes += n;
+            out.push(f.clone());
+        }
+        let next = first + out.len();
+        (out, next)
+    }
+
+    /// Whether frames numbered `from` on are still waiting.
+    pub fn has_since(&self, from: usize) -> bool {
+        from < self.start + self.frames.len()
+    }
+}
+
+#[test]
+fn outbox_goes_out_in_turns() {
+    let mut o = Outbox::default();
+    for n in 0..100 {
+        o.push(serde_json::json!({"t": "wl", "n": n, "pad": "x".repeat(1000)}));
+    }
+    let (a, next) = o.since_budget(0, 10_000);
+    assert!(a.len() >= 1 && a.len() < 100, "a turn is bounded: {}", a.len());
+    assert_eq!(a[0]["n"], 0);
+    assert!(o.has_since(next));
+    let (b, _) = o.since_budget(next, 10_000);
+    assert_eq!(b[0]["n"], serde_json::json!(a.len()), "the next turn goes on in order");
+    let (one, n1) = o.since_budget(0, 1);
+    assert_eq!((one.len(), n1), (1, 1), "at least one frame a turn");
+    let (_, end) = o.since(0);
+    assert!(!o.has_since(end));
+    assert!(o.since_budget(end, 10_000).0.is_empty());
 }
 
 #[test]

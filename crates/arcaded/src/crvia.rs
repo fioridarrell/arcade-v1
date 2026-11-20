@@ -75,8 +75,9 @@ pub fn peer_of(lender: &str) -> Option<&str> {
 /// Most bytes one turn of a link's loop sends from the queue. The loop sends, then reads: two arcades each with a
 /// large backlog for the other (clip bytes one way, screening requests the other) both blocked in their writes with
 /// neither reading, every link timed out after ~20 s and the next did the same (GX10 and txtok.app, 2026-11-19).
-/// Below what two socket buffers hold, each turn's writes finish and the loop reads before sending more.
-pub const TURN_BYTES: usize = 128 * 1024;
+/// Below a new link's receive window (~80-110 KB at the start, 2026-11-19), each turn's writes finish and the loop
+/// reads before sending more.
+pub const TURN_BYTES: usize = 32 * 1024;
 
 /// Whether frames are still queued for `peer` (its link's loop doesn't wait before its next turn).
 pub fn queued(peer: &str) -> bool {
@@ -224,7 +225,7 @@ mod tests {
         up(&peer);
         for i in 0..20 {
             let mut f = Frame::new(json!({"t": "sv", "op": "a", "id": 1, "seq": i}));
-            f.blob = vec![0u8; 48 * 1024];
+            f.blob = vec![0u8; 8 * 1024];
             send(&peer, f).unwrap();
         }
         let mut all = PEERS.lock().unwrap();

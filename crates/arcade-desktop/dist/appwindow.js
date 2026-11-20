@@ -66,9 +66,30 @@
     return yes;
   }
 
-  // Files an app saves (groups.save): the first goes through, more ask once per window.
-  const SAVE_MAX = 64 * 1024 * 1024;
+  // Files an app saves (arcade.files.save, and groups.save for apps written before it): the window asks once
+  // ("Let <app> save files?"), then the app saves until the window closes. groups.save keeps its old rule: behind the
+  // Group chats switch, the first file goes through and more ask once.
+  const SAVE_MAX = 128 * 1024 * 1024;
   let saves = 0, savesOk = false;
+  async function saveFile(m, askFirst) {
+    // An app's frame cannot save a file, so this window does, for bytes the app hands over: a file named by the app,
+    // put in the Downloads folder beside any file already there. Nothing opens it.
+    const bytes = m.data instanceof ArrayBuffer ? m.data : null;
+    const file = String(m.name || "file").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 120);
+    if (!bytes) throw new Error("nothing to save");
+    if (bytes.byteLength > SAVE_MAX) throw new Error("too big: a saved file is at most 128 MB");
+    if ((askFirst || saves > 0) && !savesOk) {
+      const mb = (bytes.byteLength / 1048576).toFixed(bytes.byteLength < 10485760 ? 1 : 0);
+      const yes = await oneCard(() => card(`Let ${appName} save files?`, [
+        `${appName} wants to save “${file}” (${mb} MB) to your Downloads folder. Allow lets it save files until this window closes.`], "Allow"));
+      if (!yes) throw new Error("declined");
+      savesOk = true;
+    }
+    saves++;
+    const kept = await invoke("save_file", { name: file, data: base64(bytes) });
+    toast(`Saved “${kept}” to Downloads`);
+    return { saved: kept };
+  }
   function base64(buf) {
     const b = new Uint8Array(buf);
     let out = "";
@@ -255,6 +276,11 @@
       if (m.op === "send") { const { arcade, seq, op, ...request } = m; return await api("apps.owner_send", { page: here, request }); }
       throw new Error("owner ops are identity and send");
     },
+    // arcade.files (/r/files.js): save a file to Downloads. No switch on the card; asks once per window.
+    async files(m) {
+      if (m.op === "save") return await saveFile(m, true);
+      throw new Error("files ops are save");
+    },
     async groups(m) {
       const p = await perms();
       if (!p.groups) throw new Error("off: turn on Group chats on this app's card");
@@ -282,24 +308,7 @@
           const r = await api("group.create", { name, members });
           return { group: (await api("group.app_list")).groups.find((g) => g.id === r.id) || { id: r.id, name } };
         }
-        case "save": {
-          // An app's frame cannot save a file, so this window does, for bytes the app hands over: a file named by
-          // the app, put in the Downloads folder beside any file already there. Nothing opens it.
-          const bytes = m.data instanceof ArrayBuffer ? m.data : null;
-          const file = String(m.name || "file").replace(/[\\/:*?"<>|\u0000-\u001f]/g, "_").slice(0, 120);
-          if (!bytes) throw new Error("nothing to save");
-          if (bytes.byteLength > SAVE_MAX) throw new Error("too big: a saved file is at most 64 MB");
-          if (saves > 0 && !savesOk) {
-            const yes = await oneCard(() => card(`Let ${appName} save more files?`, [
-              `${appName} has saved a file to your Downloads folder and wants to save another (“${file}”). Allow lets it save files until this window closes.`], "Allow"));
-            if (!yes) throw new Error("declined");
-            savesOk = true;
-          }
-          saves++;
-          const kept = await invoke("save_file", { name: file, data: base64(bytes) });
-          toast(`Saved “${kept}” to Downloads`);
-          return { saved: file };
-        }
+        case "save": return await saveFile(m);
         default: throw new Error("groups ops are list, read, send, leave, seal, open, people, add, create and save");
       }
     },
@@ -872,6 +881,27 @@
       catch (e) { await card("This request can't be sent", [e.message], "Refuse", "Close"); await api("wallet.deny", { id: r.id }); return; }
       const who = pv.page_card || {};
       const from = `${who.app || appName}${who.creator_tag ? " by @" + who.creator_tag : ""}`;
+      if (pv.kind === "fog") {
+        // A storage choice (fogkeep.rs): keep, pin, forget or undo on this arcade's own storage. Nothing is signed or
+        // written on a chain; it changes only what this arcade keeps and serves.
+        const c = (pv.fog && pv.fog.card) || {};
+        const size = (b) => b >= 10485760 ? `${Math.round(b / 1048576)} MB` : b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.ceil((b || 0) / 1000)} kB`;
+        const lines = [`${from} asks to change what this arcade keeps:`];
+        for (const l of c.lines || []) lines.push(l);
+        const facts = document.createElement("ul"); facts.className = "outs";
+        const fact = (t) => { const li = document.createElement("li"); li.textContent = t; facts.append(li); };
+        if (c.size_bytes) fact(`Size: ${size(c.size_bytes)}`);
+        if (c.copies_before != null && c.floor != null) fact(`Copies: ${c.copies_before}/${c.floor} → ${c.copies_after}/${c.floor}`);
+        for (const h of c.handover || []) fact(`${h.segment}: handing over: kept here until a new keeper is registered and audited (${h.before}/${h.floor} now)`);
+        if (c.pay_text) fact(`Pay: ${c.pay_text}`);
+        if (c.seal_text) fact(`Seal: ${c.seal_text}`);
+        if (facts.childElementCount) lines.push(facts);
+        for (const n of c.notes || []) lines.push(n);
+        const title = c.op === "forget" ? "Forget this here?" : c.op === "undo" ? "Undo this choice?" : c.mode === "pin" ? "Pin this blob here?" : "Keep this here?";
+        const yes = await card(title, lines, "Approve", "Refuse");
+        await api(yes ? "wallet.approve" : "wallet.deny", { id: r.id });
+        return;
+      }
       if (pv.kind === "repo") {
         // A repository write (reposvc.rs): signed by this wallet's @tag on the ARCADE chain.
         const arc = (u) => `${(u / 1e8).toLocaleString(undefined, { maximumFractionDigits: 8 })} ARCADE`;

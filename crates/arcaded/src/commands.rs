@@ -215,9 +215,10 @@ cmds! {
     "arc.keep" Admin "mb?" "Keep a share of the ARCADE chain's blobs by choice (rules version 5): whole segments, sealed and paid; segments short of copies first. mb: the share in MB (0 or \"off\": none).";
     "arc.fog" Read "" "Fog storage here: what it holds (own, kept, viewed), the segments it keeps, those short of copies on the network, warnings.";
     "arc.blob" Read "id" "A blob of the ARCADE chain (hex), fetched from linked arcades when it isn't here.";
-    "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?, client_ref?" "Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Without send, only the quote (blob_fee, fee).";
+    "arc.blob_publish" Wallet "path | hex, type, class?, gzip?, send?, client_ref?" "Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Copies kept: Permanent 3 from rules version 6 (7 before), Release 5, Temporary 3 for 90 days; a Temporary blob can be made Permanent later for the difference (arc.blob_upgrade). Without send, only the quote (blob_fee, fee).";
     "arc.blob_publish_large" Wallet "path | hex, type, class?, gzip?, name?, send?, client_ref?" "Put a file of up to 100 MB on the ARCADE chain as one large blob: parts of 4 MB over successive blocks, then a manifest naming them and the overall root; its id is the manifest's. Without send, the quote (parts, fee, blocks, seconds). Resumes after a restart without paying twice. arc.blob_publish switches to it above 4 MB.";
     "arc.blob_publish_status" Read "id?" "Publishing of large blobs from here: parts in blocks and waiting, the manifest, what was paid, resends.";
+    "arc.blob_upgrade" Wallet "id, send?, client_ref?" "Make a Temporary blob Permanent (ARCADE rules version 6): pay the Permanent fee minus the Temporary fee for its bytes (0.003525 ARCADE per started kB), from this wallet; anyone may upgrade any Temporary blob, and it stays its publisher's. A large blob's manifest id upgrades all its parts, paid for their bytes too. Refused for an unknown, Permanent, Release or expired Temporary blob, and before version 6. Without send, only the quote." => "{blob, blobs, parts, bytes, already_paid, permanent_fee, difference, fee, at_height, floor, txid, hex, size, sent}";
     "a.profile" Read "tag? | address?" "A profile card on the ARCADE chain (yours when neither), with follower counts.";
     "a.profile_set" Wallet "name?, bio?, url?, picture?, addresses?, client_ref?" "Publish your profile on the ARCADE chain (A://).";
     "a.follow" Wallet "tag, client_ref?" "Follow an @tag on the ARCADE chain.";
@@ -283,6 +284,10 @@ cmds! {
     "explorer.arc_segments" Public "family?, source?, offset?, limit? (<= 500)" "Every confirmed (sealed) ARCADE segment, newest first: chain, family, range, bytes, root, poster, confirmation height, settled, replicas, weight each, and each holder (owner, node, tag, replica, audits missed in a row, draw-from height).";
     "explorer.arc_holders" Public "offset?, limit? (<= 500)" "Every ARCADE earner by pay weight: replica owners (replicas, bytes, pay and draw weight, share, audits passed/missed/running, accrued pay, serving verdicts, turn and next turn, punished, silenced) and genesis earners (address, keys, weight, accrued).";
     "explorer.arc_payouts" Public "blocks? (<= 1152, default 300)" "The last blocks' ARCADE coinbases by epoch: minted, coinbase total, the writer's share, what was released to each earner; with totals per earner and the pot now.";
+    "fog.keep" Admin "segment | blob | publisher, mode?, preview?" "Keep data by choice (docs/STORAGEAPP.md): mode segment (default) makes this arcade a chosen keeper of the blob's whole segment (P#n / T#n; a publisher: every segment holding its blobs), counted once registered and audited, sealed and paid, inside the keep share (refused with the reason when the share is full, there is none, or the ARCADE chain is borrowed); mode pin keeps one blob (a large blob with its parts) as an uncounted extra copy that is never faded, uses the keep share and earns nothing. preview: true answers the card only (size, copies before and after, pay estimate, seal time on this machine) and changes nothing." => "{done, id, kind, card}";
+    "fog.forget" Admin "segment | blob | publisher, preview?" "Forget data here: drops this arcade's copies (viewer cache, grace copy, pins) and never fetches or serves it again (mesh asks get not here, the holder bloom leaves it out); a blob this arcade published is un-pinned. A segment this arcade keeps is handed over first: it drops its copy only once a new keeper is registered and passed an audit (handing over n/floor in fog.mine), and stays a keeper while no arcade has room. Local only: nothing is deleted elsewhere or written on a chain. preview: true answers the card only." => "{done, id, kind, freed_bytes, handing_over, card}";
+    "fog.undo" Admin "id, preview?" "Take back a fog.keep, pin or fog.forget (its id from fog.mine); a hand-over not finished stops and this arcade stays a keeper." => "{done, id, undone, card}";
+    "fog.mine" Admin "" "What this arcade keeps by choice (segments, pins), forgot and hands over, with Undo ids; its keep share (none on a borrowed arcade); its blobs by role (keeper, publisher, pinned, grace, viewer) and how much of the map is in the fog for it. Operator only: the forget list is never public." => "{keep_share, chosen, pins, forgotten, handing_over, totals}";
     "explorer.arc_blobs" Public "id?, offset?, limit? (<= 500, default 200), publisher? (address or @tag), class? (permanent, release, temporary, boost), short_only?, here_only?, sort? (publisher, newest, copies)" "Every ARCADE blob as fog storage sees it (the Storage app's fog map), a large blob as one item with its parts: id, type, publisher (@tag, address), class, bytes, segment (P#n, T#n), holders by role (keeper, publisher, grace, viewer; registered+audited, registered, here or announced), copies counted against the floor (registered, audited replicas only), floor, short, announced keepers not counted yet, all copies, last viewed here, here, mine. With id: that blob and its journey (published, grace until, keepers' seal and audit heights, keepers that came and went, copies outside the floor). Totals for the filtered set: overall (copy bands), per publisher, per holder.";
     "explorer.arc_fog_nodes" Public "node? (id or prefix)" "Every node fog storage knows of from here (the fog map's node panel): keep share (setting, used, free), blobs held by role (keeper, publisher, grace, viewer), held and in the fog, segments kept (n/floor each), earning weight, and the 10 nodes it shares the most blobs with.";
     "explorer.arc_machines" Public "" "The machines behind the mesh for apps (the Storage app's Machines): the same as mesh.sysinfo. Join a record's node with an earner's key in explorer.arc_holders to show what it reports beside what it has proven.";
@@ -501,7 +506,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("base", "string", "A base: a manifest blob id (64 hex) for a push, or a market's base asset."),
     ("before", "integer", "Only below this height or position (exclusive)."),
     ("bio", "string", "Profile text."),
-    ("blob", "object", "A sealed record: {kdf, iterations, salt, nonce, sealed}."),
+    ("blob", "object|string", "A sealed record: {kdf, iterations, salt, nonce, sealed}; for fog.keep and fog.forget a blob id (64 hex)."),
     ("blobs", "array", "The hex of blobs a transaction brings."),
     ("blocks", "integer", "How many blocks back."),
     ("body", "string|object", "The body: text, or a JSON object where the command says."),
@@ -599,7 +604,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("memo", "string", "A memo (up to 80 bytes)."),
     ("mentions", "array", "@tags mentioned."),
     ("message", "string", "The signed message."),
-    ("mode", "string", "How a chain is kept: full, shared or chain."),
+    ("mode", "string", "How a chain is kept: full, shared or chain; for fog.keep: segment or pin."),
     ("msg", "string", "A sealed message."),
     ("n", "integer", "How many."),
     ("name", "string", "A name."),
@@ -638,6 +643,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("psbt", "string", "A PSBT (base64 or hex)."),
     ("pubkey", "string", "A public key (33-byte hex)."),
     ("publisher", "string", "A publisher's address or @tag."),
+    ("preview", "boolean", "Only answer what it would do (the approval card); nothing changes."),
     ("q", "string", "Search text."),
     ("qr", "string", "The QR code's text."),
     ("query", "object", "Query fields."),
@@ -658,7 +664,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("scripts", "string", "\"assume\": skip script checks."),
     ("sealed", "string", "A sealed message."),
     ("secret", "string", "A WIF key or 12 words (local only)."),
-    ("segment", "string", "A segment id (64 hex)."),
+    ("segment", "string", "A segment id (64 hex); for fog.keep and fog.forget a blob segment by name, P#n or T#n (as explorer.arc_blobs gives it)."),
     ("send", "boolean", "true signs and broadcasts; absent or false only builds and shows it (nothing signed)."),
     ("service", "string", "A service name."),
     ("session", "string", "A session id."),
@@ -717,6 +723,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
 /// What one command says of one parameter: (command, parameter, allowed values (comma list, "" none), default (JSON,
 /// "" none), most (a number's limit, 0 none)).
 pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
+    ("fog.keep", "mode", "segment,pin", "\"segment\"", 0),
     ("tx.wait", "until", "accepted_local,broadcast_ok,seen_in_peer_mempool,confirmed", "\"confirmed\"", 0),
     ("tx.wait", "timeout", "", "60", 600),
     ("chains.wait", "timeout", "", "60", 600),

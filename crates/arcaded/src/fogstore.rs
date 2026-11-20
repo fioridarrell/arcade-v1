@@ -19,8 +19,9 @@
 //! arcades with room don't all pile on ([`SegHolders::for_decision`]). The registry's own count (`Registry::holders_of`,
 //! which splits pay) is consensus and isn't touched here.
 //!
-//! **Floors**: a blob-family segment needs [`blob::floor`] of its strongest class (Permanent 7, Release 5); a
-//! Temporary segment ([`segment::FAMILY_BLOBS_TEMP`]) needs 3 until its time is up, then none. Below its floor a segment
+//! **Floors**: a blob-family segment needs the highest [`blob::floor_at`] of its classes (Permanent 7, from rules version
+//! 6 Permanent 3; Release 5); a Temporary segment ([`segment::FAMILY_BLOBS_TEMP`]) needs 3 until its time is up, then
+//! none (the Permanent floor for good once a blob in it is upgraded, rules version 6). Below its floor a segment
 //! is **short**. Arcades with room in their keep share step in, ranked by a hash of node id and segment, so they don't
 //! all take it at once, until the floor is met. A keeper above the floor whose rank is the worst lets go. A keeper that
 //! goes down misses audits, its replica is removed, the segment is short, and the next-ranked arcade with room takes it.
@@ -267,7 +268,25 @@ pub fn kept_mb_used(node: &Node) -> u64 {
 
 fn kept_bytes(node: &Node) -> u64 {
     let segs = kept_segs(node);
-    crate::arcblob::known().iter().filter(|(_, m)| segs.contains(&(family_of(m.class), m.height / RANGE))).map(|(id, _)| crate::arcblob::size_here(id)).sum()
+    // Pinned blobs (crate::fogkeep, "Pin just this blob") use the keep share too, outside the segments kept.
+    let pins = crate::fogkeep::snapshot().pins();
+    crate::arcblob::known()
+        .iter()
+        .filter(|(id, m)| segs.contains(&(family_of(m.class), m.height / RANGE)) || pins.contains(&hex::encode(id)))
+        .map(|(id, _)| crate::arcblob::size_here(id))
+        .sum()
+}
+
+/// Keep segments by the operator's choice now (crate::fogkeep, `fog.keep`): added to the kept set at once (the next
+/// round fetches and seals them), `replaced` (segments the share took by itself, with copies to spare) let go to make
+/// room.
+pub fn keep_now(node: &Node, segs: &[(u8, u64)], replaced: &[(u8, u64)]) {
+    let mut kept = kept_segs(node);
+    for s in replaced {
+        kept.remove(s);
+    }
+    kept.extend(segs.iter().copied());
+    save_segs(node, &kept);
 }
 
 // ---------------- the holder announcement ----------------
@@ -313,19 +332,24 @@ fn room_mb(node: &Node) -> u64 {
 /// `bm`: a bloom of the blobs this arcade published (the fog map's publisher role); `km`, `ku`: its keep share and what
 /// the share holds, in MB (the fog map's per-node panel).
 pub fn announce(node: &Node) -> Value {
-    let ids = crate::arcblob::held_ids();
+    // What the operator forgot here is left out (crate::fogkeep): nobody is sent to fetch it from this arcade.
+    let ids: Vec<Hash> = crate::arcblob::held_ids().into_iter().filter(|id| !crate::fogkeep::refused(id)).collect();
     let mine: Vec<Hash> = ids.iter().filter(|id| crate::arcblob::is_mine(id)).copied().collect();
     let keep: Vec<Value> = kept_segs(node).into_iter().take(256).map(|(f, i)| json!([f, i])).collect();
-    json!({"bf": bloom(&ids), "bn": ids.len(), "bm": bloom(&mine), "mn": mine.len(), "keep": keep, "room": room_mb(node),
+    // Segments it is handing over (forgotten while it keeps them): other arcades count it out, so one steps in.
+    let leave: Vec<Value> = crate::fogkeep::snapshot().handing_over().into_iter().take(256).map(|(f, i)| json!([f, i])).collect();
+    json!({"bf": bloom(&ids), "bn": ids.len(), "bm": bloom(&mine), "mn": mine.len(), "keep": keep, "leave": leave, "room": room_mb(node),
            "km": keep_mb(node), "ku": kept_bytes(node) >> 20})
 }
 
 /// An announcement as kept from another arcade: only these fields, each in its form and size.
 pub fn clean(v: &Value) -> Option<Value> {
     let bf = v["bf"].as_str().filter(|s| s.len() <= 2 * BLOOM_MAX && s.bytes().all(|c| c.is_ascii_hexdigit()))?;
-    let keep: Vec<Value> = v["keep"].as_array().map(|a| a.iter().take(256).filter_map(|x| Some(json!([x[0].as_u64().filter(|f| *f < 256)?, x[1].as_u64()?]))).collect()).unwrap_or_default();
+    let pairs = |k: &str| -> Vec<Value> { v[k].as_array().map(|a| a.iter().take(256).filter_map(|x| Some(json!([x[0].as_u64().filter(|f| *f < 256)?, x[1].as_u64()?]))).collect()).unwrap_or_default() };
+    let keep = pairs("keep");
+    let leave = pairs("leave");
     let bm = v["bm"].as_str().filter(|s| s.len() <= 2 * BLOOM_MAX && s.bytes().all(|c| c.is_ascii_hexdigit())).unwrap_or("");
-    Some(json!({"bf": bf, "bn": v["bn"].as_u64().unwrap_or(0), "bm": bm, "mn": v["mn"].as_u64().unwrap_or(0), "keep": keep, "room": v["room"].as_u64().unwrap_or(0),
+    Some(json!({"bf": bf, "bn": v["bn"].as_u64().unwrap_or(0), "bm": bm, "mn": v["mn"].as_u64().unwrap_or(0), "keep": keep, "leave": leave, "room": v["room"].as_u64().unwrap_or(0),
                 "km": v["km"].as_u64().unwrap_or(0), "ku": v["ku"].as_u64().unwrap_or(0)}))
 }
 
@@ -367,26 +391,33 @@ pub fn floor_max() -> usize {
     env_secs("ARCADE_FOG_FLOOR_MAX", u64::MAX).min(usize::MAX as u64) as usize
 }
 
-/// A class's copy floor as fog storage uses it here: [`blob::floor`], at most [`floor_max`].
+/// A class's copy floor as fog storage uses it here: the rules' for the next block ([`blob::floor_at`]: Permanent 7 in
+/// rules version 5, 3 from version 6), at most [`floor_max`]. Before the chain runs here, version 5's.
 pub fn class_floor(class: Class) -> usize {
-    blob::floor(class).min(floor_max())
+    let floor = match crate::arcsvc::svc_net() {
+        Some(net) => blob::floor_at(&net, crate::arcblob::next_height(), class),
+        None => blob::priced_copies(class),
+    };
+    floor.min(floor_max())
 }
 
-/// A segment's copy floor: its strongest class's (Permanent 7, Release 5); a Temporary segment 3 until its time is up
-/// (the last blob in it older than `temporary` seconds), then 0; an empty one 0.
-pub fn floor_of(family: u8, metas: &[&crate::arcblob::Meta], now: u64, temporary: u64) -> usize {
+/// A segment's copy floor, by `floor` per class: the highest of its classes' floors (Permanent, Release); a Temporary segment the
+/// Temporary floor until its time is up (every blob in it past its time: Meta::timed_done, in blocks as the chain counts
+/// it, with `next` the next block's height), then 0, unless a blob in it
+/// was upgraded to Permanent (rules version 6): the Permanent floor then, for good. An empty one 0.
+pub fn floor_of(family: u8, metas: &[&crate::arcblob::Meta], next: u64, now: u64, temporary: u64, floor: impl Fn(Class) -> usize) -> usize {
     if metas.is_empty() {
         return 0;
     }
     if family == FAMILY_BLOBS_TEMP {
-        let last = metas.iter().map(|m| m.time.max(m.boosted_until.saturating_sub(temporary))).max().unwrap_or(0);
-        return if last.saturating_add(temporary) > now { class_floor(Class::Temporary) } else { 0 };
+        if metas.iter().any(|m| m.upgraded.is_some()) {
+            return floor(Class::Permanent).max(floor(Class::Temporary));
+        }
+        // Within its time while any blob in it is (as the chain counts it, Meta::timed_done).
+        return if metas.iter().any(|m| !m.timed_done(next, now, temporary)) { floor(Class::Temporary) } else { 0 };
     }
-    if metas.iter().any(|m| m.class == Class::Permanent as u8) {
-        class_floor(Class::Permanent)
-    } else {
-        class_floor(Class::Release)
-    }
+    // The highest floor of the classes in it (from rules version 6 Release's 5 is above Permanent's 3).
+    metas.iter().map(|m| floor(if m.class == Class::Permanent as u8 { Class::Permanent } else { Class::Release })).max().unwrap_or(0)
 }
 
 /// Where a segment's copies come from: its catalog entry's audited replicas once it's listed, else the arcades
@@ -487,7 +518,57 @@ fn holders_of_seg(ann: &[(String, Value)], me: &str, mine: bool, family: u8, ind
     if mine && !keepers.iter().any(|k| k == me) {
         keepers.push(me.to_string());
     }
-    SegHolders { registered: crate::arcsvc::segment_holders(family, index * RANGE), keepers }
+    let registered = crate::arcsvc::segment_holders(family, index * RANGE).or_else(|| test_counted(ann, me, family, index, &keepers));
+    SegHolders { registered, keepers }
+}
+
+/// Who has segment (family, index) now, as a fog round would count it (crate::fogkeep's cards).
+pub fn seg_holders(node: &Node, family: u8, index: u64) -> SegHolders {
+    holders_of_seg(&announcements(node), &node.id_hex(), kept_segs(node).contains(&(family, index)), family, index)
+}
+
+/// The arcades announcing they are leaving segment (family, index) (handing it over, crate::fogkeep).
+fn leaving_of(ann: &[(String, Value)], family: u8, index: u64) -> BTreeSet<String> {
+    ann.iter().filter(|(_, f)| f["leave"].as_array().is_some_and(|a| a.iter().any(|x| x[0] == family as u64 && x[1] == index))).map(|(n, _)| n.clone()).collect()
+}
+
+/// Whether an arcade holds every blob of a segment: its bloom has each (this arcade: the bytes are here).
+fn holds_all(ann: &[(String, Value)], me: &str, who: &str, ids: &[Hash]) -> bool {
+    if who == me {
+        return ids.iter().all(crate::arcblob::bytes_here);
+    }
+    ann.iter().find(|(n, _)| n == who).and_then(|(_, f)| f["bf"].as_str()).is_some_and(|b| ids.iter().all(|id| bloom_has(b, id)))
+}
+
+/// Test hook for a closed local net, which never completes a 10,000-block range so nothing is ever listed, registered or
+/// audited there: with `ARCADE_FOG_TEST_AUDIT_SECS=n` (local chains only), an open segment's announced keepers count as
+/// registered at once, and as audited once they have announced keeping it for n seconds while holding every blob of it.
+/// Off (None) everywhere else: copies are the registry's.
+fn test_counted(ann: &[(String, Value)], me: &str, family: u8, index: u64, keepers: &[String]) -> Option<Vec<(String, bool)>> {
+    if !crate::arcsvc::local() {
+        return None;
+    }
+    let secs: u64 = std::env::var("ARCADE_FOG_TEST_AUDIT_SECS").ok()?.parse().ok()?;
+    static SINCE: std::sync::Mutex<Option<HashMap<(String, u8, u64), u64>>> = std::sync::Mutex::new(None);
+    let now = arcade_app::now();
+    let ids: Vec<Hash> = crate::arcblob::known().into_iter().filter(|(_, m)| family_of(m.class) == family && m.height / RANGE == index).map(|(id, _)| id).collect();
+    let mut g = SINCE.lock().unwrap();
+    let since = g.get_or_insert_with(HashMap::new);
+    since.retain(|k, _| !(k.1 == family && k.2 == index) || keepers.contains(&k.0));
+    Some(keepers
+        .iter()
+        .map(|k| {
+            // The clock starts once it holds every blob (its seal could start); it then stays audited while it keeps
+            // announcing the segment, as a sealed copy passes audits whatever its plain copies (a forgotten blob's).
+            let key = (k.clone(), family, index);
+            let t = match since.get(&key) {
+                Some(t) => Some(*t),
+                None if holds_all(ann, me, k, &ids) => Some(*since.entry(key).or_insert(now)),
+                None => None,
+            };
+            (k.clone(), t.is_some_and(|t| now.saturating_sub(t) >= secs))
+        })
+        .collect())
 }
 
 /// Every other arcade's fresh announcement (node id → its "fog" part), for the storage reads (crate::fogmap).
@@ -517,7 +598,7 @@ pub struct SegView {
     pub mine: bool,
 }
 
-/// A segment's copy floor as the last fog round saw it (its strongest class's; a Temporary one past its time 0): None
+/// A segment's copy floor as the last fog round saw it (the highest of its classes'; a Temporary one past its time 0): None
 /// before the first round, or for a segment it didn't see (crate::fogmap).
 pub fn seg_floor(family: u8, index: u64) -> Option<usize> {
     SEG_FLOORS.lock().unwrap().as_ref()?.get(&(family, index)).copied()
@@ -555,6 +636,11 @@ pub fn last_round() -> Option<u64> {
     STATUS.lock().unwrap().as_ref().and_then(|s| s["at"].as_u64())
 }
 static NODE: std::sync::OnceLock<std::sync::Weak<Node>> = std::sync::OnceLock::new();
+
+/// The node, for code without it at hand (crate::fogkeep): None before the first round.
+pub fn node_now() -> Option<std::sync::Arc<Node>> {
+    NODE.get().and_then(|w| w.upgrade())
+}
 
 /// [`holders`] for code without the node at hand (crate::arcblob::view): empty before the first round.
 pub fn holders_now(id: &Hash) -> Vec<String> {
@@ -604,7 +690,17 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     }
     let ann = announcements(node);
     let keep_on = keep_mb(node) > 0;
+    // The operator's own choices (crate::fogkeep): segments kept by choice, pins, the forget list, hand-overs.
+    let ch = crate::fogkeep::snapshot();
+    let chosen = ch.chosen();
+    let handing = ch.handing_over();
     let mut segs = kept_segs(node);
+    // A segment kept by choice is kept whatever the round says (within the share; see below; none while it is off).
+    for k in chosen.iter().filter(|_| keep_on) {
+        if by_seg.contains_key(k) && segs.insert(*k) {
+            eprintln!("arc: fog: keeping {} by the operator's choice", crate::fogmap::seg_name(k.0, k.1));
+        }
+    }
     let mut room = room_mb(node) << 20;
     let mut short = Vec::new();
     let mut warnings = Vec::new();
@@ -612,9 +708,19 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let mut view: Vec<SegView> = Vec::new();
     let mut network_bytes = 0u64;
     for (&(family, index), metas) in &by_seg {
-        let floor = floor_of(family, metas, now, temporary);
+        let floor = floor_of(family, metas, crate::arcblob::next_height(), now, temporary, class_floor);
         let mine_kept = segs.contains(&(family, index));
-        let held = holders_of_seg(&ann, &me, mine_kept, family, index);
+        let held_all = holders_of_seg(&ann, &me, mine_kept, family, index);
+        // Arcades handing it over (crate::fogkeep) are counted out of every keep decision, so the next ranked with room
+        // steps in while they still hold it; this arcade too when it is the one leaving.
+        let mut leaving = leaving_of(&ann, family, index);
+        if handing.contains(&(family, index)) {
+            leaving.insert(me.clone());
+        }
+        let held = SegHolders {
+            registered: held_all.registered.as_ref().map(|r| r.iter().filter(|x| !leaving.contains(&x.0)).cloned().collect()),
+            keepers: held_all.keepers.iter().filter(|k| !leaving.contains(*k)).cloned().collect(),
+        };
         // Against the floor count only registered, audited replicas; announced keepers not counted (yet) are told apart.
         let (counted_copies, announced, counted) = (held.counted(), held.announced_only(), held.how());
         let copies = held.for_decision();
@@ -627,12 +733,25 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
         // Another arcade is a candidate only with room enough for the whole segment (one with less wouldn't take it,
         // and the segment would wait on it).
         let mut candidates: Vec<String> = ann.iter().filter(|(_, f)| f["room"].as_u64().is_some_and(|r| r > 0 && r.saturating_add(1) << 20 > size)).map(|(n, _)| n.clone()).collect();
-        if keep_on && (mine_kept || room >= size) {
+        let forgotten = ch.seg_forgotten(family, index);
+        candidates.retain(|c| !leaving.contains(c));
+        if keep_on && !forgotten && (mine_kept || room >= size) {
             candidates.push(me.clone());
         }
         let mut rooms: HashMap<String, u64> = ann.iter().map(|(n, f)| (n.clone(), f["room"].as_u64().unwrap_or(0))).collect();
         rooms.insert(me.clone(), room_mb(node));
-        let keep = decide(&me, family, index, floor, copies, mine_kept, &keepers, &candidates, &rooms);
+        let mut keep = decide(&me, family, index, floor, copies, mine_kept, &keepers, &candidates, &rooms);
+        if chosen.contains(&(family, index)) {
+            keep = true;
+        }
+        if forgotten {
+            // Forgotten: never taken here; one kept is handed over (below) before it goes.
+            keep = mine_kept;
+        }
+        if forgotten && mine_kept && !handing.contains(&(family, index)) {
+            // Forgotten, its hand-over done: let go.
+            keep = false;
+        }
         if keep && !mine_kept {
             segs.insert((family, index));
             room = room.saturating_sub(size);
@@ -651,15 +770,37 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
                 family_name(family), index * RANGE, index * RANGE + RANGE - 1));
         }
     }
+    // Hand-overs (crate::fogkeep): a forgotten segment this arcade keeps goes once its new keeper is counted (registered
+    // and audited; open: announced and holding every blob), never before.
+    let ids_of = |family: u8, index: u64| -> Vec<Hash> { known.iter().filter(|(_, m)| family_of(m.class) == family && m.height / RANGE == index).map(|(id, _)| *id).collect() };
+    let look = |family: u8, index: u64| {
+        let held = holders_of_seg(&ann, &me, true, family, index);
+        let leaving = leaving_of(&ann, family, index);
+        let size = seg_bytes.get(&(family, index)).copied().unwrap_or(0);
+        let room = ann.iter().any(|(n, f)| !held.keepers.contains(n) && !leaving.contains(n) && f["room"].as_u64().is_some_and(|r| r > 0 && r.saturating_add(1) << 20 > size));
+        let ids = ids_of(family, index);
+        let ready: BTreeSet<String> = held.keepers.iter().filter(|k| holds_all(&ann, &me, k, &ids)).cloned().collect();
+        Some((held, leaving, room, ready))
+    };
+    for (family, index) in crate::fogkeep::round_handover(&me, &segs, &look) {
+        segs.remove(&(family, index));
+        crate::fogkeep::release_sealed(node, family, index);
+        eprintln!("arc: fog: {} handed over: its new keeper is counted, this arcade's copy goes", crate::fogmap::seg_name(family, index));
+    }
     // Over the share (a segment grew after it was taken: a large blob's parts came block by block, or the operator chose
-    // a smaller share): let go of segments until what's kept fits, those with the most copies first, then the biggest.
+    // a smaller share): let go of segments until what's kept fits, those with the most copies first, then the biggest;
+    // segments kept by the operator's choice last, and never one being handed over (the network is owed it).
     let share = keep_mb(node) << 20;
+    let pins_bytes: u64 = ch.pins().iter().filter_map(|h| hex::decode(h).ok().and_then(|b| <Hash>::try_from(b).ok())).filter(|id| !metas.get(id).is_some_and(|m| segs.contains(&(family_of(m.class), m.height / RANGE)))).map(|id| crate::arcblob::size_here(&id)).sum();
     let mut over: Vec<((u8, u64), u64, usize)> = segs.iter().map(|k| (*k, seg_bytes.get(k).copied().unwrap_or(0), view.iter().find(|v| (v.family, v.index) == *k).map_or(0, |v| v.copies))).collect();
-    let mut total: u64 = over.iter().map(|o| o.1).sum();
-    over.sort_by_key(|o| (std::cmp::Reverse(o.2), std::cmp::Reverse(o.1)));
+    let mut total: u64 = over.iter().map(|o| o.1).sum::<u64>() + pins_bytes;
+    over.sort_by_key(|o| (chosen.contains(&o.0), std::cmp::Reverse(o.2), std::cmp::Reverse(o.1)));
     for (k, bytes, copies) in over {
         if total <= share {
             break;
+        }
+        if handing.contains(&k) {
+            continue;
         }
         segs.remove(&k);
         total -= bytes;
@@ -674,9 +815,18 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let idle = idle_secs();
     let grace = grace_secs();
     let in_kept = |id: &Hash| metas.get(id).is_some_and(|m| segs.contains(&(family_of(m.class), m.height / RANGE)));
+    let pins = ch.pins();
+    let pinned = |id: &Hash| pins.contains(&hex::encode(id));
+    // Forgotten here (crate::fogkeep), and not owed to the network (not in a kept segment): never alive.
+    let refused = |id: &Hash| ch.refused(&crate::fogkeep::key_of(id), &segs);
     let alive = |id: &Hash| {
+        if refused(id) && !in_kept(id) {
+            return false;
+        }
         crate::arcblob::is_mine(id)
+            || pinned(id)
             || in_kept(id)
+
             || metas.get(id).is_some_and(|m| m.time.saturating_add(grace) > now)
             || crate::arcblob::last_use(id).is_some_and(|t| t.saturating_add(idle) > now)
     };
@@ -695,7 +845,13 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     // Fetch what a kept segment lacks, and the rest of the large blobs it keeps a part of (not a view: it doesn't count
     // as one).
     let mut fetched = 0;
-    let wanted = known.iter().filter(|(id, m)| segs.contains(&(family_of(m.class), m.height / RANGE)) && !crate::arcblob::here(id)).map(|(id, _)| *id).chain(whole_fetch);
+    // Pinned blobs (crate::fogkeep) are fetched to be kept as well.
+    let wanted = known
+        .iter()
+        .filter(|(id, m)| (segs.contains(&(family_of(m.class), m.height / RANGE)) || pinned(id)) && !crate::arcblob::here(id))
+        .map(|(id, _)| *id)
+        .chain(whole_fetch)
+        .filter(|id| !refused(id) || in_kept(id));
     for id in wanted {
         if fetched >= 64 {
             break;
@@ -708,10 +864,23 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let (mut dropped, mut freed) = (0, 0u64);
     if !archive {
         for (id, m) in &known {
+            if pinned(id) {
+                continue;
+            }
+            // Forgotten here and owed to nobody: its bytes go now, new or viewed (crate::fogkeep).
+            if refused(id) && !in_kept(id) && !crate::arcblob::is_mine(id) {
+                let n = crate::arcblob::drop_plain(id) + crate::arcblob::drop_cached(id);
+                if n > 0 {
+                    freed += n;
+                    dropped += 1;
+                }
+                continue;
+            }
             if crate::arcblob::is_mine(id) {
                 continue;
             }
-            let temp_done = family_of(m.class) == FAMILY_BLOBS_TEMP && m.time.saturating_add(temporary).max(m.boosted_until) <= now;
+            // Past its time as the chain counts it (an upgraded one never is: Meta::timed_done).
+            let temp_done = family_of(m.class) == FAMILY_BLOBS_TEMP && m.timed_done(crate::arcblob::next_height(), now, temporary);
             if temp_done {
                 freed += crate::arcblob::forget(id);
                 dropped += 1;
@@ -766,9 +935,12 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     Some(())
 }
 
-/// A blob class's copy floor (for the storage reads, explorer.arc_*).
+/// A blob class's copy floor (for the storage reads, explorer.arc_*): the rules' for the next block.
 pub fn blob_floor(class: Class) -> usize {
-    blob::floor(class)
+    match crate::arcsvc::svc_net() {
+        Some(net) => blob::floor_at(&net, crate::arcblob::next_height(), class),
+        None => blob::priced_copies(class),
+    }
 }
 
 /// The segments short of their copy floor, as the last round saw them (for the storage reads, explorer.arc_*):
@@ -844,16 +1016,34 @@ mod tests {
 
     #[test]
     fn floors_by_class() {
-        assert_eq!(blob::floor(Class::Temporary), 3);
-        assert_eq!(blob::floor(Class::Release), 5);
-        assert_eq!(blob::floor(Class::Permanent), 7);
-        let m = |class: Class, time: u64| crate::arcblob::Meta { class: class as u8, kind: String::new(), encoding: 0, height: 1, time, line: String::new(), boosted_until: 0, len: 0, publisher: String::new() };
+        use arcade_arc::params::{Net, TESTNET};
+        // Rules version 5: Permanent 7; version 6 (Martin 2026-11-19): Permanent 3. Prices don't move.
+        let v6 = Net { rules: &[(3, 0), (5, 1), (6, 100)], ..TESTNET };
+        let at = |h: u64| move |c: Class| blob::floor_at(&v6, h, c);
+        assert_eq!((at(99)(Class::Temporary), at(99)(Class::Release), at(99)(Class::Permanent)), (3, 5, 7));
+        assert_eq!((at(100)(Class::Temporary), at(100)(Class::Release), at(100)(Class::Permanent)), (3, 5, 3));
+        let m = |class: Class, time: u64| crate::arcblob::Meta { class: class as u8, kind: String::new(), encoding: 0, height: 1, time, line: String::new(), boosted_until: 0, len: 0, publisher: String::new(), upgraded: None, until: None };
         let (p, r, t) = (m(Class::Permanent, 0), m(Class::Release, 0), m(Class::Temporary, 1000));
-        assert_eq!(floor_of(FAMILY_BLOBS, &[&r, &p], 0, 90), 7);
-        assert_eq!(floor_of(FAMILY_BLOBS, &[&r], 0, 90), 5);
-        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 1050, 90), 3);
-        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 1100, 90), 0, "a Temporary segment past its time needs no copies");
-        assert_eq!(floor_of(FAMILY_BLOBS, &[], 0, 90), 0);
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&r, &p], 0, 0, 90, at(99)), 7);
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&r, &p], 0, 0, 90, at(100)), 5, "Release 5 is now the strongest floor");
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&p], 0, 0, 90, at(100)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&r], 0, 0, 90, at(99)), 5);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 0, 1050, 90, at(99)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 0, 1100, 90, at(99)), 0, "a Temporary segment past its time needs no copies");
+        assert_eq!(floor_of(FAMILY_BLOBS, &[], 0, 0, 90, at(99)), 0);
+        // A Temporary blob upgraded to Permanent (rules version 6): its segment keeps the Permanent floor past its time.
+        let up = crate::arcblob::Meta { upgraded: Some(blob::Upgraded { height: 100, txid: arcade_chain::hash::Hash256([1; 32]), paid: 352_500, by: Vec::new() }), ..t.clone() };
+        assert_eq!(up.class_now(), Class::Permanent as u8);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t, &up], 0, 1_000_000, 90, at(100)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t, &up], 0, 1_000_000, 90, at(99)), 7);
+        // The chain's count in blocks wins over the clock when it knows the blob: kept until the height an upgrade is
+        // refused at, whatever the time says, and not after.
+        let counted = crate::arcblob::Meta { until: Some(50), ..t.clone() };
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&counted], 49, 1_000_000, 90, at(99)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&counted], 50, 1_050, 90, at(99)), 0);
+        assert!(!counted.timed_done(49, u64::MAX, 90) && counted.timed_done(50, 0, 90));
+        assert!(!up.timed_done(u64::MAX, u64::MAX, 90), "an upgraded blob is never past its time");
+        assert!(!p.timed_done(u64::MAX, u64::MAX, 90));
     }
 
     #[test]

@@ -689,6 +689,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             "app" => Some(include_str!("shims/app.js")),
             "realtime" => Some(include_str!("shims/realtime.js")),
             "groups" => Some(include_str!("shims/groups.js")),
+            "files" => Some(include_str!("shims/files.js")),
             "feed" => Some(include_str!("shims/feed.js")),
             "social" => Some(include_str!("shims/social.js")),
             "access" => Some(include_str!("shims/access.js")),
@@ -782,6 +783,22 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                 ("GET" | "HEAD", x) if x.starts_with("req/") => crate::reposvc::status(node, &page, &x[4..]),
                 ("POST", op) => crate::reposvc::file(node, &page, op, &serde_json::from_slice(&r.body).unwrap_or(Value::Null)),
                 _ => (404, json!({"error": "no such repository request"})),
+            };
+            return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
+        }
+        // Storage choices (fogkeep.rs, docs/STORAGEAPP.md): the Storage app asks to keep, pin, forget or undo; the
+        // request waits for the operator's approval card like a repository write. `mine` is this arcade's own list
+        // (its forget list included), so it answers only an app page this arcade serves its operator, never a public read.
+        if let Some(rest) = path.strip_prefix("/r/fog/") {
+            let Some((_, page)) = page.clone() else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
+            let (code, v) = match (r.method.as_str(), rest) {
+                ("GET" | "HEAD", "mine") => match crate::fogkeep::mine(node) {
+                    Ok(v) => (200, v),
+                    Err(e) => (400, json!({"error": e})),
+                },
+                ("GET" | "HEAD", x) if x.starts_with("req/") => crate::fogkeep::status(node, &page, &x[4..]),
+                ("POST", op @ ("keep" | "forget" | "undo")) => crate::fogkeep::file(node, &page, op, &serde_json::from_slice(&r.body).unwrap_or(Value::Null)),
+                _ => (404, json!({"error": "no such storage request"})),
             };
             return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
         }

@@ -162,3 +162,35 @@ unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/keepernet.py target
 ```
 
 It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about 8 minutes.
+
+## Keep, pin and forget (`fogkeepnet.py`)
+
+Six arcades on a closed ARCADE chain (copy floor 2): W publishes, A is the operator under test, B and C keep, D is
+linked to A alone, T borrows ARCADE. Registration and audits never happen on a closed net, so
+`ARCADE_FOG_TEST_AUDIT_SECS` stands in for them (an announced keeper is audited after 25 s holding every blob). It
+checks: Keep refused with the reason on a borrowed arcade and with no keep share; A keeps P#0 and T#0 by choice (the
+card first) and is counted only after its first audit; C doesn't take a segment at its floor; A forgets P#0: C steps
+in, A shows `handing over (n/2)` and drops only after C is counted; A forgets one blob of T#0 (which it keeps): it keeps
+the bytes, refuses its own view, leaves it out of its bloom and answers D "not here", while C fetches it from B; undo:
+D gets it from A again; T forgets a blob it viewed through its lenders.
+
+```sh
+cargo build --release -p arcaded
+unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/fogkeepnet.py target/release/arcaded /tmp/fogkeepnet'
+
+## Rules version 6: a Temporary blob upgraded to Permanent (`upgradenet.py`)
+
+Three arcades on a closed ARCADE chain with rules version 6 from height 170 (docs/FOGSTORE.md "Rules version 6"). A
+writes and publishes two Temporary blobs; B and C get ARCADE from A. Before 170 `arc.blob_upgrade` is refused. From
+it B (not the publisher) quotes the upgrade (the difference: 352,500 base units per started kB) and sends it; every
+arcade has the blob Permanent in the same block, upgraded by B, paid the difference, still A's, with the Permanent
+floor 3 (`arc.blob`, `explorer.arc_blobs`, `explorer.arc_storage_summary`). A second upgrade is refused, and an
+underpaid one (built by C with `ARCADE_TEST_UPGRADE_SHORT`, honored on closed test nets only) is refused by every
+arcade's pool.
+
+```sh
+cargo build -p arcaded
+unshare -Urn sh -c 'ip link set lo up; python3 tests/regtest/upgradenet.py target/debug/arcaded /tmp/upgradenet'
+```
+
+It prints `RESULT: PASS` (exit 0) or the failed steps. It takes about 7 minutes.

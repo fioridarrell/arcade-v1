@@ -21,6 +21,8 @@ pub const MAX_WAITING: usize = 64 << 20;
 #[derive(Default)]
 struct Waiting {
     blobs: HashMap<Hash, Vec<u8>>,
+    /// When each was held: one held a moment ago may be on its way into the pool with its transaction.
+    since: HashMap<Hash, std::time::Instant>,
     bytes: usize,
     /// Pieces of blobs on their way from a peer: (peer, id) -> (next piece, bytes so far).
     parts: HashMap<(String, Hash), (u64, Vec<u8>)>,
@@ -64,6 +66,7 @@ pub fn hold(net: &Net, bytes: Vec<u8>) -> Option<Hash> {
         }
         w.bytes += bytes.len();
         w.blobs.insert(id, bytes);
+        w.since.insert(id, std::time::Instant::now());
         Some(id)
     })
 }
@@ -88,6 +91,72 @@ pub struct Meta {
     /// empty in a meta written before it was kept (crate::fogmap reads it from the block then).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub publisher: String,
+    /// Its upgrade to Permanent (rules version 6), as the chain's best branch has it: never stored, filled in when the
+    /// meta is read ([`meta`], from [`set_chain_blobs`]).
+    #[serde(skip)]
+    pub upgraded: Option<arcade_arc::blob::Upgraded>,
+    /// A timed blob's end as consensus counts it (the first height past its time, blob::State::until), as the best branch
+    /// has it: never stored, filled in when the meta is read; None when the chain doesn't know it as timed.
+    #[serde(skip)]
+    pub until: Option<u64>,
+}
+
+impl Meta {
+    /// Whether a timed blob (Temporary, or brought by a boost) is past its time with the next block at `next`: by the
+    /// chain's count in blocks when it knows the blob (the height from which an upgrade is refused, so its bytes are
+    /// kept as long as one is taken), else `temporary` seconds after its block or latest boost. Never once upgraded,
+    /// never for another class.
+    pub fn timed_done(&self, next: u64, now: u64, temporary: u64) -> bool {
+        use arcade_arc::blob::Class;
+        if self.upgraded.is_some() || !(self.class == Class::Temporary as u8 || self.class == Class::Boost as u8) {
+            return false;
+        }
+        match self.until {
+            Some(u) => next >= u,
+            None => self.time.saturating_add(temporary).max(self.boosted_until) <= now,
+        }
+    }
+
+    /// Its class now: Permanent (0) once upgraded (rules version 6), else its record's. Its record's class (`class`)
+    /// still says where it is sealed (crate::fogstore::family_of).
+    pub fn class_now(&self) -> u8 {
+        if self.upgraded.is_some() {
+            arcade_arc::blob::Class::Permanent as u8
+        } else {
+            self.class
+        }
+    }
+}
+
+/// The best branch's upgraded blobs (rules version 6), its timed blobs' ends, and the next block's height, as the chain
+/// last moved: kept here so reading a meta never takes the chain's lock.
+struct ChainBlobs {
+    upgraded: HashMap<Hash, arcade_arc::blob::Upgraded>,
+    until: HashMap<Hash, u64>,
+    next: u64,
+}
+
+static UPGRADED: Mutex<Option<ChainBlobs>> = Mutex::new(None);
+
+/// The chain moved (crate::arcsvc): its upgraded blobs, its timed blobs' ends and the next block's height.
+pub fn set_chain_blobs(upgraded: Vec<(Hash, arcade_arc::blob::State)>, timed: Vec<(Hash, u64)>, next: u64) {
+    let upgraded = upgraded.into_iter().filter_map(|(id, s)| Some((id, s.upgraded?))).collect();
+    *UPGRADED.lock().unwrap() = Some(ChainBlobs { upgraded, until: timed.into_iter().collect(), next });
+}
+
+/// A timed blob's end as the chain last moved (blob::State::until).
+pub fn until(id: &Hash) -> Option<u64> {
+    UPGRADED.lock().unwrap().as_ref()?.until.get(id).copied()
+}
+
+/// Blob `id`'s upgrade, as the chain last moved.
+pub fn upgraded(id: &Hash) -> Option<arcade_arc::blob::Upgraded> {
+    UPGRADED.lock().unwrap().as_ref()?.upgraded.get(id).cloned()
+}
+
+/// The next block's height as the chain last moved (0 before it ran).
+pub fn next_height() -> u64 {
+    UPGRADED.lock().unwrap().as_ref().map_or(0, |u| u.next)
 }
 
 /// The address a script pays (pay to a key hash or a script hash on `net`), None for any other script.
@@ -117,7 +186,10 @@ fn meta_path(id: &Hash) -> PathBuf {
 }
 
 pub fn meta(id: &Hash) -> Option<Meta> {
-    serde_json::from_slice(&std::fs::read(meta_path(id)).ok()?).ok()
+    let mut m: Meta = serde_json::from_slice(&std::fs::read(meta_path(id)).ok()?).ok()?;
+    m.upgraded = upgraded(id);
+    m.until = until(id);
+    Some(m)
 }
 
 /// Reads a sealed blob-family unit at a height (this arcade's own replica), set when the chain starts.
@@ -253,6 +325,10 @@ fn cache_put(id: &Hash, bytes: &[u8]) {
 /// A blob for a viewer: here (stored, waiting, sealed, cached), else fetched from the arcades this one is linked to and
 /// kept in the cache, so a blob many view spreads to many arcades and leaves them when nobody views it any more.
 pub fn view(id: &Hash) -> Option<Vec<u8>> {
+    // Forgotten here by the operator (crate::fogkeep): never fetched or kept again until that's undone.
+    if crate::fogkeep::refused(id) {
+        return None;
+    }
     if let Some(b) = get(id).or_else(|| cached(id)) {
         touch(id);
         return Some(b);
@@ -370,7 +446,8 @@ pub fn serve_piece(link: &mut arcade_mesh::link::Link, head: &serde_json::Value)
     let id_n = head["id"].as_u64().unwrap_or(0);
     let at = head["at"].as_u64().unwrap_or(0);
     let id = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok());
-    let piece = id.as_ref().and_then(|id| read_piece(id, at, PIECE as usize));
+    // Forgotten here (crate::fogkeep): "not here", as if it never was.
+    let piece = id.as_ref().filter(|id| !crate::fogkeep::refused(id)).and_then(|id| read_piece(id, at, PIECE as usize));
     let mut f = crate::arcsvc::keeper_frame("a", serde_json::json!({"id": id_n}));
     match (id, piece) {
         (Some(id), Some((len, bytes))) => {
@@ -459,7 +536,7 @@ pub fn keep_block(net: &Net, block: &Block) {
             let line = hex::encode(&sha2::Sha256::digest([r.kind.as_bytes(), b"\0", publisher].concat())[..16]);
             let boosted_until = if r.class == arcade_arc::blob::Class::Boost { boost_until } else { 0 };
             let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until, len: r.len,
-                           publisher: address_of_script(net, publisher).unwrap_or_default() };
+                           publisher: address_of_script(net, publisher).unwrap_or_default(), upgraded: None, until: None };
             let _ = std::fs::write(meta_path(id), serde_json::to_vec(&m).unwrap_or_default());
         }
     }
@@ -478,6 +555,7 @@ pub fn keep_block(net: &Net, block: &Block) {
             if let Some(b) = w.blobs.remove(id) {
                 w.bytes -= b.len();
             }
+            w.since.remove(id);
         });
     }
 }
@@ -505,11 +583,15 @@ pub fn attach(block: &Block) -> Option<Block> {
 /// Waiting blobs no waiting transaction names any more (and none the chain lacks) go.
 pub fn forget_except(keep: &std::collections::HashSet<Hash>) {
     with(|w| {
-        let gone: Vec<Hash> = w.blobs.keys().filter(|k| !keep.contains(*k)).copied().collect();
+        // A blob held in the last minute stays: its transaction may not be in the pool yet (a block between `hold` and
+        // the pool taking it dropped the bytes, and the publish was refused "a blob it brings isn't here").
+        let fresh = |k: &Hash| w.since.get(k).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
+        let gone: Vec<Hash> = w.blobs.keys().filter(|k| !keep.contains(*k) && !fresh(k)).copied().collect();
         for k in gone {
             if let Some(b) = w.blobs.remove(&k) {
                 w.bytes -= b.len();
             }
+            w.since.remove(&k);
         }
     });
 }
@@ -591,6 +673,22 @@ fn mine_path(id: &Hash) -> PathBuf {
 pub fn mark_mine(id: &Hash) {
     let _ = std::fs::create_dir_all(dir());
     let _ = std::fs::write(mine_path(id), b"");
+}
+
+/// Un-mark a blob this arcade published (`fog.forget` on its own blob, crate::fogkeep): it fades like any other.
+pub fn unmark_mine(id: &Hash) {
+    let _ = std::fs::remove_file(mine_path(id));
+}
+
+/// Drop a blob's copy in the viewer cache. Bytes freed.
+pub fn drop_cached(id: &Hash) -> u64 {
+    let n = hex::encode(id);
+    let p = cache_dir().join(&n);
+    let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(cache_dir().join(format!("{n}.kind")));
+    let _ = std::fs::remove_file(cache_dir().join(format!("{n}.gz")));
+    len
 }
 
 /// Whether this arcade published the blob.
@@ -706,6 +804,9 @@ pub fn fetch_any(node: &crate::node::Node, id: &Hash) -> Option<(Vec<u8>, String
 
 /// Fetch a blob a kept segment lacks and keep it in the store (not counted as viewed). Whether it's here now.
 pub fn fetch_keep(node: &crate::node::Node, id: &Hash) -> bool {
+    if crate::fogkeep::refused(id) {
+        return false;
+    }
     let Some((b, ..)) = fetch_any(node, id) else { return false };
     let p = path(id);
     let tmp = p.with_extension("in");

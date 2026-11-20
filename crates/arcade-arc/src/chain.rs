@@ -486,9 +486,10 @@ pub struct Chain<T: TimeProofs, S: Storage> {
     evidence: Vec<Equivocation>,
     /// A better branch that waited (BlockError::Waiting): its last block, tried again with retry().
     waiting: Option<Hash256>,
-    /// Every blob on the best branch (crate::blob), and per block of it the ones it brought (to take back).
-    blobs: HashSet<Hash>,
-    blob_undo: HashMap<Hash256, Vec<Hash>>,
+    /// Every blob on the best branch (crate::blob) with what consensus knows of it, and per block of it each blob it
+    /// brought or changed (a boost, rules version 6's upgrade) with its state before (None: brought), to take back.
+    blobs: HashMap<Hash, crate::blob::State>,
+    blob_undo: HashMap<Hash256, Vec<(Hash, Option<crate::blob::State>)>>,
 }
 
 impl<T: TimeProofs, S: Storage> Chain<T, S> {
@@ -514,7 +515,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             written: HashMap::new(),
             evidence: Vec::new(),
             waiting: None,
-            blobs: HashSet::new(),
+            blobs: HashMap::new(),
             blob_undo: HashMap::new(),
         }
     }
@@ -746,7 +747,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         }
         let (payouts, writer_paid) = self.payouts_at(entry.height, &block.header.writer);
         let changes = coins::check_block(&block.txs, entry.height, &entry.prev, &self.coins, &payouts)?;
-        let brought = self.blobs_brought(block, &changes)?;
+        let blob_changes = self.blob_changes(block, entry.height, &changes)?;
         let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees, writer_paid })?;
         for (at, _) in &changes.spent {
             self.coins.remove(at);
@@ -756,10 +757,11 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             debug_assert!(before.is_none(), "no two transactions share an id");
         }
         self.undo.insert(*id, (changes, undo));
-        for b in &brought {
-            self.blobs.insert(*b);
+        let mut blob_undo = Vec::with_capacity(blob_changes.len());
+        for (b, state) in blob_changes {
+            blob_undo.push((b, self.blobs.insert(b, state)));
         }
-        self.blob_undo.insert(*id, brought);
+        self.blob_undo.insert(*id, blob_undo);
         self.best.push(*id);
         Ok(())
     }
@@ -770,8 +772,12 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         let id = self.best.pop().expect("not empty");
         let (changes, undo) = self.undo.remove(&id).expect("every block of the branch can be taken back");
         self.storage.undo(undo);
-        for b in self.blob_undo.remove(&id).unwrap_or_default() {
-            self.blobs.remove(&b);
+        // Last change first, so a blob changed twice in the block gets its state from before the block.
+        for (b, before) in self.blob_undo.remove(&id).unwrap_or_default().into_iter().rev() {
+            match before {
+                Some(st) => self.blobs.insert(b, st),
+                None => self.blobs.remove(&b),
+            };
         }
         for (at, _) in &changes.made {
             self.coins.remove(at);
@@ -782,41 +788,114 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         id
     }
 
-    /// The blobs a block brings (rules version 3): exactly those its records name that the branch doesn't hold yet, in
-    /// the order the records come, each transaction paying the blob fee for the bytes it brings.
-    fn blobs_brought(&self, block: &Block, changes: &coins::Changes) -> Result<Vec<Hash>, ChainError> {
+    /// What a block does to the blobs (rules version 3): it brings exactly those its records name that the branch doesn't
+    /// hold yet, in the order the records come; a boost keeps a timed blob longer; from rules version 6 an upgrade output
+    /// makes a Temporary blob Permanent (crate::blob::check_upgrades). Each transaction pays the blob fee for the bytes it
+    /// brings and every boost, plus each upgrade's difference. The blobs' new states, in order (one blob may come more
+    /// than once: the last is its state after the block).
+    fn blob_changes(&self, block: &Block, height: u64, changes: &coins::Changes) -> Result<Vec<(Hash, crate::blob::State)>, ChainError> {
+        use crate::blob::{self, State};
         if block.header.version < 3 {
             return Ok(Vec::new());
         }
+        let v6 = params::rules_v6(&self.net, height);
         let mut want = Vec::new();
-        let mut here: HashSet<Hash> = HashSet::new();
+        let mut out: Vec<(Hash, State)> = Vec::new();
+        let mut here: HashMap<Hash, State> = HashMap::new();
+        let mut upgraded: HashSet<Hash> = HashSet::new();
+        // The length the records declare for the blobs the block brings: what it would carry with its bytes.
+        let mut declared = 0u64;
         for (i, tx) in block.txs.iter().enumerate().skip(1) {
-            let mut paid: Vec<(crate::blob::Class, u64)> = Vec::new();
-            for r in crate::blob::records(tx) {
+            let mut paid: Vec<(blob::Class, u64)> = Vec::new();
+            for r in blob::records(tx) {
                 let id = r.id(&self.net);
-                let brings = !self.blobs.contains(&id) && here.insert(id);
+                let brings = !self.blobs.contains_key(&id) && !here.contains_key(&id);
                 if brings {
+                    declared = declared.saturating_add(r.len);
                     want.push(id);
+                    let st = State::brought(&self.net, r.class, r.len, height);
+                    here.insert(id, st.clone());
+                    out.push((id, st));
                 }
-                // A boost pays the full blob fee whether it brings the bytes or not (§15 step 4).
-                if brings || r.class == crate::blob::Class::Boost {
+                // A boost pays the full blob fee whether it brings the bytes or not (§15 step 4), and keeps a timed blob
+                // its time past this block.
+                if brings || r.class == blob::Class::Boost {
                     paid.push((r.class, r.len));
+                }
+                if r.class == blob::Class::Boost && !brings {
+                    if let Some(mut st) = here.get(&id).or_else(|| self.blobs.get(&id)).cloned() {
+                        st.boost(&self.net, height);
+                        here.insert(id, st.clone());
+                        out.push((id, st));
+                    }
+                }
+            }
+            let base = blob::fee_at(&self.net, height, &paid);
+            let mut need = base;
+            // Rules version 6: upgrades, judged against the blobs as the chain held them before this block (one brought
+            // in it is unknown to them), each blob at most once in the block. Before version 6 an upgrade output is only
+            // an OP_RETURN's data.
+            if v6 {
+                let ids = blob::upgrades(tx);
+                if !ids.is_empty() {
+                    let fee = blob::check_upgrades(&self.net, height, &ids, &|id| self.blobs.get(id).cloned(), &mut upgraded)
+                        .map_err(|e| ChainError::Block(BlockError::Upgrade(e)))?;
+                    need = need.saturating_add(fee);
+                    // Who paid: the script of the coin it spends first (on the chain before, or made earlier in this block).
+                    let by = tx.inputs.first().and_then(|inp| {
+                        self.coins.get(&inp.prevout).map(|c| c.script.clone()).or_else(|| {
+                            block.txs.iter().find(|t| t.txid == inp.prevout.txid).and_then(|t| t.outputs.get(inp.prevout.vout as usize)).map(|o| o.script_pubkey.clone())
+                        })
+                    }).unwrap_or_default();
+                    for id in ids {
+                        let mut st = here.get(&id).or_else(|| self.blobs.get(&id)).cloned().expect("checked: the chain holds it");
+                        st.upgraded = Some(blob::Upgraded { height, txid: tx.txid, paid: blob::upgrade_fee_at(&self.net, height, st.class, st.len), by: by.clone() });
+                        st.until = u64::MAX;
+                        here.insert(id, st.clone());
+                        out.push((id, st));
+                    }
                 }
             }
             let fee = changes.fees_by_tx.get(i - 1).copied().unwrap_or(0);
-            if fee < crate::blob::fee_at(&self.net, block.header.height, &paid) {
+            if fee < base {
                 return Err(ChainError::Block(BlockError::Blobs("a transaction doesn't pay the blob fee for the blobs it brings")));
             }
+            if fee < need {
+                return Err(ChainError::Block(BlockError::Upgrade(blob::UpgradeError::Underpaid)));
+            }
+        }
+        // Rules version 6: the blobs a block brings are at most one block's blob bytes by their records' lengths too, not
+        // only by the bytes it carries (from version 5 a block may come without them, so the carried bytes alone don't
+        // cap it). A boost that brings nothing new doesn't count; a large blob's parts do, each a blob.
+        if v6 && declared > blob::MAX_BLOB_BYTES as u64 {
+            return Err(ChainError::Block(BlockError::TooBig("declared blobs")));
         }
         if block.blob_ids != want {
             return Err(ChainError::Block(BlockError::Blobs("not the blobs its records bring")));
         }
-        Ok(want)
+        Ok(out)
+    }
+
+    /// The blobs upgraded to Permanent on the best branch (rules version 6), with what consensus knows of each.
+    pub fn upgraded_blobs(&self) -> Vec<(Hash, crate::blob::State)> {
+        self.blobs.iter().filter(|(_, s)| s.upgraded.is_some()).map(|(id, s)| (*id, s.clone())).collect()
+    }
+
+    /// The timed blobs on the best branch (Temporary, or brought by a boost; not upgraded) and the height from which each
+    /// is past its time (crate::blob::State::until).
+    pub fn timed_blobs(&self) -> Vec<(Hash, u64)> {
+        self.blobs.iter().filter(|(_, s)| s.until != u64::MAX).map(|(id, s)| (*id, s.until)).collect()
+    }
+
+    /// What consensus knows of blob `id` on the best branch: its class, length, the block that brought it, a timed blob's
+    /// time, and its upgrade (rules version 6).
+    pub fn blob_state(&self, id: &Hash) -> Option<&crate::blob::State> {
+        self.blobs.get(id)
     }
 
     /// Whether the best branch holds blob `id`.
     pub fn holds_blob(&self, id: &Hash) -> bool {
-        self.blobs.contains(id)
+        self.blobs.contains_key(id)
     }
 
     /// The ids of the blobs block `id` brought.
@@ -1636,6 +1715,302 @@ pub(crate) mod tests {
         }
         assert_eq!(c.tip().id, other.tip().id);
         assert!(!c.holds_blob(&id));
+    }
+
+    /// A local network on rules version 5 from block 2 and version 6 from block 205, Temporary blobs kept 30 blocks.
+    const NET6: Net = Net { rules: &[(1, 0), (2, 1), (3, 2), (5, 2), (6, 205)], blob_temporary: 30 * params::BLOCK_SECONDS, ..TESTNET };
+
+    fn chain6() -> TestChain {
+        let list: Vec<_> = HOLDERS.iter().map(|&who| (vrf::public_key(&secret(who)), who as u64 * GIB, address(who))).collect();
+        Chain::new(NET6, &genesis(), StandIn, FixedHolders::new(&NET6, &list).unwrap(), &[])
+    }
+
+    /// The block `who` writes on the tip of `c` with `txs`, bringing those of `new` its records name.
+    fn block_txs(c: &TestChain, who: u8, txs: Vec<Tx>, new: &HashMap<Hash, Vec<u8>>) -> Block {
+        let net = *c.net();
+        let draw_seed = seed_proof(c);
+        let ticket = c.ticket(&secret(who), draw_seed.as_ref()).unwrap();
+        let mut all = vec![coins::coinbase(ticket.height, &ticket.prev, b"", &c.payouts_for(&vrf::public_key(&secret(who))))];
+        all.extend(txs);
+        ticket.seal_with_blobs(&net, &secret(who), next_time(c), all, Vec::new(), StandIn.prove(&ticket.challenge, ticket.steps), draw_seed, new)
+    }
+
+    #[test]
+    fn rules_v6_a_temporary_blob_is_upgraded_to_permanent_for_the_difference() {
+        use crate::blob::{self, Class, Encoding, Record, UpgradeError};
+        let mut c = chain6();
+        let blocks = grow_to(&mut c, 150);
+        let (sk, pk) = coin_key(3);
+        let lock = p2pkh(&pk);
+        // Someone else pays the upgrade: key 7 (anyone may upgrade; the blob stays its publisher's).
+        let (sk7, pk7) = coin_key(7);
+        let lock7 = p2pkh(&pk7);
+        let paid = &blocks[99].txs[0];
+        let vout = paid.outputs.iter().position(|o| o.script_pubkey == lock).unwrap();
+        let from = OutPoint { txid: paid.txid, vout: vout as u32 };
+        let amount = paid.outputs[vout].value;
+        grow_to(&mut c, 199);
+        let sign_with = |t: Tx, sk: &secp256k1::SecretKey, pk: &[u8], lock: &[u8]| {
+            let mut s = Vec::new();
+            push(&mut s, &sign(&t, 0, lock, sk, SIGHASH_ALL));
+            push(&mut s, pk);
+            with_sig(&t, 0, s)
+        };
+
+        // Block 200 (version 5): a Temporary blob t1 (5,000 bytes), another t2, a Release blob; change in four coins of
+        // key 7, one of key 3.
+        let blob_bytes = |seed: u32, n: u32| -> Vec<u8> { (0..n).map(|i| ((i * seed) % 251) as u8).collect() };
+        let (b1, b2, br) = (blob_bytes(31, 5_000), blob_bytes(37, 2_500), blob_bytes(41, 1_000));
+        let r1 = Record::of(&b1, Class::Temporary, Encoding::Plain, "text/plain");
+        let r2 = Record::of(&b2, Class::Temporary, Encoding::Plain, "text/plain");
+        let rr = Record::of(&br, Class::Release, Encoding::Plain, "text/plain");
+        let (t1, t2, rel) = (r1.id(&NET6), r2.id(&NET6), rr.id(&NET6));
+        let blob_fee = blob::fee_at(&NET6, 200, &[(Class::Temporary, 5_000), (Class::Temporary, 2_500), (Class::Release, 1_000)]);
+        assert_eq!(blob_fee, 5 * 42_300 + 3 * 42_300 + 282_000);
+        let each = 10 * COIN;
+        let publish = tx(
+            vec![(from, vec![], u32::MAX)],
+            vec![(0, r1.script()), (0, r2.script()), (0, rr.script()), (amount - blob_fee - COIN / 100 - 4 * each, lock.clone()), (each, lock7.clone()), (each, lock7.clone()), (each, lock7.clone()), (each, lock7.clone())],
+            0,
+        );
+        let publish = sign_with(publish, &sk, &pk, &lock);
+        let new = HashMap::from([(t1, b1.clone()), (t2, b2.clone()), (rel, br.clone())]);
+        let b200 = block_txs(&c, ranked(&c)[0], vec![publish.clone()], &new);
+        assert!(matches!(c.accept(b200, LATE), Ok(Accepted::Tip { .. })));
+        let st1 = c.blob_state(&t1).unwrap().clone();
+        assert_eq!((st1.class, st1.len, st1.height, st1.until, st1.upgraded.clone()), (Class::Temporary, 5_000, 200, 230, None));
+        assert_eq!(c.blob_state(&rel).unwrap().until, u64::MAX);
+        let coin7 = |n: u32| OutPoint { txid: publish.txid, vout: 4 + n };
+        let upgrade = |n: u32, ids: &[Hash], fee: u64| {
+            let t = tx(vec![(coin7(n), vec![], u32::MAX)], vec![(0, blob::upgrade_script(ids)), (each - fee, lock7.clone())], 0);
+            sign_with(t, &sk7, &pk7, &lock7)
+        };
+        let diff = blob::upgrade_fee_at(&NET6, 205, Class::Temporary, 5_000);
+        assert_eq!(diff, 5 * (394_800 - 42_300));
+
+        // Block 201 (version 5): an upgrade output is only an OP_RETURN's data: taken, and nothing changes.
+        let early = upgrade(0, &[t1], diff);
+        assert!(matches!(c.accept(block_txs(&c, ranked(&c)[0], vec![early], &HashMap::new()), LATE), Ok(Accepted::Tip { .. })));
+        assert_eq!(c.blob_state(&t1).unwrap().upgraded, None);
+        assert_eq!(blob::check_upgrade(&NET6, 201, c.blob_state(&t1)), Err(UpgradeError::NotYet));
+        grow_to(&mut c, 204);
+
+        // Block 205 (version 6): every refusal, each its own block.
+        let refused = |c: &mut TestChain, txs: Vec<Tx>, why: UpgradeError| {
+            let b = block_txs(c, ranked(c)[0], txs, &HashMap::new());
+            assert_eq!(c.accept(b, LATE), Err(ChainError::Block(BlockError::Upgrade(why))), "{why:?}");
+        };
+        refused(&mut c, vec![upgrade(1, &[t1], diff - 1)], UpgradeError::Underpaid);
+        refused(&mut c, vec![upgrade(1, &[[9; 32]], diff)], UpgradeError::Unknown);
+        refused(&mut c, vec![upgrade(1, &[rel], diff)], UpgradeError::NotTemporary);
+        refused(&mut c, vec![upgrade(1, &[t1, t1], 2 * diff)], UpgradeError::Twice);
+        refused(&mut c, vec![upgrade(1, &[t1], diff), upgrade(2, &[t1], diff)], UpgradeError::Twice);
+
+        // Paid in full by key 7: from this block the blob is Permanent, kept for good, by key 7's coin, at the difference.
+        let good = upgrade(1, &[t1], diff);
+        let b205 = block_txs(&c, ranked(&c)[0], vec![good.clone()], &HashMap::new());
+        let at = c.tip().clone();
+        assert!(matches!(c.accept(b205.clone(), LATE), Ok(Accepted::Tip { .. })));
+        let st = c.blob_state(&t1).unwrap();
+        assert_eq!(st.class_now(), Class::Permanent);
+        assert_eq!(st.class, Class::Temporary, "its record's class, and so its sealed family, stay");
+        assert_eq!(st.until, u64::MAX);
+        assert_eq!(st.upgraded, Some(blob::Upgraded { height: 205, txid: good.txid, paid: diff, by: lock7.clone() }));
+        // The floor it counts against now: Permanent's, 3 from version 6 (7 in version 5).
+        assert_eq!((blob::floor_at(&NET6, 204, st.class_now()), blob::floor_at(&NET6, 205, st.class_now())), (7, 3));
+        // Once Permanent, a second upgrade is refused.
+        refused(&mut c, vec![upgrade(2, &[t1], diff)], UpgradeError::NotTemporary);
+
+        // t2 is past its time from block 230 (brought at 200, kept 30 blocks): refused then, whatever it pays.
+        grow_to(&mut c, 229);
+        assert_eq!(blob::check_upgrade(&NET6, 229, c.blob_state(&t2)), Ok(blob::upgrade_fee_at(&NET6, 229, Class::Temporary, 2_500)));
+        // An arcade replaying the blocks knows the same of every blob.
+        let mut c2 = chain6();
+        for h in 1..=c.tip().height {
+            let kept = c.block(&c.id_at(h).unwrap()).unwrap();
+            c2.accept(Block::decode(&kept.encode()).unwrap(), LATE).unwrap();
+        }
+        for id in [t1, t2, rel] {
+            assert_eq!(c2.blob_state(&id), c.blob_state(&id));
+        }
+        grow(&mut c);
+        refused(&mut c, vec![upgrade(2, &[t2], 10 * diff)], UpgradeError::Expired);
+
+        // Taken back by a heavier branch without block 205: t1 is Temporary again.
+        let mut other = chain6();
+        for h in 1..at.height + 1 {
+            other.accept(Block::decode(&c.block(&c.id_at(h).unwrap()).unwrap().encode()).unwrap(), LATE).unwrap();
+        }
+        grow_to(&mut other, c.tip().height + 2);
+        for h in at.height + 1..=other.tip().height {
+            let _ = c.accept(other.block(&other.id_at(h).unwrap()).unwrap().clone(), LATE);
+        }
+        assert_eq!(c.tip().id, other.tip().id);
+        assert_eq!(c.blob_state(&t1).unwrap().upgraded, None);
+        assert_eq!(c.blob_state(&t1).unwrap().class_now(), Class::Temporary);
+    }
+
+    #[test]
+    fn rules_v6_a_block_brings_at_most_4_mb_of_blobs_by_their_records() {
+        use crate::blob::{self, Class, Encoding, Record, MAX_BLOB_BYTES};
+        let mut c = chain6();
+        let blocks = grow_to(&mut c, 150);
+        let (sk, pk) = coin_key(3);
+        let lock = p2pkh(&pk);
+        let paid = &blocks[99].txs[0];
+        let vout = paid.outputs.iter().position(|o| o.script_pubkey == lock).unwrap();
+        let from = OutPoint { txid: paid.txid, vout: vout as u32 };
+        let amount = paid.outputs[vout].value;
+        grow_to(&mut c, 199);
+        let sign_with = |t: Tx| {
+            let mut s = Vec::new();
+            push(&mut s, &sign(&t, 0, &lock, &sk, SIGHASH_ALL));
+            push(&mut s, &pk);
+            with_sig(&t, 0, s)
+        };
+        // Block 200: holder 3's pay in four coins.
+        let each = amount / 4 - COIN;
+        let split = sign_with(tx(vec![(from, vec![], u32::MAX)], vec![(each, lock.clone()), (each, lock.clone()), (each, lock.clone()), (each, lock.clone())], 0));
+        assert!(matches!(c.accept(block_txs(&c, ranked(&c)[0], vec![split.clone()], &HashMap::new()), LATE), Ok(Accepted::Tip { .. })));
+        // Records of Temporary blobs of these lengths (made-up contents: the block goes without their bytes, as any block
+        // may from rules version 5), in one transaction spending coin `n`, paying their blob fee.
+        // (Version 5 and 6 rates are the same.) `extra` records go first.
+        let with = |n: u32, lens: &[u64], seed: u8, extra: &[Record]| -> (Tx, Vec<Hash>) {
+            let recs: Vec<Record> = lens.iter().enumerate().map(|(i, &len)| Record { root: [seed + i as u8; 32], len, class: Class::Temporary, encoding: Encoding::Plain, kind: "x".into() }).collect();
+            let all: Vec<&Record> = extra.iter().chain(&recs).collect();
+            let fee = blob::fee_at(&NET6, 201, &all.iter().map(|r| (r.class, r.len)).collect::<Vec<_>>()) + COIN / 100;
+            let mut outs: Vec<(u64, Vec<u8>)> = all.iter().map(|r| (0, r.script())).collect();
+            outs.push((each - fee, lock.clone()));
+            (sign_with(tx(vec![(OutPoint { txid: split.txid, vout: n }, vec![], u32::MAX)], outs, 0)), recs.iter().map(|r| r.id(&NET6)).collect())
+        };
+        let records = |n: u32, lens: &[u64], seed: u8| with(n, lens, seed, &[]);
+        // The block without its blobs' bytes, as it travels once they're dropped.
+        let bytesless = |c: &TestChain, t: Tx, ids: &[Hash]| {
+            let fake: HashMap<Hash, Vec<u8>> = ids.iter().map(|id| (*id, vec![1])).collect();
+            let mut b = block_txs(c, ranked(c)[0], vec![t], &fake);
+            assert_eq!(b.blob_ids.len(), ids.len());
+            b.blobs = vec![Vec::new(); ids.len()];
+            Block::decode(&b.encode()).unwrap().with_blob_ids(&NET6)
+        };
+        let max = MAX_BLOB_BYTES as u64;
+        // Block 201 (version 5): nothing capped the declared lengths (8 MB declared, none carried): taken.
+        let (over5, ids) = records(0, &[max, max], 10);
+        assert!(matches!(c.accept(bytesless(&c, over5, &ids), LATE), Ok(Accepted::Tip { .. })));
+        grow_to(&mut c, 204);
+        // Version 6: one byte over the cap, without the bytes (and so whatever the bytes carried): refused.
+        let (over, ids) = records(1, &[max - 1_000, 1_001], 20);
+        assert_eq!(c.accept(bytesless(&c, over, &ids), LATE), Err(ChainError::Block(BlockError::TooBig("declared blobs"))));
+        let (way_over, ids) = records(1, &[max, max, max], 30);
+        assert_eq!(c.accept(bytesless(&c, way_over, &ids), LATE), Err(ChainError::Block(BlockError::TooBig("declared blobs"))));
+        // At the cap exactly: taken.
+        let (at_cap, ids) = records(1, &[max - 1_000, 1_000], 40);
+        assert!(matches!(c.accept(bytesless(&c, at_cap, &ids), LATE), Ok(Accepted::Tip { .. })));
+        assert!(ids.iter().all(|id| c.holds_blob(id)));
+        // A boost of a blob the chain holds brings nothing, so it doesn't count: 4 MB new beside it is at the cap.
+        let boost = Record { root: [40; 32], len: max - 1_000, class: Class::Boost, encoding: Encoding::Plain, kind: "x".into() };
+        let (both, fresh_ids) = with(2, &[max], 50, &[boost]);
+        assert!(matches!(c.accept(bytesless(&c, both, &fresh_ids), LATE), Ok(Accepted::Tip { .. })), "4 MB new and a boost of a blob held: at the cap");
+    }
+
+    #[test]
+    fn rules_v6_upgrades_beside_brought_blobs_boosts_and_a_reorg() {
+        use crate::blob::{self, Class, Encoding, Record, UpgradeError};
+        let mut c = chain6();
+        let blocks = grow_to(&mut c, 150);
+        let (sk, pk) = coin_key(3);
+        let lock = p2pkh(&pk);
+        let paid = &blocks[99].txs[0];
+        let vout = paid.outputs.iter().position(|o| o.script_pubkey == lock).unwrap();
+        let from = OutPoint { txid: paid.txid, vout: vout as u32 };
+        let amount = paid.outputs[vout].value;
+        grow_to(&mut c, 199);
+        let sign_with = |t: Tx| {
+            let mut s = Vec::new();
+            push(&mut s, &sign(&t, 0, &lock, &sk, SIGHASH_ALL));
+            push(&mut s, &pk);
+            with_sig(&t, 0, s)
+        };
+        let bytes_of = |seed: u32, n: u32| -> Vec<u8> { (0..n).map(|i| ((i * seed) % 251) as u8).collect() };
+        // Block 200: a Temporary blob t, and a blob bb a boost brings (kept as a Temporary one, its boost fee paid), with
+        // the change in six coins.
+        let (tb, bbb) = (bytes_of(31, 1_500), bytes_of(37, 2_000));
+        let rt = Record::of(&tb, Class::Temporary, Encoding::Plain, "text/plain");
+        let rb = Record::of(&bbb, Class::Boost, Encoding::Plain, "text/plain");
+        let (t, bb) = (rt.id(&NET6), rb.id(&NET6));
+        let fee0 = blob::fee_at(&NET6, 200, &[(Class::Temporary, 1_500), (Class::Boost, 2_000)]) + COIN / 100;
+        let each = (amount - fee0) / 6;
+        let mut outs = vec![(0, rt.script()), (0, rb.script())];
+        outs.extend((0..6).map(|_| (each, lock.clone())));
+        let publish = sign_with(tx(vec![(from, vec![], u32::MAX)], outs, 0));
+        let new = HashMap::from([(t, tb.clone()), (bb, bbb.clone())]);
+        assert!(matches!(c.accept(block_txs(&c, ranked(&c)[0], vec![publish.clone()], &new), LATE), Ok(Accepted::Tip { .. })));
+        assert_eq!(c.blob_state(&bb).unwrap().class, Class::Boost);
+        let coin = |n: u32| OutPoint { txid: publish.txid, vout: 2 + n };
+        // A transaction from coin `n` with `data` outputs, paying `fee`.
+        let pay = |n: u32, data: Vec<Vec<u8>>, fee: u64| {
+            let mut o: Vec<(u64, Vec<u8>)> = data.into_iter().map(|d| (0, d)).collect();
+            o.push((each - fee, lock.clone()));
+            sign_with(tx(vec![(coin(n), vec![], u32::MAX)], o, 0))
+        };
+        grow_to(&mut c, 204);
+        let floor = COIN / 100;
+
+        // A blob brought in the same block is unknown to an upgrade in it: in another transaction, or in the same one.
+        let nb = bytes_of(41, 1_000);
+        let rn = Record::of(&nb, Class::Temporary, Encoding::Plain, "text/plain");
+        let n_id = rn.id(&NET6);
+        let n_new = HashMap::from([(n_id, nb.clone())]);
+        let up_n = blob::upgrade_fee_at(&NET6, 205, Class::Temporary, 1_000);
+        let bring = pay(0, vec![rn.script()], blob::fee_at(&NET6, 205, &[(Class::Temporary, 1_000)]) + floor);
+        let other = pay(1, vec![blob::upgrade_script(&[n_id])], up_n + floor);
+        let b = block_txs(&c, ranked(&c)[0], vec![bring, other], &n_new);
+        assert_eq!(c.accept(b, LATE), Err(ChainError::Block(BlockError::Upgrade(UpgradeError::Unknown))));
+        let both = pay(0, vec![rn.script(), blob::upgrade_script(&[n_id])], blob::fee_at(&NET6, 205, &[(Class::Temporary, 1_000)]) + up_n + floor);
+        let b = block_txs(&c, ranked(&c)[0], vec![both], &n_new);
+        assert_eq!(c.accept(b, LATE), Err(ChainError::Block(BlockError::Upgrade(UpgradeError::Unknown))));
+
+        // A blob a boost brought pays Permanent minus the boost's fee (2 kB: 2 x 366,600); Permanent minus Temporary is
+        // short of that.
+        let as_temp = blob::upgrade_fee_at(&NET6, 205, Class::Temporary, 2_000);
+        let as_boost = blob::upgrade_fee_at(&NET6, 205, Class::Boost, 2_000);
+        assert_eq!((as_temp, as_boost), (2 * 352_500, 2 * 366_600));
+        let b = block_txs(&c, ranked(&c)[0], vec![pay(2, vec![blob::upgrade_script(&[bb])], as_temp)], &HashMap::new());
+        assert_eq!(c.accept(b, LATE), Err(ChainError::Block(BlockError::Upgrade(UpgradeError::Underpaid))));
+        let b205 = block_txs(&c, ranked(&c)[0], vec![pay(2, vec![blob::upgrade_script(&[bb])], as_boost)], &HashMap::new());
+        assert!(matches!(c.accept(b205, LATE), Ok(Accepted::Tip { .. })));
+        assert_eq!(c.blob_state(&bb).unwrap().upgraded.as_ref().map(|u| u.paid), Some(as_boost));
+        // In all it paid what a Permanent blob pays.
+        assert_eq!(blob::fee_at(&NET6, 200, &[(Class::Boost, 2_000)]) + as_boost, blob::fee_at(&NET6, 205, &[(Class::Permanent, 2_000)]));
+
+        // A boost and an upgrade of t in one block (two transactions): Permanent after it; a reorg takes both back.
+        let before_t = c.blob_state(&t).unwrap().clone();
+        let before_bb = c.blob_state(&bb).unwrap().clone();
+        let boost = Record { class: Class::Boost, ..rt.clone() };
+        let boost_tx = pay(3, vec![boost.script()], blob::fee_at(&NET6, 206, &[(Class::Boost, 1_500)]) + floor);
+        let up_tx = pay(4, vec![blob::upgrade_script(&[t])], blob::upgrade_fee_at(&NET6, 206, Class::Temporary, 1_500) + floor);
+        let b206 = block_txs(&c, ranked(&c)[0], vec![boost_tx, up_tx], &HashMap::new());
+        assert!(matches!(c.accept(b206, LATE), Ok(Accepted::Tip { .. })));
+        let after = c.blob_state(&t).unwrap();
+        assert!(after.upgraded.is_some() && after.until == u64::MAX);
+        let mut other = chain6();
+        for h in 1..=204 {
+            other.accept(Block::decode(&c.block(&c.id_at(h).unwrap()).unwrap().encode()).unwrap(), LATE).unwrap();
+        }
+        grow_to(&mut other, 209);
+        for h in 205..=209 {
+            let _ = c.accept(other.block(&other.id_at(h).unwrap()).unwrap().clone(), LATE);
+        }
+        assert_eq!(c.tip().id, other.tip().id);
+        assert_eq!(c.blob_state(&t), Some(&before_t), "the boost and the upgrade undone in reverse");
+        assert_eq!(c.blob_state(&bb).map(|s| s.upgraded.is_some()), Some(false));
+        assert_eq!(before_bb.upgraded.as_ref().map(|u| u.height), Some(205));
+
+        // A boost past a blob's time doesn't bring it back: t ends at 230; boosted at 231 it stays past its time.
+        grow_to(&mut c, 230);
+        let late = pay(5, vec![boost.script()], blob::fee_at(&NET6, 231, &[(Class::Boost, 1_500)]) + floor);
+        assert!(matches!(c.accept(block_txs(&c, ranked(&c)[0], vec![late], &HashMap::new()), LATE), Ok(Accepted::Tip { .. })));
+        assert_eq!(c.blob_state(&t).unwrap().until, 230);
+        assert_eq!(blob::check_upgrade(&NET6, 232, c.blob_state(&t)), Err(UpgradeError::Expired));
     }
 
     #[test]

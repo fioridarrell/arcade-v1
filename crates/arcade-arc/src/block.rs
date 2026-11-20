@@ -59,6 +59,9 @@ pub enum BlockError {
     Trailing(&'static str),
     #[error("blobs: {0}")]
     Blobs(&'static str),
+    /// A blob upgrade the rules refuse (rules version 6, crate::blob::check_upgrade).
+    #[error("blob upgrade: {0}")]
+    Upgrade(crate::blob::UpgradeError),
     #[error("block has no transactions")]
     Empty,
     #[error("first transaction is not a coinbase")]

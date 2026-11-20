@@ -684,6 +684,11 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
         let built = if send { crate::reposvc::start(node, r) } else { crate::reposvc::preview(node, r).map(|(fee, outs)| (String::new(), fee, outs)) };
         return built.map(|(t, f, o)| (t, f, o, None));
     }
+    if r["kind"] == "fog" {
+        // A storage choice (fogkeep.rs): applied here when approved, nothing written on a chain.
+        let built = if send { crate::fogkeep::approved(node, r) } else { crate::fogkeep::card(node, r["op"].as_str().unwrap_or(""), &r["args"]).map(|_| (String::new(), 0, vec![])) };
+        return built.map(|(t, f, o)| (t, f, o, None));
+    }
     // A request a page on the ARCADE chain made (batch 7): built and sent on that chain, not the home chain.
     if let Some(k) = r["chain"].as_str().filter(|k| *k != p.key) {
         let ap = crate::chains::find(k).filter(|ap| crate::arcsvc::defines(ap.key)).ok_or_else(|| format!("a page's send is on the home chain or the ARCADE chain, not {k}"))?;
@@ -871,6 +876,10 @@ pub fn preview(node: &Node, id: &str) -> Result<Value, String> {
     v["outputs"] = json!(outs);
     v["caution"] = json!(caution);
     v["page_card"] = page_card(node, r["page"].as_str().unwrap_or(""));
+    if r["kind"] == "fog" {
+        // Its card as things stand now (copies, room and pay move while it waits).
+        v["fog"]["card"] = crate::fogkeep::card(node, r["op"].as_str().unwrap_or(""), &r["args"])?;
+    }
     Ok(v)
 }
 

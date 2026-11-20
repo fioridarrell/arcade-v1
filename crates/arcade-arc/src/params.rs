@@ -134,7 +134,7 @@ pub const RULES_KNOWN: u32 = 6;
 
 /// The testnet height rules version 6 starts at (CONSENSUS: set in the release that ships it, ahead of the tip; this is
 /// a placeholder until then). [`TESTNET`]'s schedule reads it.
-pub const RULES_V6_HEIGHT: u64 = 3_000;
+pub const RULES_V6_HEIGHT: u64 = 2_725;
 
 /// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
 /// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the

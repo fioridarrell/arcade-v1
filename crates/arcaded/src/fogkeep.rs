@@ -360,7 +360,7 @@ fn seg_now(node: &Node, segs: &BTreeMap<(u8, u64), Vec<(Hash, crate::arcblob::Me
     let held = fogstore::seg_holders(node, family, index);
     let floor = fogstore::seg_floor(family, index).unwrap_or_else(|| {
         let refs: Vec<&crate::arcblob::Meta> = metas.iter().map(|x| &x.1).collect();
-        fogstore::floor_of(family, &refs, arcade_app::now(), u64::MAX / 4)
+        fogstore::floor_of(family, &refs, arcade_app::now(), u64::MAX / 4, fogstore::class_floor)
     });
     let room_elsewhere = fogstore::announcements_now(node)
         .iter()

@@ -913,7 +913,13 @@ fn approve_with(node: &Node, id: &str, send: impl FnOnce(&Value) -> Result<(Stri
     if r["status"] != "pending" {
         return Err(format!("that request is {}", r["status"].as_str().unwrap_or("closed")));
     }
-    match send(&r) {
+    let sent = send(&r);
+    // What the send itself stored on the request is kept: a storage choice (fogkeep::approved) writes its result there,
+    // and saving the copy read before the send put it back to "asked" (ARCADE fog, #327).
+    if let Some(now) = get_req(node, id) {
+        r = now;
+    }
+    match sent {
         Ok((txid, fee, _)) => {
             r["status"] = json!("sent");
             r["txid"] = json!(txid);
@@ -1195,6 +1201,27 @@ mod tests {
         assert_eq!(answers.iter().filter(|a| a.is_ok()).count(), 1);
         assert!(answers.iter().any(|a| a.as_ref().is_err_and(|e| e.contains("sent"))), "the other is told it was sent: {answers:?}");
         assert_eq!(get_req(&t.node, "r1").unwrap()["status"], "sent");
+    }
+
+    #[test]
+    fn what_the_send_stored_on_the_request_is_kept() {
+        let (_one, t) = crate::http::tests::node();
+        let r = json!({"id": "f1", "page": "a".repeat(64), "kind": "fog", "op": "keep", "what": "keep",
+                       "status": "pending", "created": arcade_app::now(), "txid": Value::Null, "error": Value::Null,
+                       "fog": {"state": "asked"}});
+        put_req(&t.node, &r);
+        let done = approve_with(&t.node, "f1", |r| {
+            let mut x = get_req(&t.node, r["id"].as_str().unwrap()).unwrap();
+            x["fog"] = json!({"state": "done", "result": {"kept": 1}});
+            put_req(&t.node, &x);
+            Ok((String::new(), 0, vec![]))
+        })
+        .unwrap();
+        assert_eq!(done["status"], "sent");
+        let stored = get_req(&t.node, "f1").unwrap();
+        assert_eq!(stored["fog"]["state"], "done", "the result the send wrote is kept: {stored}");
+        assert_eq!(stored["fog"]["result"]["kept"], 1);
+        assert_eq!(stored["status"], "sent");
     }
 
     #[test]

@@ -20,9 +20,13 @@
 //! - `fog.undo {id}`: takes a choice back (a keep, a pin, a forget; a hand-over not finished is cancelled).
 //! - `fog.mine`: the list for the Storage app's Mine tab. Operator only: the forget list is nobody else's business.
 //!
-//! An app page asks through `POST /r/fog/<keep|forget|undo>` (crate::http): the request waits in the wallet's approval
+//! An app page asks through `POST /r/fog/<keep|forget|undo|keep_share|cache>` (crate::http): the request waits in the wallet's approval
 //! queue like a repository write (crate::reposvc), and Arcade V1.0 shows its card over the app (the size, copies before
 //! and after, the pay estimate and the seal time on this machine). Nothing changes before the operator approves.
+//!
+//! The Storage app's Settings (Martin 2026-11-19: the keep share and the blob cache moved there from Arcade V1's
+//! Options tab) go the same way: `GET /r/fog/settings`, `POST /r/fog/keep_share {mb | gb | pct}` and
+//! `POST /r/fog/cache {mb}`, each change on a card first (old → new, what it would hold or drop, the disk left).
 //!
 //! The choices are kept per network in `<home>/arc/<net>/fog-choices.json`.
 
@@ -483,7 +487,7 @@ fn cant_keep(node: &Node) -> Option<String> {
         return Some("no keep share: this arcade borrows the ARCADE chain (it borrows everything), so it can't keep or pin data. Forget still works on its viewer cache.".into());
     }
     if fogstore::keep_mb(node) == 0 {
-        return Some("no keep share: set one in Options (Keep ARCADE data) first. Forget still works.".into());
+        return Some("no keep share: set one in the Storage app's Settings (or arc.keep) first. Forget still works.".into());
     }
     None
 }
@@ -797,7 +801,9 @@ pub fn card(node: &Node, op: &str, req: &Value) -> Result<Value, String> {
         "keep" => keep_plan(node, req).map(|p| p.card),
         "forget" => forget_plan(node, req).map(|p| p.card),
         "undo" => undo_plan(req).map(|p| p.0),
-        _ => Err(format!("no storage op called {op}: keep, forget or undo")),
+        "keep_share" => share_plan(node, req).map(|p| p.0),
+        "cache" => cache_plan(req).map(|p| p.0),
+        _ => Err(format!("no storage op called {op}: keep, forget, undo, keep_share or cache")),
     }
 }
 
@@ -871,7 +877,22 @@ pub fn apply(node: &Node, op: &str, req: &Value) -> Result<Value, String> {
             let _ = node.app.event("chains", &format!("Storage: undo {}", e.label));
             Ok(json!({"done": true, "id": e.id, "undone": e.kind, "card": card}))
         }
-        _ => Err(format!("no storage op called {op}: keep, forget or undo")),
+        "keep_share" => {
+            // Set as arc.keep sets it (the operator's command, unchanged): a share of free space, a size or Off.
+            let (card, ask) = share_plan(node, req)?;
+            let k = fogstore::api_keep(node, &ask.arc_keep_args())?;
+            Ok(json!({"done": true, "keep": k, "card": card}))
+        }
+        "cache" => {
+            // Set as arc.cache sets it, then brought down to the new size now (what the card said it drops).
+            let (card, new_mb) = cache_plan(req)?;
+            node.app.store.write(|w| w.put(arcade_app::META, b"arc_cache_mb", new_mb.to_string().as_bytes())).map_err(|e| e.to_string())?;
+            crate::arcblob::set_cache_limit(new_mb << 20);
+            let (dropped, freed) = crate::arcblob::cache_trim(new_mb << 20);
+            let _ = node.app.event("chains", &format!("Storage: blob cache {}", if new_mb == 0 { "off".to_string() } else { format!("{new_mb} MB") }));
+            Ok(json!({"done": true, "mb": new_mb, "dropped": dropped, "freed_bytes": freed, "card": card}))
+        }
+        _ => Err(format!("no storage op called {op}: keep, forget, undo, keep_share or cache")),
     }
 }
 
@@ -967,7 +988,7 @@ pub fn mine(node: &Node) -> Result<Value, String> {
         "why_not": cant_keep(node),
         "keep_share": {"mb": share, "used_mb": used, "free_mb": share.saturating_sub(used), "none": share == 0,
                        "label": if borrowed { "none · borrows everything".to_string() } else if share == 0 { "none (Off)".to_string() } else { format!("{used} of {share} MB used") },
-                       "options": "Options → Keep ARCADE data (arc.keep)"},
+                       "options": "Settings in this app (GET /r/fog/settings, POST /r/fog/keep_share; arc.keep)"},
         "kept_segments": kept.iter().map(|(f, i)| {
             // Whether this arcade's own copy counts now (registered and audited), and the segment's copies.
             let held = fogstore::seg_holders(node, *f, *i);
@@ -987,9 +1008,243 @@ pub fn mine(node: &Node) -> Result<Value, String> {
     }))
 }
 
+// ---------------- settings: the keep share and the blob cache (POST /r/fog/<keep_share|cache>) ----------------
+//
+// Martin 2026-11-19: every storage setting lives in the Storage app, not in Arcade V1's Options tab. The app reads
+// them (GET /r/fog/settings) and asks for a change; the operator approves it on the card. arc.keep and arc.cache stay
+// the operator's (and agents') commands on every API surface, unchanged.
+
+/// A keep share is at most this many MB (16 TB): a size past any disk is a typo.
+const SHARE_MAX_MB: u64 = 16 << 20;
+/// A blob cache is at most this many MB (1 TB).
+const CACHE_MAX_MB: u64 = 1 << 20;
+
+/// The keep share a page asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ShareAsk {
+    Off,
+    /// A share of free space, recomputed as it changes (one of fogstore::KEEP_PCTS).
+    Pct(u64),
+    /// A fixed size, in MB.
+    Mb(u64),
+}
+
+impl ShareAsk {
+    fn arc_keep_args(self) -> Value {
+        match self {
+            ShareAsk::Off => json!({"mb": 0}),
+            ShareAsk::Pct(p) => json!({"pct": p}),
+            ShareAsk::Mb(m) => json!({"mb": m}),
+        }
+    }
+}
+
+/// `{mb}`, `{gb}` or `{pct}` (one of them; `mb: 0` or `"off"` is Off), as arc.keep takes them.
+pub fn share_ask(req: &Value) -> Result<ShareAsk, String> {
+    let given = ["mb", "gb", "pct"].iter().filter(|k| !req[**k].is_null()).count();
+    if given != 1 {
+        return Err("give one of mb, gb or pct (Off: mb 0)".into());
+    }
+    if !req["pct"].is_null() {
+        let p = req["pct"].as_u64().filter(|p| fogstore::KEEP_PCTS.contains(p)).ok_or_else(|| format!("pct is one of {:?}", fogstore::KEEP_PCTS))?;
+        return Ok(ShareAsk::Pct(p));
+    }
+    if req["mb"] == "off" || req["gb"] == "off" {
+        return Ok(ShareAsk::Off);
+    }
+    let mb = req["mb"].as_u64().or_else(|| req["gb"].as_f64().filter(|g| g.is_finite() && *g >= 0.0 && *g < 1e9).map(|g| (g * 1024.0).round() as u64));
+    match mb {
+        Some(0) => Ok(ShareAsk::Off),
+        Some(m) if m > SHARE_MAX_MB => Err(format!("a keep share is at most {} TB", SHARE_MAX_MB >> 20)),
+        Some(m) => Ok(ShareAsk::Mb(m)),
+        None => Err("mb and gb are sizes (a whole number of MB, a number of GB), or \"off\"".into()),
+    }
+}
+
+/// Bytes for people, as the Options tab wrote them (GB past 1 GB).
+fn gb(b: u64) -> String {
+    if b >= 1 << 30 {
+        let g = b as f64 / (1u64 << 30) as f64;
+        if b >= 10 << 30 { format!("{g:.0} GB") } else { format!("{g:.1} GB") }
+    } else if b >= 1 << 20 {
+        format!("{:.1} MB", b as f64 / (1u64 << 20) as f64)
+    } else if b > 0 {
+        format!("{} kB", (b / 1024).max(1))
+    } else {
+        "0".into()
+    }
+}
+
+/// What a share would hold, in words (fogstore::would_hold's answer; the Options tab's holdsText).
+fn holds_text(hd: &Value, bytes: u64) -> String {
+    if bytes == 0 || hd.is_null() {
+        return "Holds nothing for the network.".into();
+    }
+    let n = |k: &str| hd[k].as_u64().unwrap_or(0);
+    if n("of_segments") == 0 {
+        return "Holds segments once there are files on the chain under the fog rules.".into();
+    }
+    let short = if n("short") > 0 {
+        format!(" · short today: holds {} of {}{}", n("short_held"), n("short"), if n("short_filled") > 0 { format!(", {} reach their floor with it", n("short_filled")) } else { String::new() })
+    } else {
+        " · nothing is short today".into()
+    };
+    format!("Would hold {} of {} segments ({} of {} files, {}){short}.", n("segments"), n("of_segments"), n("blobs"), n("of_blobs"), gb(n("bytes")))
+}
+
+/// The share chosen now, in words, from arc.keep's answer.
+fn share_label(k: &Value) -> String {
+    let mb = k["mb"].as_u64().unwrap_or(0);
+    match k["choice"].as_str().unwrap_or("") {
+        "off" => "Off".into(),
+        c if c.starts_with("pct:") => format!("{}% of free space ({})", &c[4..], gb(mb << 20)),
+        _ if mb > 0 && k["suggested"]["mb"].as_u64() == Some(mb) => format!("Suggested for this machine ({})", gb(mb << 20)),
+        _ if mb == 0 => "Off".into(),
+        _ => gb(mb << 20),
+    }
+}
+
+/// The card for a keep share change: from arc.keep's answer now (`k`), `borrowed` (why this arcade has no keep share,
+/// when it borrows ARCADE) and what a share of n bytes would hold. Refused when it changes nothing, doesn't fit, or
+/// there is no share to have.
+pub fn share_card(k: &Value, ask: ShareAsk, borrowed: Option<&str>, holds: &dyn Fn(u64) -> Value) -> Result<Value, String> {
+    if let (Some(why), false) = (borrowed, ask == ShareAsk::Off) {
+        return Err(why.to_string());
+    }
+    let b = &k["budget"];
+    let u = |v: &Value| v.as_u64().unwrap_or(0);
+    let (free, used, reserve) = (u(&b["free_bytes"]), u(&b["keep_bytes"]), u(&b["reserve_bytes"]));
+    let floor_gb = k["free_floor_gb"].as_u64().unwrap_or(fogstore::KEEP_FREE_FLOOR >> 30);
+    let old_mb = u(&k["mb"]);
+    let old = share_label(k);
+    let room = (free + used).saturating_sub(reserve).saturating_sub(floor_gb << 30);
+    let (new_bytes, new_label, hd) = match ask {
+        ShareAsk::Off => (0, "Off".to_string(), Value::Null),
+        ShareAsk::Pct(p) => {
+            let pre = k["presets"].as_array().and_then(|a| a.iter().find(|x| x["id"] == format!("pct:{p}"))).cloned().unwrap_or(Value::Null);
+            let bytes = u(&pre["bytes"]);
+            (bytes, format!("{p}% of free space ({})", gb(bytes)), if pre["holds"].is_null() { holds(bytes) } else { pre["holds"].clone() })
+        }
+        ShareAsk::Mb(m) => {
+            let label = if k["suggested"]["mb"].as_u64() == Some(m) { format!("Suggested for this machine ({})", gb(m << 20)) } else { gb(m << 20) };
+            (m << 20, label, holds(m << 20))
+        }
+    };
+    let same = match ask {
+        ShareAsk::Off => old_mb == 0,
+        ShareAsk::Pct(p) => k["pct"].as_u64() == Some(p),
+        ShareAsk::Mb(m) => k["pct"].is_null() && old_mb == m,
+    };
+    if same {
+        return Err(format!("the keep share is {old} already"));
+    }
+    if ask != ShareAsk::Off && (new_bytes == 0 || new_bytes > room) {
+        return Err(format!(
+            "not enough free space for {new_label}: a keep share never leaves less than {floor_gb} GB free after what your chains will grow to ({} free, {} of it for your chains to grow: at most {} now)",
+            gb(free), gb(reserve), gb(room)
+        ));
+    }
+    let leaves = (free + used).saturating_sub(new_bytes);
+    let mut lines = vec![format!("Keep share for ARCADE data: {old} → {new_label}.")];
+    let mut notes = Vec::new();
+    if ask == ShareAsk::Off {
+        lines.push("This machine keeps no ARCADE data for the network (it still works fully): the segments the share holds are let go at once; other arcades keep their copies.".into());
+    } else {
+        lines.push(holds_text(&hd, new_bytes));
+        lines.push(if new_bytes < used {
+            format!("It holds {} now: the segments past the new share are let go at the next fog round.", gb(used))
+        } else {
+            "Filled at the next fog round, the segments short of copies first, sealed and audited like the chain data Earn ARCADE seals; their pay is split among their copies.".into()
+        });
+    }
+    if let ShareAsk::Pct(_) = ask {
+        notes.push(format!("A share of free space is recomputed as the free space changes, never past {floor_gb} GB left free."));
+    }
+    notes.push("Your own files, new files (for a week) and files viewed here are kept anyway. Nothing is written on a chain.".into());
+    let facts = vec![
+        format!("Share: {} → {}", gb(old_mb << 20), gb(new_bytes)),
+        format!("Disk: {} free now · leaves {} free when the share is full", gb(free), gb(leaves)),
+    ];
+    Ok(json!({"op": "keep_share", "title": format!("Keep share: {old} → {new_label}"), "lines": lines, "facts": facts, "notes": notes,
+              "old_mb": old_mb, "new_mb": new_bytes >> 20, "new_bytes": new_bytes, "pct": match ask { ShareAsk::Pct(p) => json!(p), _ => Value::Null },
+              "leaves_free": leaves, "holds": hd, "size_bytes": 0, "seal_text": Value::Null, "pay_text": Value::Null}))
+}
+
+fn share_plan(node: &Node, req: &Value) -> Result<(Value, ShareAsk), String> {
+    let ask = share_ask(req)?;
+    let k = fogstore::api_keep(node, &json!({}))?;
+    let borrowed = crate::arcsvc::svc_net().is_none().then_some("no keep share: this arcade borrows the ARCADE chain (it borrows everything), so it keeps nothing for the network. Install the ARCADE chain in Chains & Coins to keep a share.");
+    share_card(&k, ask, borrowed, &fogstore::holds_now).map(|c| (c, ask))
+}
+
+/// `{mb}` for the blob cache (0 or "off": off).
+pub fn cache_ask(req: &Value) -> Result<u64, String> {
+    if req["mb"] == "off" {
+        return Ok(0);
+    }
+    match req["mb"].as_u64() {
+        Some(m) if m > CACHE_MAX_MB => Err(format!("a blob cache is at most {} TB", CACHE_MAX_MB >> 20)),
+        Some(m) => Ok(m),
+        None => Err("mb required: the blob cache's size in MB (0 or \"off\" turns it off)".into()),
+    }
+}
+
+/// The card for a blob cache change: from its size now (`old_mb`), the cached files' sizes (the least recently viewed
+/// first) and the free disk.
+pub fn cache_card(old_mb: u64, new_mb: u64, lens: &[u64], free: u64) -> Result<Value, String> {
+    let label = |m: u64| if m == 0 { "off".to_string() } else { gb(m << 20) };
+    if old_mb == new_mb {
+        return Err(format!("the blob cache is {} already", label(old_mb)));
+    }
+    let holding: u64 = lens.iter().sum();
+    let (n, freed) = crate::arcblob::cache_drops(lens, new_mb << 20);
+    let mut lines = vec![format!("Blob cache: {} → {}.", label(old_mb), label(new_mb))];
+    if new_mb == 0 {
+        lines.push("Off: this arcade keeps no copy of what it fetches for a viewer, so each view fetches it again, and it hands none to other arcades that ask.".into());
+    } else {
+        lines.push(format!("Blobs fetched for a viewer here are kept up to {} and handed to other arcades that ask; past it the least recently viewed go first.", gb(new_mb << 20)));
+    }
+    if n > 0 {
+        lines.push(format!("Drops {n} of {} cached blobs ({}) now, the least recently viewed first. Other arcades still hold them; one viewed again is fetched again.", lens.len(), gb(freed)));
+    } else if new_mb < old_mb {
+        lines.push(format!("It holds {} now: nothing is dropped.", gb(holding)));
+    }
+    let disk = if n > 0 {
+        format!("Disk: {} free now → {} after", gb(free), gb(free + freed))
+    } else if new_mb > old_mb {
+        format!("Disk: {} free now · the cache may use up to {} more", gb(free), gb((new_mb << 20).saturating_sub(holding)))
+    } else {
+        format!("Disk: {} free now", gb(free))
+    };
+    let facts = vec![format!("Holding: {} blobs, {}", lens.len(), gb(holding)), disk];
+    Ok(json!({"op": "cache", "title": format!("Blob cache: {} → {}", label(old_mb), label(new_mb)), "lines": lines, "facts": facts,
+              "notes": ["Only this arcade's copies of what was viewed here: nothing is deleted anywhere else or written on a chain."],
+              "old_mb": old_mb, "new_mb": new_mb, "drops": {"blobs": n, "bytes": freed}, "holding": {"blobs": lens.len(), "bytes": holding},
+              "size_bytes": 0, "seal_text": Value::Null, "pay_text": Value::Null}))
+}
+
+fn cache_plan(req: &Value) -> Result<(Value, u64), String> {
+    let new_mb = cache_ask(req)?;
+    let lens: Vec<u64> = crate::arcblob::cache_files().into_iter().map(|f| f.0).collect();
+    cache_card(crate::arcblob::cache_limit() >> 20, new_mb, &lens, crate::diskbudget::free_bytes()).map(|c| (c, new_mb))
+}
+
+/// `GET /r/fog/settings`: what the Storage app's Settings show: the keep share (arc.keep's answer: the choice, the
+/// presets with what each would hold, the suggestion, the disk budget) and the blob cache (arc.cache's).
+pub fn settings(node: &Node) -> Value {
+    let (files, bytes) = crate::arcblob::cache_use();
+    let limit = crate::arcblob::cache_limit();
+    let borrowed = crate::arcsvc::svc_net().is_none();
+    let keep = fogstore::api_keep(node, &json!({})).unwrap_or_else(|e| json!({"error": e}));
+    json!({"keep": keep, "label": if borrowed { "none · borrows everything".to_string() } else { share_label(&keep) }, "borrowed": borrowed,
+           "cache": {"mb": limit >> 20, "on": limit > 0, "files": files, "bytes": bytes, "default_mb": crate::arcblob::CACHE_DEFAULT >> 20, "max_mb": CACHE_MAX_MB},
+           "doors": {"keep_share": "POST /r/fog/keep_share {mb | gb | pct}", "cache": "POST /r/fog/cache {mb}"},
+           "commands": ["arc.keep", "arc.cache"]})
+}
+
 // ---------------- app requests (POST /r/fog/<op>) ----------------
 
-/// `POST /r/fog/<keep|forget|undo>` from app page `page`: checked now (its card), then filed in the wallet's approval
+/// `POST /r/fog/<keep|forget|undo|keep_share|cache>` from app page `page`: checked now (its card), then filed in the wallet's approval
 /// queue for Arcade V1.0 to show; nothing changes until the operator approves.
 pub fn file(node: &Node, page: &str, op: &str, b: &Value) -> (u16, Value) {
     let c = match card(node, op, b) {
@@ -997,7 +1252,7 @@ pub fn file(node: &Node, page: &str, op: &str, b: &Value) -> (u16, Value) {
         Err(e) => return (400, json!({"error": e})),
     };
     let mut args = json!({});
-    for k in ["segment", "blob", "publisher", "mode", "id"] {
+    for k in ["segment", "blob", "publisher", "mode", "id", "mb", "gb", "pct"] {
         if !b[k].is_null() {
             args[k] = b[k].clone();
         }
@@ -1143,5 +1398,86 @@ mod tests {
         assert!(!refused(&[9u8; 32]));
         assert!(snapshot().pinned(&hex::encode([8u8; 32])) && !snapshot().pinned(&hex::encode(id)));
         set_for_test(Choices::default());
+    }
+
+    /// arc.keep's answer, as fogstore::api_keep gives it, for a machine with `free` GB free.
+    fn keep_now(mb: u64, choice: &str, pct: Option<u64>, free_gb: u64) -> Value {
+        let free = free_gb << 30;
+        json!({"mb": mb, "choice": choice, "pct": pct, "free_floor_gb": 20,
+               "presets": [{"id": "off", "bytes": 0}, {"id": "pct:5", "bytes": free / 20, "holds": {"segments": 1, "of_segments": 4, "blobs": 3, "of_blobs": 9, "bytes": 1 << 20, "short": 1, "short_held": 1, "short_filled": 1}},
+                           {"id": "pct:10", "bytes": free / 10}, {"id": "pct:25", "bytes": free / 4}],
+               "suggested": {"mb": 8192, "bytes": 8u64 << 30},
+               "budget": {"free_bytes": free, "keep_bytes": 0, "reserve_bytes": 10u64 << 30}})
+    }
+
+    #[test]
+    fn a_page_asks_for_a_keep_share_as_arc_keep_takes_it() {
+        assert_eq!(share_ask(&json!({"pct": 10})), Ok(ShareAsk::Pct(10)));
+        assert!(share_ask(&json!({"pct": 7})).unwrap_err().contains("pct is one of"));
+        assert_eq!(share_ask(&json!({"mb": 0})), Ok(ShareAsk::Off));
+        assert_eq!(share_ask(&json!({"mb": "off"})), Ok(ShareAsk::Off));
+        assert_eq!(share_ask(&json!({"gb": 1.5})), Ok(ShareAsk::Mb(1536)));
+        assert_eq!(share_ask(&json!({"mb": 800})), Ok(ShareAsk::Mb(800)));
+        assert!(share_ask(&json!({})).is_err() && share_ask(&json!({"mb": 1, "pct": 5})).is_err(), "exactly one");
+        assert!(share_ask(&json!({"gb": -1})).is_err() && share_ask(&json!({"mb": "lots"})).is_err());
+        assert!(share_ask(&json!({"mb": SHARE_MAX_MB + 1})).is_err());
+        assert_eq!(ShareAsk::Pct(25).arc_keep_args(), json!({"pct": 25}));
+        assert_eq!(ShareAsk::Off.arc_keep_args(), json!({"mb": 0}));
+    }
+
+    #[test]
+    fn the_keep_share_card_shows_old_and_new_what_it_holds_and_the_disk() {
+        let none = |_: u64| json!({"segments": 2, "of_segments": 4, "blobs": 5, "of_blobs": 9, "bytes": 3u64 << 20, "short": 0});
+        // Off → 5% of 200 GB free: 10 GB, the preset's own holds.
+        let c = share_card(&keep_now(0, "off", None, 200), ShareAsk::Pct(5), None, &none).unwrap();
+        assert_eq!(c["op"], "keep_share");
+        assert_eq!(c["lines"][0], "Keep share for ARCADE data: Off → 5% of free space (10 GB).");
+        assert!(c["lines"][1].as_str().unwrap().starts_with("Would hold 1 of 4 segments (3 of 9 files"), "{c}");
+        assert_eq!(c["new_mb"], 10 * 1024);
+        assert!(c["facts"][1].as_str().unwrap().contains("200 GB free now · leaves 190 GB free"), "{c}");
+        assert!(c["notes"][0].as_str().unwrap().contains("recomputed"));
+        // A size: the suggestion is named as such; what it would hold comes from the fog view.
+        let c = share_card(&keep_now(0, "off", None, 200), ShareAsk::Mb(8192), None, &none).unwrap();
+        assert!(c["title"].as_str().unwrap().ends_with("Suggested for this machine (8.0 GB)"), "{c}");
+        assert!(c["lines"][1].as_str().unwrap().starts_with("Would hold 2 of 4 segments"));
+        // Shrinking: what goes, and when.
+        let mut k = keep_now(4096, "custom", None, 200);
+        k["budget"]["keep_bytes"] = json!(3u64 << 30);
+        let c = share_card(&k, ShareAsk::Mb(1024), None, &none).unwrap();
+        assert!(c["lines"][0].as_str().unwrap().contains("4.0 GB → 1.0 GB") && c["lines"][2].as_str().unwrap().contains("let go at the next fog round"), "{c}");
+        // Off from a share.
+        let c = share_card(&k, ShareAsk::Off, None, &none).unwrap();
+        assert!(c["lines"][1].as_str().unwrap().contains("keeps no ARCADE data") && c["new_mb"] == 0, "{c}");
+        // Refused: no change, past the free space (20 GB stay free after the chains' 10 GB to grow), borrowed.
+        assert!(share_card(&keep_now(0, "off", None, 200), ShareAsk::Off, None, &none).unwrap_err().contains("already"));
+        assert!(share_card(&keep_now(0, "pct:10", Some(10), 200), ShareAsk::Pct(10), None, &none).unwrap_err().contains("already"));
+        assert!(share_card(&k, ShareAsk::Mb(4096), None, &none).unwrap_err().contains("already"));
+        let e = share_card(&keep_now(0, "off", None, 40), ShareAsk::Mb(20 * 1024), None, &none).unwrap_err();
+        assert!(e.contains("not enough free space") && e.contains("at most 10 GB"), "{e}");
+        assert!(share_card(&keep_now(0, "off", None, 40), ShareAsk::Mb(9 * 1024), None, &none).is_ok());
+        assert!(share_card(&keep_now(0, "off", None, 200), ShareAsk::Pct(5), Some("borrows everything"), &none).unwrap_err().contains("borrows"));
+        assert!(share_card(&k, ShareAsk::Off, Some("borrows everything"), &none).is_ok(), "Off is always allowed");
+    }
+
+    #[test]
+    fn the_cache_card_says_what_it_drops() {
+        // Five cached blobs of 1 MB, the least recently viewed first.
+        let lens = vec![1u64 << 20; 5];
+        assert_eq!(crate::arcblob::cache_drops(&lens, 3 << 20), (2, 2 << 20));
+        assert_eq!(crate::arcblob::cache_drops(&lens, 5 << 20), (0, 0));
+        assert_eq!(crate::arcblob::cache_drops(&lens, 0), (5, 5 << 20));
+        let c = cache_card(2048, 3, &lens, 50 << 30).unwrap();
+        assert_eq!(c["op"], "cache");
+        assert_eq!(c["lines"][0], "Blob cache: 2.0 GB → 3.0 MB.");
+        assert!(c["lines"][2].as_str().unwrap().starts_with("Drops 2 of 5 cached blobs (2.0 MB) now"), "{c}");
+        assert_eq!(c["drops"], json!({"blobs": 2, "bytes": 2u64 << 20}));
+        assert!(c["facts"][1].as_str().unwrap().contains("→"), "{c}");
+        let c = cache_card(2048, 0, &lens, 50 << 30).unwrap();
+        assert!(c["title"].as_str().unwrap().ends_with("→ off") && c["lines"][1].as_str().unwrap().starts_with("Off:") && c["drops"]["blobs"] == 5, "{c}");
+        let c = cache_card(2048, 4096, &lens, 50 << 30).unwrap();
+        assert!(c["drops"]["blobs"] == 0 && c["facts"][1].as_str().unwrap().contains("may use up to"), "{c}");
+        assert!(cache_card(2048, 2048, &lens, 0).unwrap_err().contains("already"));
+        assert_eq!(cache_ask(&json!({"mb": "off"})), Ok(0));
+        assert!(cache_ask(&json!({})).is_err() && cache_ask(&json!({"mb": CACHE_MAX_MB + 1})).is_err());
     }
 }

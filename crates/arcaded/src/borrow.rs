@@ -3080,13 +3080,27 @@ fn unspent(node: &Node, p: &'static ChainParams, tip: u32, minconf: &Value, maxc
 
 /// Every coin of these addresses from the first lender whose address index answers at once;
 /// a lender still reading them (an older arcade's background scan) is passed over.
+/// Lenders asked after one that found no coins, before "no coins" is believed.
+const EMPTY_RETRIES: usize = 2;
+
 fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(String, Vec<Found>), String> {
     let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
     let parts: Vec<Value> = refs.chunks(SCAN_ADDRESSES).map(|c| json!(["arcade_coinscan", [{"addresses": c}]])).collect();
     // Every lender's answer, for the error when none could: "a shared Core does not answer" is an
     // arcade lending a coin node with no address index.
     let mut why: Vec<String> = Vec::new();
+    // An empty answer isn't the last word: an older arcade's index may not know an address form (a DigiDollar's
+    // Taproot address, dgb1p...) and answers "no coins" (2026-11-20: a DD wallet showed $0 from such a lender while
+    // another lender held its coin). The first answer with coins wins; else the first empty one, after a few more asked.
+    let mut empty: Option<String> = None;
+    let mut asked_after_empty = 0;
     'lenders: for l in lenders(node, p) {
+        if empty.is_some() {
+            if asked_after_empty >= EMPTY_RETRIES {
+                break;
+            }
+            asked_after_empty += 1;
+        }
         let a = match call(node, &l, p, json!(parts)) {
             Ok(a) => a,
             Err(x) => {
@@ -3108,7 +3122,14 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
                 }
             }
         }
+        if found.is_empty() {
+            empty.get_or_insert(l);
+            continue;
+        }
         return Ok((l, found));
+    }
+    if let Some(l) = empty {
+        return Ok((l, Vec::new()));
     }
     if why.is_empty() {
         return Err(format!("no arcade lends {} now", p.name));

@@ -192,6 +192,16 @@ Rules: an app with a card follows its Contacts switch ('off'); no card asks once
 /^@?[A-Za-z0-9_]{1,24}$/ or an address /^[A-Za-z0-9]{25,90}$/ ("not an address: give an address or an @tag"); name
 text ≤ 60; one question at a time ("busy: ..."); only claimed tags ("no name: ..."); refusal "declined".
 
+## B3a. /r/files.js → arcade.files (V1.0)
+- save(name, bytes) → {saved: the name kept} (bytes: ArrayBuffer, typed array or Blob; at most 128 MB, "too big: a
+  saved file is at most 128 MB"; none: "nothing to save"). The arcade window writes it to this computer's Downloads
+  folder beside any file already there (a number is added on a clash); nothing opens it.
+- No switch on the app's card. The first file in a window asks once ("Let <app> save files?"); Allow lets the app save
+  until the window closes; a no rejects "declined". Outside the arcade window it rejects after 600 s ("no arcade
+  window is listening").
+- groups.save(name, bytes) still works for apps written before files.js (behind the Group chats switch: the first file
+  goes through, more ask once), with the same 128 MB limit.
+
 ## B3. /r/groups.js → arcade.groups (timeout 120 s "no viewer is listening, or the wallet is still locked")
 - list() → {me, groups:[{id, name, room, members:[{tag, address}]}]}; read(id, {after, limit}) → lines oldest first
   [{txid, when, height, mine, from, text}] (after 0, limit 200); send(id, text) → {txid, fee}; leave(id) (600 s) →

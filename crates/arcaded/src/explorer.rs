@@ -1696,7 +1696,7 @@ fn tx(x: &Ctx, id: &str) -> R {
 fn held(x: &Ctx, a: &str, req: &Value) -> R {
     let c = x.c();
     let a = a.trim();
-    let script = address::script_for_address(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
+    let script = crate::ddsvc::lookup_script(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
     let mut all: Vec<(u64, String)> = ord::held_by(&x.node.chain, x.p, &script)
         .map_err(e)?
         .into_iter()
@@ -1728,7 +1728,7 @@ fn held(x: &Ctx, a: &str, req: &Value) -> R {
 fn addr(x: &Ctx, a: &str, req: &Value) -> R {
     let c = x.c();
     let a = a.trim();
-    let script = address::script_for_address(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
+    let script = crate::ddsvc::lookup_script(x.p, a).ok_or_else(|| format!("{a} is not a {} address", x.p.name))?;
     let mut v = json!({"address": a, "tag": tag_of(x, a), "unit": unit(x.p)});
     let want = |k: &str| req[k] != false;
     if !want("history") {
@@ -1967,6 +1967,69 @@ fn search_hits(ix: &str, v: &Value) -> Vec<Value> {
     all.into_iter().filter(|h| h["kind"] == kind && h["id"].is_string()).collect()
 }
 
+/// Whether `h` is a block or a transaction on `p` here (installed, or borrowed: asked of a lender).
+fn hex_kind(node: &Node, p: &'static ChainParams, h: &Hash256) -> Option<&'static str> {
+    if node.chain.header(p.chain_no, h).ok().flatten().is_some() {
+        return Some("block");
+    }
+    if node.chain.tx_raw(p, h).ok().flatten().is_some() || node.chain.tx_location(p, h).ok().flatten().is_some() {
+        return Some("tx");
+    }
+    if crate::borrow::is_borrowed(p.key) {
+        let hx = h.to_hex();
+        if crate::borrow::ask_lender(node, p, "getblockheader", json!([hx, true])).is_ok_and(|v| v.is_object()) {
+            return Some("block");
+        }
+        if crate::borrow::raw_tx(node, p, h).is_ok() {
+            return Some("tx");
+        }
+    }
+    None
+}
+
+/// Every chain this arcade keeps or borrows but `x.p`: what `look` finds on each, asked at once and waited on up to
+/// 4 s (a borrowed chain asks a lender). (chain, kind, id) for each hit.
+fn elsewhere(x: &Ctx, look: impl Fn(&Node, &'static ChainParams) -> Option<(&'static str, String)> + Send + Sync + Clone + 'static) -> Vec<(&'static ChainParams, &'static str, String)> {
+    let mut keys: Vec<&'static str> = vec![x.node.params.key];
+    keys.extend(x.node.extra.lock().unwrap().values().map(|r| r.params.key));
+    keys.extend(crate::borrow::borrowed_keys().into_iter().filter_map(|k| crate::chains::find(&k).map(|p| p.key)));
+    if let Ok(a) = crate::arcledger::chain() {
+        keys.push(a.key);
+    }
+    let mut seen = std::collections::HashSet::new();
+    let chains: Vec<&'static ChainParams> = keys.into_iter().filter(|k| *k != x.p.key && seen.insert(*k)).filter_map(crate::chains::find).collect();
+    let (tx, rx) = std::sync::mpsc::channel();
+    for p in &chains {
+        let (tx, n, p, look) = (tx.clone(), x.node.self_arc(), *p, look.clone());
+        std::thread::spawn(move || {
+            let _ = tx.send((p, look(&n, p)));
+        });
+    }
+    drop(tx);
+    let until = std::time::Instant::now() + std::time::Duration::from_secs(4);
+    let mut out = Vec::new();
+    for _ in 0..chains.len() {
+        let Some(left) = until.checked_duration_since(std::time::Instant::now()) else { break };
+        let Ok((p, got)) = rx.recv_timeout(left) else { break };
+        if let Some((kind, id)) = got {
+            out.push((p, kind, id));
+        }
+    }
+    out.sort_by_key(|(p, _, _)| p.key);
+    out
+}
+
+/// A search answer for hits on other chains: one hit (with its chain), a list, or None for none.
+fn found_answer(q: &str, found: Vec<(&'static ChainParams, &'static str, String)>) -> Option<R> {
+    match found.len() {
+        0 => None,
+        1 => Some(Ok(json!({"kind": found[0].1, "id": found[0].2, "chain": found[0].0.key}))),
+        _ => Some(Ok(json!({"kind": "results", "id": q, "items": found.iter().map(|(p, k, id)| json!({
+            "kind": k, "id": id, "chain": p.key, "label": format!("{} on {}", if *k == "block" { "Block" } else if *k == "tx" { "Transaction" } else { "Address" }, p.name),
+            "what": p.name})).collect::<Vec<_>>()}))),
+    }
+}
+
 fn search(x: &Ctx, q: &str) -> R {
     let c = x.c();
     let q = q.trim();
@@ -1991,23 +2054,41 @@ fn search(x: &Ctx, q: &str) -> R {
     if q.len() == 66 && q.as_bytes()[64] == b'i' || (q.len() > 65 && q[..64].bytes().all(|b| b.is_ascii_hexdigit()) && q.as_bytes()[64] == b'i') {
         return hit("inscription", q.to_string());
     }
+    // A coin (txid:vout): its transaction.
+    let q = match q.split_once(':') {
+        Some((t, v)) if crate::udpsvc::is_hex(t, 64) && !v.is_empty() && v.bytes().all(|b| b.is_ascii_digit()) => t,
+        _ => q,
+    };
     if crate::udpsvc::is_hex(q, 64) {
         let h = Hash256::from_hex(q).map_err(e)?;
-        if x.node.chain.header(c, &h).ok().flatten().is_some() {
-            return hit("block", q.to_lowercase());
+        let id = q.to_lowercase();
+        match hex_kind(x.node, x.p, &h) {
+            Some(kind) => return hit(kind, id),
+            // Not a block or a transaction on this chain: whichever other chain here has it (Martin 2026-11-20: the
+            // search found only the chain picked).
+            None => {
+                let (h2, id2) = (h, id.clone());
+                let found = elsewhere(x, move |n, p| hex_kind(n, p, &h2).map(|k| (k, id2.clone())));
+                if let Some(r) = found_answer(q, found) {
+                    return r;
+                }
+            }
         }
-        // A borrowed chain (or one catching up): our copy may not have that header; a lender knows the block.
-        if crate::borrow::is_borrowed(x.p.key) && crate::borrow::ask_lender(x.node, x.p, "getblockheader", json!([q.to_lowercase(), true])).is_ok_and(|v| v.is_object()) {
-            return hit("block", q.to_lowercase());
-        }
-        return hit("tx", q.to_lowercase());
+        // Nowhere yet: a transaction still waiting on this chain, maybe.
+        return hit("tx", id);
     }
     let digits = q.replace(',', "");
     if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
         return hit("block", digits);
     }
-    if address::script_for_address(x.p, q).is_some() {
+    if crate::ddsvc::lookup_script(x.p, q).is_some() {
         return hit("address", q.to_string());
+    }
+    // Another chain's address: each chain here whose addresses it reads as (a shared version byte can name several).
+    let qa = q.to_string();
+    let found = elsewhere(x, move |_, p| crate::ddsvc::lookup_script(p, &qa).map(|_| ("address", qa.clone())));
+    if let Some(r) = found_answer(q, found) {
+        return r;
     }
     if q.contains('.') {
         if x.has("maps") && maps::lookup(&x.node.chain, c, q).is_some() {
@@ -2362,6 +2443,18 @@ fn index_reads_from_elsewhere_keep_their_shape() {
 
 /// Search hits from another arcade: only the kinds of the index asked of it (the rest this arcade finds itself).
 #[cfg(test)]
+#[test]
+fn hits_on_other_chains_say_their_chain() {
+    use arcade_chain::params::{DIGIBYTE_MAIN, DOGECOIN_MAIN};
+    assert!(found_answer("x", vec![]).is_none());
+    let one = found_answer("ab", vec![(&DIGIBYTE_MAIN, "tx", "ab".into())]).unwrap().unwrap();
+    assert_eq!(one, json!({"kind": "tx", "id": "ab", "chain": "dgb"}));
+    let two = found_answer("ab", vec![(&DIGIBYTE_MAIN, "block", "ab".into()), (&DOGECOIN_MAIN, "tx", "ab".into())]).unwrap().unwrap();
+    assert_eq!(two["kind"], "results");
+    assert_eq!(two["items"][0]["chain"], "dgb");
+    assert_eq!(two["items"][1]["label"], "Transaction on Dogecoin");
+}
+
 #[test]
 fn search_hits_from_elsewhere() {
     let list = json!({"kind": "results", "id": "pe", "items": [

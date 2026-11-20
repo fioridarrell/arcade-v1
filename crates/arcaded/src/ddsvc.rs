@@ -39,6 +39,13 @@ pub fn dd_script_of(p: &ChainParams, a: &str) -> Option<Vec<u8>> {
     parse_address(p, a).ok().map(|k| arcade_wallet::taproot::p2tr_script(&k))
 }
 
+/// The output script an address names, for looking it up (the explorer, tx.activity): any address of the chain, or on
+/// DigiByte a DigiDollar address (DD... / TD...), whose coins are outputs paying its Taproot key. Not for sends: a
+/// DigiByte send to a DigiDollar address would pay plain DGB to that key.
+pub fn lookup_script(p: &ChainParams, a: &str) -> Option<Vec<u8>> {
+    arcade_ledger::address::script_for_address(p, a).or_else(|| if is_dd_chain(p) { dd_script_of(p, a) } else { None })
+}
+
 pub fn parse_address(p: &ChainParams, a: &str) -> Result<XOnlyPublicKey, String> {
     let body = bs58::decode(a.trim()).with_check(None).into_vec().unwrap_or_default();
     let (main, test) = (arcade_ledger::digidollar::VERSION_MAIN, arcade_ledger::digidollar::VERSION_TEST);
@@ -172,6 +179,33 @@ fn load_key(node: &Node, p: &'static ChainParams, pk: PublicKey, key_index: u32)
                 held.push((u, cents, h));
             }
         }
+        // This wallet's own coins from before the borrow floor (watching starts there): a lender's address index has
+        // them from any height (coins received before the floor showed as $0 without this).
+        if let Some(addr) = lent_address(p, &script) {
+            if let Ok(lent) = crate::borrow::lender_coins(node, p, &[addr]) {
+                whole = true;
+                for c in lent {
+                    let op = c.op;
+                    if held.iter().any(|h| h.0.outpoint == op) {
+                        continue;
+                    }
+                    let cents = match cents_cache().get(&(op.txid, op.vout)).copied() {
+                        Some(x) => x,
+                        None => match crate::borrow::raw_tx(node, p, &op.txid) {
+                            Ok(tx) => {
+                                let x = cents_of(&tx, op.vout);
+                                cents_cache().insert((op.txid, op.vout), x);
+                                x
+                            }
+                            Err(_) => continue,
+                        },
+                    };
+                    if cents > 0 {
+                        held.push((Utxo { outpoint: op, value: c.value, script: script.clone() }, cents, c.height));
+                    }
+                }
+            }
+        }
     } else {
         return Err(format!("{} is neither installed nor borrowed here", p.name));
     }
@@ -302,6 +336,20 @@ mod tests {
         assert_eq!(hex::encode(q.serialize()), "53a1f6e454df1aa2776a2814a721372d6258050de330b3c6d10ee8f4e0dda343");
         assert!(parse_address(&DIGIBYTE_TEST, "DD1siytB6xVXUwsd6NGSJgD5KV57WPp9Q2sKXxbLGbR3ARXN7ezm").unwrap_err().contains("other chain"));
         assert!(parse_address(&DIGIBYTE_MAIN, "DSLs2dis7txD4Y1VeZzcZAvxsyaj2ZFNDo").is_err());
+    }
+
+    #[test]
+    fn a_dd_address_is_looked_up_by_its_taproot_output() {
+        // explorer.address and tx.activity find a DigiDollar address's coins as the outputs paying its Taproot key.
+        let sk = arcade_wallet::SecretKey::from_slice(&[9u8; 32]).unwrap();
+        let pk = PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk);
+        let (dd, _, script) = dd_address(&DIGIBYTE_MAIN, &pk).unwrap();
+        assert_eq!(lookup_script(&DIGIBYTE_MAIN, &dd), Some(script.clone()));
+        let tr = lent_address(&DIGIBYTE_MAIN, &script).unwrap();
+        assert_eq!(lookup_script(&DIGIBYTE_MAIN, &tr), Some(script), "the same key's bech32m address");
+        assert_eq!(lookup_script(&DIGIBYTE_TEST, &dd), None, "a mainnet DD address on the test chain");
+        assert_eq!(lookup_script(&DOGECOIN_MAIN, &dd), None, "DigiDollar is DigiByte's");
+        assert!(arcade_ledger::address::script_for_address(&DIGIBYTE_MAIN, &dd).is_none(), "sends still refuse it as a DGB address");
     }
 }
 

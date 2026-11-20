@@ -1531,6 +1531,11 @@ pub fn is_borrowed(key: &str) -> bool {
     ST.runs.lock().unwrap().contains_key(key)
 }
 
+/// The chains borrowed here now (their keys).
+pub fn borrowed_keys() -> Vec<String> {
+    ST.runs.lock().unwrap().keys().cloned().collect()
+}
+
 fn follow(node: Arc<Node>, p: &'static ChainParams, run: Arc<Run>) {
     let set = |s: String| *run.state.lock().unwrap() = s;
     // Chains start together: spread their first coin scans out a little.

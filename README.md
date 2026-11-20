@@ -1,6 +1,6 @@
 # Arcade V1.0
 
-A from-scratch Rust rebuild of Dogecoin Arcade, wire-compatible with the existing arcades. Pepecoin testnet first; other chains are add-ons. See [docs/PLAN.md](docs/PLAN.md).
+One arcade, many chains. Ordinals/inscriptions, a block explorer, an on-chain app store and a peer-to-peer mesh, in Rust. Self-host in one command; runs [app.dogecoinarcade.com](https://app.dogecoinarcade.com).
 
 > **Try it before you install anything:** [app.dogecoinarcade.com](https://app.dogecoinarcade.com) runs this same software. [Make an account](https://app.dogecoinarcade.com/join), claim an @handle, and post to [the Feed](https://app.dogecoinarcade.com/feed) or install something from [the App Store](https://app.dogecoinarcade.com/apps) — in the browser, in a couple of minutes. It is Pepecoin testnet, and the arcade hands out testnet coins itself, so nothing you try there costs real money. Installing your own arcade takes one command (below) and it finds the other arcades on the mesh by itself.
 

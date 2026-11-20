@@ -160,14 +160,14 @@ def main():
     b_arc, c_arc = arc_addr("B"), arc_addr("C")
 
     print("1. A writes until it can spend (coinbase maturity), pays B and C, publishes two Temporary blobs")
-    if not wait("A can spend", lambda: call("A", "wallet.send", chain="arctest", to=a_arc, amount=50_000_000) is not None, 1500, show=lambda: f"height A {h()}"):
+    if not wait("A can spend", lambda: call("A", "wallet.send", chain="arctest", to=a_arc, amount=8 * 100_000_000) is not None, 1500, show=lambda: f"height A {h()}"):
         return 1
     if h() >= V6_FROM - 25:
         print(f"  A reached {h()} before publishing; raise V6_FROM")
         return 1
-    pay_b = call("A", "wallet.send", chain="arctest", to=b_arc, amount=10 * 100_000_000, send=True)["txid"]
+    pay_b = call("A", "wallet.send", chain="arctest", to=b_arc, amount=3 * 100_000_000, send=True)["txid"]
     wait("A's payment to B in a block", lambda: tx_height("A", pay_b) > 0, 120)
-    pay_c = call("A", "wallet.send", chain="arctest", to=c_arc, amount=10 * 100_000_000, send=True)["txid"]
+    pay_c = call("A", "wallet.send", chain="arctest", to=c_arc, amount=3 * 100_000_000, send=True)["txid"]
     t_text, u_text = "a clip worth keeping " * 120, "another clip " * 200
     pub = call("A", "arc.blob_publish", hex=t_text.encode().hex(), type="text/plain", **{"class": 2}, send=True)
     t_blob, t_tx = pub["blob"], pub["txid"]

@@ -1,4 +1,4 @@
-# Fog-of-war storage for ARCADE blobs (rules version 5)
+# Fog-of-war storage for ARCADE blobs (rules versions 5 and 6)
 
 From rules version 5, no arcade has to keep every blob's bytes. Every arcade still keeps every block and every blob's
 ~110-byte record (root, length, class, type), so any bytes can be checked when they arrive. The bytes themselves live
@@ -16,7 +16,7 @@ where they're wanted. Code: `crates/arcaded/src/fogstore.rs`; consensus: `arcade
   |---|---|---|---|
   | Temporary | 3 | 3 | 42,300 (0.000423 ARCADE) |
   | Release | 5 | 12 | 282,000 (0.00282 ARCADE) |
-  | Permanent | 7 | 12 | 394,800 (0.003948 ARCADE) |
+  | Permanent | 7 (3 from version 6) | 12 | 394,800 (0.003948 ARCADE) |
   | Boost | +2 | 3 | 28,200 (0.000282 ARCADE) |
 
   Before version 5 the flat 0.01 ARCADE per kB holds.
@@ -44,8 +44,10 @@ Anything else is dropped after the grace window. A Temporary blob goes everywher
 
 ## Copy floors and keepers
 
-- A blob-family segment needs the floor of its strongest class (Permanent 7, otherwise Release 5). A Temporary segment
-  needs 3 until its time is up, then none.
+- A blob-family segment needs the highest floor of the classes in it (Permanent 7, from rules version 6 Permanent 3;
+  Release 5: a segment with a Release blob needs 5). A Temporary segment needs 3 until its time is up, then none; one
+  holding a blob upgraded to Permanent (version 6) needs the Permanent floor for good. The floors are the rules' (`blob::FLOORS`, read at the next block's
+  height by `blob::floor_at`).
 - **Copies count only when registered and audited.** Once a segment is listed in the catalog, its copies against the
   floor are the registry's replicas of it that passed an audit and haven't missed one since. A replica stops counting
   at its first miss and goes after `MAX_MISSED_AUDITS` misses. Arcades that announce keeping a segment but whose copy
@@ -175,7 +177,64 @@ data that they wish to forget" (docs/STORAGEAPP.md in the plans). `crate::fogkee
   `ARCADE_FOG_TEST_AUDIT_SECS=n` (local chains only) counts an announced keeper as registered at once and audited once
   it has kept the segment n seconds holding every blob (`fogstore::test_counted`). See `tests/regtest/fogkeepnet.py`.
 
+## Rules version 6 (Martin's decisions, 2026-11-19)
+
+Consensus change on the testnet from `params::RULES_V6_HEIGHT` (a placeholder, 3,000, until the release sets it).
+Code: `arcade-arc` `params::rules_v6`, `blob.rs` (`FLOORS`, `floor_at`, the upgrade), `chain.rs` (`blob_changes`),
+`pool.rs`; `arcaded` `coinsend::upgrade_blob`, `fogstore`, `fogmap`.
+
+- **Permanent copy floor 3** (was 7). Release 5, Temporary 3 and a boost's +2 stay. The floor is a row of the rules
+  table `blob::FLOORS` (`(version, [Permanent, Release, Temporary, Boost])`), so a later version can raise it again
+  (toward 7 as the network grows) with a new row; nothing scales by itself. **Prices don't change:** a Permanent blob
+  still pays for 7 copies a year (`blob::priced_copies`, 394,800 base units per started kB).
+- **A Temporary blob can be upgraded to Permanent.** A transaction output `OP_RETURN <push>` whose push is `"aupg"` ‖
+  the blob ids it upgrades (32 bytes each, 1 to `blob::MAX_UPGRADE_IDS` = 64) makes them Permanent from the block that
+  holds it. The transaction pays, on top of its own fee floor, for each blob the **difference**: the Permanent fee
+  minus the Temporary fee for its bytes, both by `blob::fee_at` at that block's height (`blob::upgrade_fee_at`; today
+  394,800 − 42,300 = **352,500 base units per started kB**: 1 kB 0.003525 ARCADE, 1 MB 3.525 ARCADE, 100 MB about
+  352.5 ARCADE). The fee goes into the pot, as every blob fee does. **Anyone may upgrade** any Temporary blob (the payer
+  needn't be the publisher); it stays its publisher's. A blob a boost brought (kept as a Temporary one) is upgraded the
+  same way, paying Permanent minus the fee of the class that brought it, the boost's (394,800 − 28,200 = 366,600 per
+  started kB): every upgraded blob has paid a Permanent blob's fee in all.
+- **From that block** the blob is Permanent: its class now (`blob::State::class_now`, the reads' `class`), its floor
+  (Permanent's), no expiry, and fog storage treats it as one (its segment keeps the Permanent floor, the old class
+  pruning never forgets it). Its record's class, and so the family it is sealed in (`FAMILY_BLOBS_TEMP`), don't change.
+- **Refused** (the whole block is invalid; the pool refuses the transaction): an id the chain doesn't hold before the
+  block (one brought in the same block counts as unknown: publish it Permanent instead); a blob that is Permanent or
+  Release already, or upgraded already; a Temporary blob **past its time**: consensus counts the Temporary time in
+  blocks (`blob::temporary_blocks`: `Net::blob_temporary` / block seconds = 51,840 blocks for 90 days) from the block
+  that brought it, or from its latest boost, and refuses an upgrade at or after that height, since its bytes may be
+  gone; a blob named twice in one transaction or one block; and a transaction paying less than the sum of the
+  differences on top of the blob fee for what it brings.
+- **A boost past a blob's time doesn't bring it back.** A boost keeps a timed blob `temporary_blocks` past the boost's
+  block only while the blob is within its time; boosting one already past it is still valid and paid (as before
+  version 6) but leaves it past its time, so it can't be upgraded.
+- **Fog storage keeps a timed blob's bytes by the chain's count.** The old class pruning and fog storage drop a
+  Temporary blob, and its segment's floor goes to 0, at the height consensus refuses its upgrade from
+  (`blob::State::until`, `arcblob::Meta::timed_done`), not by the clock, so no arcade drops bytes an upgrade can still
+  make Permanent. An upgraded blob is never dropped as Temporary.
+- **Large blobs:** consensus can't read a manifest (no arcade must keep the bytes), so an upgrade names every blob it
+  upgrades. `arc.blob_upgrade` on a manifest's id names the manifest and all its parts (each once) in one output and
+  pays each one's difference by its own bytes (as each was paid for), i.e. the difference for the total bytes. When the
+  manifest's parts can't be read here it refuses, rather than upgrading the manifest alone.
+- **A block brings at most 4 MB of blobs by their records.** The lengths the records declare for the blobs a block
+  brings new (a boost of a blob the chain holds brings nothing and doesn't count; each part of a large blob does) add up
+  to at most `blob::MAX_BLOB_BYTES`, or the block is refused (`BlockError::TooBig("declared blobs")`). Until now only the
+  bytes a block carries were capped, and since version 5 a block may come without them, so a writer could declare any
+  amount in a bytes-less block. The pool refuses a transaction declaring more than that, and a block template's blob
+  budget counts the declared lengths (`Pool::pick_with`), so writers never build such a block.
+- **Before the height** an `"aupg"` output is only an OP_RETURN's data, as it always was (older arcades take such
+  blocks too, so nothing splits before the switch); the pool and `arc.blob_upgrade` refuse upgrades until then.
+- **API:** `arc.blob_upgrade {id, send?}` (Wallet): without `send` the quote (`bytes`, `already_paid` the Temporary
+  fee, `permanent_fee`, `difference`, `fee` with the transaction's own, `at_height`, `floor`); with `send` it goes. `arc.blob`
+  and `explorer.arc_blobs` give `class` as it is now and `upgraded {by, at_height, paid, txid}` (a large blob's `paid`
+  sums its manifest and parts).
+- **Pass test:** `tests/regtest/upgradenet.py`: a closed net with version 6 at a low height; a Temporary blob is
+  published, an upgrade is refused before the height, a different wallet upgrades it after, every arcade has it
+  Permanent with floor 3 at the same block, and an underpaid or second upgrade is refused by all.
+
 ## Switching it on
 
-The ARCADE testnet has no version 5 height yet. A release adds `(5, height)` to `params::TESTNET.rules`. A closed test
-net sets it in its settings (`"rules": [[3, 0], [4, 1], [5, H]]`). See `tests/regtest/fognet.py`.
+Version 5 runs on the testnet from block 2,150 (v0.1.133). Version 6 is scheduled at `params::RULES_V6_HEIGHT` (one
+constant; the release sets the real height ahead of the tip). A closed test net sets its own schedule in its settings
+(`"rules": [[3, 0], [4, 1], [5, 2], [6, H]]`). See `tests/regtest/fognet.py` and `tests/regtest/upgradenet.py`.

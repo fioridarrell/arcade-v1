@@ -223,7 +223,7 @@ fn arc_in(net: &arcade_arc::params::Net, chain: &crate::arcsvc::LocalChain) -> A
         chain: net.key.into(),
         height,
         listed: net.listed_at(height + 1).map(String::from).collect(),
-        floor: arcade_arc::blob::floor(arcade_arc::blob::Class::Temporary) as u64,
+        floor: arcade_arc::blob::floor_at(net, height + 1, arcade_arc::blob::Class::Temporary) as u64,
         ..Default::default()
     };
     let mut by_id: HashMap<arcade_arc::merkle::Hash, (String, u64, u64)> = HashMap::new();

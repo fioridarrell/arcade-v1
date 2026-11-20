@@ -134,6 +134,15 @@ struct Item {
 }
 
 impl Item {
+    /// Its class now: Permanent once upgraded (rules version 6), else its record's (a large blob's, its manifest's).
+    fn class(&self) -> u8 {
+        if self.meta.upgraded.is_some() {
+            arcade_arc::blob::Class::Permanent as u8
+        } else {
+            self.large.as_ref().map_or(self.meta.class, |l| l.class)
+        }
+    }
+
     fn short(&self) -> bool {
         self.floor.is_some_and(|f| self.copies < f)
     }
@@ -267,7 +276,7 @@ fn view(node: &Node) -> Result<View, String> {
                 copies = copies.min(s.counted());
                 announced = announced.max(s.announced_only());
                 if fogstore::on(&net, pm.height) {
-                    let f = fogstore::seg_floor(family, index).unwrap_or_else(|| fogstore::class_floor(class_enum(pm.class)));
+                    let f = fogstore::seg_floor(family, index).unwrap_or_else(|| fogstore::class_floor(class_enum(pm.class_now())));
                     floor = Some(floor.map_or(f, |x: usize| x.max(f)));
                 }
             }
@@ -309,7 +318,7 @@ fn view(node: &Node) -> Result<View, String> {
             segments: vec![index],
             copies: s.counted(),
             announced: s.announced_only(),
-            floor: fog.then(|| fogstore::seg_floor(family, index).unwrap_or_else(|| fogstore::class_floor(class_enum(m.class)))),
+            floor: fog.then(|| fogstore::seg_floor(family, index).unwrap_or_else(|| fogstore::class_floor(class_enum(m.class_now())))),
             holders,
             last_viewed: crate::arcblob::last_view(id),
             here: held.contains(id),
@@ -393,7 +402,7 @@ pub fn blobs(node: &Node, req: &Value) -> R {
     let tags = v.tags.clone();
     v.items.retain(|it| {
         want_id.as_ref().is_none_or(|i| hex::encode(it.id) == *i || it.large.as_ref().is_some_and(|l| l.parts.iter().any(|p| hex::encode(p.0) == *i)))
-            && want_class.is_none_or(|c| it.meta.class == c)
+            && want_class.is_none_or(|c| it.class() == c)
             && want_pub.as_ref().is_none_or(|p| it.meta.publisher.to_ascii_lowercase() == *p || tags.get(&it.meta.publisher).and_then(|t| t.as_ref()).is_some_and(|t| t.to_ascii_lowercase() == *p))
             && (!short_only || it.short())
             && (!here_only || it.here)
@@ -433,7 +442,7 @@ pub fn blobs(node: &Node, req: &Value) -> R {
         add(&mut totals, "here", it.here as u64);
         add(&mut totals, "mine", it.mine as u64);
         add(&mut totals["bands"], band(it), 1);
-        add(&mut totals["classes"], class_name(it.meta.class), 1);
+        add(&mut totals["classes"], class_name(it.class()), 1);
         let p = pubs.entry(it.meta.publisher.clone()).or_insert_with(|| {
             json!({"address": it.meta.publisher, "tag": tags.get(&it.meta.publisher).cloned().flatten(), "items": 0, "bytes": 0, "short": 0,
                    "bands": {"at_floor": 0, "below_floor": 0, "thin": 0, "none_counted": 0, "no_holder_seen": 0}, "classes": {}, "types": {}})
@@ -442,7 +451,7 @@ pub fn blobs(node: &Node, req: &Value) -> R {
         add(p, "bytes", it.bytes);
         add(p, "short", it.short() as u64);
         add(&mut p["bands"], band(it), 1);
-        add(&mut p["classes"], class_name(it.meta.class), 1);
+        add(&mut p["classes"], class_name(it.class()), 1);
         add(&mut p["types"], &it.large.as_ref().map_or(it.meta.kind.clone(), |m| m.kind.clone()), 1);
         for (n, h) in &it.holders {
             let e = nodes.entry(n.clone()).or_insert_with(|| {
@@ -510,6 +519,17 @@ fn holders_json(it: &Item, me: &str) -> Vec<Value> {
     out
 }
 
+/// An item's upgrade to Permanent (rules version 6): `{by, at_height, paid, txid}`, null without one. A large blob's is its
+/// manifest's, `paid` summed over the manifest and every part upgraded with it.
+fn upgraded_json(it: &Item, v: &View) -> Value {
+    let Some(u) = &it.meta.upgraded else { return Value::Null };
+    let mut paid = u.paid;
+    if let Some(l) = &it.large {
+        paid += l.parts.iter().filter_map(|(pid, _)| v.metas.get(pid)?.upgraded.as_ref().map(|x| x.paid)).sum::<u64>();
+    }
+    json!({"by": crate::arcblob::address_of_script(&v.net, &u.by).unwrap_or_else(|| hex::encode(&u.by)), "at_height": u.height, "paid": paid, "txid": u.txid.to_hex()})
+}
+
 fn item_json(it: &Item, v: &View, journey: bool) -> Value {
     let m = &it.meta;
     let roles = |r: &str| it.holders.values().filter(|h| h.role(it.new) == r).count();
@@ -518,7 +538,8 @@ fn item_json(it: &Item, v: &View, journey: bool) -> Value {
         "kind": if it.large.is_some() { "large" } else { "blob" },
         "type": it.large.as_ref().map_or(m.kind.clone(), |l| l.kind.clone()),
         "publisher": {"address": m.publisher, "tag": v.tags.get(&m.publisher).cloned().flatten()},
-        "class": class_name(it.large.as_ref().map_or(m.class, |l| l.class)),
+        "class": class_name(it.class()),
+        "upgraded": upgraded_json(it, v),
         "bytes": it.bytes,
         "height": m.height,
         "time": m.time,

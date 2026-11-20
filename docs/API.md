@@ -481,8 +481,9 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `arc.blob_publish` | `/api/v1/arc/blob_publish` | wallet | path \| hex, type, class?, gzip?, send?, client_ref? | Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Without send, only the quote (blob_fee, fee). |
+| `arc.blob_publish` | `/api/v1/arc/blob_publish` | wallet | path \| hex, type, class?, gzip?, send?, client_ref? | Put a file on the ARCADE chain as a blob. The fee is per started kB by class from rules version 5 (Temporary 0.000423, Release 0.00282, Permanent 0.003948, Boost 0.000282 ARCADE), 0.01 before. Copies kept: Permanent 3 from rules version 6 (7 before), Release 5, Temporary 3 for 90 days; a Temporary blob can be made Permanent later for the difference (arc.blob_upgrade). Without send, only the quote (blob_fee, fee). |
 | `arc.blob_publish_large` | `/api/v1/arc/blob_publish_large` | wallet | path \| hex, type, class?, gzip?, name?, send?, client_ref? | Put a file of up to 100 MB on the ARCADE chain as one large blob: parts of 4 MB over successive blocks, then a manifest naming them and the overall root; its id is the manifest's. Without send, the quote (parts, fee, blocks, seconds). Resumes after a restart without paying twice. arc.blob_publish switches to it above 4 MB. |
+| `arc.blob_upgrade` | `/api/v1/arc/blob_upgrade` | wallet | id, send?, client_ref? | Make a Temporary blob Permanent (ARCADE rules version 6): pay the Permanent fee minus the Temporary fee for its bytes (0.003525 ARCADE per started kB), from this wallet; anyone may upgrade any Temporary blob, and it stays its publisher's. A large blob's manifest id upgrades all its parts, paid for their bytes too. Refused for an unknown, Permanent, Release or expired Temporary blob, and before version 6. Without send, only the quote. |
 | `arc.block` | `/api/v1/arc/block` | public | height? \| id?, raw? | One block of the ARCADE chain run here: by height (the branch it is on) or by id (any branch it holds): id, prev, height, time, difficulty, writer, score, steps, best, txs (txids), raw (with raw: true, the transactions' hex), bytes, pot_runs. |
 | `arc.submit` | `/api/v1/arc/submit` | post | hex, blobs? | A signed ARCADE transaction (hex) into this arcade's pool, from where it goes to the other arcades and into a block; blobs: the hex of blobs it brings. As tx.broadcast for the ARCADE chain. |
 | `arc.pool` | `/api/v1/arc/pool` | public | — | The ARCADE transactions waiting in this arcade's pool, in order of arrival (at most 1,000 listed). |
@@ -595,7 +596,7 @@ Part 2 (ARCADE Git #25):
 - **The guide.** `GET /api/v1/agents.md` (also `rpc.guide`) is a short guide for agents. It covers keys, chains,
   units, error codes, retries with `client_ref`, waiting and paging.
 - **Receipts at signing.** Every command that signs takes `client_ref`. This covers ledger.*, a.*, wallet.send,
-  borrow.send, token.send, ord.send, msg.send, feed.post, feed.act, follow, tag.claim, arc.blob_publish*,
+  borrow.send, token.send, ord.send, msg.send, feed.post, feed.act, follow, tag.claim, arc.blob_publish*, arc.blob_upgrade,
   dogefeed.post, dogefeed.act, inscribe and svc.pay (`sends: true` in rpc.help).
   - The receipt is written the moment a transaction is signed, before any network step. `tx.status` answers
     `signed` even if the call timed out.
@@ -700,7 +701,7 @@ the repository has moved on from is refused (the request fails with the reason, 
 push landed first). The work runs in the background: records wait for the wallet's coins, a push for its manifest's
 block, then the push record. The socket command is `ledger.repo_push {name, manifest, base?, force?}` (same rules).
 
-**Signing as another @tag** (socket requests): `"as": "@tag"` on `ledger.*`, `a.*` and `arc.blob_publish*` signs and
+**Signing as another @tag** (socket requests): `"as": "@tag"` on `ledger.*`, `a.*`, `arc.blob_publish*` and `arc.blob_upgrade` signs and
 pays with the key that holds that tag on ARCADE: one of the wallet's own, or a key imported for the ARCADE chain with
 `wallet.import {chain: "arctest", secret: <WIF or words>}` (kept encrypted like the wallet). Without `as`, nothing changes.
 `scripts/git-publish.py --as @tag` uses it. A text record (an issue, a comment) is two transactions, its text's blob and

@@ -19,8 +19,9 @@
 //! arcades with room don't all pile on ([`SegHolders::for_decision`]). The registry's own count (`Registry::holders_of`,
 //! which splits pay) is consensus and isn't touched here.
 //!
-//! **Floors**: a blob-family segment needs [`blob::floor`] of its strongest class (Permanent 7, Release 5); a
-//! Temporary segment ([`segment::FAMILY_BLOBS_TEMP`]) needs 3 until its time is up, then none. Below its floor a segment
+//! **Floors**: a blob-family segment needs the highest [`blob::floor_at`] of its classes (Permanent 7, from rules version
+//! 6 Permanent 3; Release 5); a Temporary segment ([`segment::FAMILY_BLOBS_TEMP`]) needs 3 until its time is up, then
+//! none (the Permanent floor for good once a blob in it is upgraded, rules version 6). Below its floor a segment
 //! is **short**. Arcades with room in their keep share step in, ranked by a hash of node id and segment, so they don't
 //! all take it at once, until the floor is met. A keeper above the floor whose rank is the worst lets go. A keeper that
 //! goes down misses audits, its replica is removed, the segment is short, and the next-ranked arcade with room takes it.
@@ -390,26 +391,33 @@ pub fn floor_max() -> usize {
     env_secs("ARCADE_FOG_FLOOR_MAX", u64::MAX).min(usize::MAX as u64) as usize
 }
 
-/// A class's copy floor as fog storage uses it here: [`blob::floor`], at most [`floor_max`].
+/// A class's copy floor as fog storage uses it here: the rules' for the next block ([`blob::floor_at`]: Permanent 7 in
+/// rules version 5, 3 from version 6), at most [`floor_max`]. Before the chain runs here, version 5's.
 pub fn class_floor(class: Class) -> usize {
-    blob::floor(class).min(floor_max())
+    let floor = match crate::arcsvc::svc_net() {
+        Some(net) => blob::floor_at(&net, crate::arcblob::next_height(), class),
+        None => blob::priced_copies(class),
+    };
+    floor.min(floor_max())
 }
 
-/// A segment's copy floor: its strongest class's (Permanent 7, Release 5); a Temporary segment 3 until its time is up
-/// (the last blob in it older than `temporary` seconds), then 0; an empty one 0.
-pub fn floor_of(family: u8, metas: &[&crate::arcblob::Meta], now: u64, temporary: u64) -> usize {
+/// A segment's copy floor, by `floor` per class: the highest of its classes' floors (Permanent, Release); a Temporary segment the
+/// Temporary floor until its time is up (every blob in it past its time: Meta::timed_done, in blocks as the chain counts
+/// it, with `next` the next block's height), then 0, unless a blob in it
+/// was upgraded to Permanent (rules version 6): the Permanent floor then, for good. An empty one 0.
+pub fn floor_of(family: u8, metas: &[&crate::arcblob::Meta], next: u64, now: u64, temporary: u64, floor: impl Fn(Class) -> usize) -> usize {
     if metas.is_empty() {
         return 0;
     }
     if family == FAMILY_BLOBS_TEMP {
-        let last = metas.iter().map(|m| m.time.max(m.boosted_until.saturating_sub(temporary))).max().unwrap_or(0);
-        return if last.saturating_add(temporary) > now { class_floor(Class::Temporary) } else { 0 };
+        if metas.iter().any(|m| m.upgraded.is_some()) {
+            return floor(Class::Permanent).max(floor(Class::Temporary));
+        }
+        // Within its time while any blob in it is (as the chain counts it, Meta::timed_done).
+        return if metas.iter().any(|m| !m.timed_done(next, now, temporary)) { floor(Class::Temporary) } else { 0 };
     }
-    if metas.iter().any(|m| m.class == Class::Permanent as u8) {
-        class_floor(Class::Permanent)
-    } else {
-        class_floor(Class::Release)
-    }
+    // The highest floor of the classes in it (from rules version 6 Release's 5 is above Permanent's 3).
+    metas.iter().map(|m| floor(if m.class == Class::Permanent as u8 { Class::Permanent } else { Class::Release })).max().unwrap_or(0)
 }
 
 /// Where a segment's copies come from: its catalog entry's audited replicas once it's listed, else the arcades
@@ -590,7 +598,7 @@ pub struct SegView {
     pub mine: bool,
 }
 
-/// A segment's copy floor as the last fog round saw it (its strongest class's; a Temporary one past its time 0): None
+/// A segment's copy floor as the last fog round saw it (the highest of its classes'; a Temporary one past its time 0): None
 /// before the first round, or for a segment it didn't see (crate::fogmap).
 pub fn seg_floor(family: u8, index: u64) -> Option<usize> {
     SEG_FLOORS.lock().unwrap().as_ref()?.get(&(family, index)).copied()
@@ -700,7 +708,7 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let mut view: Vec<SegView> = Vec::new();
     let mut network_bytes = 0u64;
     for (&(family, index), metas) in &by_seg {
-        let floor = floor_of(family, metas, now, temporary);
+        let floor = floor_of(family, metas, crate::arcblob::next_height(), now, temporary, class_floor);
         let mine_kept = segs.contains(&(family, index));
         let held_all = holders_of_seg(&ann, &me, mine_kept, family, index);
         // Arcades handing it over (crate::fogkeep) are counted out of every keep decision, so the next ranked with room
@@ -871,7 +879,8 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
             if crate::arcblob::is_mine(id) {
                 continue;
             }
-            let temp_done = family_of(m.class) == FAMILY_BLOBS_TEMP && m.time.saturating_add(temporary).max(m.boosted_until) <= now;
+            // Past its time as the chain counts it (an upgraded one never is: Meta::timed_done).
+            let temp_done = family_of(m.class) == FAMILY_BLOBS_TEMP && m.timed_done(crate::arcblob::next_height(), now, temporary);
             if temp_done {
                 freed += crate::arcblob::forget(id);
                 dropped += 1;
@@ -926,9 +935,12 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     Some(())
 }
 
-/// A blob class's copy floor (for the storage reads, explorer.arc_*).
+/// A blob class's copy floor (for the storage reads, explorer.arc_*): the rules' for the next block.
 pub fn blob_floor(class: Class) -> usize {
-    blob::floor(class)
+    match crate::arcsvc::svc_net() {
+        Some(net) => blob::floor_at(&net, crate::arcblob::next_height(), class),
+        None => blob::priced_copies(class),
+    }
 }
 
 /// The segments short of their copy floor, as the last round saw them (for the storage reads, explorer.arc_*):
@@ -1004,16 +1016,34 @@ mod tests {
 
     #[test]
     fn floors_by_class() {
-        assert_eq!(blob::floor(Class::Temporary), 3);
-        assert_eq!(blob::floor(Class::Release), 5);
-        assert_eq!(blob::floor(Class::Permanent), 7);
-        let m = |class: Class, time: u64| crate::arcblob::Meta { class: class as u8, kind: String::new(), encoding: 0, height: 1, time, line: String::new(), boosted_until: 0, len: 0, publisher: String::new() };
+        use arcade_arc::params::{Net, TESTNET};
+        // Rules version 5: Permanent 7; version 6 (Martin 2026-11-19): Permanent 3. Prices don't move.
+        let v6 = Net { rules: &[(3, 0), (5, 1), (6, 100)], ..TESTNET };
+        let at = |h: u64| move |c: Class| blob::floor_at(&v6, h, c);
+        assert_eq!((at(99)(Class::Temporary), at(99)(Class::Release), at(99)(Class::Permanent)), (3, 5, 7));
+        assert_eq!((at(100)(Class::Temporary), at(100)(Class::Release), at(100)(Class::Permanent)), (3, 5, 3));
+        let m = |class: Class, time: u64| crate::arcblob::Meta { class: class as u8, kind: String::new(), encoding: 0, height: 1, time, line: String::new(), boosted_until: 0, len: 0, publisher: String::new(), upgraded: None, until: None };
         let (p, r, t) = (m(Class::Permanent, 0), m(Class::Release, 0), m(Class::Temporary, 1000));
-        assert_eq!(floor_of(FAMILY_BLOBS, &[&r, &p], 0, 90), 7);
-        assert_eq!(floor_of(FAMILY_BLOBS, &[&r], 0, 90), 5);
-        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 1050, 90), 3);
-        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 1100, 90), 0, "a Temporary segment past its time needs no copies");
-        assert_eq!(floor_of(FAMILY_BLOBS, &[], 0, 90), 0);
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&r, &p], 0, 0, 90, at(99)), 7);
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&r, &p], 0, 0, 90, at(100)), 5, "Release 5 is now the strongest floor");
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&p], 0, 0, 90, at(100)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS, &[&r], 0, 0, 90, at(99)), 5);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 0, 1050, 90, at(99)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t], 0, 1100, 90, at(99)), 0, "a Temporary segment past its time needs no copies");
+        assert_eq!(floor_of(FAMILY_BLOBS, &[], 0, 0, 90, at(99)), 0);
+        // A Temporary blob upgraded to Permanent (rules version 6): its segment keeps the Permanent floor past its time.
+        let up = crate::arcblob::Meta { upgraded: Some(blob::Upgraded { height: 100, txid: arcade_chain::hash::Hash256([1; 32]), paid: 352_500, by: Vec::new() }), ..t.clone() };
+        assert_eq!(up.class_now(), Class::Permanent as u8);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t, &up], 0, 1_000_000, 90, at(100)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&t, &up], 0, 1_000_000, 90, at(99)), 7);
+        // The chain's count in blocks wins over the clock when it knows the blob: kept until the height an upgrade is
+        // refused at, whatever the time says, and not after.
+        let counted = crate::arcblob::Meta { until: Some(50), ..t.clone() };
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&counted], 49, 1_000_000, 90, at(99)), 3);
+        assert_eq!(floor_of(FAMILY_BLOBS_TEMP, &[&counted], 50, 1_050, 90, at(99)), 0);
+        assert!(!counted.timed_done(49, u64::MAX, 90) && counted.timed_done(50, 0, 90));
+        assert!(!up.timed_done(u64::MAX, u64::MAX, 90), "an upgraded blob is never past its time");
+        assert!(!p.timed_done(u64::MAX, u64::MAX, 90));
     }
 
     #[test]

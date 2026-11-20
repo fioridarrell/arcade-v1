@@ -21,10 +21,13 @@ every blob of it. Everything else (hand-over, forget list, serve, fetch, bloom, 
      out of its bloom, and C still fetches it from B
   u  undo: D gets the blob from A again; fog.mine lists no forget
   t  T (borrowed): fog.keep refused ("borrows everything"); fog.forget drops its viewer copy
+  s  the Storage app's Settings (A, as an app page with its pass): GET /r/fog/settings; POST /r/fog/keep_share files a
+     card and changes nothing until approved, then arc.keep says the new share; POST /r/fog/cache refused on the card
+     leaves arc.cache as it was, approved sets it
 
 Run inside: unshare -Urn sh -c "ip link set lo up; python3 fogkeepnet.py ARCADED WORKDIR"
 """
-import hashlib, json, os, shutil, signal, socket, subprocess, sys, time, urllib.parse, urllib.request
+import hashlib, hmac, json, os, shutil, signal, socket, subprocess, sys, time, urllib.parse, urllib.request
 
 EXE, WORK = sys.argv[1], sys.argv[2]
 NAMES = "WABCDT"
@@ -35,6 +38,10 @@ GRACE, IDLE, STALE = 30, 60, 60
 ENV = {"ARCADE_FOG_GRACE_SECS": str(GRACE), "ARCADE_FOG_IDLE_SECS": str(IDLE), "ARCADE_FOG_STALE_SECS": str(STALE),
        "ARCADE_FOG_FLOOR_MAX": str(FLOOR), "ARCADE_SHARE_EVERY": "10", "ARCADE_FOG_TEST_AUDIT_SECS": str(AUDIT)}
 procs = {}
+# A's node identity, imported at its first start, so this test can make the pass an app page of A's would carry
+# (crate::http::page_pass: HMAC-SHA256 under sha256("arcade page pass\0" + the identity seed), its first 16 bytes).
+A_SEED = bytes(range(1, 33))
+PAGE = "5" * 64
 B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 
 
@@ -80,9 +87,9 @@ def err(n, cmd, **p):
         return str(e)
 
 
-def start(n, settings=None):
+def start(n, settings=None, extra=()):
     http, mesh = PORTS[n]
-    args = ["nice", "-n", "19", EXE, "--home", home(n), "--http-port", str(http), "--mesh-port", str(mesh), "--stun-port", "0", "--no-seeds"]
+    args = ["nice", "-n", "19", EXE, "--home", home(n), "--http-port", str(http), "--mesh-port", str(mesh), "--stun-port", "0", "--no-seeds", *extra]
     for peer in PEERS[n]:
         args += ["--mesh-peer", f"127.0.0.1:{PORTS[peer][1]}"]
     if settings:
@@ -153,6 +160,40 @@ def counted(n, seg):
     return bool(s and s["counted_here"])
 
 
+def page_pass(chain="arctest", txid=PAGE):
+    key = hashlib.sha256(b"arcade page pass\0" + A_SEED).digest()
+    return f"{chain}:{txid}:{hmac.new(key, f'{chain}/{txid}'.encode(), hashlib.sha256).hexdigest()[:32]}"
+
+
+def page_req(n, method, path, body=None, as_page=True):
+    """A request as A's app frame sends it (Origin null, its pass): (status, answer)."""
+    headers = {"Content-Type": "application/json"}
+    if as_page:
+        headers.update({"Origin": "null", "X-Arcade-Page": page_pass()})
+    req = urllib.request.Request(f"http://127.0.0.1:{PORTS[n][0]}{path}", method=method, headers=headers,
+                                 data=json.dumps(body).encode() if body is not None else None)
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            return r.status, json.loads(r.read() or b"null")
+    except urllib.error.HTTPError as e:
+        try:
+            return e.code, json.loads(e.read() or b"null")
+        except ValueError:
+            return e.code, None
+
+
+def ask_and_answer(n, path, body, yes):
+    """The app asks, the operator answers its card (wallet.approve / wallet.deny), the app sees where it stands."""
+    code, r = page_req(n, "POST", path, body)
+    if code != 202:
+        raise RuntimeError(f"{path} {body}: {code} {r}")
+    before = (call(n, "arc.keep")["mb"], call(n, "arc.cache")["mb"])
+    pv = call(n, "wallet.preview", id=r["id"])
+    call(n, "wallet.approve" if yes else "wallet.deny", id=r["id"])
+    code, st = page_req(n, "GET", f"/r/fog/req/{r['id']}")
+    return r, pv, before, st
+
+
 def log_has(n, text):
     return text in open(os.path.join(WORK, f"{n}.log"), errors="replace").read()
 
@@ -183,8 +224,10 @@ def main():
     }
     sp = os.path.join(WORK, "settings.json")
     json.dump(settings, open(sp, "w"))
+    seed_file = os.path.join(WORK, "a-node.key")
+    open(seed_file, "w").write(A_SEED.hex())
     for n in NAMES:
-        start(n, settings=sp)
+        start(n, settings=sp, extra=("--import-node-key", seed_file) if n == "A" else ())
         if n != "T":
             call(n, "chains.add", key="arctest")
     ids = {n: call(n, "status")["node_id"] for n in NAMES}
@@ -325,6 +368,32 @@ def main():
     kid = next(x["id"] for x in call("A", "fog.mine")["chosen"] if x["key"] == "T#0")
     call("A", "fog.undo", id=kid)
     res["u: undoing a keep leaves the choice to the round"] = not any(x["key"] == "T#0" for x in call("A", "fog.mine")["chosen"])
+
+    print("s. the Storage app's Settings on A: keep share and blob cache through the card")
+    code, st = page_req("A", "GET", "/r/fog/settings")
+    print(f"   settings: {code} keep {st and st['keep'].get('choice')} {st and st['keep'].get('mb')} MB, cache {st and st['cache']}")
+    res["s: the app reads its settings (arc.keep's choice and presets, arc.cache's size)"] = (
+        code == 200 and st["keep"]["mb"] == 50 and st["keep"]["choice"] == "custom" and any(p["id"] == "pct:10" for p in st["keep"]["presets"])
+        and st["cache"]["mb"] == call("A", "arc.cache")["mb"] and not st["borrowed"])
+    code, _ = page_req("A", "GET", "/r/fog/settings", as_page=False)
+    res["s: not without the page's pass"] = code in (400, 403)
+    r, pv, before, st = ask_and_answer("A", "/r/fog/keep_share", {"mb": 80}, yes=True)
+    c = r["fog"]["card"]
+    print(f"   keep share card: {c['title']}: {c['lines']} {c['facts']}")
+    res["s: the keep share card: old → new, what it would hold, the disk left"] = (
+        c["op"] == "keep_share" and "50.0 MB → 80.0 MB" in c["lines"][0] and ("hold" in c["lines"][1].lower()) and any("free" in f for f in c["facts"])
+        and pv["fog"]["card"]["new_mb"] == 80)
+    res["s: nothing changed before the card was approved"] = before[0] == 50
+    k = call("A", "arc.keep")
+    res["s: approved: arc.keep says the app's share"] = st["status"] == "sent" and k["mb"] == 80 and k["choice"] == "custom"
+    code, e = page_req("A", "POST", "/r/fog/keep_share", {"mb": 80})
+    res["s: the same share again is refused at once"] = code == 400 and "already" in (e or {}).get("error", "")
+    cache0 = call("A", "arc.cache")["mb"]
+    r, pv, before, st = ask_and_answer("A", "/r/fog/cache", {"mb": 0}, yes=False)
+    print(f"   cache card: {r['fog']['card']['lines']} {r['fog']['card']['facts']}")
+    res["s: a cache card refused leaves arc.cache as it was"] = st["status"] == "denied" and call("A", "arc.cache")["mb"] == cache0 and "→ off" in r["fog"]["card"]["title"]
+    r, pv, before, st = ask_and_answer("A", "/r/fog/cache", {"mb": 1024}, yes=True)
+    res["s: an approved cache card sets arc.cache"] = st["status"] == "sent" and call("A", "arc.cache")["mb"] == 1024 and before[1] == cache0
     json.dump({"timeline": timeline, "mine_A": call("A", "fog.mine")}, open(os.path.join(WORK, "fogkeep.json"), "w"), indent=1)
     return finish(res)
 

@@ -785,9 +785,10 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             };
             return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
         }
-        // Storage choices (fogkeep.rs, docs/STORAGEAPP.md): the Storage app asks to keep, pin, forget or undo; the
-        // request waits for the operator's approval card like a repository write. `mine` is this arcade's own list
-        // (its forget list included), so it answers only an app page this arcade serves its operator, never a public read.
+        // Storage choices (fogkeep.rs, docs/STORAGEAPP.md): the Storage app asks to keep, pin, forget or undo, or to
+        // change the keep share or the blob cache (its Settings); the request waits for the operator's approval card
+        // like a repository write. `mine` and `settings` are this arcade's own (its forget list included), so they
+        // answer only an app page this arcade serves its operator, never a public read.
         if let Some(rest) = path.strip_prefix("/r/fog/") {
             let Some((_, page)) = page.clone() else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
             let (code, v) = match (r.method.as_str(), rest) {
@@ -795,8 +796,10 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                     Ok(v) => (200, v),
                     Err(e) => (400, json!({"error": e})),
                 },
+                // The keep share and the blob cache, as the Storage app's Settings show them (its own arcade's, like mine).
+                ("GET" | "HEAD", "settings") => (200, crate::fogkeep::settings(node)),
                 ("GET" | "HEAD", x) if x.starts_with("req/") => crate::fogkeep::status(node, &page, &x[4..]),
-                ("POST", op @ ("keep" | "forget" | "undo")) => crate::fogkeep::file(node, &page, op, &serde_json::from_slice(&r.body).unwrap_or(Value::Null)),
+                ("POST", op @ ("keep" | "forget" | "undo" | "keep_share" | "cache")) => crate::fogkeep::file(node, &page, op, &serde_json::from_slice(&r.body).unwrap_or(Value::Null)),
                 _ => (404, json!({"error": "no such storage request"})),
             };
             return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
@@ -1608,6 +1611,56 @@ pub(crate) mod tests {
         // Reads need it too, except the chain's height and time.
         assert_eq!(status(&ask(&t.node, &conf(), &get("/r/wallet", ""))), "403");
         assert_eq!(status(&ask(&t.node, &conf(), &get("/r/blockheight", ""))), "200");
+    }
+
+    /// The Storage app's Settings doors (fogkeep.rs): read behind the page's pass, every change filed for the card and
+    /// applied only on Approve.
+    #[test]
+    fn storage_settings_go_through_the_card() {
+        let (_one, t) = crate::http::tests::node();
+        let page = "e".repeat(64);
+        let pass = page_pass(&t.node, t.p.key, &page);
+        let post = |path: &str, body: &str, extra: &str| {
+            format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).into_bytes()
+        };
+        let from_page = format!("Origin: null\r\nX-Arcade-Page: {pass}\r\n");
+        // Not a page of this arcade's: no settings, nothing filed.
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/fog/settings", ""))), "403");
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/fog/settings", &format!("X-Arcade-Page: {pass}\r\n")))), "403", "a pass without a page's Origin");
+        assert_eq!(status(&ask(&t.node, &conf(), &post("/r/fog/cache", r#"{"mb":4096}"#, ""))), "403");
+        // The page reads them: the keep share as arc.keep answers it, the cache as arc.cache does.
+        let a = ask(&t.node, &conf(), &get("/r/fog/settings", &from_page));
+        assert_eq!(status(&a), "200", "{a}");
+        let v: Value = serde_json::from_str(a.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert!(v["keep"].is_object() && v["cache"]["mb"].is_u64() && v["doors"]["keep_share"].is_string(), "{v}");
+        // A bad ask is refused at once, not filed.
+        let a = ask(&t.node, &conf(), &post("/r/fog/keep_share", r#"{"pct":7}"#, &from_page));
+        assert_eq!(status(&a), "400", "{a}");
+        assert!(a.contains("pct is one of"), "{a}");
+        let a = ask(&t.node, &conf(), &post("/r/fog/cache", r#"{"mb":"lots"}"#, &from_page));
+        assert_eq!(status(&a), "400", "{a}");
+        assert_eq!(crate::walletsvc::requests(&t.node, Some(&page)).as_array().unwrap().len(), 0, "nothing filed");
+        // A cache change waits for the card: nothing changes until it is approved.
+        let before = crate::arcblob::cache_limit();
+        let want = (before >> 20) + 1;
+        let a = ask(&t.node, &conf(), &post("/r/fog/cache", &format!(r#"{{"mb":{want}}}"#), &from_page));
+        assert_eq!(status(&a), "202", "{a}");
+        let r: Value = serde_json::from_str(a.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        assert_eq!((r["kind"].as_str(), r["op"].as_str(), r["args"]["mb"].as_u64()), (Some("fog"), Some("cache"), Some(want)), "{r}");
+        assert!(r["fog"]["card"]["lines"][0].as_str().unwrap().starts_with("Blob cache: "), "{r}");
+        assert_eq!(crate::arcblob::cache_limit(), before, "not before the card is approved");
+        let id = r["id"].as_str().unwrap().to_string();
+        let pv = crate::walletsvc::preview(&t.node, &id).unwrap();
+        assert_eq!(pv["fog"]["card"]["new_mb"], want, "the card as things stand now");
+        crate::walletsvc::deny(&t.node, &id).unwrap();
+        assert_eq!(crate::arcblob::cache_limit(), before, "refused: unchanged");
+        let a = ask(&t.node, &conf(), &post("/r/fog/cache", &format!(r#"{{"mb":{want}}}"#), &from_page));
+        let id = serde_json::from_str::<Value>(a.split("\r\n\r\n").nth(1).unwrap()).unwrap()["id"].as_str().unwrap().to_string();
+        assert_eq!(crate::walletsvc::approve(&t.node, &id).unwrap()["status"], "sent");
+        assert_eq!(crate::arcblob::cache_limit(), want << 20, "approved: set");
+        let a = ask(&t.node, &conf(), &get(&format!("/r/fog/req/{id}"), &from_page));
+        assert!(a.contains(r#""status":"sent""#), "{a}");
+        crate::arcblob::set_cache_limit(before);
     }
 
     #[test]

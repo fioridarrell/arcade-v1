@@ -112,7 +112,8 @@ who steps in, never as a copy count for a listed segment.
 - `arc.keep`: the share kept by choice and its segments; also the default, whether the operator chose, free disk,
   whether Earn ARCADE is on here, `suggest` (the app's prompt: Earn ARCADE on, 50 GB or more free, no share, not
   dismissed; `{dismiss: true}` hides it for good) and `would_hold` (the segments short of copies now, the network's
-  segments and bytes). The app's Options tab sets it ("Keep ARCADE data", in GB); nothing sets it by itself.
+  segments and bytes). The ARCADE Storage app's Settings set it through the approval card (below; Arcade V1's
+  Options tab only points there since 2026-11-19); nothing sets it by itself.
 - `explorer.arc_blobs` (/r/explorer/arc_blobs): every blob as fog storage sees it from here, for the Storage app's fog
   map. A large blob is one item with its parts. Per item: id, type, publisher (@tag, address), class, bytes, segment
   (`P#n` for the blobs family, `T#n` for temporary blobs), copies (registered, audited) against the floor, announced
@@ -169,6 +170,15 @@ data that they wish to forget" (docs/STORAGEAPP.md in the plans). `crate::fogkee
   copies before and after, pay estimate, seal time on this machine from `sysinfo::seal_speed`) with Approve / Refuse.
   `GET /r/fog/req/<id>` is where it stands; `GET /r/fog/mine` is `fog.mine` for a page this arcade serves its operator.
   The card is worked out again when shown (`wallet.preview`) and applied on approval; nothing changes before.
+- **Settings from the app** (Martin 2026-11-19: every storage setting lives in the Storage app, not in Options):
+  `GET /r/fog/settings` (a page this arcade serves its operator) is `{keep: arc.keep's answer (choice, presets with
+  what each would hold, suggested, budget), label, borrowed, cache: {mb, on, files, bytes, default_mb, max_mb}}`.
+  `POST /r/fog/keep_share {mb | gb | pct}` (one of them; `mb: 0` is Off; `pct` one of 5, 10, 25) and
+  `POST /r/fog/cache {mb}` (0 is off) file a `fog` request whose card shows old → new, what the share would hold or
+  which cached blobs go (the least recently viewed first; the cache is trimmed on approval), and the disk left. Refused
+  at once: no change, a share past the free space (20 GB stay free after what the chains will grow to), a share on a
+  borrowed ARCADE chain (Off is always allowed). Approved, they set what `arc.keep` and `arc.cache` set; those commands
+  stay as they are for operators and agents.
 - Pay estimate: the segment's weight B/n (n = copies with this arcade) against all pay weight now (owners' replicas and
   the genesis bytes), of 49 ARCADE a block over a 30-day month. An estimate, labeled so.
 - Closed test nets never complete a 10,000-block range, so nothing is listed or audited there:

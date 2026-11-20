@@ -149,6 +149,11 @@ pub fn would_hold(view: &[SegView], bytes: u64) -> Value {
            "all_short_held": short.iter().all(|s| s.bytes <= bytes) && short.iter().map(|s| s.bytes).sum::<u64>() <= bytes})
 }
 
+/// What a share of `bytes` would hold now, as the last fog round saw the network (the Storage app's Settings card).
+pub fn holds_now(bytes: u64) -> Value {
+    would_hold(&SEG_VIEW.lock().unwrap().clone(), bytes)
+}
+
 /// The blob-family segments kept by choice: (family, range index).
 pub fn kept_segs(node: &Node) -> BTreeSet<(u8, u64)> {
     node.app

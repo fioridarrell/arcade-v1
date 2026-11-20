@@ -172,7 +172,11 @@ checks: Keep refused with the reason on a borrowed arcade and with no keep share
 card first) and is counted only after its first audit; C doesn't take a segment at its floor; A forgets P#0: C steps
 in, A shows `handing over (n/2)` and drops only after C is counted; A forgets one blob of T#0 (which it keeps): it keeps
 the bytes, refuses its own view, leaves it out of its bloom and answers D "not here", while C fetches it from B; undo:
-D gets it from A again; T forgets a blob it viewed through its lenders.
+D gets it from A again; T forgets a blob it viewed through its lenders. Last, the Storage app's Settings on A (as an
+app page with its pass: A's node key is imported so the test can make it): `GET /r/fog/settings` shows arc.keep's
+choice and presets and the cache size; `POST /r/fog/keep_share {mb: 80}` files a card (50.0 MB → 80.0 MB, what it would
+hold, the disk left) and changes nothing until approved, then `arc.keep` says 80 MB; a cache card refused leaves
+`arc.cache` as it was, one approved sets it.
 
 ```sh
 cargo build --release -p arcaded

@@ -187,7 +187,7 @@ pub fn split_unit(unit: &[u8]) -> Vec<Vec<u8>> {
 // ---------------- the viewer cache (§15 step 4) ----------------
 
 /// The cache's size limit in bytes (Options; 0: off). On by default at 2 GB (Martin 2026-11-14).
-static CACHE_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(2 << 30);
+static CACHE_LIMIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(CACHE_DEFAULT);
 
 pub fn set_cache_limit(bytes: u64) {
     CACHE_LIMIT.store(bytes, std::sync::atomic::Ordering::Relaxed);
@@ -215,6 +215,58 @@ fn cached(id: &Hash) -> Option<Vec<u8>> {
 pub fn cache_use() -> (u64, u64) {
     let Ok(rd) = std::fs::read_dir(cache_dir()) else { return (0, 0) };
     rd.flatten().filter_map(|e| e.metadata().ok()).filter(|m| m.is_file()).fold((0, 0), |(n, b), m| (n + 1, b + m.len()))
+}
+
+/// The default size of the viewer cache, in bytes (`arc.cache`): 2 GB.
+pub const CACHE_DEFAULT: u64 = 2 << 30;
+
+/// The cache's files, the least recently viewed first: (bytes, path).
+pub fn cache_files() -> Vec<(u64, PathBuf)> {
+    // No blob store opened (unit tests): no cache, rather than a "cache" folder wherever this runs.
+    if dir().as_os_str().is_empty() {
+        return Vec::new();
+    }
+    let Ok(rd) = std::fs::read_dir(cache_dir()) else { return Vec::new() };
+    let mut files: Vec<(std::time::SystemTime, u64, PathBuf)> = rd
+        .flatten()
+        .filter_map(|e| {
+            let m = e.metadata().ok()?;
+            m.is_file().then_some(())?;
+            Some((m.modified().ok()?, m.len(), e.path()))
+        })
+        .collect();
+    files.sort_by_key(|f| f.0);
+    files.into_iter().map(|f| (f.1, f.2)).collect()
+}
+
+/// How many of `lens` (the least recently viewed first) go to bring them to `limit` bytes: (count, bytes).
+pub fn cache_drops(lens: &[u64], limit: u64) -> (usize, u64) {
+    let mut total: u64 = lens.iter().sum();
+    let (mut n, mut freed) = (0, 0);
+    for len in lens {
+        if total <= limit {
+            break;
+        }
+        total -= len;
+        freed += len;
+        n += 1;
+    }
+    (n, freed)
+}
+
+/// Bring the cache down to `limit` bytes now, the least recently viewed first: (blobs dropped, bytes freed).
+pub fn cache_trim(limit: u64) -> (usize, u64) {
+    let files = cache_files();
+    let (n, _) = cache_drops(&files.iter().map(|f| f.0).collect::<Vec<_>>(), limit);
+    let mut freed = 0;
+    let mut gone = 0;
+    for (len, path) in files.into_iter().take(n) {
+        if std::fs::remove_file(path).is_ok() {
+            freed += len;
+            gone += 1;
+        }
+    }
+    (gone, freed)
 }
 
 /// Keep a fetched blob in the cache, then drop the least recently viewed while over the limit.

@@ -556,7 +556,9 @@ fn take(node: &Node, svc: &Svc, block: Block) -> Result<Accepted, ChainError> {
 fn new_tip(node: &Node, svc: &Svc, st: &mut State, undone: &[Hash256]) {
     st.since = Instant::now();
     let back: Vec<Tx> = undone.iter().rev().filter_map(|id| st.chain.block(id)).flat_map(|b| b.txs.iter().skip(1).cloned()).collect();
-    st.pool.retip(st.chain.coins(), st.chain.tip().height + 1, back);
+    // Against the chain's blobs now: after a reorg a blob it held may be new again (counted in the next block's blob budget).
+    let (pool, chain) = (&mut st.pool, &st.chain);
+    pool.retip_with(chain.coins(), chain.tip().height + 1, back, &svc.net, &|id| chain.blob_state(id).cloned());
     // Waiting upgrades (rules version 6) the next block would refuse go: the blob upgraded by the block just taken,
     // past its time, or upgraded twice by transactions a block left.
     let (pool, chain) = (&mut st.pool, &st.chain);
@@ -564,7 +566,7 @@ fn new_tip(node: &Node, svc: &Svc, st: &mut State, undone: &[Hash256]) {
     if gone > 0 {
         eprintln!("arc: {gone} waiting transactions dropped: a blob upgrade they carry (or spend) no longer holds");
     }
-    crate::arcblob::set_upgraded(st.chain.upgraded_blobs(), st.chain.tip().height + 1);
+    crate::arcblob::set_chain_blobs(st.chain.upgraded_blobs(), st.chain.timed_blobs(), st.chain.tip().height + 1);
     st.refused.clear();
     // Waiting blobs no waiting transaction brings any more go (the store keeps what blocks brought).
     let named: std::collections::HashSet<arcade_arc::merkle::Hash> = st.pool.iter().flat_map(|w| w.blobs.iter().map(|b| b.0)).collect();
@@ -1444,7 +1446,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         }
     }
     // The blobs its blocks upgraded (rules version 6), for the blob reads and fog storage.
-    crate::arcblob::set_upgraded(chain.upgraded_blobs(), chain.tip().height + 1);
+    crate::arcblob::set_chain_blobs(chain.upgraded_blobs(), chain.timed_blobs(), chain.tip().height + 1);
     // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
     // the store takes; an arcade that stored blocks before it had them walks those once, below.
     arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
@@ -2833,9 +2835,10 @@ fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
         if m.boosted_until > now {
             continue;
         }
-        // A Temporary blob upgraded to Permanent (rules version 6) is kept as one.
+        // A Temporary blob upgraded to Permanent (rules version 6) is kept as one; a timed blob's time is the chain's, in
+        // blocks, when it knows it (Meta::timed_done).
         if (m.class == Class::Temporary as u8 || m.class == Class::Boost as u8) && m.upgraded.is_none() {
-            if m.time.saturating_add(temporary).max(m.boosted_until) <= now {
+            if m.timed_done(crate::arcblob::next_height(), now, temporary) {
                 freed += crate::arcblob::forget(&id);
                 dropped += 1;
             }

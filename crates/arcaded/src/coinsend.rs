@@ -504,7 +504,8 @@ pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc
 }
 
 /// `arc.blob_upgrade {id, send?}` (rules version 6): make a Temporary blob Permanent by paying the difference, Permanent
-/// fee minus the Temporary fee for its bytes at the next block's rates (blob::upgrade_fee_at), from this arcade's
+/// fee minus the fee of the class that brought it (Temporary, or Boost for one a boost brought) for its bytes at the next
+/// block's rates (blob::upgrade_fee_at), from this arcade's
 /// ARCADE wallet; anyone may upgrade any Temporary blob, and it stays its publisher's. A large blob's manifest brings all
 /// its parts along, paid for their bytes too. Without `send`, only the quote: bytes, already paid (the Temporary fee),
 /// the Permanent fee, the difference, and the whole fee.
@@ -513,12 +514,21 @@ pub fn upgrade_blob(node: &Node, id: &arcade_arc::merkle::Hash, send: bool) -> R
     let p = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or("the ARCADE chain isn't running here")?;
     let net = crate::arcsvc::svc_net().ok_or("the ARCADE chain isn't running here")?;
     let (_, next) = crate::arcsvc::blob_state(id).ok_or("the ARCADE chain holds no such blob")?;
-    // A large blob: its manifest and every part.
+    // A file manifest (a large blob, or an older file of blobs): it and every part, each once. When its parts can't be
+    // read here (its bytes aren't here or at a linked arcade, or a part isn't on the chain) it is refused rather than
+    // upgraded alone, which would leave its parts Temporary.
     let mut ids = vec![*id];
-    let large = crate::arcblob::file_manifest(id).filter(|m| m.large());
-    if let Some(m) = &large {
-        ids.extend(m.parts.iter().map(|x| x.0).filter(|x| x != id));
-    }
+    let large = if crate::arcblob::kind_of(id).as_deref() == Some(crate::arcblob::FILE_MANIFEST) {
+        let m = crate::arcblob::file_manifest(id).ok_or("this blob is a file manifest, but its parts aren't known here (its bytes can't be read, or a part isn't on the chain): an upgrade must name every part, so it isn't sent")?;
+        for (p, _) in &m.parts {
+            if !ids.contains(p) {
+                ids.push(*p);
+            }
+        }
+        Some(m)
+    } else {
+        None
+    };
     if ids.len() > blob::MAX_UPGRADE_IDS {
         return Err(format!("a large blob of {} parts is more than one upgrade names ({})", ids.len() - 1, blob::MAX_UPGRADE_IDS));
     }
@@ -530,9 +540,10 @@ pub fn upgrade_blob(node: &Node, id: &arcade_arc::merkle::Hash, send: bool) -> R
             _ if x != id => format!("part {}: {e}", hex::encode(x)),
             _ => e.to_string(),
         })?;
-        let len = st.map_or(0, |s| s.len);
+        let (len, brought) = st.as_ref().map_or((0, Class::Temporary), |s| (s.len, s.class));
         bytes += len;
-        already += blob::fee_at(&net, next, &[(Class::Temporary, len)]);
+        // What its class paid (Temporary, or a boost's fee for one a boost brought), at today's rates.
+        already += blob::fee_at(&net, next, &[(brought, len)]);
         permanent += blob::fee_at(&net, next, &[(Class::Permanent, len)]);
         diff += f;
     }
@@ -541,7 +552,7 @@ pub fn upgrade_blob(node: &Node, id: &arcade_arc::merkle::Hash, send: bool) -> R
     // every arcade refusing an underpaid upgrade.
     let short = if crate::arcsvc::local() { std::env::var("ARCADE_TEST_UPGRADE_SHORT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) } else { 0 };
     let (tx, fee) = arc_data_tx(node, p, tip, &[blob::upgrade_script(&ids)], diff.saturating_sub(short), "the upgrade fee", &[])?;
-    let mut out = json!({"blob": hex::encode(id), "blobs": ids.iter().map(hex::encode).collect::<Vec<_>>(), "parts": large.as_ref().map(|m| m.parts.len()),
+    let mut out = json!({"blob": hex::encode(id), "blobs": ids.iter().map(hex::encode).collect::<Vec<_>>(), "parts": large.as_ref().map(|_| ids.len() - 1),
                          "bytes": bytes, "already_paid": already, "permanent_fee": permanent, "difference": diff, "fee": fee,
                          "at_height": next, "floor": blob::floor_at(&net, next, Class::Permanent),
                          "txid": tx.txid.to_hex(), "hex": hex::encode(&tx.raw), "size": tx.raw.len(), "sent": false});

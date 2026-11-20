@@ -151,7 +151,8 @@ Code: `arcade-arc` `params::rules_v6`, `blob.rs` (`FLOORS`, `floor_at`, the upgr
   394,800 − 42,300 = **352,500 base units per started kB**: 1 kB 0.003525 ARCADE, 1 MB 3.525 ARCADE, 100 MB about
   352.5 ARCADE). The fee goes into the pot, as every blob fee does. **Anyone may upgrade** any Temporary blob (the payer
   needn't be the publisher); it stays its publisher's. A blob a boost brought (kept as a Temporary one) is upgraded the
-  same way, for the same difference.
+  same way, paying Permanent minus the fee of the class that brought it, the boost's (394,800 − 28,200 = 366,600 per
+  started kB): every upgraded blob has paid a Permanent blob's fee in all.
 - **From that block** the blob is Permanent: its class now (`blob::State::class_now`, the reads' `class`), its floor
   (Permanent's), no expiry, and fog storage treats it as one (its segment keeps the Permanent floor, the old class
   pruning never forgets it). Its record's class, and so the family it is sealed in (`FAMILY_BLOBS_TEMP`), don't change.
@@ -162,9 +163,17 @@ Code: `arcade-arc` `params::rules_v6`, `blob.rs` (`FLOORS`, `floor_at`, the upgr
   that brought it, or from its latest boost, and refuses an upgrade at or after that height, since its bytes may be
   gone; a blob named twice in one transaction or one block; and a transaction paying less than the sum of the
   differences on top of the blob fee for what it brings.
+- **A boost past a blob's time doesn't bring it back.** A boost keeps a timed blob `temporary_blocks` past the boost's
+  block only while the blob is within its time; boosting one already past it is still valid and paid (as before
+  version 6) but leaves it past its time, so it can't be upgraded.
+- **Fog storage keeps a timed blob's bytes by the chain's count.** The old class pruning and fog storage drop a
+  Temporary blob, and its segment's floor goes to 0, at the height consensus refuses its upgrade from
+  (`blob::State::until`, `arcblob::Meta::timed_done`), not by the clock, so no arcade drops bytes an upgrade can still
+  make Permanent. An upgraded blob is never dropped as Temporary.
 - **Large blobs:** consensus can't read a manifest (no arcade must keep the bytes), so an upgrade names every blob it
-  upgrades. `arc.blob_upgrade` on a large blob's manifest id names the manifest and all its parts in one output and
-  pays each one's difference by its own bytes (as each was paid for), i.e. the difference for the total bytes.
+  upgrades. `arc.blob_upgrade` on a manifest's id names the manifest and all its parts (each once) in one output and
+  pays each one's difference by its own bytes (as each was paid for), i.e. the difference for the total bytes. When the
+  manifest's parts can't be read here it refuses, rather than upgrading the manifest alone.
 - **A block brings at most 4 MB of blobs by their records.** The lengths the records declare for the blobs a block
   brings new (a boost of a blob the chain holds brings nothing and doesn't count; each part of a large blob does) add up
   to at most `blob::MAX_BLOB_BYTES`, or the block is refused (`BlockError::TooBig("declared blobs")`). Until now only the

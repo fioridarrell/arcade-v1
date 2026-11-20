@@ -89,12 +89,31 @@ pub struct Meta {
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub publisher: String,
     /// Its upgrade to Permanent (rules version 6), as the chain's best branch has it: never stored, filled in when the
-    /// meta is read ([`meta`], from [`set_upgraded`]).
+    /// meta is read ([`meta`], from [`set_chain_blobs`]).
     #[serde(skip)]
     pub upgraded: Option<arcade_arc::blob::Upgraded>,
+    /// A timed blob's end as consensus counts it (the first height past its time, blob::State::until), as the best branch
+    /// has it: never stored, filled in when the meta is read; None when the chain doesn't know it as timed.
+    #[serde(skip)]
+    pub until: Option<u64>,
 }
 
 impl Meta {
+    /// Whether a timed blob (Temporary, or brought by a boost) is past its time with the next block at `next`: by the
+    /// chain's count in blocks when it knows the blob (the height from which an upgrade is refused, so its bytes are
+    /// kept as long as one is taken), else `temporary` seconds after its block or latest boost. Never once upgraded,
+    /// never for another class.
+    pub fn timed_done(&self, next: u64, now: u64, temporary: u64) -> bool {
+        use arcade_arc::blob::Class;
+        if self.upgraded.is_some() || !(self.class == Class::Temporary as u8 || self.class == Class::Boost as u8) {
+            return false;
+        }
+        match self.until {
+            Some(u) => next >= u,
+            None => self.time.saturating_add(temporary).max(self.boosted_until) <= now,
+        }
+    }
+
     /// Its class now: Permanent (0) once upgraded (rules version 6), else its record's. Its record's class (`class`)
     /// still says where it is sealed (crate::fogstore::family_of).
     pub fn class_now(&self) -> u8 {
@@ -106,24 +125,35 @@ impl Meta {
     }
 }
 
-/// The best branch's upgraded blobs (rules version 6) and the next block's height, as the chain last moved: kept here
-/// so reading a meta never takes the chain's lock.
-static UPGRADED: Mutex<Option<(HashMap<Hash, arcade_arc::blob::Upgraded>, u64)>> = Mutex::new(None);
+/// The best branch's upgraded blobs (rules version 6), its timed blobs' ends, and the next block's height, as the chain
+/// last moved: kept here so reading a meta never takes the chain's lock.
+struct ChainBlobs {
+    upgraded: HashMap<Hash, arcade_arc::blob::Upgraded>,
+    until: HashMap<Hash, u64>,
+    next: u64,
+}
 
-/// The chain moved (crate::arcsvc): its upgraded blobs and the next block's height.
-pub fn set_upgraded(list: Vec<(Hash, arcade_arc::blob::State)>, next: u64) {
-    let map = list.into_iter().filter_map(|(id, s)| Some((id, s.upgraded?))).collect();
-    *UPGRADED.lock().unwrap() = Some((map, next));
+static UPGRADED: Mutex<Option<ChainBlobs>> = Mutex::new(None);
+
+/// The chain moved (crate::arcsvc): its upgraded blobs, its timed blobs' ends and the next block's height.
+pub fn set_chain_blobs(upgraded: Vec<(Hash, arcade_arc::blob::State)>, timed: Vec<(Hash, u64)>, next: u64) {
+    let upgraded = upgraded.into_iter().filter_map(|(id, s)| Some((id, s.upgraded?))).collect();
+    *UPGRADED.lock().unwrap() = Some(ChainBlobs { upgraded, until: timed.into_iter().collect(), next });
+}
+
+/// A timed blob's end as the chain last moved (blob::State::until).
+pub fn until(id: &Hash) -> Option<u64> {
+    UPGRADED.lock().unwrap().as_ref()?.until.get(id).copied()
 }
 
 /// Blob `id`'s upgrade, as the chain last moved.
 pub fn upgraded(id: &Hash) -> Option<arcade_arc::blob::Upgraded> {
-    UPGRADED.lock().unwrap().as_ref()?.0.get(id).cloned()
+    UPGRADED.lock().unwrap().as_ref()?.upgraded.get(id).cloned()
 }
 
 /// The next block's height as the chain last moved (0 before it ran).
 pub fn next_height() -> u64 {
-    UPGRADED.lock().unwrap().as_ref().map_or(0, |u| u.1)
+    UPGRADED.lock().unwrap().as_ref().map_or(0, |u| u.next)
 }
 
 /// The address a script pays (pay to a key hash or a script hash on `net`), None for any other script.
@@ -155,6 +185,7 @@ fn meta_path(id: &Hash) -> PathBuf {
 pub fn meta(id: &Hash) -> Option<Meta> {
     let mut m: Meta = serde_json::from_slice(&std::fs::read(meta_path(id)).ok()?).ok()?;
     m.upgraded = upgraded(id);
+    m.until = until(id);
     Some(m)
 }
 
@@ -497,7 +528,7 @@ pub fn keep_block(net: &Net, block: &Block) {
             let line = hex::encode(&sha2::Sha256::digest([r.kind.as_bytes(), b"\0", publisher].concat())[..16]);
             let boosted_until = if r.class == arcade_arc::blob::Class::Boost { boost_until } else { 0 };
             let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until, len: r.len,
-                           publisher: address_of_script(net, publisher).unwrap_or_default(), upgraded: None };
+                           publisher: address_of_script(net, publisher).unwrap_or_default(), upgraded: None, until: None };
             let _ = std::fs::write(meta_path(id), serde_json::to_vec(&m).unwrap_or_default());
         }
     }

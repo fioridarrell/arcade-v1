@@ -265,11 +265,12 @@ pub fn upgrades(tx: &arcade_chain::Tx) -> Vec<Hash> {
     tx.outputs.iter().filter_map(|o| parse_upgrade(&o.script_pubkey)).flatten().collect()
 }
 
-/// What upgrading a Temporary blob of `len` bytes to Permanent costs in the block at `height`: the Permanent fee minus
-/// the Temporary fee for the same bytes, both by [`fee_at`] at that height (rules version 5 rates: 394,800 − 42,300 =
-/// 352,500 base units per started kB).
-pub fn upgrade_fee_at(net: &Net, height: u64, len: u64) -> u64 {
-    fee_at(net, height, &[(Class::Permanent, len)]).saturating_sub(fee_at(net, height, &[(Class::Temporary, len)]))
+/// What upgrading a timed blob of `len` bytes, brought by a record of class `brought`, to Permanent costs in the block at
+/// `height`: the Permanent fee minus the fee of the class that brought it, for the same bytes, both by [`fee_at`] at that
+/// height. Rules version 5 rates: a Temporary one 394,800 − 42,300 = 352,500 base units per started kB; one a boost
+/// brought 394,800 − 28,200 = 366,600, so either way the blob has paid a Permanent blob's fee in all.
+pub fn upgrade_fee_at(net: &Net, height: u64, brought: Class, len: u64) -> u64 {
+    fee_at(net, height, &[(Class::Permanent, len)]).saturating_sub(fee_at(net, height, &[(brought, len)]))
 }
 
 /// Blocks a Temporary blob (and one a boost brought, or a boost kept) is kept from its block: the network's Temporary
@@ -316,9 +317,11 @@ impl State {
         State { class, len, height, until, upgraded: None }
     }
 
-    /// A boost in the block at `height`: a timed blob is kept [`temporary_blocks`] past it.
+    /// A boost in the block at `height`: a timed blob still within its time is kept [`temporary_blocks`] past it. One
+    /// past its time stays past it (its bytes may be gone everywhere): a boost doesn't bring it back, so it can't be
+    /// upgraded after (the boost itself stays valid and paid, as before rules version 6).
     pub fn boost(&mut self, net: &Net, height: u64) {
-        if self.until != u64::MAX {
+        if self.until != u64::MAX && height < self.until {
             self.until = self.until.max(height.saturating_add(temporary_blocks(net)));
         }
     }
@@ -363,7 +366,7 @@ pub fn check_upgrade(net: &Net, height: u64, state: Option<&State>) -> Result<u6
     if height >= s.until {
         return Err(UpgradeError::Expired);
     }
-    Ok(upgrade_fee_at(net, height, s.len))
+    Ok(upgrade_fee_at(net, height, s.class, s.len))
 }
 
 /// The upgrades of one transaction in the block at `height` against the blobs as the chain held them before the block
@@ -469,15 +472,15 @@ mod tests {
         assert!(Record::parse(&s).is_none(), "an upgrade is no blob record");
 
         // The difference per started kB: 394,800 - 42,300 = 352,500.
-        assert_eq!(upgrade_fee_at(&V6, 100, 1), 352_500);
-        assert_eq!(upgrade_fee_at(&V6, 100, 1_000), 352_500);
-        assert_eq!(upgrade_fee_at(&V6, 100, 1_001), 2 * 352_500);
-        assert_eq!(upgrade_fee_at(&V6, 100, 5_000), fee_at(&V6, 100, &[(Class::Permanent, 5_000)]) - fee_at(&V6, 100, &[(Class::Temporary, 5_000)]));
+        assert_eq!(upgrade_fee_at(&V6, 100, Class::Temporary, 1), 352_500);
+        assert_eq!(upgrade_fee_at(&V6, 100, Class::Temporary, 1_000), 352_500);
+        assert_eq!(upgrade_fee_at(&V6, 100, Class::Temporary, 1_001), 2 * 352_500);
+        assert_eq!(upgrade_fee_at(&V6, 100, Class::Temporary, 5_000), fee_at(&V6, 100, &[(Class::Permanent, 5_000)]) - fee_at(&V6, 100, &[(Class::Temporary, 5_000)]));
         // A large blob: each part's difference by its own bytes, as each part's fee was paid. 100 MB: 25 parts of
         // 3,999,992 bytes (4,000 started kB each), plus the rest, plus the manifest.
         let part = (crate::blob::MAX_BLOB_BYTES / LEAF * LEAF) as u64;
         let last = 100_000_000 - 24 * part;
-        let large: u64 = (0..24).map(|_| upgrade_fee_at(&V6, 100, part)).sum::<u64>() + upgrade_fee_at(&V6, 100, last) + upgrade_fee_at(&V6, 100, 3_000);
+        let large: u64 = (0..24).map(|_| upgrade_fee_at(&V6, 100, Class::Temporary, part)).sum::<u64>() + upgrade_fee_at(&V6, 100, Class::Temporary, last) + upgrade_fee_at(&V6, 100, Class::Temporary, 3_000);
         assert_eq!(large, (24 * 4_000 + last.div_ceil(1_000) + 3) * 352_500);
     }
 
@@ -498,7 +501,14 @@ mod tests {
         assert_eq!(boosted.until, 160);
         assert_eq!(check_upgrade(&V6, 130, Some(&boosted)), Ok(2 * 352_500));
         // One a boost brought is timed too; Permanent and Release ones aren't upgraded, nor one upgraded already.
-        assert!(check_upgrade(&V6, 100, Some(&State::brought(&V6, Class::Boost, 10, 95))).is_ok());
+        // One a boost brought pays Permanent minus the boost's fee: 394,800 - 28,200 a started kB.
+        assert_eq!(check_upgrade(&V6, 100, Some(&State::brought(&V6, Class::Boost, 10, 95))), Ok(366_600));
+        assert_eq!(upgrade_fee_at(&V6, 100, Class::Boost, 1_001), 2 * 366_600);
+        // A boost past its time doesn't extend it.
+        let mut late = t.clone();
+        late.boost(&V6, 130);
+        assert_eq!(late.until, 130);
+        assert_eq!(check_upgrade(&V6, 131, Some(&late)), Err(UpgradeError::Expired));
         assert_eq!(check_upgrade(&V6, 100, Some(&State::brought(&V6, Class::Permanent, 10, 95))), Err(UpgradeError::NotTemporary));
         assert_eq!(check_upgrade(&V6, 100, Some(&State::brought(&V6, Class::Release, 10, 95))), Err(UpgradeError::NotTemporary));
         let mut up = t.clone();

@@ -940,6 +940,17 @@ fn prove_in_pieces(dir: &std::path::Path, challenge: &arcade_arc::merkle::Hash, 
 }
 
 fn prove_in_pieces_of(dir: &std::path::Path, challenge: &arcade_arc::merkle::Hash, steps: u64, most: usize, piece: u64) -> Option<TimeProof> {
+    prove_in_pieces_until(dir, challenge, steps, most, piece, &|| false)
+}
+
+/// Pieces a block's own proof of time is made in (the rules allow up to `pot_runs`, 8): between pieces it stops once
+/// its tip is no longer wanted. Made in one run, a proof for a tip that moved on ran to its end at the lowest priority:
+/// on a 4-thread laptop 31 of them ran at once, the load stayed near 32 and arcaded was killed for memory 6 times in
+/// 3 days (2026-11-18..20).
+const BLOCK_POT_PIECES: u64 = 4;
+
+/// `prove_in_pieces_of`, giving up (None) before a piece when `stop` says the proof is no longer wanted.
+fn prove_in_pieces_until(dir: &std::path::Path, challenge: &arcade_arc::merkle::Hash, steps: u64, most: usize, piece: u64, stop: &dyn Fn() -> bool) -> Option<TimeProof> {
     use arcade_arc::time::{join, Segment, SEGMENT_BYTES};
     if most <= 1 || steps <= piece {
         return ChiaVdf.prove(challenge, steps);
@@ -984,6 +995,9 @@ fn prove_in_pieces_of(dir: &std::path::Path, challenge: &arcade_arc::merkle::Has
     }
     let mut done: u64 = runs.iter().map(|r| r.steps).sum();
     while done < steps {
+        if stop() {
+            return None;
+        }
         // The last piece the cap allows takes all that is left.
         let n = if runs.len() + 1 >= most { steps - done } else { (steps - done).min(piece) };
         let from = runs.last().map(|r| r.output.clone()).unwrap_or_else(|| ChiaVdf::start().to_vec());
@@ -1203,7 +1217,17 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                                 // tips that moved on are pushed down (above), as before.
                                 let _ = likely;
                                 running.lock().unwrap().push((me, tip));
-                                let proof = prove_in_pieces(&pot_dir, &challenge, steps, most);
+                                // In a few pieces, stopping between them once this tip is dropped from the proofs wanted
+                                // (`p.retain` above keeps only the tip and the parent raced on).
+                                let wanted = {
+                                    let job = job.clone();
+                                    move || job.lock().unwrap().contains_key(&tip)
+                                };
+                                let piece = steps.div_ceil(BLOCK_POT_PIECES).max(1);
+                                let proof = prove_in_pieces_until(&pot_dir, &challenge, steps, most, piece, &|| !wanted());
+                                if proof.is_none() && !wanted() {
+                                    eprintln!("arc: stopped a proof of time for a block whose tip moved on");
+                                }
                                 running.lock().unwrap().retain(|t| t.0 != me);
                                 {
                                     let mut own = OWN_PROOF.lock().unwrap();
@@ -3885,6 +3909,26 @@ mod tests {
 
     /// A proof of time made in pieces is the one a single run gives, carries on from saved pieces after a restart, and
     /// makes again any saved piece that doesn't check.
+    /// A block's proof stops between pieces once its tip is no longer wanted, and made whole in BLOCK_POT_PIECES pieces
+    /// it is a valid proof under the rules' run cap.
+    #[test]
+    fn a_block_proof_stops_between_pieces_when_its_tip_moves_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let c = [9u8; 32];
+        let (steps, most) = (4_000u64, 8usize);
+        let piece = steps.div_ceil(BLOCK_POT_PIECES);
+        let pieces = std::sync::atomic::AtomicUsize::new(0);
+        // Wanted for the first piece only: the tip moved on while it ran.
+        let stopped = prove_in_pieces_until(dir.path(), &c, steps, most, piece, &|| pieces.fetch_add(1, std::sync::atomic::Ordering::SeqCst) >= 1);
+        assert!(stopped.is_none(), "given up before the second piece");
+        assert_eq!(pieces.load(std::sync::atomic::Ordering::SeqCst), 2, "asked before each piece it began");
+        let other = tempfile::tempdir().unwrap();
+        let whole = prove_in_pieces_until(other.path(), &c, steps, most, piece, &|| false).unwrap();
+        assert_eq!(whole.output, ChiaVdf.prove(&c, steps).unwrap().output);
+        assert!(ChiaVdf.verify_pot(&c, steps, &whole, most), "valid in {BLOCK_POT_PIECES} pieces under a cap of {most}");
+        assert!(!ChiaVdf.verify_pot(&c, steps, &whole, 1), "it is more than one run");
+    }
+
     #[test]
     fn a_proof_in_pieces_carries_on_after_a_restart() {
         use arcade_arc::time::{join, SEGMENT_BYTES};

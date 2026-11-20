@@ -21,6 +21,8 @@ pub const MAX_WAITING: usize = 64 << 20;
 #[derive(Default)]
 struct Waiting {
     blobs: HashMap<Hash, Vec<u8>>,
+    /// When each was held: one held a moment ago may be on its way into the pool with its transaction.
+    since: HashMap<Hash, std::time::Instant>,
     bytes: usize,
     /// Pieces of blobs on their way from a peer: (peer, id) -> (next piece, bytes so far).
     parts: HashMap<(String, Hash), (u64, Vec<u8>)>,
@@ -64,6 +66,7 @@ pub fn hold(net: &Net, bytes: Vec<u8>) -> Option<Hash> {
         }
         w.bytes += bytes.len();
         w.blobs.insert(id, bytes);
+        w.since.insert(id, std::time::Instant::now());
         Some(id)
     })
 }
@@ -547,6 +550,7 @@ pub fn keep_block(net: &Net, block: &Block) {
             if let Some(b) = w.blobs.remove(id) {
                 w.bytes -= b.len();
             }
+            w.since.remove(id);
         });
     }
 }
@@ -574,11 +578,15 @@ pub fn attach(block: &Block) -> Option<Block> {
 /// Waiting blobs no waiting transaction names any more (and none the chain lacks) go.
 pub fn forget_except(keep: &std::collections::HashSet<Hash>) {
     with(|w| {
-        let gone: Vec<Hash> = w.blobs.keys().filter(|k| !keep.contains(*k)).copied().collect();
+        // A blob held in the last minute stays: its transaction may not be in the pool yet (a block between `hold` and
+        // the pool taking it dropped the bytes, and the publish was refused "a blob it brings isn't here").
+        let fresh = |k: &Hash| w.since.get(k).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
+        let gone: Vec<Hash> = w.blobs.keys().filter(|k| !keep.contains(*k) && !fresh(k)).copied().collect();
         for k in gone {
             if let Some(b) = w.blobs.remove(&k) {
                 w.bytes -= b.len();
             }
+            w.since.remove(&k);
         }
     });
 }

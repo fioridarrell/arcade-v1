@@ -649,10 +649,11 @@ fn take_tx(svc: &Svc, raw: &[u8]) -> Result<(Hash256, u64), PoolError> {
         return Err(PoolError::Refused);
     }
     // Its records' blobs the chain hasn't got must be here (they came with it, or ahead of it in `bl` frames).
-    if arcade_arc::blob::records(&tx).iter().any(|r| {
+    if let Some(r) = arcade_arc::blob::records(&tx).into_iter().find(|r| {
         let id = r.id(&svc.net);
         !st.chain.holds_blob(&id) && !crate::arcblob::here(&id)
     }) {
+        eprintln!("arc: transaction {} refused: the bytes of blob {} ({} bytes) aren't here", id.to_hex(), hex::encode(r.id(&svc.net)), r.len);
         return Err(PoolError::BlobMissing);
     }
     let chain = &st.chain;

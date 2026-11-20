@@ -91,7 +91,7 @@ fn addresses(p: &ChainParams, req: &Value) -> Result<Vec<(String, Vec<u8>)>, Str
         if !seen.insert(a.clone()) {
             continue;
         }
-        let script = arcade_ledger::address::script_for_address(p, &a).ok_or_else(|| format!("{a} is not a {} address", p.name))?;
+        let script = crate::ddsvc::lookup_script(p, &a).ok_or_else(|| format!("{a} is not a {} address", p.name))?;
         out.push((a, script));
     }
     Ok(out)

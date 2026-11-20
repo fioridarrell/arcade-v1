@@ -616,10 +616,18 @@
       cpager(), items, cpager());
   }
   let lastResults = null;
+  // A search hit on another chain (explorer.search looks on every chain here when the one picked hasn't it): switch to
+  // that chain first, so Back returns to where the search started.
+  function onChain(key) {
+    if (!key || !chain || key === chain.key) return;
+    const c = chains.find((x) => x.key === key);
+    if (c) { remember(); chain = c; sum = SUMS[c.key]?.v || null; paintSelector(); announce(); }
+  }
   async function vResults() {
     const r = lastResults && lastResults.id === arg ? lastResults : await xapi("explorer.search", { chain: chain.key, q: arg });
-    if (r.kind !== "results") { go(r.kind, r.id); return h("div"); }
-    return sect(`Results for "${r.id}" on ${chain.name}`, null, table([["Match"], ["What"]], r.items.map((it) => ({ go: () => go(it.kind, it.id),
+    if (r.kind !== "results") { onChain(r.chain); go(r.kind, r.id); return h("div"); }
+    const across = r.items.some((it) => it.chain);
+    return sect(across ? `Results for "${r.id}"` : `Results for "${r.id}" on ${chain.name}`, null, table([["Match"], ["What"]], r.items.map((it) => ({ go: () => { onChain(it.chain); go(it.kind, it.id); },
       cells: [[h("span", { class: "mono" }, it.label)], [it.what]] }))));
   }
   async function vTag() {
@@ -843,8 +851,9 @@
     if (!q || !chain) return;
     try {
       const r = await xapi("explorer.search", { chain: chain.key, q });
-      if (NEEDS[r.kind] && !has(NEEDS[r.kind])) throw new Error(`Turn on the ${NEEDS[r.kind]} index for ${chain.name} in Chains & Coins to look up ${q}.`);
       if (r.kind === "results") { lastResults = r; go("results", r.id); return; }
+      onChain(r.chain);
+      if (sum && NEEDS[r.kind] && !has(NEEDS[r.kind])) throw new Error(`Turn on the ${NEEDS[r.kind]} index for ${chain.name} in Chains & Coins to look up ${q}.`);
       go(r.kind, r.id);
     } catch (e) { $("x-view").replaceChildren(h("div", { class: "x-empty" }, `${chain.name}: ${e.message}`)); }
   });

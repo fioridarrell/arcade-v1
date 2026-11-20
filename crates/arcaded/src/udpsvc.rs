@@ -75,6 +75,14 @@ pub fn proved_stun() -> Vec<SocketAddr> {
     g().lock().unwrap().proved.clone()
 }
 
+/// The public IPs STUN servers saw this arcade as in the last NAT check (samerouter: who is behind our router).
+pub fn stun_public_ips() -> Vec<IpAddr> {
+    let st = g().lock().unwrap();
+    let mut v: Vec<IpAddr> = st.nat.mapped.iter().map(|a| arcade_mesh::stun::normalize(*a).ip()).filter(|ip| udp::is_public(ip)).collect();
+    v.dedup();
+    v
+}
+
 /// This arcade's LAN address on its STUN port (a player at home reaches its media relay there).
 pub fn lan_stun() -> Option<SocketAddr> {
     let port = g().lock().unwrap().stun_bound.iter().find_map(|a| a.parse::<SocketAddr>().ok()).map(|a| a.port())?;
@@ -208,7 +216,7 @@ pub fn is_hex(s: &str, n: usize) -> bool {
 }
 
 /// Our IPv4 LAN address (the one the default route leaves from).
-fn lan_ip() -> Option<Ipv4Addr> {
+pub(crate) fn lan_ip() -> Option<Ipv4Addr> {
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
     s.connect("192.0.2.1:9").ok()?;
     match s.local_addr().ok()?.ip() {

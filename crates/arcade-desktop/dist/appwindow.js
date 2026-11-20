@@ -882,8 +882,9 @@
       const who = pv.page_card || {};
       const from = `${who.app || appName}${who.creator_tag ? " by @" + who.creator_tag : ""}`;
       if (pv.kind === "fog") {
-        // A storage choice (fogkeep.rs): keep, pin, forget or undo on this arcade's own storage. Nothing is signed or
-        // written on a chain; it changes only what this arcade keeps and serves.
+        // A storage choice (fogkeep.rs): keep, pin, forget or undo on this arcade's own storage, or a setting (the keep
+        // share, the blob cache: the Storage app's Settings). Nothing is signed or written on a chain; it changes only
+        // what this arcade keeps and serves.
         const c = (pv.fog && pv.fog.card) || {};
         const size = (b) => b >= 10485760 ? `${Math.round(b / 1048576)} MB` : b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : `${Math.ceil((b || 0) / 1000)} kB`;
         const lines = [`${from} asks to change what this arcade keeps:`];
@@ -893,11 +894,13 @@
         if (c.size_bytes) fact(`Size: ${size(c.size_bytes)}`);
         if (c.copies_before != null && c.floor != null) fact(`Copies: ${c.copies_before}/${c.floor} → ${c.copies_after}/${c.floor}`);
         for (const h of c.handover || []) fact(`${h.segment}: handing over: kept here until a new keeper is registered and audited (${h.before}/${h.floor} now)`);
+        for (const t of c.facts || []) fact(t);
         if (c.pay_text) fact(`Pay: ${c.pay_text}`);
         if (c.seal_text) fact(`Seal: ${c.seal_text}`);
         if (facts.childElementCount) lines.push(facts);
         for (const n of c.notes || []) lines.push(n);
-        const title = c.op === "forget" ? "Forget this here?" : c.op === "undo" ? "Undo this choice?" : c.mode === "pin" ? "Pin this blob here?" : "Keep this here?";
+        const title = c.op === "forget" ? "Forget this here?" : c.op === "undo" ? "Undo this choice?" : c.op === "keep_share" ? "Change the keep share?"
+          : c.op === "cache" ? "Change the blob cache?" : c.mode === "pin" ? "Pin this blob here?" : "Keep this here?";
         const yes = await card(title, lines, "Approve", "Refuse");
         await api(yes ? "wallet.approve" : "wallet.deny", { id: r.id });
         return;

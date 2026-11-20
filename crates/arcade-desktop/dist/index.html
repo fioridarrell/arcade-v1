@@ -46,6 +46,7 @@
     <div class="pp-banner" id="h-keep" hidden>
       <b>Keep ARCADE data?</b> <span id="h-keep-text"></span>
       <div class="row"><button class="primary" id="h-keep-go">Choose a keep share…</button><button id="h-keep-no">Not now</button></div>
+      <p class="msg" id="h-keep-msg"></p>
     </div>
     <h1>Arcade mesh</h1>
     <div class="arcades" id="h-top"><div class="arcade"><div class="meta">Asking the mesh…</div></div></div>
@@ -334,7 +335,7 @@
   <!-- Chains & Coins (MOCKUP: simulated data and progress) -->
   <section id="chains" class="tab">
     <h1>Chains &amp; Coins</h1>
-    <p class="disk-line" id="c-disk">—</p>
+    <p class="disk-line" id="c-disk-row"><span id="c-disk">—</span> <button class="small" id="c-disk-open">Storage settings</button> <span class="msg" id="c-disk-msg"></span></p>
     <div class="borrow" id="c-borrow">
       <div class="borrow-head">
         <h2>Coins</h2>
@@ -429,22 +430,9 @@
     <div class="row"><button id="o-check">Check now</button><button class="primary" id="o-now" disabled>Update now</button></div>
     <p class="msg" id="o-msg"></p>
 
-    <h2 id="o-keep">Keep ARCADE data</h2>
-    <p class="disk-line" id="o-keep-disk">—</p>
-    <p class="opt">How much of the ARCADE network's files (pictures, apps, releases, videos) this machine stores for everyone. It's your choice, and it depends on the machine: a small computer that borrows every chain can keep none and is still a full arcade; a big one with many chains and indexes can keep a lot. The share holds whole 10,000-block segments, the ones short of copies first, sealed and audited like the chain data Earn ARCADE seals; their pay is split among their copies, so scarce data pays more. Your own files, new files (for a week) and files viewed here are kept anyway.</p>
-    <div class="keep-list" id="o-keep-list"></div>
-    <div class="row"><label class="keep-custom"><input type="radio" name="o-keep-pick" value="custom" id="o-keep-custom"> Custom</label> <input type="number" id="o-keep-in" min="0" step="1" style="width:7em"> GB <button id="o-keep-set">Set</button></div>
-    <p class="opt muted" id="o-keep-what">—</p>
-    <p class="msg" id="o-keep-msg"></p>
-
-    <h2>Blob cache</h2>
-    <div class="grid">
-      <div class="card"><div class="k">Size limit</div><div class="v" id="o-cache-mb">—</div></div>
-      <div class="card"><div class="k">Holding</div><div class="v" id="o-cache-use">—</div></div>
-    </div>
-    <div class="row"><input type="number" id="o-cache-in" min="0" step="256" style="width:8em"> MB <button id="o-cache-set">Set</button></div>
-    <p class="opt">Blobs this arcade fetched for someone to view (ARCADE files, apps, pictures) are kept here and handed to other arcades that ask, so what many people view spreads to many arcades, and leaves them when nobody views it any more. On by default; 0 turns it off.</p>
-    <p class="msg" id="o-cache-msg"></p>
+    <h2 id="o-storage">Storage</h2>
+    <p class="opt">Storage settings (keep share, blob cache, what to keep) are in the ARCADE Storage app. <button class="small" id="o-storage-open">Open ARCADE Storage</button></p>
+    <p class="msg" id="o-storage-msg"></p>
 
     <h2>Relay links for other arcades</h2>
     <div class="grid">

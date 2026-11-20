@@ -9,27 +9,29 @@ function agoText(t) {
   return `${Math.round(s / 3600)} hours ago`;
 }
 
-async function refreshCache() {
-  try {
-    const c = await api("arc.cache");
-    $("o-cache-mb").textContent = c.on ? `${c.mb} MB` : "off";
-    $("o-cache-use").textContent = `${c.files} files, ${(c.bytes / 1048576).toFixed(1)} MB`;
-    if (document.activeElement !== $("o-cache-in")) $("o-cache-in").value = c.mb;
-  } catch (e) {
-    $("o-cache-mb").textContent = "—";
-    $("o-cache-use").textContent = "the ARCADE chain isn't running here";
+// Storage settings (Martin 2026-11-19): the keep share, the blob cache and what to keep live in the ARCADE Storage app
+// (@strawberry's, family "arcade-storage"), which asks for each change through this arcade's approval card
+// (POST /r/fog/keep_share, /r/fog/cache). arc.keep and arc.cache stay the operator's commands. Here: the disk line on
+// Chains & Coins (information), the Home suggestion, and buttons that open the app at its Settings.
+const STORAGE_APP = { family: "arcade-storage", creator: "strawberry", at: "#/settings" };
+async function openStorage(msgId) {
+  const pick = (l) => (l || []).filter((a) => a.card && a.card.family === STORAGE_APP.family && a.creator_tag === STORAGE_APP.creator)
+    .sort((x, y) => (y.height || 0) - (x.height || 0))[0];
+  let a;
+  try { a = pick(await api("apps.installed")); } catch (e) { say(msgId, e.message, true); return; }
+  if (!a) {
+    say(msgId, "ARCADE Storage (by @strawberry) isn't installed here: get it in Apps → App Store (search \"ARCADE Storage\"), then open its Settings tab.", true);
+    return;
   }
+  try {
+    const l = await api("apps.launch", { chain: a.chain, txid: a.txid });
+    await invoke("open_app", { id: l.id, title: l.title, frame: l.frame, at: STORAGE_APP.at });
+    $(msgId).textContent = "";
+  } catch (e) { say(msgId, e.message || String(e), true); }
 }
-$("o-cache-set").addEventListener("click", async () => {
-  const mb = Math.max(0, Math.floor(Number($("o-cache-in").value) || 0));
-  try { await api("arc.cache", { mb }); say("o-cache-msg", mb ? `Blob cache set to ${mb} MB.` : "Blob cache off."); }
-  catch (e) { say("o-cache-msg", e.message, true); }
-  refreshCache();
-});
+$("o-storage-open").addEventListener("click", () => openStorage("o-storage-msg"));
+$("c-disk-open").addEventListener("click", () => openStorage("c-disk-msg"));
 
-// Keep ARCADE data (arc.keep, docs/FOGSTORE.md, crate::diskbudget): the share of the chain's blobs this machine keeps
-// by choice. Quick picks (Off, a share of free space, the machine's suggestion) and Custom; each shows what it would
-// hold and is greyed when it doesn't fit. Never set by itself: the default is Off.
 const gbText = (b) => b >= 1 << 30 ? `${(b / (1 << 30)).toFixed(b >= 10 * (1 << 30) ? 0 : 1)} GB` : b >= 1048576 ? `${(b / 1048576).toFixed(1)} MB` : b > 0 ? `${Math.max(1, Math.round(b / 1024))} kB` : "0";
 function diskLine(k) {
   const b = k.budget || {};
@@ -38,76 +40,18 @@ function diskLine(k) {
   const keep = k.mb ? `ARCADE keep <b>${gbText(k.mb * 1048576)}</b> (holding ${gbText(b.keep_bytes || 0)})` : "ARCADE keep <b>off</b>";
   return `${chains} · ${keep} · <b>${gbText(b.free_bytes || 0)}</b> free`;
 }
-function holdsText(hd, bytes) {
-  if (!hd || !bytes) return "Holds nothing for the network.";
-  if (!hd.of_segments) return "Holds segments once there are files on the chain under the fog rules.";
-  const short = hd.short ? ` · short today: holds ${hd.short_held} of ${hd.short}${hd.short_filled ? `, ${hd.short_filled} reach their floor with it` : ""}` : " · nothing is short today";
-  return `Would hold ${hd.segments} of ${hd.of_segments} segments (${hd.blobs} of ${hd.of_blobs} files, ${gbText(hd.bytes)})${short}`;
-}
-function keepRow(id, name, sub, bytes, fits, note, k) {
-  const on = k.choice === id;
-  const el = h("label", { class: "keep-opt" + (on ? " on" : "") + (fits ? "" : " off") },
-    h("input", { type: "radio", name: "o-keep-pick", value: id }),
-    h("span", { class: "ko-name" }, name, sub ? h("small", {}, sub) : null),
-    h("span", { class: "ko-note" }, note));
-  const r = el.querySelector("input");
-  r.checked = on; r.disabled = !fits;
-  r.addEventListener("change", () => pickKeep(id, bytes));
-  return el;
-}
-async function refreshKeep() {
+// The disk line on Chains & Coins (arc.keep, crate::diskbudget): information only; its button opens the Storage app.
+async function refreshDisk() {
   let k;
-  try { k = await api("arc.keep"); } catch (e) {
-    $("o-keep-disk").textContent = "—"; $("o-keep-what").textContent = "the ARCADE chain isn't running here"; return;
-  }
-  $("o-keep-disk").innerHTML = diskLine(k);
+  try { k = await api("arc.keep"); } catch (e) { $("c-disk").textContent = "—"; return; }
   $("c-disk").innerHTML = diskLine(k);
-  const free = k.budget?.free_bytes || 0;
-  const rows = [];
-  for (const p of k.presets) {
-    const sub = p.id === "off" ? "keeps none" : `${gbText(p.bytes)} now, of ${gbText(free)} free · leaves ${gbText(p.leaves_free)}`;
-    const note = p.id === "off" ? "This machine keeps no ARCADE data for the network (it still works fully)." : p.fits ? holdsText(p.holds, p.bytes) : `Not enough free space: never past ${k.free_floor_gb} GB left free, after what your chains will grow to.`;
-    rows.push(keepRow(p.id, p.label, sub, p.bytes, p.fits, note, k));
-  }
-  const sg = k.suggested || {};
-  rows.push(keepRow("suggested", "Suggested for this machine", sg.bytes ? `${gbText(sg.bytes)} · leaves ${gbText(Math.max(0, free - sg.bytes))} free` : "none",
-    sg.bytes, sg.bytes > 0,
-    sg.bytes ? `A quarter of the free space past what Chains & Coins will still grow by (${gbText(k.budget?.reserve_bytes || 0)}) and ${k.free_floor_gb} GB. ${holdsText(sg.holds, sg.bytes)}`
-             : `Nothing to suggest: ${gbText(free)} free, ${gbText(k.budget?.reserve_bytes || 0)} of it for your chains to grow, ${k.free_floor_gb} GB always left free.`,
-    { ...k, choice: k.choice === "custom" && sg.bytes && k.mb === sg.mb ? "suggested" : k.choice }));
-  $("o-keep-list").replaceChildren(...rows);
-  $("o-keep-custom").checked = k.choice === "custom" && !(sg.bytes && k.mb === sg.mb);
-  if (document.activeElement !== $("o-keep-in")) $("o-keep-in").value = +(k.mb / 1024).toFixed(1);
-  const w = k.would_hold || {};
-  $("o-keep-what").textContent = (k.mb ? holdsText(k.custom_holds, k.mb * 1048576) + "." : "") +
-    (w.on ? ` The network has ${w.network_segments || 0} segments of files (${gbText(w.network_bytes || 0)}); ${w.short_segments || 0} short of copies now.` : " Fog storage isn't on yet at the chain's height.") +
-    (k.chosen ? "" : ` Not chosen here yet: the default is ${k.default_mb ? gbText(k.default_mb * 1048576) : "Off"}.`);
   return k;
 }
-async function pickKeep(id, bytes) {
-  const args = id.startsWith("pct:") ? { pct: Number(id.slice(4)) } : id === "off" ? { mb: 0 } : { mb: Math.round(bytes / 1048576) };
-  try {
-    const k = await api("arc.keep", args);
-    say("o-keep-msg", k.mb ? `Keeping up to ${gbText(k.mb * 1048576)} of ARCADE data${k.pct ? ` (${k.pct}% of free space, recomputed as it changes)` : ""}: segments short of copies first, from the next fog round.` : "Keeping no ARCADE data by choice.");
-    keepPrompt();
-  } catch (e) { say("o-keep-msg", e.message, true); }
-  refreshKeep();
-}
-async function setKeep(gb) {
-  try {
-    const k = await api("arc.keep", { gb });
-    say("o-keep-msg", k.mb ? `Keeping up to ${gbText(k.mb * 1048576)} of ARCADE data: segments short of copies are taken first, at the next fog round.` : "Keeping no ARCADE data by choice.");
-    keepPrompt();
-  } catch (e) { say("o-keep-msg", e.message, true); }
-  refreshKeep();
-}
-$("o-keep-set").addEventListener("click", () => setKeep(Math.max(0, Number($("o-keep-in").value) || 0)));
-$("o-keep-custom").addEventListener("change", () => $("o-keep-in").focus());
-document.querySelector('nav button[data-tab="chains"]')?.addEventListener("click", refreshKeep);
-refreshKeep();
+document.querySelector('nav button[data-tab="chains"]')?.addEventListener("click", refreshDisk);
+refreshDisk();
 
 // The suggestion on Home: for an arcade earning ARCADE with 50 GB or more free that keeps nothing. Dismissable for
-// good; it only opens the setting, it never sets a share.
+// good; it only opens the Storage app's keep settings, it never sets a share.
 async function keepPrompt() {
   let k;
   try { k = await api("arc.keep"); } catch { $("h-keep").hidden = true; return; }
@@ -117,13 +61,10 @@ async function keepPrompt() {
     $("h-keep-text").textContent = `This arcade earns ARCADE and has ${gbText(k.free_bytes)} free, but keeps none of the chain's files for the network.` +
       (w.short_segments ? ` ${w.short_segments} segment${w.short_segments === 1 ? " is" : "s are"} short of copies right now.` : "") +
       ` Suggested for this machine: ${gbText(k.suggested?.bytes || 0)}, after what your chains will grow to.` +
-      " A keep share holds some of them, sealed and paid like your other Earn ARCADE data. Nothing changes unless you choose one.";
+      " A keep share holds some of them, sealed and paid like your other Earn ARCADE data. Nothing changes unless you choose one in the ARCADE Storage app.";
   }
 }
-$("h-keep-go").addEventListener("click", () => {
-  goTab("options");
-  setTimeout(() => { $("o-keep")?.scrollIntoView({ block: "start" }); $("o-keep-in")?.focus(); }, 50);
-});
+$("h-keep-go").addEventListener("click", () => openStorage("h-keep-msg"));
 $("h-keep-no").addEventListener("click", async () => {
   try { await api("arc.keep", { dismiss: true }); } catch {}
   $("h-keep").hidden = true;
@@ -235,8 +176,7 @@ $("o-si-on").addEventListener("change", async (e) => {
 });
 
 async function refreshOptions() {
-  refreshKeep();
-  refreshCache();
+  refreshDisk();
   refreshRelay();
   refreshSysinfo();
   const u = await api("update.status");

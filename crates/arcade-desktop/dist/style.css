@@ -692,14 +692,6 @@ button.linkish { border: 0; background: none; padding: 0; font-size: 11px; color
 .tagpick-card h3 { margin: 0 0 6px; }
 .tagpick-row { display: block; width: 100%; text-align: left; margin: 6px 0; padding: 10px; border-radius: 8px; overflow-wrap: anywhere; }
 
-/* The disk budget line (Chains & Coins and Options) and the keep-share choices. */
+/* The disk budget line (Chains & Coins). */
 .disk-line { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; margin: 8px 0 12px; }
 .disk-line b { font-weight: 600; }
-.keep-list { display: grid; gap: 6px; margin: 10px 0; }
-.keep-opt { display: grid; grid-template-columns: auto 1fr; gap: 2px 10px; align-items: baseline; background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 8px 12px; cursor: pointer; }
-.keep-opt.on { border-color: var(--accent, #2e7d32); }
-.keep-opt.off { opacity: .45; cursor: not-allowed; }
-.keep-opt .ko-name { font-weight: 600; }
-.keep-opt .ko-name small { font-weight: 400; color: var(--muted); margin-left: 6px; }
-.keep-opt .ko-note { grid-column: 2; color: var(--muted); font-size: .92em; }
-.keep-opt .ko-tag { display: inline-block; font-size: .8em; padding: 0 6px; border-radius: 8px; border: 1px solid var(--line); margin-left: 6px; }

@@ -1243,6 +1243,11 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         // Fog storage (rules version 5, crate::fogstore): the share kept by choice, and what the fog keeps here.
         "arc.keep" => crate::fogstore::api_keep(node, req),
         "arc.fog" => Ok(crate::fogstore::status()),
+        // What this arcade keeps by its operator's choice, and forgets (crate::fogkeep; the Storage app's Mine tab).
+        "fog.keep" => crate::fogkeep::api(node, "keep", req),
+        "fog.forget" => crate::fogkeep::api(node, "forget", req),
+        "fog.undo" => crate::fogkeep::api(node, "undo", req),
+        "fog.mine" => crate::fogkeep::mine(node),
         // The viewer cache (§15 step 4): its size in MB (0: off; on by default at 2,048) and what it holds.
         "arc.cache" => {
             if let Some(mb) = req["mb"].as_u64() {

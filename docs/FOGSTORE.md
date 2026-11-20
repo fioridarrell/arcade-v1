@@ -132,6 +132,49 @@ who steps in, never as a copy count for a listed segment.
 - `explorer.arc_storage_summary` (what the ARCADE Storage app reads) carries them as `floors` (per class), `short`
   (segments and blobs below their floor) and `fog` (this arcade's settings, keep share and blobs held).
 
+## Node storage management (keep, pin, forget; the Storage app)
+
+Martin 2026-11-19: operators "opt into being additional keepers for data that they value and opt out of keeping any
+data that they wish to forget" (docs/STORAGEAPP.md in the plans). `crate::fogkeep`, the choices kept per network in
+`<home>/arc/<net>/fog-choices.json`:
+
+- `fog.keep {segment | blob | publisher, mode?: "segment" | "pin", preview?}` (Admin):
+  - `segment` (default): this arcade becomes a chosen keeper of the blob's whole segment (`P#n` / `T#n`; a publisher:
+    every segment holding its blobs). Counted once registered and audited, sealed and paid, inside the keep share. The
+    fog round never lets a chosen segment go above the floor as it does segments the share took by itself; over the
+    share, chosen segments go last. A full share is refused with the reason, or room is made by letting go of
+    segments the share took by itself whose copies hold without this arcade (the card lists them).
+  - `pin` (a blob; a large blob with its parts): one uncounted extra copy, never faded, served to anyone. It uses the
+    keep share and earns nothing (decided 2026-11-19).
+  - Refused with the reason on a borrowed ARCADE chain ("no keep share: ... borrows everything") or with no keep share.
+- `fog.forget {segment | blob | publisher, preview?}` (Admin): the local forget list. Its blobs are dropped here (viewer
+  cache, grace copy, pins; a blob this arcade published is un-pinned, its `.mine` mark goes) and refused from then on:
+  `arcblob::view` doesn't fetch them, `bq` asks get "not here", `fetch_keep` skips them, and the holder bloom leaves them
+  out. A blob in a segment this arcade keeps keeps its bytes (the network is owed the segment) but is still never
+  served. A forgotten segment is never taken again until undone.
+- **Hand-over.** Forgetting a segment this arcade keeps doesn't drop it: the hold announcement lists it under `leave`,
+  every arcade counts leaving keepers out of its keep decisions, so the next ranked arcade with room steps in (the
+  lost-keeper path), and this arcade drops its copy only once the copies counted without it are back to
+  `min(floor, copies when forgotten)`: the new keeper registered and passed an audit. An open segment (not listed:
+  nothing can be registered) waits for a new keeper that announces it and holds every blob of it. With no arcade
+  announcing room, it stays a keeper and `fog.mine` says so. On the drop its sealed copy is deleted: it stops answering
+  audits, so the registry removes it the usual way (3 missed); nothing is written on a chain. The sealing run never
+  goes back over a segment let go (`fogkeep::released_end`).
+- `fog.undo {id}` (Admin): takes back a keep, pin or forget (a hand-over not finished stops: it stays a keeper).
+- `fog.mine` (Admin): kept by choice (with pay estimates), pins, forgotten, handing over (`handing over (n/floor)` and
+  why it waits), the keep share (`none · borrows everything` on a borrowed arcade), each segment kept here (counted or
+  not), its blobs by role and how much of the map is in the fog for it. Never public.
+- **From an app page** (the Storage app): `POST /r/fog/<keep|forget|undo>` files a request (kind `fog`) in the wallet's
+  approval queue, as `/r/repo/<op>` does; Arcade V1.0's app window shows its card (`appwindow.js`: what it does, size,
+  copies before and after, pay estimate, seal time on this machine from `sysinfo::seal_speed`) with Approve / Refuse.
+  `GET /r/fog/req/<id>` is where it stands; `GET /r/fog/mine` is `fog.mine` for a page this arcade serves its operator.
+  The card is worked out again when shown (`wallet.preview`) and applied on approval; nothing changes before.
+- Pay estimate: the segment's weight B/n (n = copies with this arcade) against all pay weight now (owners' replicas and
+  the genesis bytes), of 49 ARCADE a block over a 30-day month. An estimate, labeled so.
+- Closed test nets never complete a 10,000-block range, so nothing is listed or audited there:
+  `ARCADE_FOG_TEST_AUDIT_SECS=n` (local chains only) counts an announced keeper as registered at once and audited once
+  it has kept the segment n seconds holding every blob (`fogstore::test_counted`). See `tests/regtest/fogkeepnet.py`.
+
 ## Switching it on
 
 The ARCADE testnet has no version 5 height yet. A release adds `(5, height)` to `params::TESTNET.rules`. A closed test

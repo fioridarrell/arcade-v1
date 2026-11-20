@@ -513,7 +513,7 @@ pub fn auto_seal(node: &Node, net: &Net, catalog: &Catalog, height: u64) {
 /// The next height of a family to seal here, and the last that is settled (no further than its index has journaled);
 /// None while nothing is settled.
 fn seal_work(node: &Node, net: &Net, p: &ChainParams, family: u8) -> Option<(u64, u64)> {
-    let closed = crate::arcseal::replicas(node, net).iter().filter(|r| r.chain == p.key && r.family == family).map(|r| r.last + 1).max().unwrap_or(0);
+    let closed = crate::arcseal::replicas(node, net).iter().filter(|r| r.chain == p.key && r.family == family).map(|r| r.last + 1).max().unwrap_or(0).max(crate::fogkeep::released_end(p.key, family));
     let open = crate::arcseal::opens(node, net).into_iter().find(|o| o.chain == p.key && o.family == family && o.first == closed);
     let next = open.and_then(|o| o.through).map(|t| t + 1).unwrap_or(closed);
     let tip = tip_of(node, p) as u64;
@@ -544,7 +544,7 @@ fn seal_on(node: &Node, net: &Net, p: &'static ChainParams, family: u8, full: u6
             prune(r.first, r.last);
         }
         let Some((next, settled)) = seal_work(node, net, p, family).filter(|(n, s)| n <= s) else { return Ok(()) };
-        let closed = crate::arcseal::replicas(node, net).iter().filter(|r| r.chain == p.key && r.family == family).map(|r| r.last + 1).max().unwrap_or(0);
+        let closed = crate::arcseal::replicas(node, net).iter().filter(|r| r.chain == p.key && r.family == family).map(|r| r.last + 1).max().unwrap_or(0).max(crate::fogkeep::released_end(p.key, family));
         let mut open = crate::arcseal::Open::start(node, net, p.key, family, closed)?;
         // A segment that ended at its range's end but whose close didn't go: closed again before anything is added.
         if open.is_full(RANGE, full) {
@@ -627,7 +627,7 @@ pub fn earn_progress(node: &Node, net: &Net, p: &ChainParams) -> (u64, u64) {
 
 /// Where sealing a family of a coin stands: sealed up to which height of how many.
 pub fn family_progress(node: &Node, net: &Net, p: &ChainParams, family: u8) -> (u64, u64) {
-    let closed = crate::arcseal::replicas(node, net).iter().filter(|r| r.chain == p.key && r.family == family).map(|r| r.last + 1).max().unwrap_or(0);
+    let closed = crate::arcseal::replicas(node, net).iter().filter(|r| r.chain == p.key && r.family == family).map(|r| r.last + 1).max().unwrap_or(0).max(crate::fogkeep::released_end(p.key, family));
     // Sealed block by block: the open segment's through counts too.
     let open = crate::arcseal::opens(node, net).into_iter().filter(|o| o.chain == p.key && o.family == family && o.first == closed).find_map(|o| o.through).map(|t| t + 1);
     (open.unwrap_or(closed).max(closed), tip_of(node, p) as u64 + 1)

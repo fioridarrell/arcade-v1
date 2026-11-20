@@ -253,6 +253,10 @@ fn cache_put(id: &Hash, bytes: &[u8]) {
 /// A blob for a viewer: here (stored, waiting, sealed, cached), else fetched from the arcades this one is linked to and
 /// kept in the cache, so a blob many view spreads to many arcades and leaves them when nobody views it any more.
 pub fn view(id: &Hash) -> Option<Vec<u8>> {
+    // Forgotten here by the operator (crate::fogkeep): never fetched or kept again until that's undone.
+    if crate::fogkeep::refused(id) {
+        return None;
+    }
     if let Some(b) = get(id).or_else(|| cached(id)) {
         touch(id);
         return Some(b);
@@ -370,7 +374,8 @@ pub fn serve_piece(link: &mut arcade_mesh::link::Link, head: &serde_json::Value)
     let id_n = head["id"].as_u64().unwrap_or(0);
     let at = head["at"].as_u64().unwrap_or(0);
     let id = head["b"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| <Hash>::try_from(b).ok());
-    let piece = id.as_ref().and_then(|id| read_piece(id, at, PIECE as usize));
+    // Forgotten here (crate::fogkeep): "not here", as if it never was.
+    let piece = id.as_ref().filter(|id| !crate::fogkeep::refused(id)).and_then(|id| read_piece(id, at, PIECE as usize));
     let mut f = crate::arcsvc::keeper_frame("a", serde_json::json!({"id": id_n}));
     match (id, piece) {
         (Some(id), Some((len, bytes))) => {
@@ -593,6 +598,22 @@ pub fn mark_mine(id: &Hash) {
     let _ = std::fs::write(mine_path(id), b"");
 }
 
+/// Un-mark a blob this arcade published (`fog.forget` on its own blob, crate::fogkeep): it fades like any other.
+pub fn unmark_mine(id: &Hash) {
+    let _ = std::fs::remove_file(mine_path(id));
+}
+
+/// Drop a blob's copy in the viewer cache. Bytes freed.
+pub fn drop_cached(id: &Hash) -> u64 {
+    let n = hex::encode(id);
+    let p = cache_dir().join(&n);
+    let len = std::fs::metadata(&p).map(|m| m.len()).unwrap_or(0);
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(cache_dir().join(format!("{n}.kind")));
+    let _ = std::fs::remove_file(cache_dir().join(format!("{n}.gz")));
+    len
+}
+
 /// Whether this arcade published the blob.
 pub fn is_mine(id: &Hash) -> bool {
     mine_path(id).exists()
@@ -706,6 +727,9 @@ pub fn fetch_any(node: &crate::node::Node, id: &Hash) -> Option<(Vec<u8>, String
 
 /// Fetch a blob a kept segment lacks and keep it in the store (not counted as viewed). Whether it's here now.
 pub fn fetch_keep(node: &crate::node::Node, id: &Hash) -> bool {
+    if crate::fogkeep::refused(id) {
+        return false;
+    }
     let Some((b, ..)) = fetch_any(node, id) else { return false };
     let p = path(id);
     let tmp = p.with_extension("in");

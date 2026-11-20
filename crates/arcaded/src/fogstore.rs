@@ -267,7 +267,25 @@ pub fn kept_mb_used(node: &Node) -> u64 {
 
 fn kept_bytes(node: &Node) -> u64 {
     let segs = kept_segs(node);
-    crate::arcblob::known().iter().filter(|(_, m)| segs.contains(&(family_of(m.class), m.height / RANGE))).map(|(id, _)| crate::arcblob::size_here(id)).sum()
+    // Pinned blobs (crate::fogkeep, "Pin just this blob") use the keep share too, outside the segments kept.
+    let pins = crate::fogkeep::snapshot().pins();
+    crate::arcblob::known()
+        .iter()
+        .filter(|(id, m)| segs.contains(&(family_of(m.class), m.height / RANGE)) || pins.contains(&hex::encode(id)))
+        .map(|(id, _)| crate::arcblob::size_here(id))
+        .sum()
+}
+
+/// Keep segments by the operator's choice now (crate::fogkeep, `fog.keep`): added to the kept set at once (the next
+/// round fetches and seals them), `replaced` (segments the share took by itself, with copies to spare) let go to make
+/// room.
+pub fn keep_now(node: &Node, segs: &[(u8, u64)], replaced: &[(u8, u64)]) {
+    let mut kept = kept_segs(node);
+    for s in replaced {
+        kept.remove(s);
+    }
+    kept.extend(segs.iter().copied());
+    save_segs(node, &kept);
 }
 
 // ---------------- the holder announcement ----------------
@@ -313,19 +331,24 @@ fn room_mb(node: &Node) -> u64 {
 /// `bm`: a bloom of the blobs this arcade published (the fog map's publisher role); `km`, `ku`: its keep share and what
 /// the share holds, in MB (the fog map's per-node panel).
 pub fn announce(node: &Node) -> Value {
-    let ids = crate::arcblob::held_ids();
+    // What the operator forgot here is left out (crate::fogkeep): nobody is sent to fetch it from this arcade.
+    let ids: Vec<Hash> = crate::arcblob::held_ids().into_iter().filter(|id| !crate::fogkeep::refused(id)).collect();
     let mine: Vec<Hash> = ids.iter().filter(|id| crate::arcblob::is_mine(id)).copied().collect();
     let keep: Vec<Value> = kept_segs(node).into_iter().take(256).map(|(f, i)| json!([f, i])).collect();
-    json!({"bf": bloom(&ids), "bn": ids.len(), "bm": bloom(&mine), "mn": mine.len(), "keep": keep, "room": room_mb(node),
+    // Segments it is handing over (forgotten while it keeps them): other arcades count it out, so one steps in.
+    let leave: Vec<Value> = crate::fogkeep::snapshot().handing_over().into_iter().take(256).map(|(f, i)| json!([f, i])).collect();
+    json!({"bf": bloom(&ids), "bn": ids.len(), "bm": bloom(&mine), "mn": mine.len(), "keep": keep, "leave": leave, "room": room_mb(node),
            "km": keep_mb(node), "ku": kept_bytes(node) >> 20})
 }
 
 /// An announcement as kept from another arcade: only these fields, each in its form and size.
 pub fn clean(v: &Value) -> Option<Value> {
     let bf = v["bf"].as_str().filter(|s| s.len() <= 2 * BLOOM_MAX && s.bytes().all(|c| c.is_ascii_hexdigit()))?;
-    let keep: Vec<Value> = v["keep"].as_array().map(|a| a.iter().take(256).filter_map(|x| Some(json!([x[0].as_u64().filter(|f| *f < 256)?, x[1].as_u64()?]))).collect()).unwrap_or_default();
+    let pairs = |k: &str| -> Vec<Value> { v[k].as_array().map(|a| a.iter().take(256).filter_map(|x| Some(json!([x[0].as_u64().filter(|f| *f < 256)?, x[1].as_u64()?]))).collect()).unwrap_or_default() };
+    let keep = pairs("keep");
+    let leave = pairs("leave");
     let bm = v["bm"].as_str().filter(|s| s.len() <= 2 * BLOOM_MAX && s.bytes().all(|c| c.is_ascii_hexdigit())).unwrap_or("");
-    Some(json!({"bf": bf, "bn": v["bn"].as_u64().unwrap_or(0), "bm": bm, "mn": v["mn"].as_u64().unwrap_or(0), "keep": keep, "room": v["room"].as_u64().unwrap_or(0),
+    Some(json!({"bf": bf, "bn": v["bn"].as_u64().unwrap_or(0), "bm": bm, "mn": v["mn"].as_u64().unwrap_or(0), "keep": keep, "leave": leave, "room": v["room"].as_u64().unwrap_or(0),
                 "km": v["km"].as_u64().unwrap_or(0), "ku": v["ku"].as_u64().unwrap_or(0)}))
 }
 
@@ -487,7 +510,57 @@ fn holders_of_seg(ann: &[(String, Value)], me: &str, mine: bool, family: u8, ind
     if mine && !keepers.iter().any(|k| k == me) {
         keepers.push(me.to_string());
     }
-    SegHolders { registered: crate::arcsvc::segment_holders(family, index * RANGE), keepers }
+    let registered = crate::arcsvc::segment_holders(family, index * RANGE).or_else(|| test_counted(ann, me, family, index, &keepers));
+    SegHolders { registered, keepers }
+}
+
+/// Who has segment (family, index) now, as a fog round would count it (crate::fogkeep's cards).
+pub fn seg_holders(node: &Node, family: u8, index: u64) -> SegHolders {
+    holders_of_seg(&announcements(node), &node.id_hex(), kept_segs(node).contains(&(family, index)), family, index)
+}
+
+/// The arcades announcing they are leaving segment (family, index) (handing it over, crate::fogkeep).
+fn leaving_of(ann: &[(String, Value)], family: u8, index: u64) -> BTreeSet<String> {
+    ann.iter().filter(|(_, f)| f["leave"].as_array().is_some_and(|a| a.iter().any(|x| x[0] == family as u64 && x[1] == index))).map(|(n, _)| n.clone()).collect()
+}
+
+/// Whether an arcade holds every blob of a segment: its bloom has each (this arcade: the bytes are here).
+fn holds_all(ann: &[(String, Value)], me: &str, who: &str, ids: &[Hash]) -> bool {
+    if who == me {
+        return ids.iter().all(crate::arcblob::bytes_here);
+    }
+    ann.iter().find(|(n, _)| n == who).and_then(|(_, f)| f["bf"].as_str()).is_some_and(|b| ids.iter().all(|id| bloom_has(b, id)))
+}
+
+/// Test hook for a closed local net, which never completes a 10,000-block range so nothing is ever listed, registered or
+/// audited there: with `ARCADE_FOG_TEST_AUDIT_SECS=n` (local chains only), an open segment's announced keepers count as
+/// registered at once, and as audited once they have announced keeping it for n seconds while holding every blob of it.
+/// Off (None) everywhere else: copies are the registry's.
+fn test_counted(ann: &[(String, Value)], me: &str, family: u8, index: u64, keepers: &[String]) -> Option<Vec<(String, bool)>> {
+    if !crate::arcsvc::local() {
+        return None;
+    }
+    let secs: u64 = std::env::var("ARCADE_FOG_TEST_AUDIT_SECS").ok()?.parse().ok()?;
+    static SINCE: std::sync::Mutex<Option<HashMap<(String, u8, u64), u64>>> = std::sync::Mutex::new(None);
+    let now = arcade_app::now();
+    let ids: Vec<Hash> = crate::arcblob::known().into_iter().filter(|(_, m)| family_of(m.class) == family && m.height / RANGE == index).map(|(id, _)| id).collect();
+    let mut g = SINCE.lock().unwrap();
+    let since = g.get_or_insert_with(HashMap::new);
+    since.retain(|k, _| !(k.1 == family && k.2 == index) || keepers.contains(&k.0));
+    Some(keepers
+        .iter()
+        .map(|k| {
+            // The clock starts once it holds every blob (its seal could start); it then stays audited while it keeps
+            // announcing the segment, as a sealed copy passes audits whatever its plain copies (a forgotten blob's).
+            let key = (k.clone(), family, index);
+            let t = match since.get(&key) {
+                Some(t) => Some(*t),
+                None if holds_all(ann, me, k, &ids) => Some(*since.entry(key).or_insert(now)),
+                None => None,
+            };
+            (k.clone(), t.is_some_and(|t| now.saturating_sub(t) >= secs))
+        })
+        .collect())
 }
 
 /// Every other arcade's fresh announcement (node id → its "fog" part), for the storage reads (crate::fogmap).
@@ -556,6 +629,11 @@ pub fn last_round() -> Option<u64> {
 }
 static NODE: std::sync::OnceLock<std::sync::Weak<Node>> = std::sync::OnceLock::new();
 
+/// The node, for code without it at hand (crate::fogkeep): None before the first round.
+pub fn node_now() -> Option<std::sync::Arc<Node>> {
+    NODE.get().and_then(|w| w.upgrade())
+}
+
 /// [`holders`] for code without the node at hand (crate::arcblob::view): empty before the first round.
 pub fn holders_now(id: &Hash) -> Vec<String> {
     NODE.get().and_then(|w| w.upgrade()).map(|n| holders(&n, id)).unwrap_or_default()
@@ -604,7 +682,17 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     }
     let ann = announcements(node);
     let keep_on = keep_mb(node) > 0;
+    // The operator's own choices (crate::fogkeep): segments kept by choice, pins, the forget list, hand-overs.
+    let ch = crate::fogkeep::snapshot();
+    let chosen = ch.chosen();
+    let handing = ch.handing_over();
     let mut segs = kept_segs(node);
+    // A segment kept by choice is kept whatever the round says (within the share; see below; none while it is off).
+    for k in chosen.iter().filter(|_| keep_on) {
+        if by_seg.contains_key(k) && segs.insert(*k) {
+            eprintln!("arc: fog: keeping {} by the operator's choice", crate::fogmap::seg_name(k.0, k.1));
+        }
+    }
     let mut room = room_mb(node) << 20;
     let mut short = Vec::new();
     let mut warnings = Vec::new();
@@ -614,7 +702,17 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     for (&(family, index), metas) in &by_seg {
         let floor = floor_of(family, metas, now, temporary);
         let mine_kept = segs.contains(&(family, index));
-        let held = holders_of_seg(&ann, &me, mine_kept, family, index);
+        let held_all = holders_of_seg(&ann, &me, mine_kept, family, index);
+        // Arcades handing it over (crate::fogkeep) are counted out of every keep decision, so the next ranked with room
+        // steps in while they still hold it; this arcade too when it is the one leaving.
+        let mut leaving = leaving_of(&ann, family, index);
+        if handing.contains(&(family, index)) {
+            leaving.insert(me.clone());
+        }
+        let held = SegHolders {
+            registered: held_all.registered.as_ref().map(|r| r.iter().filter(|x| !leaving.contains(&x.0)).cloned().collect()),
+            keepers: held_all.keepers.iter().filter(|k| !leaving.contains(*k)).cloned().collect(),
+        };
         // Against the floor count only registered, audited replicas; announced keepers not counted (yet) are told apart.
         let (counted_copies, announced, counted) = (held.counted(), held.announced_only(), held.how());
         let copies = held.for_decision();
@@ -627,12 +725,25 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
         // Another arcade is a candidate only with room enough for the whole segment (one with less wouldn't take it,
         // and the segment would wait on it).
         let mut candidates: Vec<String> = ann.iter().filter(|(_, f)| f["room"].as_u64().is_some_and(|r| r > 0 && r.saturating_add(1) << 20 > size)).map(|(n, _)| n.clone()).collect();
-        if keep_on && (mine_kept || room >= size) {
+        let forgotten = ch.seg_forgotten(family, index);
+        candidates.retain(|c| !leaving.contains(c));
+        if keep_on && !forgotten && (mine_kept || room >= size) {
             candidates.push(me.clone());
         }
         let mut rooms: HashMap<String, u64> = ann.iter().map(|(n, f)| (n.clone(), f["room"].as_u64().unwrap_or(0))).collect();
         rooms.insert(me.clone(), room_mb(node));
-        let keep = decide(&me, family, index, floor, copies, mine_kept, &keepers, &candidates, &rooms);
+        let mut keep = decide(&me, family, index, floor, copies, mine_kept, &keepers, &candidates, &rooms);
+        if chosen.contains(&(family, index)) {
+            keep = true;
+        }
+        if forgotten {
+            // Forgotten: never taken here; one kept is handed over (below) before it goes.
+            keep = mine_kept;
+        }
+        if forgotten && mine_kept && !handing.contains(&(family, index)) {
+            // Forgotten, its hand-over done: let go.
+            keep = false;
+        }
         if keep && !mine_kept {
             segs.insert((family, index));
             room = room.saturating_sub(size);
@@ -651,15 +762,37 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
                 family_name(family), index * RANGE, index * RANGE + RANGE - 1));
         }
     }
+    // Hand-overs (crate::fogkeep): a forgotten segment this arcade keeps goes once its new keeper is counted (registered
+    // and audited; open: announced and holding every blob), never before.
+    let ids_of = |family: u8, index: u64| -> Vec<Hash> { known.iter().filter(|(_, m)| family_of(m.class) == family && m.height / RANGE == index).map(|(id, _)| *id).collect() };
+    let look = |family: u8, index: u64| {
+        let held = holders_of_seg(&ann, &me, true, family, index);
+        let leaving = leaving_of(&ann, family, index);
+        let size = seg_bytes.get(&(family, index)).copied().unwrap_or(0);
+        let room = ann.iter().any(|(n, f)| !held.keepers.contains(n) && !leaving.contains(n) && f["room"].as_u64().is_some_and(|r| r > 0 && r.saturating_add(1) << 20 > size));
+        let ids = ids_of(family, index);
+        let ready: BTreeSet<String> = held.keepers.iter().filter(|k| holds_all(&ann, &me, k, &ids)).cloned().collect();
+        Some((held, leaving, room, ready))
+    };
+    for (family, index) in crate::fogkeep::round_handover(&me, &segs, &look) {
+        segs.remove(&(family, index));
+        crate::fogkeep::release_sealed(node, family, index);
+        eprintln!("arc: fog: {} handed over: its new keeper is counted, this arcade's copy goes", crate::fogmap::seg_name(family, index));
+    }
     // Over the share (a segment grew after it was taken: a large blob's parts came block by block, or the operator chose
-    // a smaller share): let go of segments until what's kept fits, those with the most copies first, then the biggest.
+    // a smaller share): let go of segments until what's kept fits, those with the most copies first, then the biggest;
+    // segments kept by the operator's choice last, and never one being handed over (the network is owed it).
     let share = keep_mb(node) << 20;
+    let pins_bytes: u64 = ch.pins().iter().filter_map(|h| hex::decode(h).ok().and_then(|b| <Hash>::try_from(b).ok())).filter(|id| !metas.get(id).is_some_and(|m| segs.contains(&(family_of(m.class), m.height / RANGE)))).map(|id| crate::arcblob::size_here(&id)).sum();
     let mut over: Vec<((u8, u64), u64, usize)> = segs.iter().map(|k| (*k, seg_bytes.get(k).copied().unwrap_or(0), view.iter().find(|v| (v.family, v.index) == *k).map_or(0, |v| v.copies))).collect();
-    let mut total: u64 = over.iter().map(|o| o.1).sum();
-    over.sort_by_key(|o| (std::cmp::Reverse(o.2), std::cmp::Reverse(o.1)));
+    let mut total: u64 = over.iter().map(|o| o.1).sum::<u64>() + pins_bytes;
+    over.sort_by_key(|o| (chosen.contains(&o.0), std::cmp::Reverse(o.2), std::cmp::Reverse(o.1)));
     for (k, bytes, copies) in over {
         if total <= share {
             break;
+        }
+        if handing.contains(&k) {
+            continue;
         }
         segs.remove(&k);
         total -= bytes;
@@ -674,9 +807,18 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let idle = idle_secs();
     let grace = grace_secs();
     let in_kept = |id: &Hash| metas.get(id).is_some_and(|m| segs.contains(&(family_of(m.class), m.height / RANGE)));
+    let pins = ch.pins();
+    let pinned = |id: &Hash| pins.contains(&hex::encode(id));
+    // Forgotten here (crate::fogkeep), and not owed to the network (not in a kept segment): never alive.
+    let refused = |id: &Hash| ch.refused(&crate::fogkeep::key_of(id), &segs);
     let alive = |id: &Hash| {
+        if refused(id) && !in_kept(id) {
+            return false;
+        }
         crate::arcblob::is_mine(id)
+            || pinned(id)
             || in_kept(id)
+
             || metas.get(id).is_some_and(|m| m.time.saturating_add(grace) > now)
             || crate::arcblob::last_use(id).is_some_and(|t| t.saturating_add(idle) > now)
     };
@@ -695,7 +837,13 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     // Fetch what a kept segment lacks, and the rest of the large blobs it keeps a part of (not a view: it doesn't count
     // as one).
     let mut fetched = 0;
-    let wanted = known.iter().filter(|(id, m)| segs.contains(&(family_of(m.class), m.height / RANGE)) && !crate::arcblob::here(id)).map(|(id, _)| *id).chain(whole_fetch);
+    // Pinned blobs (crate::fogkeep) are fetched to be kept as well.
+    let wanted = known
+        .iter()
+        .filter(|(id, m)| (segs.contains(&(family_of(m.class), m.height / RANGE)) || pinned(id)) && !crate::arcblob::here(id))
+        .map(|(id, _)| *id)
+        .chain(whole_fetch)
+        .filter(|id| !refused(id) || in_kept(id));
     for id in wanted {
         if fetched >= 64 {
             break;
@@ -708,6 +856,18 @@ fn round_inner(node: &Node, net: &Net, temporary: u64, archive: bool) -> Option<
     let (mut dropped, mut freed) = (0, 0u64);
     if !archive {
         for (id, m) in &known {
+            if pinned(id) {
+                continue;
+            }
+            // Forgotten here and owed to nobody: its bytes go now, new or viewed (crate::fogkeep).
+            if refused(id) && !in_kept(id) && !crate::arcblob::is_mine(id) {
+                let n = crate::arcblob::drop_plain(id) + crate::arcblob::drop_cached(id);
+                if n > 0 {
+                    freed += n;
+                    dropped += 1;
+                }
+                continue;
+            }
             if crate::arcblob::is_mine(id) {
                 continue;
             }

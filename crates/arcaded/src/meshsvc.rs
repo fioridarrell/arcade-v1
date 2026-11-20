@@ -1181,7 +1181,7 @@ fn serve_loop(
             run = 0;
             // Queued frames: every link sends every frame once (those still in the ring).
             let pending: Vec<Value> = {
-                let (v, next) = node.mesh_outbox.lock().unwrap().since(*sent_outbox);
+                let (v, next) = node.mesh_outbox.lock().unwrap().since_budget(*sent_outbox, crate::crvia::TURN_BYTES);
                 *sent_outbox = next;
                 v
             };
@@ -1236,8 +1236,8 @@ fn serve_loop(
             // Wait briefly for a frame, so queued room frames go out within ~50 ms (2 ms while the
             // fast lane is busy).
         }
-        // Reading a run, or more queued for this peer than one turn sends (crvia::TURN_BYTES): only a look for a frame.
-        let wait = if run > 0 || crate::crvia::queued(peer) { 0 } else if crate::realtime::fast::busy() { 2 } else { 50 };
+        // Reading a run, or more queued than one turn sends (crvia::TURN_BYTES, the outbox): only a look for a frame.
+        let wait = if run > 0 || crate::crvia::queued(peer) || node.mesh_outbox.lock().unwrap().has_since(*sent_outbox) { 0 } else if crate::realtime::fast::busy() { 2 } else { 50 };
         if !link.ready(Duration::from_millis(wait))? {
             run = 0;
             // Checked only with nothing waiting to be read, so a long turn of this loop isn't taken for silence.

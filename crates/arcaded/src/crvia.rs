@@ -72,10 +72,36 @@ pub fn peer_of(lender: &str) -> Option<&str> {
     lender.strip_prefix(PREFIX)
 }
 
-/// Send what is queued for this link's peer (from the link's loop).
+/// Most bytes one turn of a link's loop sends from the queue. The loop sends, then reads: two arcades each with a
+/// large backlog for the other (clip bytes one way, screening requests the other) both blocked in their writes with
+/// neither reading, every link timed out after ~20 s and the next did the same (GX10 and txtok.app, 2026-11-19).
+/// Below what two socket buffers hold, each turn's writes finish and the loop reads before sending more.
+pub const TURN_BYTES: usize = 128 * 1024;
+
+/// Whether frames are still queued for `peer` (its link's loop doesn't wait before its next turn).
+pub fn queued(peer: &str) -> bool {
+    PEERS.lock().unwrap().get(peer).is_some_and(|p| !p.out.is_empty())
+}
+
+/// Frames to send this turn: at least one, then while under TURN_BYTES.
+fn take_turn(p: &mut Peer) -> Vec<Frame> {
+    let mut out = Vec::new();
+    let mut bytes = 0usize;
+    while let Some(f) = p.out.front() {
+        let n = f.blob.len() + 256;
+        if !out.is_empty() && bytes + n > TURN_BYTES {
+            break;
+        }
+        bytes += n;
+        out.push(p.out.pop_front().unwrap());
+    }
+    out
+}
+
+/// Send what is queued for this link's peer, up to TURN_BYTES (from the link's loop).
 pub fn tick(peer: &str, link: &mut Link) -> Result<(), LinkError> {
     let out: Vec<Frame> = match PEERS.lock().unwrap().get_mut(peer) {
-        Some(p) if !p.out.is_empty() => p.out.drain(..).collect(),
+        Some(p) if !p.out.is_empty() => take_turn(p),
         _ => return Ok(()),
     };
     for (i, f) in out.iter().enumerate() {
@@ -190,5 +216,31 @@ mod tests {
         assert!(a.send(&Frame::new(json!({}))).is_err());
         assert_eq!(peer_of(&name(&peer)), Some(peer.as_str()));
         assert_eq!(peer_of("1.2.3.4:8421"), None);
+    }
+
+    #[test]
+    fn a_turn_sends_a_budget_then_reads() {
+        let peer = "cd".repeat(32);
+        up(&peer);
+        for i in 0..20 {
+            let mut f = Frame::new(json!({"t": "sv", "op": "a", "id": 1, "seq": i}));
+            f.blob = vec![0u8; 48 * 1024];
+            send(&peer, f).unwrap();
+        }
+        let mut all = PEERS.lock().unwrap();
+        let p = all.get_mut(&peer).unwrap();
+        let first = take_turn(p);
+        assert!(!first.is_empty() && first.len() < 20, "a turn is bounded: {}", first.len());
+        assert!(first.iter().map(|f| f.blob.len()).sum::<usize>() <= TURN_BYTES);
+        assert_eq!(first[0].head["seq"], json!(0), "in order");
+        assert_eq!(p.out.front().unwrap().head["seq"], json!(first.len()));
+        let mut big = Frame::new(json!({}));
+        big.blob = vec![0u8; TURN_BYTES * 2];
+        p.out.clear();
+        p.out.push_back(big);
+        assert_eq!(take_turn(p).len(), 1, "a frame over the budget still goes, alone");
+        drop(all);
+        assert!(!queued(&peer));
+        down(&peer);
     }
 }

@@ -1149,6 +1149,9 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Most frames a link's loop reads in a row before it sends again (pings and pongs keep going between runs).
+const READ_RUN: usize = 64;
+
 fn serve_loop(
     node: &Node,
     link: &mut Link,
@@ -1169,65 +1172,74 @@ fn serve_loop(
     // is dead (a relayed link whose far end is gone, a socket the network dropped without a reset): it ends, so the two
     // arcades can link again, instead of staying "linked" with nothing going through (seen 2026-11-16, ARCADE #19).
     let mut heard = std::time::Instant::now();
+    // Frames read in a row since this loop last sent. While the peer has more for us, we read it before sending more
+    // (up to READ_RUN): two arcades that each sent before reading, with a large backlog for the other, both blocked in
+    // their writes and every link timed out (GX10 and txtok.app, 2026-11-19).
+    let mut run = 0usize;
     loop {
-        // Queued frames: every link sends every frame once (those still in the ring).
-        let pending: Vec<Value> = {
-            let (v, next) = node.mesh_outbox.lock().unwrap().since(*sent_outbox);
-            *sent_outbox = next;
-            v
-        };
-        for f in pending {
-            link.send(&Frame::new(f))?;
-        }
-        // Room traffic for this link (routed, not flooded).
-        for f in crate::realtime::take(peer, conn) {
-            link.send(&f)?;
-        }
-        // UDP path: ask, switch over, fall back; proofs and introductions for this link.
-        crate::udpsvc::tick(node, link)?;
-        crate::coreboot::tick(node, link)?;
-        crate::vxshare::tick(node, link)?;
-        crate::arcsvc::tick(node, link)?;
-        crate::arcgenesis::tick(&link.peer_id.clone(), link)?;
-        crate::arccode::tick(&link.peer_id.clone(), link)?;
-        crate::shares::tick(link)?;
-        crate::mempoolshare::tick(node, peer, link)?;
-        crate::crvia::tick(peer, link)?;
-        crate::relaysvc::tick(node, link)?;
-        #[cfg(feature = "oldimport")]
-        crate::lxfetch::tick(link)?;
-        #[cfg(feature = "oldimport")]
-        crate::dxfetch::tick(link)?;
-        if last_me.elapsed() > Duration::from_secs(60) {
-            link.send(&Frame::new(operator_me(node)))?;
-            // The chains we lend, again when they change (a chain finishing its sync, say).
-            if let Some(o) = crate::coreshare::offer(node) {
-                if *last_offer != o.head["nets"] {
-                    *last_offer = o.head["nets"].clone();
-                    link.send(&o)?;
+        if run == 0 || run >= READ_RUN {
+            run = 0;
+            // Queued frames: every link sends every frame once (those still in the ring).
+            let pending: Vec<Value> = {
+                let (v, next) = node.mesh_outbox.lock().unwrap().since(*sent_outbox);
+                *sent_outbox = next;
+                v
+            };
+            for f in pending {
+                link.send(&Frame::new(f))?;
+            }
+            // Room traffic for this link (routed, not flooded).
+            for f in crate::realtime::take(peer, conn) {
+                link.send(&f)?;
+            }
+            // UDP path: ask, switch over, fall back; proofs and introductions for this link.
+            crate::udpsvc::tick(node, link)?;
+            crate::coreboot::tick(node, link)?;
+            crate::vxshare::tick(node, link)?;
+            crate::arcsvc::tick(node, link)?;
+            crate::arcgenesis::tick(&link.peer_id.clone(), link)?;
+            crate::arccode::tick(&link.peer_id.clone(), link)?;
+            crate::shares::tick(link)?;
+            crate::mempoolshare::tick(node, peer, link)?;
+            crate::crvia::tick(peer, link)?;
+            crate::relaysvc::tick(node, link)?;
+            #[cfg(feature = "oldimport")]
+            crate::lxfetch::tick(link)?;
+            #[cfg(feature = "oldimport")]
+            crate::dxfetch::tick(link)?;
+            if last_me.elapsed() > Duration::from_secs(60) {
+                link.send(&Frame::new(operator_me(node)))?;
+                // The chains we lend, again when they change (a chain finishing its sync, say).
+                if let Some(o) = crate::coreshare::offer(node) {
+                    if *last_offer != o.head["nets"] {
+                        *last_offer = o.head["nets"].clone();
+                        link.send(&o)?;
+                    }
                 }
+                *last_me = std::time::Instant::now();
             }
-            *last_me = std::time::Instant::now();
-        }
-        if last_hold.elapsed() > Duration::from_secs(crate::shares::every().clamp(20, 120)) {
-            link.send(&crate::shares::hold_frame(node))?;
-            *last_hold = std::time::Instant::now();
-        }
-        if last_sz.elapsed() > Duration::from_secs(3600) {
-            if let Some(sz) = crate::sizes::frame(node) {
-                link.send(&Frame::new(sz))?;
+            if last_hold.elapsed() > Duration::from_secs(crate::shares::every().clamp(20, 120)) {
+                link.send(&crate::shares::hold_frame(node))?;
+                *last_hold = std::time::Instant::now();
             }
-            *last_sz = std::time::Instant::now();
+            if last_sz.elapsed() > Duration::from_secs(3600) {
+                if let Some(sz) = crate::sizes::frame(node) {
+                    link.send(&Frame::new(sz))?;
+                }
+                *last_sz = std::time::Instant::now();
+            }
+            if last_ping.elapsed() > Duration::from_secs(15) {
+                link.send(&Frame::new(json!({"t": "ping", "n": crate::linkrtt::ping_n(peer)})))?;
+                crate::udpsvc::keepalive(link)?;
+                *last_ping = std::time::Instant::now();
+            }
+            // Wait briefly for a frame, so queued room frames go out within ~50 ms (2 ms while the
+            // fast lane is busy).
         }
-        if last_ping.elapsed() > Duration::from_secs(15) {
-            link.send(&Frame::new(json!({"t": "ping", "n": crate::linkrtt::ping_n(peer)})))?;
-            crate::udpsvc::keepalive(link)?;
-            *last_ping = std::time::Instant::now();
-        }
-        // Wait briefly for a frame, so queued room frames go out within ~50 ms (2 ms while the
-        // fast lane is busy).
-        let wait = if crate::realtime::fast::busy() { 2 } else { 50 };
+        // Reading a run, or more queued for this peer than one turn sends (crvia::TURN_BYTES): only a look for a frame.
+        let wait = if run > 0 || crate::crvia::queued(peer) { 0 } else if crate::realtime::fast::busy() { 2 } else { 50 };
         if !link.ready(Duration::from_millis(wait))? {
+            run = 0;
             // Checked only with nothing waiting to be read, so a long turn of this loop isn't taken for silence.
             if heard.elapsed() > LINK_SILENT {
                 return Err(LinkError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, format!("nothing heard for {} s", LINK_SILENT.as_secs()))));
@@ -1240,6 +1252,7 @@ fn serve_loop(
             Err(e) => return Err(e),
         };
         heard = std::time::Instant::now();
+        run += 1;
         match f.kind() {
             "ping" => link.send(&Frame::pong(&f))?,
             "pong" => crate::linkrtt::on_pong(peer, f.head["n"].as_str().unwrap_or(""), crate::relaysvc::is_relayed(link)),

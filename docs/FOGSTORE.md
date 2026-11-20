@@ -165,6 +165,12 @@ Code: `arcade-arc` `params::rules_v6`, `blob.rs` (`FLOORS`, `floor_at`, the upgr
 - **Large blobs:** consensus can't read a manifest (no arcade must keep the bytes), so an upgrade names every blob it
   upgrades. `arc.blob_upgrade` on a large blob's manifest id names the manifest and all its parts in one output and
   pays each one's difference by its own bytes (as each was paid for), i.e. the difference for the total bytes.
+- **A block brings at most 4 MB of blobs by their records.** The lengths the records declare for the blobs a block
+  brings new (a boost of a blob the chain holds brings nothing and doesn't count; each part of a large blob does) add up
+  to at most `blob::MAX_BLOB_BYTES`, or the block is refused (`BlockError::TooBig("declared blobs")`). Until now only the
+  bytes a block carries were capped, and since version 5 a block may come without them, so a writer could declare any
+  amount in a bytes-less block. The pool refuses a transaction declaring more than that, and a block template's blob
+  budget counts the declared lengths (`Pool::pick_with`), so writers never build such a block.
 - **Before the height** an `"aupg"` output is only an OP_RETURN's data, as it always was (older arcades take such
   blocks too, so nothing splits before the switch); the pool and `arc.blob_upgrade` refuse upgrades until then.
 - **API:** `arc.blob_upgrade {id, send?}` (Wallet): without `send` the quote (`bytes`, `already_paid` the Temporary

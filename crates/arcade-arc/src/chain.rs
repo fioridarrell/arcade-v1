@@ -803,12 +803,15 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
         let mut out: Vec<(Hash, State)> = Vec::new();
         let mut here: HashMap<Hash, State> = HashMap::new();
         let mut upgraded: HashSet<Hash> = HashSet::new();
+        // The length the records declare for the blobs the block brings: what it would carry with its bytes.
+        let mut declared = 0u64;
         for (i, tx) in block.txs.iter().enumerate().skip(1) {
             let mut paid: Vec<(blob::Class, u64)> = Vec::new();
             for r in blob::records(tx) {
                 let id = r.id(&self.net);
                 let brings = !self.blobs.contains_key(&id) && !here.contains_key(&id);
                 if brings {
+                    declared = declared.saturating_add(r.len);
                     want.push(id);
                     let st = State::brought(&self.net, r.class, r.len, height);
                     here.insert(id, st.clone());
@@ -860,6 +863,12 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             if fee < need {
                 return Err(ChainError::Block(BlockError::Upgrade(blob::UpgradeError::Underpaid)));
             }
+        }
+        // Rules version 6: the blobs a block brings are at most one block's blob bytes by their records' lengths too, not
+        // only by the bytes it carries (from version 5 a block may come without them, so the carried bytes alone don't
+        // cap it). A boost that brings nothing new doesn't count; a large blob's parts do, each a blob.
+        if v6 && declared > blob::MAX_BLOB_BYTES as u64 {
+            return Err(ChainError::Block(BlockError::TooBig("declared blobs")));
         }
         if block.blob_ids != want {
             return Err(ChainError::Block(BlockError::Blobs("not the blobs its records bring")));
@@ -1833,6 +1842,68 @@ pub(crate) mod tests {
         assert_eq!(c.tip().id, other.tip().id);
         assert_eq!(c.blob_state(&t1).unwrap().upgraded, None);
         assert_eq!(c.blob_state(&t1).unwrap().class_now(), Class::Temporary);
+    }
+
+    #[test]
+    fn rules_v6_a_block_brings_at_most_4_mb_of_blobs_by_their_records() {
+        use crate::blob::{self, Class, Encoding, Record, MAX_BLOB_BYTES};
+        let mut c = chain6();
+        let blocks = grow_to(&mut c, 150);
+        let (sk, pk) = coin_key(3);
+        let lock = p2pkh(&pk);
+        let paid = &blocks[99].txs[0];
+        let vout = paid.outputs.iter().position(|o| o.script_pubkey == lock).unwrap();
+        let from = OutPoint { txid: paid.txid, vout: vout as u32 };
+        let amount = paid.outputs[vout].value;
+        grow_to(&mut c, 199);
+        let sign_with = |t: Tx| {
+            let mut s = Vec::new();
+            push(&mut s, &sign(&t, 0, &lock, &sk, SIGHASH_ALL));
+            push(&mut s, &pk);
+            with_sig(&t, 0, s)
+        };
+        // Block 200: holder 3's pay in four coins.
+        let each = amount / 4 - COIN;
+        let split = sign_with(tx(vec![(from, vec![], u32::MAX)], vec![(each, lock.clone()), (each, lock.clone()), (each, lock.clone()), (each, lock.clone())], 0));
+        assert!(matches!(c.accept(block_txs(&c, ranked(&c)[0], vec![split.clone()], &HashMap::new()), LATE), Ok(Accepted::Tip { .. })));
+        // Records of Temporary blobs of these lengths (made-up contents: the block goes without their bytes, as any block
+        // may from rules version 5), in one transaction spending coin `n`, paying their blob fee.
+        // (Version 5 and 6 rates are the same.) `extra` records go first.
+        let with = |n: u32, lens: &[u64], seed: u8, extra: &[Record]| -> (Tx, Vec<Hash>) {
+            let recs: Vec<Record> = lens.iter().enumerate().map(|(i, &len)| Record { root: [seed + i as u8; 32], len, class: Class::Temporary, encoding: Encoding::Plain, kind: "x".into() }).collect();
+            let all: Vec<&Record> = extra.iter().chain(&recs).collect();
+            let fee = blob::fee_at(&NET6, 201, &all.iter().map(|r| (r.class, r.len)).collect::<Vec<_>>()) + COIN / 100;
+            let mut outs: Vec<(u64, Vec<u8>)> = all.iter().map(|r| (0, r.script())).collect();
+            outs.push((each - fee, lock.clone()));
+            (sign_with(tx(vec![(OutPoint { txid: split.txid, vout: n }, vec![], u32::MAX)], outs, 0)), recs.iter().map(|r| r.id(&NET6)).collect())
+        };
+        let records = |n: u32, lens: &[u64], seed: u8| with(n, lens, seed, &[]);
+        // The block without its blobs' bytes, as it travels once they're dropped.
+        let bytesless = |c: &TestChain, t: Tx, ids: &[Hash]| {
+            let fake: HashMap<Hash, Vec<u8>> = ids.iter().map(|id| (*id, vec![1])).collect();
+            let mut b = block_txs(c, ranked(c)[0], vec![t], &fake);
+            assert_eq!(b.blob_ids.len(), ids.len());
+            b.blobs = vec![Vec::new(); ids.len()];
+            Block::decode(&b.encode()).unwrap().with_blob_ids(&NET6)
+        };
+        let max = MAX_BLOB_BYTES as u64;
+        // Block 201 (version 5): nothing capped the declared lengths (8 MB declared, none carried): taken.
+        let (over5, ids) = records(0, &[max, max], 10);
+        assert!(matches!(c.accept(bytesless(&c, over5, &ids), LATE), Ok(Accepted::Tip { .. })));
+        grow_to(&mut c, 204);
+        // Version 6: one byte over the cap, without the bytes (and so whatever the bytes carried): refused.
+        let (over, ids) = records(1, &[max - 1_000, 1_001], 20);
+        assert_eq!(c.accept(bytesless(&c, over, &ids), LATE), Err(ChainError::Block(BlockError::TooBig("declared blobs"))));
+        let (way_over, ids) = records(1, &[max, max, max], 30);
+        assert_eq!(c.accept(bytesless(&c, way_over, &ids), LATE), Err(ChainError::Block(BlockError::TooBig("declared blobs"))));
+        // At the cap exactly: taken.
+        let (at_cap, ids) = records(1, &[max - 1_000, 1_000], 40);
+        assert!(matches!(c.accept(bytesless(&c, at_cap, &ids), LATE), Ok(Accepted::Tip { .. })));
+        assert!(ids.iter().all(|id| c.holds_blob(id)));
+        // A boost of a blob the chain holds brings nothing, so it doesn't count: 4 MB new beside it is at the cap.
+        let boost = Record { root: [40; 32], len: max - 1_000, class: Class::Boost, encoding: Encoding::Plain, kind: "x".into() };
+        let (both, fresh_ids) = with(2, &[max], 50, &[boost]);
+        assert!(matches!(c.accept(bytesless(&c, both, &fresh_ids), LATE), Ok(Accepted::Tip { .. })), "4 MB new and a boost of a blob held: at the cap");
     }
 
     #[test]

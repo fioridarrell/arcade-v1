@@ -239,6 +239,11 @@ impl Pool {
                 paid.push((r.class, r.len));
             }
         }
+        // More new blobs by their records' lengths than one block brings (a block's cap from rules version 6, and a block
+        // template's always, Pool::pick_with): no block could take it.
+        if blobs.iter().map(|b| b.1).sum::<u64>() > crate::blob::MAX_BLOB_BYTES as u64 {
+            return Err(PoolError::Tx(TxError::TooBig));
+        }
         // Priced as the next block (`height`) will judge it.
         let mut blob_fee = crate::blob::fee_at(net, height, &paid);
         if fee < blob_fee {
@@ -494,6 +499,7 @@ mod tests {
     use secp256k1::SecretKey;
 
     const PREV: Hash256 = Hash256([0xab; 32]);
+    const TESTNET_V6: crate::params::Net = crate::params::Net { rules: &[(3, 0), (5, 1), (6, HEIGHT)], ..crate::params::TESTNET };
     const HEIGHT: u64 = 500;
 
     fn point(n: u32) -> OutPoint {
@@ -778,5 +784,34 @@ mod tests {
         assert_eq!(pool.pick(1_000_000).0.len(), 1);
         assert_eq!(pool.drop_bad_upgrades(&V6, HEIGHT, &state), 1);
         assert_eq!(pool.len(), 1);
+    }
+
+    #[test]
+    fn rules_v6_a_block_picks_at_most_4_mb_of_blobs_by_their_records() {
+        use crate::blob::{self, Class, Encoding, Record, MAX_BLOB_BYTES};
+        let coins = held(6);
+        let (sk, pk) = key(1);
+        let max = MAX_BLOB_BYTES as u64;
+        // Records only (their bytes needn't be here for the pool's own counting), new to the chain.
+        let rec = |seed: u8, len: u64| Record { root: [seed; 32], len, class: Class::Temporary, encoding: Encoding::Plain, kind: "x".into() };
+        let with = |n: u32, recs: &[Record]| {
+            let fee = blob::fee_at(&TESTNET_V6, HEIGHT, &recs.iter().map(|r| (r.class, r.len)).collect::<Vec<_>>()) + COIN / 100;
+            let mut outs: Vec<(u64, Vec<u8>)> = recs.iter().map(|r| (0, r.script())).collect();
+            outs.push((10 * COIN - fee, p2pkh(&pk)));
+            pay(&[point(n)], outs, &sk, &pk)
+        };
+        let none = |_: &crate::merkle::Hash| None;
+        let mut pool = Pool::new(MAX_POOL_BYTES);
+        // One transaction declaring more than a block brings: refused.
+        assert_eq!(pool.add_with(with(0, &[rec(1, max), rec(2, 1)]), &coins, HEIGHT, &TESTNET_V6, &none), Err(PoolError::Tx(TxError::TooBig)));
+        // Two of 3 MB each: both wait, a block takes one (the declared lengths count, not bytes held).
+        pool.add_with(with(1, &[rec(3, 3_000_000)]), &coins, HEIGHT, &TESTNET_V6, &none).unwrap();
+        pool.add_with(with(2, &[rec(4, 3_000_000)]), &coins, HEIGHT, &TESTNET_V6, &none).unwrap();
+        pool.add_with(with(3, &[rec(5, max - 3_000_000)]), &coins, HEIGHT, &TESTNET_V6, &none).unwrap();
+        let new = |_: &crate::merkle::Hash| true;
+        let (txs, _) = pool.pick_with(1_000_000, MAX_BLOB_BYTES, &new);
+        let declared: u64 = txs.iter().flat_map(blob::records).map(|r| r.len).sum();
+        assert_eq!(txs.len(), 2, "one 3 MB and the 1 MB one: at the cap exactly");
+        assert_eq!(declared, max);
     }
 }

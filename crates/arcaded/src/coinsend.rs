@@ -358,61 +358,11 @@ pub fn send_parts(node: &Node, key: Option<&str>, to: &str, parts: &[u64], from:
     Ok(out)
 }
 
-/// `arc.blob_publish`: put `bytes` on the ARCADE chain as a blob (arcade-arc `blob.rs`). See [`publish_blobs`].
-pub fn publish_blob(node: &Node, bytes: &[u8], kind: &str, class: arcade_arc::blob::Class, encoding: arcade_arc::blob::Encoding, send: bool) -> Result<Value, String> {
-    let mut v = publish_blobs(node, &[(bytes.to_vec(), kind.to_string(), class, encoding)], send)?;
-    // One blob: its own fields at the top, as before.
-    if let Some(first) = v["blobs"].get(0).cloned() {
-        for k in ["blob", "root", "bytes", "type", "class", "new"] {
-            v[k] = first[k].clone();
-        }
-    }
-    Ok(v)
-}
-
-/// `arc.blob_publish_many`: blobs in one transaction from this arcade's wallet: a record each, change back, paying
-/// the wallet's rate for its own bytes and the blob fee for every blob the chain doesn't hold yet (and every boost), at
-/// the rate the next block takes (blob::fee_at: 0.01 ARCADE a kB before rules version 5, each class's rate since); into the pool with
-/// the blobs' bytes. At most 4 MB of new blobs (one block's budget) and the transaction under 100 kB. Without `send`,
-/// only what it would be.
-pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool) -> Result<Value, String> {
-    publish_blobs_spending(node, items, send, &[])
-}
-
-/// [`publish_blobs`], spending every coin of `must` that is still spendable here (and more as needed). A large blob's
-/// publisher (crate::largeblob) rebuilds a part's transaction this way, so the old one can never also go in a block.
-pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool, must: &[arcade_chain::OutPoint]) -> Result<Value, String> {
-    use arcade_arc::blob::{self, Record};
+/// A transaction from this arcade's ARCADE wallet carrying `data` (zero-value OP_RETURN outputs, in order) and change
+/// back, paying the wallet's rate for its own bytes plus `extra` (a blob or upgrade fee, `what` in the error), spending
+/// every coin of `must` still spendable here and more as needed. Signed, not sent: (the transaction, its whole fee).
+fn arc_data_tx(node: &Node, p: &'static ChainParams, tip: u32, data: &[Vec<u8>], extra: u64, what: &str, must: &[arcade_chain::OutPoint]) -> Result<(arcade_chain::Tx, u64), String> {
     use arcade_wallet::tx::{fee_for_size, sign_keyhash, verify_keyhash, TxOutSpec};
-    // Blobs travel with their transaction from this arcade's own pool (crate::arcblob holds their bytes until a block
-    // takes them); lenders take transactions only, so a borrowed ARCADE can't carry them yet.
-    if crate::arcsvc::usable_chain().is_some_and(|p| !crate::arcsvc::own(p)) {
-        return Err("long texts and files go on the ARCADE chain as blobs, and those need ARCADE installed here (it is only borrowed): install it in Chains & Coins".into());
-    }
-    let p = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or("the ARCADE chain isn't running here")?;
-    let net = crate::arcsvc::svc_net().ok_or("the ARCADE chain isn't running here")?;
-    if items.is_empty() {
-        return Err("no blobs".into());
-    }
-    let mut recs = Vec::new();
-    // What the blobs pay for, as the pool counts it (arcade_arc::pool): each new blob once, and every boost.
-    let (mut paid, mut seen) = (Vec::new(), std::collections::HashSet::new());
-    for (bytes, kind, class, encoding) in items {
-        if bytes.is_empty() || bytes.len() > blob::MAX_BLOB_BYTES || kind.len() > blob::MAX_TYPE {
-            return Err(format!("a blob is 1 to {} bytes, its type at most {} characters", blob::MAX_BLOB_BYTES, blob::MAX_TYPE));
-        }
-        let rec = Record::of(bytes, *class, *encoding, kind);
-        let id = rec.id(&net);
-        let new = !crate::arcsvc::holds_blob(&id) && seen.insert(id);
-        if new || *class == blob::Class::Boost {
-            paid.push((*class, bytes.len() as u64));
-        }
-        recs.push((rec, id, new));
-    }
-    if recs.iter().filter(|r| r.2).map(|r| r.0.len).sum::<u64>() > blob::MAX_BLOB_BYTES as u64 {
-        return Err("more than one block's 4 MB of new blobs: split them into several".into());
-    }
-    let tip = node.chain.tip(p.chain_no).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
     // Signing as a tag (crate::arcledger::with_sign_as): that tag's key pays; else the wallet's first key, as always.
     let (pk, sk) = if crate::arcledger::sign_as().is_some() {
         let (_, _, sk) = crate::arcledger::sender(node, p)?;
@@ -447,11 +397,9 @@ pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc
     coins.sort_by_key(|c| !must.contains(&c.outpoint));
     let fp = fee_policy(p);
     let change_script = scripts[0].1.clone();
-    let mut out_scripts: Vec<usize> = recs.iter().map(|r| r.0.script().len()).collect();
+    let mut out_scripts: Vec<usize> = data.iter().map(Vec::len).collect();
     out_scripts.push(change_script.len());
-    // Priced as the next block will judge it.
-    let blob_fee = blob::fee_at(&net, tip as u64 + 1, &paid);
-    let fee_of = |n: usize| fee_for_size(p, arcade_wallet::tx::estimate_size(n, &out_scripts) as u64, fp.fallback_per_kb) + blob_fee;
+    let fee_of = |n: usize| fee_for_size(p, arcade_wallet::tx::estimate_size(n, &out_scripts) as u64, fp.fallback_per_kb) + extra;
     let (mut chosen, mut have) = (Vec::new(), 0u64);
     for c in coins {
         let needed = must.contains(&c.outpoint);
@@ -463,14 +411,75 @@ pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc
     }
     let fee = fee_of(chosen.len());
     if have < fee + fp.dust {
-        return Err(format!("not enough ARCADE: have {have}, need {} (the blob fee is {blob_fee})", fee + fp.dust));
+        return Err(format!("not enough ARCADE: have {have}, need {} ({what} is {extra})", fee + fp.dust));
     }
-    let mut outs: Vec<TxOutSpec> = recs.iter().map(|r| TxOutSpec { value: 0, script: r.0.script() }).collect();
+    let mut outs: Vec<TxOutSpec> = data.iter().map(|d| TxOutSpec { value: 0, script: d.clone() }).collect();
     outs.push(TxOutSpec { value: have - fee, script: change_script });
     let tx = sign_keyhash(p, 1, &chosen, &outs, &sk, arcade_app::now() as u32)?;
     if !verify_keyhash(p, &tx, &chosen) {
         return Err("the signed transaction didn't verify".into());
     }
+    Ok((tx, fee))
+}
+
+/// `arc.blob_publish`: put `bytes` on the ARCADE chain as a blob (arcade-arc `blob.rs`). See [`publish_blobs`].
+pub fn publish_blob(node: &Node, bytes: &[u8], kind: &str, class: arcade_arc::blob::Class, encoding: arcade_arc::blob::Encoding, send: bool) -> Result<Value, String> {
+    let mut v = publish_blobs(node, &[(bytes.to_vec(), kind.to_string(), class, encoding)], send)?;
+    // One blob: its own fields at the top, as before.
+    if let Some(first) = v["blobs"].get(0).cloned() {
+        for k in ["blob", "root", "bytes", "type", "class", "new"] {
+            v[k] = first[k].clone();
+        }
+    }
+    Ok(v)
+}
+
+/// `arc.blob_publish_many`: blobs in one transaction from this arcade's wallet: a record each, change back, paying
+/// the wallet's rate for its own bytes and the blob fee for every blob the chain doesn't hold yet (and every boost), at
+/// the rate the next block takes (blob::fee_at: 0.01 ARCADE a kB before rules version 5, each class's rate since); into the pool with
+/// the blobs' bytes. At most 4 MB of new blobs (one block's budget) and the transaction under 100 kB. Without `send`,
+/// only what it would be.
+pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool) -> Result<Value, String> {
+    publish_blobs_spending(node, items, send, &[])
+}
+
+/// [`publish_blobs`], spending every coin of `must` that is still spendable here (and more as needed). A large blob's
+/// publisher (crate::largeblob) rebuilds a part's transaction this way, so the old one can never also go in a block.
+pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool, must: &[arcade_chain::OutPoint]) -> Result<Value, String> {
+    use arcade_arc::blob::{self, Record};
+    // Blobs travel with their transaction from this arcade's own pool (crate::arcblob holds their bytes until a block
+    // takes them); lenders take transactions only, so a borrowed ARCADE can't carry them yet.
+    if crate::arcsvc::usable_chain().is_some_and(|p| !crate::arcsvc::own(p)) {
+        return Err("long texts and files go on the ARCADE chain as blobs, and those need ARCADE installed here (it is only borrowed): install it in Chains & Coins".into());
+    }
+    let p = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or("the ARCADE chain isn't running here")?;
+    let net = crate::arcsvc::svc_net().ok_or("the ARCADE chain isn't running here")?;
+    if items.is_empty() {
+        return Err("no blobs".into());
+    }
+    let mut recs = Vec::new();
+    // What the blobs pay for, as the pool counts it (arcade_arc::pool): each new blob once, and every boost.
+    let (mut paid, mut seen) = (Vec::new(), std::collections::HashSet::new());
+    for (bytes, kind, class, encoding) in items {
+        if bytes.is_empty() || bytes.len() > blob::MAX_BLOB_BYTES || kind.len() > blob::MAX_TYPE {
+            return Err(format!("a blob is 1 to {} bytes, its type at most {} characters", blob::MAX_BLOB_BYTES, blob::MAX_TYPE));
+        }
+        let rec = Record::of(bytes, *class, *encoding, kind);
+        let id = rec.id(&net);
+        let new = !crate::arcsvc::holds_blob(&id) && seen.insert(id);
+        if new || *class == blob::Class::Boost {
+            paid.push((*class, bytes.len() as u64));
+        }
+        recs.push((rec, id, new));
+    }
+    if recs.iter().filter(|r| r.2).map(|r| r.0.len).sum::<u64>() > blob::MAX_BLOB_BYTES as u64 {
+        return Err("more than one block's 4 MB of new blobs: split them into several".into());
+    }
+    let tip = node.chain.tip(p.chain_no).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
+    // Priced as the next block will judge it.
+    let blob_fee = blob::fee_at(&net, tip as u64 + 1, &paid);
+    let data: Vec<Vec<u8>> = recs.iter().map(|r| r.0.script()).collect();
+    let (tx, fee) = arc_data_tx(node, p, tip, &data, blob_fee, "the blob fee", must)?;
     if tx.raw.len() > arcade_arc::coins::MAX_ONE_TX_BYTES {
         return Err(format!("{} blobs make a transaction over 100 kB: send fewer at once", recs.len()));
     }
@@ -486,6 +495,58 @@ pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc
             // This arcade's own: it keeps them for good (crate::fogstore).
             crate::arcblob::mark_mine(&id);
         }
+        let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
+        out["sent"] = json!(true);
+        out["txid"] = json!(txid.to_hex());
+        out["fee"] = json!(fee);
+    }
+    Ok(out)
+}
+
+/// `arc.blob_upgrade {id, send?}` (rules version 6): make a Temporary blob Permanent by paying the difference, Permanent
+/// fee minus the Temporary fee for its bytes at the next block's rates (blob::upgrade_fee_at), from this arcade's
+/// ARCADE wallet; anyone may upgrade any Temporary blob, and it stays its publisher's. A large blob's manifest brings all
+/// its parts along, paid for their bytes too. Without `send`, only the quote: bytes, already paid (the Temporary fee),
+/// the Permanent fee, the difference, and the whole fee.
+pub fn upgrade_blob(node: &Node, id: &arcade_arc::merkle::Hash, send: bool) -> Result<Value, String> {
+    use arcade_arc::blob::{self, Class, UpgradeError};
+    let p = crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).ok_or("the ARCADE chain isn't running here")?;
+    let net = crate::arcsvc::svc_net().ok_or("the ARCADE chain isn't running here")?;
+    let (_, next) = crate::arcsvc::blob_state(id).ok_or("the ARCADE chain holds no such blob")?;
+    // A large blob: its manifest and every part.
+    let mut ids = vec![*id];
+    let large = crate::arcblob::file_manifest(id).filter(|m| m.large());
+    if let Some(m) = &large {
+        ids.extend(m.parts.iter().map(|x| x.0).filter(|x| x != id));
+    }
+    if ids.len() > blob::MAX_UPGRADE_IDS {
+        return Err(format!("a large blob of {} parts is more than one upgrade names ({})", ids.len() - 1, blob::MAX_UPGRADE_IDS));
+    }
+    let (mut bytes, mut already, mut permanent, mut diff) = (0u64, 0u64, 0u64, 0u64);
+    for x in &ids {
+        let st = crate::arcsvc::blob_state(x).map(|s| s.0);
+        let f = blob::check_upgrade(&net, next, st.as_ref()).map_err(|e| match e {
+            UpgradeError::NotYet => format!("{e}: the next block is {next}, rules version 6 starts at {}", net.rules.iter().find(|r| r.0 >= 6).map_or("no height yet".to_string(), |r| r.1.to_string())),
+            _ if x != id => format!("part {}: {e}", hex::encode(x)),
+            _ => e.to_string(),
+        })?;
+        let len = st.map_or(0, |s| s.len);
+        bytes += len;
+        already += blob::fee_at(&net, next, &[(Class::Temporary, len)]);
+        permanent += blob::fee_at(&net, next, &[(Class::Permanent, len)]);
+        diff += f;
+    }
+    let tip = node.chain.tip(p.chain_no).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
+    // A closed test net only: pay this much less (`ARCADE_TEST_UPGRADE_SHORT`), so tests/regtest/upgradenet.py can show
+    // every arcade refusing an underpaid upgrade.
+    let short = if crate::arcsvc::local() { std::env::var("ARCADE_TEST_UPGRADE_SHORT").ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0) } else { 0 };
+    let (tx, fee) = arc_data_tx(node, p, tip, &[blob::upgrade_script(&ids)], diff.saturating_sub(short), "the upgrade fee", &[])?;
+    let mut out = json!({"blob": hex::encode(id), "blobs": ids.iter().map(hex::encode).collect::<Vec<_>>(), "parts": large.as_ref().map(|m| m.parts.len()),
+                         "bytes": bytes, "already_paid": already, "permanent_fee": permanent, "difference": diff, "fee": fee,
+                         "at_height": next, "floor": blob::floor_at(&net, next, Class::Permanent),
+                         "txid": tx.txid.to_hex(), "hex": hex::encode(&tx.raw), "size": tx.raw.len(), "sent": false});
+    if send {
+        crate::receipts::signed(node, p.key, &tx.txid);
         let (txid, fee) = crate::ownwait::send_arc(node, &tx)?;
         out["sent"] = json!(true);
         out["txid"] = json!(txid.to_hex());

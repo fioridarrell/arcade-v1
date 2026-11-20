@@ -725,6 +725,11 @@ never touch the coin. So the rules themselves are versioned, as Bitcoin and Doge
 - **The mesh:** every ARCADE frame carries the protocol (`PROTOCOL` 1) and the sender's rules schedule. Frames of a
   protocol under `MIN_PROTOCOL` aren't taken (arc.status counts such peers). An arcade on the mesh that schedules a
   version this one doesn't know makes it say, in arc.status and on the Earn ARCADE card, "update before block N".
+- **The versions so far** (testnet `arctest`): 3 from block 0 (blobs), 4 from 1,000 (ARCADE issues #6, #10, #11, #14,
+  #20), 5 from 2,150 (fog storage: blocks valid without blob bytes, blob fees by class, a Temporary blob family;
+  docs/FOGSTORE.md), 6 from `params::RULES_V6_HEIGHT` (Martin 2026-11-19: Permanent copy floor 3 with prices unchanged,
+  and an `OP_RETURN "aupg"` output that upgrades a Temporary blob to Permanent for the difference; docs/FOGSTORE.md
+  "Rules version 6"). Mainnet's schedule is version 2 from block 0 until a release adds more.
 
 ### 14.22 The plan from here (Martin 2026-11-12: "add everything to the plan")
 

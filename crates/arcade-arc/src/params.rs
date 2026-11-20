@@ -115,15 +115,26 @@ pub struct Net {
     /// Seconds after which a block may travel without the bytes of its blobs (§15 step 3: full nodes may drop old
     /// blobs' plain copies): [`BLOB_WINDOW`]; only a local test chain (`blob_window`) sets less.
     pub blob_window: u64,
+    /// Seconds a Temporary blob is kept: [`BLOB_TEMPORARY`]; only a local test chain (`blob_temporary`) sets less. From
+    /// rules version 6 consensus counts it in blocks (crate::blob::temporary_blocks): an upgrade of a Temporary blob past
+    /// its time is refused.
+    pub blob_temporary: u64,
 }
 
 /// 30 days.
 pub const BLOB_WINDOW: u64 = 30 * 24 * 3600;
+/// 90 days.
+pub const BLOB_TEMPORARY: u64 = 90 * 24 * 3600;
 
 /// The newest rules version this arcade knows. Version 2 (time keepers, §6.2): a block's proof of time may come in
 /// up to [`MAX_POT_RUNS`] runs one after another. Version 3 (blobs, §15 step 1): blob records and a block's blob section.
-/// Version 4 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20): see [`rules_v4`].
-pub const RULES_KNOWN: u32 = 5;
+/// Version 4 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20): see [`rules_v4`]. Version 5 (fog storage): see
+/// [`rules_v5`]. Version 6 (Martin 2026-11-19): see [`rules_v6`].
+pub const RULES_KNOWN: u32 = 6;
+
+/// The testnet height rules version 6 starts at (CONSENSUS: set in the release that ships it, ahead of the tip; this is
+/// a placeholder until then). [`TESTNET`]'s schedule reads it.
+pub const RULES_V6_HEIGHT: u64 = 3_000;
 
 /// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
 /// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the
@@ -140,6 +151,14 @@ pub fn rules_v4(net: &Net, height: u64) -> bool {
 /// scheduled on the testnet until a release names its height.
 pub fn rules_v5(net: &Net, height: u64) -> bool {
     net.rules_at(height) >= 5
+}
+
+/// Whether rules version 6 applies to the block at `height` (Martin 2026-11-19, docs/FOGSTORE.md): the Permanent copy
+/// floor is 3 (crate::blob::FLOORS; its price stays version 5's 7 copies), and a transaction may upgrade a Temporary blob
+/// to Permanent by paying the difference (crate::blob::upgrade_script, crate::blob::check_upgrade). Before it an upgrade
+/// output is only an OP_RETURN's data, as it always was.
+pub fn rules_v6(net: &Net, height: u64) -> bool {
+    net.rules_at(height) >= 6
 }
 
 /// The first height where [`rules_v4`] holds, if any (a network's rules versions rise with height).
@@ -237,6 +256,7 @@ pub const MAINNET: Net = Net {
     rules: &[(2, 0)],
     audit_period: AUDIT_PERIOD_BLOCKS,
     blob_window: BLOB_WINDOW,
+    blob_temporary: BLOB_TEMPORARY,
 };
 
 pub const TESTNET: Net = Net {
@@ -255,9 +275,12 @@ pub const TESTNET: Net = Net {
     // Restarted 2026-11-15 (Martin: "restart + carry ledger"): version 3 (blobs, the tenth with its challenge window, on
     // top of version 2's time keepers and writer's share) from block 0. The chain before ran 1 from 0 and 2 from 1,065.
     // Version 4 from block 1,000 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20; released in v0.1.106).
-    rules: &[(3, 0), (4, 1_000), (5, 2_150)],
+    // Version 5 (fog storage) from 2,150 (v0.1.133). Version 6 (Permanent floor 3, Temporary-to-Permanent upgrades)
+    // from [`RULES_V6_HEIGHT`].
+    rules: &[(3, 0), (4, 1_000), (5, 2_150), (6, RULES_V6_HEIGHT)],
     audit_period: AUDIT_PERIOD_BLOCKS,
     blob_window: BLOB_WINDOW,
+    blob_temporary: BLOB_TEMPORARY,
 };
 
 /// The first height of the epoch `height` is in.
@@ -294,6 +317,10 @@ mod tests {
         let v4 = Net { rules: &[(3, 0), (4, 700)], ..TESTNET };
         assert_eq!(rules_v4_from(&v4), Some(700));
         assert!(!rules_v4(&v4, 699) && rules_v4(&v4, 700) && rules_v4(&v4, 10_000));
+        // Version 6 on the testnet from its constant, after version 5.
+        assert_eq!(TESTNET.rules_at(RULES_V6_HEIGHT - 1), 5);
+        assert!(!rules_v6(&TESTNET, RULES_V6_HEIGHT - 1) && rules_v6(&TESTNET, RULES_V6_HEIGHT));
+        assert!(!rules_v6(&MAINNET, u64::MAX));
         // Every version scheduled on the real networks is one this arcade knows.
         for n in [MAINNET, TESTNET] {
             assert!(n.rules.iter().all(|(v, _)| *v <= RULES_KNOWN));

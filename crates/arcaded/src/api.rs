@@ -207,7 +207,7 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
 }
 
 pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
-    // `"as": "@tag"` on an ARCADE write (ledger.*, a.*, arc.blob_publish*): signed by the key holding that tag, the
+    // `"as": "@tag"` on an ARCADE write (ledger.*, a.*, arc.blob_publish*, arc.blob_upgrade): signed by the key holding that tag, the
     // wallet's own or an imported one (crate::arcledger::with_sign_as).
     let cmd = req["cmd"].as_str().unwrap_or("");
     // One table for every surface (crate::commands): a name it doesn't list is no command here either, so the socket
@@ -215,7 +215,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     if crate::commands::find(cmd).is_none() {
         return Err(format!("unknown command {cmd:?}: rpc.help lists them"));
     }
-    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish")) {
+    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish") || cmd == "arc.blob_upgrade") {
         return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
     }
     // `"chain": key` on a post, act, follow or message: written there (crate::msgsvc::write_chains; option C).
@@ -1280,6 +1280,11 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         // A large blob (crate::largeblob, up to 100 MB): parts over several blocks, then its manifest.
         "arc.blob_publish_large" => crate::largeblob::api_publish(node, req),
         "arc.blob_publish_status" => crate::largeblob::api_status(req),
+        // Rules version 6: a Temporary blob made Permanent for the difference (`id`, `send`; without send, the quote).
+        "arc.blob_upgrade" => {
+            let id: arcade_arc::merkle::Hash = s("id").and_then(|x| hex::decode(x.trim()).ok()).and_then(|b| b.try_into().ok()).ok_or("id required (the blob's id, 64 hex)")?;
+            crate::coinsend::upgrade_blob(node, &id, req["send"] == true)
+        }
         "arc.blob_publish" => {
             // Over one block's 4 MB: a large blob.
             let big = match (s("path"), s("hex")) {

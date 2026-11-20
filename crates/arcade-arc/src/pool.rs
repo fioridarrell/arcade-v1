@@ -48,6 +48,9 @@ pub enum PoolError {
     BlobMissing,
     #[error("the pool is full of transactions that pay more")]
     Full,
+    /// A blob upgrade it carries is refused (rules version 6; before it the pool takes none).
+    #[error("blob upgrade: {0}")]
+    Upgrade(crate::blob::UpgradeError),
     /// Not the pool's own answer: an arcade's, for a transaction it refused a moment ago.
     #[error("refused a moment ago; it can be offered again after the next block")]
     Refused,
@@ -64,6 +67,9 @@ impl PoolError {
             PoolError::Row => "rules",
             PoolError::BlobMissing => "blob_missing",
             PoolError::Full => "pool_full",
+            PoolError::Upgrade(crate::blob::UpgradeError::Underpaid) => "fee_too_low",
+            PoolError::Upgrade(crate::blob::UpgradeError::NotYet) => "not_yet_valid",
+            PoolError::Upgrade(_) => "invalid",
             PoolError::Refused => "refused_recently",
             PoolError::Tx(TxError::MissingCoin) => "missing_coin",
             PoolError::Tx(TxError::Dust) => "dust",
@@ -193,13 +199,20 @@ impl Pool {
     /// Take in a transaction for the block at `height` (the one after the tip), whose coins
     /// before it are `coins`. Its fee.
     pub fn add(&mut self, tx: Tx, coins: &impl Coins, height: u64) -> Result<u64, PoolError> {
-        self.add_with(tx, coins, height, &crate::params::TESTNET, &|_| true)
+        self.add_inner(tx, coins, height, &crate::params::TESTNET, &|_| true, None)
     }
 
     /// [`Pool::add`] for a chain with blobs (rules version 3): of the blobs `tx`'s records name, those `held` says the
     /// chain hasn't got are paid for at the blob rate on top of the transaction's own floor (every waiting transaction
-    /// naming a blob new to the chain pays for it, so whichever a block puts first may bring it).
-    pub fn add_with(&mut self, tx: Tx, coins: &impl Coins, height: u64, net: &crate::params::Net, held: &dyn Fn(&crate::merkle::Hash) -> bool) -> Result<u64, PoolError> {
+    /// naming a blob new to the chain pays for it, so whichever a block puts first may bring it). Its upgrades (rules
+    /// version 6) are judged against the blobs as `state` says the chain holds them, each blob upgraded by one waiting
+    /// transaction at most, and paid for on top; before version 6 a transaction carrying one is refused (the chain would
+    /// take it as plain data, and its sender would pay for nothing).
+    pub fn add_with(&mut self, tx: Tx, coins: &impl Coins, height: u64, net: &crate::params::Net, state: &dyn Fn(&crate::merkle::Hash) -> Option<crate::blob::State>) -> Result<u64, PoolError> {
+        self.add_inner(tx, coins, height, net, &|id| state(id).is_some(), Some(state))
+    }
+
+    fn add_inner(&mut self, tx: Tx, coins: &impl Coins, height: u64, net: &crate::params::Net, held: &dyn Fn(&crate::merkle::Hash) -> bool, state: Option<&dyn Fn(&crate::merkle::Hash) -> Option<crate::blob::State>>) -> Result<u64, PoolError> {
         if self.txs.contains_key(&tx.txid) {
             return Err(PoolError::Known);
         }
@@ -227,9 +240,19 @@ impl Pool {
             }
         }
         // Priced as the next block (`height`) will judge it.
-        let blob_fee = crate::blob::fee_at(net, height, &paid);
+        let mut blob_fee = crate::blob::fee_at(net, height, &paid);
         if fee < blob_fee {
             return Err(PoolError::LowBlobFee);
+        }
+        // Upgrades (only where the caller knows the chain's blobs: a transaction a block left comes back without, and
+        // the pool is gone through again after, Pool::drop_bad_upgrades).
+        let ups = crate::blob::upgrades(&tx);
+        if let (Some(state), false) = (state, ups.is_empty()) {
+            let mut taken = self.upgrading();
+            blob_fee = blob_fee.saturating_add(crate::blob::check_upgrades(net, height, &ups, state, &mut taken).map_err(PoolError::Upgrade)?);
+            if fee < blob_fee {
+                return Err(PoolError::Upgrade(crate::blob::UpgradeError::Underpaid));
+            }
         }
         if ((fee - blob_fee) as u128) * 1_000 < MIN_FEE_PER_KB as u128 * bytes as u128 {
             return Err(PoolError::LowFee);
@@ -241,6 +264,35 @@ impl Pool {
         self.next_seq += 1;
         self.admit(Waiting { tx, fee, checks, seq, parents, row, blobs });
         Ok(fee)
+    }
+
+    /// The blobs waiting transactions upgrade (rules version 6).
+    fn upgrading(&self) -> HashSet<crate::merkle::Hash> {
+        self.txs.values().flat_map(|w| crate::blob::upgrades(&w.tx)).collect()
+    }
+
+    /// After a change of tip: waiting transactions whose upgrades the block at `height` would refuse go, with everything
+    /// that spends them (a blob upgraded by the block just taken, past its time, or upgraded by a transaction that waited
+    /// longer; before rules version 6, any). `state` is the chain's blobs at the tip. How many went.
+    pub fn drop_bad_upgrades(&mut self, net: &crate::params::Net, height: u64, state: &dyn Fn(&crate::merkle::Hash) -> Option<crate::blob::State>) -> usize {
+        let mut taken: HashSet<crate::merkle::Hash> = HashSet::new();
+        let mut bad: HashSet<Hash256> = HashSet::new();
+        let order: Vec<Hash256> = self.order.values().copied().collect();
+        for id in order {
+            let w = &self.txs[&id];
+            let ups = crate::blob::upgrades(&w.tx);
+            if ups.is_empty() || bad.contains(&id) {
+                continue;
+            }
+            let ok = crate::blob::check_upgrades(net, height, &ups, state, &mut taken).is_ok_and(|f| w.fee >= f);
+            if !ok {
+                self.with_descendants(&id, &mut bad);
+            }
+        }
+        for id in &bad {
+            self.remove(id);
+        }
+        bad.len()
     }
 
     /// The waiting transactions `tx` spends, and how long a row it would stand at the end of.
@@ -381,6 +433,7 @@ impl Pool {
     /// (each counted once, however many transactions name it).
     pub fn pick_with(&self, max_bytes: usize, max_blob_bytes: usize, new: &dyn Fn(&crate::merkle::Hash) -> bool) -> (Vec<Tx>, u64) {
         let mut blob_ids: HashSet<crate::merkle::Hash> = HashSet::new();
+        let mut upgraded: HashSet<crate::merkle::Hash> = HashSet::new();
         let mut blob_bytes = 0usize;
         let mut best: Vec<&Waiting> = self.txs.values().collect();
         best.sort_unstable_by(|a, b| (b.fee as u128 * a.bytes() as u128).cmp(&(a.fee as u128 * b.bytes() as u128)).then(a.seq.cmp(&b.seq)));
@@ -401,6 +454,12 @@ impl Pool {
                 if blob_bytes + more > max_blob_bytes {
                     continue;
                 }
+                // A blob is upgraded once in a block (rules version 6; the pool takes one upgrade of each anyway).
+                let ups = crate::blob::upgrades(&w.tx);
+                if ups.iter().any(|u| upgraded.contains(u)) {
+                    continue;
+                }
+                upgraded.extend(ups);
                 blob_bytes += more;
                 blob_ids.extend(w.blobs.iter().filter(|b| new(&b.0)).map(|b| b.0));
                 picked.insert(w.tx.txid);
@@ -675,5 +734,49 @@ mod tests {
         assert_eq!(PoolError::Tx(TxError::Overspend).code(), "invalid");
         assert_eq!(PoolError::Tx(TxError::Immature).code(), "not_yet_valid");
         assert_eq!(PoolError::Known.code(), "known");
+    }
+
+    #[test]
+    fn rules_v6_the_pool_takes_one_paid_upgrade_of_a_temporary_blob() {
+        use crate::blob::{self, Class, State, UpgradeError};
+        use crate::params::{Net, TESTNET};
+        const V6: Net = Net { rules: &[(3, 0), (5, 1), (6, HEIGHT)], ..TESTNET };
+        let coins = held(6);
+        let (sk, pk) = key(1);
+        let t: crate::merkle::Hash = [1; 32];
+        let state = |id: &crate::merkle::Hash| (*id == t).then(|| State::brought(&V6, Class::Temporary, 1_000, 10));
+        let diff = blob::upgrade_fee_at(&V6, HEIGHT, 1_000);
+        // Paying `fee` in all: the difference plus the floor, or less.
+        let up = |n: u32, ids: &[crate::merkle::Hash], fee: u64| pay(&[point(n)], vec![(0, blob::upgrade_script(ids)), (10 * COIN - fee, p2pkh(&pk))], &sk, &pk);
+        let full = diff + COIN / 100;
+        let mut pool = Pool::new(MAX_POOL_BYTES);
+        // Before version 6 the pool takes none.
+        assert_eq!(pool.add_with(up(0, &[t], full), &coins, HEIGHT - 1, &V6, &state), Err(PoolError::Upgrade(UpgradeError::NotYet)));
+        // Short of the difference, of an unknown blob: refused.
+        assert_eq!(pool.add_with(up(0, &[t], diff - 1), &coins, HEIGHT, &V6, &state), Err(PoolError::Upgrade(UpgradeError::Underpaid)));
+        assert_eq!(pool.add_with(up(0, &[[2; 32]], full), &coins, HEIGHT, &V6, &state), Err(PoolError::Upgrade(UpgradeError::Unknown)));
+        // Paid: in; a second upgrade of the same blob waits behind none.
+        assert_eq!(pool.add_with(up(0, &[t], full), &coins, HEIGHT, &V6, &state), Ok(full));
+        assert_eq!(pool.add_with(up(1, &[t], full), &coins, HEIGHT, &V6, &state), Err(PoolError::Upgrade(UpgradeError::Twice)));
+        assert_eq!(PoolError::Upgrade(UpgradeError::Underpaid).code(), "fee_too_low");
+        // A block upgraded it: the waiting one goes at the next change of tip, with what spends it.
+        let first = pool.iter().next().unwrap().tx.clone();
+        let child = pay(&[OutPoint { txid: first.txid, vout: 1 }], vec![(10 * COIN - 2 * COIN / 100 - diff, p2pkh(&pk))], &sk, &pk);
+        pool.add_with(child, &coins, HEIGHT, &V6, &state).unwrap();
+        assert_eq!(pool.len(), 2);
+        assert_eq!(pool.drop_bad_upgrades(&V6, HEIGHT, &state), 0);
+        let upgraded = |id: &crate::merkle::Hash| state(id).map(|mut s| {
+            s.upgraded = Some(blob::Upgraded { height: HEIGHT, txid: Hash256([3; 32]), paid: diff, by: Vec::new() });
+            s
+        });
+        assert_eq!(pool.drop_bad_upgrades(&V6, HEIGHT + 1, &upgraded), 2);
+        assert!(pool.is_empty());
+        // Two waiting upgrades of one blob (a block's transactions back after a reorg): the first stays, and a block
+        // takes one only.
+        pool.add(up(2, &[t], full), &coins, HEIGHT).unwrap();
+        pool.add(up(3, &[t], full), &coins, HEIGHT).unwrap();
+        assert_eq!(pool.pick(1_000_000).0.len(), 1);
+        assert_eq!(pool.drop_bad_upgrades(&V6, HEIGHT, &state), 1);
+        assert_eq!(pool.len(), 1);
     }
 }

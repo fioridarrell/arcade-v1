@@ -88,6 +88,42 @@ pub struct Meta {
     /// empty in a meta written before it was kept (crate::fogmap reads it from the block then).
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub publisher: String,
+    /// Its upgrade to Permanent (rules version 6), as the chain's best branch has it: never stored, filled in when the
+    /// meta is read ([`meta`], from [`set_upgraded`]).
+    #[serde(skip)]
+    pub upgraded: Option<arcade_arc::blob::Upgraded>,
+}
+
+impl Meta {
+    /// Its class now: Permanent (0) once upgraded (rules version 6), else its record's. Its record's class (`class`)
+    /// still says where it is sealed (crate::fogstore::family_of).
+    pub fn class_now(&self) -> u8 {
+        if self.upgraded.is_some() {
+            arcade_arc::blob::Class::Permanent as u8
+        } else {
+            self.class
+        }
+    }
+}
+
+/// The best branch's upgraded blobs (rules version 6) and the next block's height, as the chain last moved: kept here
+/// so reading a meta never takes the chain's lock.
+static UPGRADED: Mutex<Option<(HashMap<Hash, arcade_arc::blob::Upgraded>, u64)>> = Mutex::new(None);
+
+/// The chain moved (crate::arcsvc): its upgraded blobs and the next block's height.
+pub fn set_upgraded(list: Vec<(Hash, arcade_arc::blob::State)>, next: u64) {
+    let map = list.into_iter().filter_map(|(id, s)| Some((id, s.upgraded?))).collect();
+    *UPGRADED.lock().unwrap() = Some((map, next));
+}
+
+/// Blob `id`'s upgrade, as the chain last moved.
+pub fn upgraded(id: &Hash) -> Option<arcade_arc::blob::Upgraded> {
+    UPGRADED.lock().unwrap().as_ref()?.0.get(id).cloned()
+}
+
+/// The next block's height as the chain last moved (0 before it ran).
+pub fn next_height() -> u64 {
+    UPGRADED.lock().unwrap().as_ref().map_or(0, |u| u.1)
 }
 
 /// The address a script pays (pay to a key hash or a script hash on `net`), None for any other script.
@@ -117,7 +153,9 @@ fn meta_path(id: &Hash) -> PathBuf {
 }
 
 pub fn meta(id: &Hash) -> Option<Meta> {
-    serde_json::from_slice(&std::fs::read(meta_path(id)).ok()?).ok()
+    let mut m: Meta = serde_json::from_slice(&std::fs::read(meta_path(id)).ok()?).ok()?;
+    m.upgraded = upgraded(id);
+    Some(m)
 }
 
 /// Reads a sealed blob-family unit at a height (this arcade's own replica), set when the chain starts.
@@ -459,7 +497,7 @@ pub fn keep_block(net: &Net, block: &Block) {
             let line = hex::encode(&sha2::Sha256::digest([r.kind.as_bytes(), b"\0", publisher].concat())[..16]);
             let boosted_until = if r.class == arcade_arc::blob::Class::Boost { boost_until } else { 0 };
             let m = Meta { class: r.class as u8, kind: r.kind.clone(), encoding: r.encoding as u8, height: block.header.height, time: block.header.time, line, boosted_until, len: r.len,
-                           publisher: address_of_script(net, publisher).unwrap_or_default() };
+                           publisher: address_of_script(net, publisher).unwrap_or_default(), upgraded: None };
             let _ = std::fs::write(meta_path(id), serde_json::to_vec(&m).unwrap_or_default());
         }
     }

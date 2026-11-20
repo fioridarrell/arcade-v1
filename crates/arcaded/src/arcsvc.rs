@@ -557,6 +557,14 @@ fn new_tip(node: &Node, svc: &Svc, st: &mut State, undone: &[Hash256]) {
     st.since = Instant::now();
     let back: Vec<Tx> = undone.iter().rev().filter_map(|id| st.chain.block(id)).flat_map(|b| b.txs.iter().skip(1).cloned()).collect();
     st.pool.retip(st.chain.coins(), st.chain.tip().height + 1, back);
+    // Waiting upgrades (rules version 6) the next block would refuse go: the blob upgraded by the block just taken,
+    // past its time, or upgraded twice by transactions a block left.
+    let (pool, chain) = (&mut st.pool, &st.chain);
+    let gone = pool.drop_bad_upgrades(&svc.net, chain.tip().height + 1, &|id| chain.blob_state(id).cloned());
+    if gone > 0 {
+        eprintln!("arc: {gone} waiting transactions dropped: a blob upgrade they carry (or spend) no longer holds");
+    }
+    crate::arcblob::set_upgraded(st.chain.upgraded_blobs(), st.chain.tip().height + 1);
     st.refused.clear();
     // Waiting blobs no waiting transaction brings any more go (the store keeps what blocks brought).
     let named: std::collections::HashSet<arcade_arc::merkle::Hash> = st.pool.iter().flat_map(|w| w.blobs.iter().map(|b| b.0)).collect();
@@ -646,7 +654,7 @@ fn take_tx(svc: &Svc, raw: &[u8]) -> Result<(Hash256, u64), PoolError> {
         return Err(PoolError::BlobMissing);
     }
     let chain = &st.chain;
-    match st.pool.add_with(tx, chain.coins(), chain.tip().height + 1, &svc.net, &|id| chain.holds_blob(id)) {
+    match st.pool.add_with(tx, chain.coins(), chain.tip().height + 1, &svc.net, &|id| chain.blob_state(id).cloned()) {
         Ok(fee) => Ok((id, fee)),
         Err(e) => {
             // A coin that isn't there may yet come (its transaction is on the way, or a
@@ -1300,7 +1308,7 @@ fn undo_auto_btc(node: &Arc<Node>) {
 /// [`define`] from the settings' text (the built-in testnet's, or a file's).
 pub fn define_text(node: &Arc<Node>, text: &str) -> Result<(), String> {
     let s = Settings::parse(&params::TESTNET, text)?;
-    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), blob_window: s.blob_window, ..params::TESTNET };
+    let net = Net { block_seconds: s.block_seconds, audit_period: s.audit_period, rules: s.rules.unwrap_or(params::TESTNET.rules), blob_window: s.blob_window, blob_temporary: s.blob_temporary, ..params::TESTNET };
     registry_of(&net, &s)?;
     let genesis = s.genesis.id(&net);
     let def = Def { net, params: store::chain_params(&net, &genesis), genesis, settings: s };
@@ -1435,6 +1443,8 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
             while node.chain.remove_chain_batch(p.chain_no, 50_000).map_err(db_err)? > 0 {}
         }
     }
+    // The blobs its blocks upgraded (rules version 6), for the blob reads and fog storage.
+    crate::arcblob::set_upgraded(chain.upgraded_blobs(), chain.tip().height + 1);
     // The ledger on ARCADE (§15 step 7): tags, profiles and every arcade record, indexed in the same commit as each block
     // the store takes; an arcade that stored blocks before it had them walks those once, below.
     arcade_ledger::tags::set_expiry(p.chain_no, Some(s.tag_expiry));
@@ -2583,12 +2593,33 @@ pub fn holds_blob(id: &arcade_arc::merkle::Hash) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().chain.holds_blob(id))
 }
 
+/// What the running ARCADE chain's best branch knows of blob `id` (its record's class, length, block, a timed blob's
+/// time, its upgrade: rules version 6), and the height of the next block.
+pub fn blob_state(id: &arcade_arc::merkle::Hash) -> Option<(arcade_arc::blob::State, u64)> {
+    let svc = svc()?;
+    let st = svc.st.lock().unwrap();
+    Some((st.chain.blob_state(id)?.clone(), st.chain.tip().height + 1))
+}
+
+/// A blob's upgrade (rules version 6) as reads show it: `{by (address), at_height, paid, txid}`, null when it has none.
+pub fn upgraded_json(net: &Net, st: &arcade_arc::blob::State) -> Value {
+    match &st.upgraded {
+        Some(u) => json!({"by": crate::arcblob::address_of_script(net, &u.by).unwrap_or_else(|| hex::encode(&u.by)), "at_height": u.height, "paid": u.paid, "txid": u.txid.to_hex()}),
+        None => Value::Null,
+    }
+}
+
 /// `arc.blob {id}`: a blob's bytes (hex) and whether the chain holds it.
 pub fn blob(req: &Value) -> Result<Value, String> {
     let id: arcade_arc::merkle::Hash = req["id"].as_str().and_then(|s| hex::decode(s).ok()).and_then(|b| b.try_into().ok()).ok_or("id required (64 hex)")?;
     // Fetched from the arcades this one is linked to when it isn't here (kept in the viewer cache).
     let bytes = crate::arcblob::view(&id).ok_or("no such blob here, nor at the arcades linked to this one")?;
     let mut out = json!({"id": hex::encode(id), "bytes": bytes.len(), "on_chain": holds_blob(&id), "hex": hex::encode(&bytes)});
+    // Its class now (Permanent once upgraded, rules version 6) and the upgrade.
+    if let (Some((st, _)), Some(net)) = (blob_state(&id), svc_net()) {
+        out["class"] = json!(st.class_now() as u8);
+        out["upgraded"] = upgraded_json(&net, &st);
+    }
     // A large blob's manifest: the whole as /content/<id> serves it (crate::largeblob).
     if let Some(m) = crate::arcblob::file_manifest(&id).filter(|m| m.large()) {
         out["large"] = json!({"bytes": m.size, "type": m.kind, "parts": m.parts.len(), "class": m.class, "gzip": m.gzip(),
@@ -2802,7 +2833,8 @@ fn prune_blobs(node: &Node, svc: &Svc, temporary: u64) {
         if m.boosted_until > now {
             continue;
         }
-        if m.class == Class::Temporary as u8 || m.class == Class::Boost as u8 {
+        // A Temporary blob upgraded to Permanent (rules version 6) is kept as one.
+        if (m.class == Class::Temporary as u8 || m.class == Class::Boost as u8) && m.upgraded.is_none() {
             if m.time.saturating_add(temporary).max(m.boosted_until) <= now {
                 freed += crate::arcblob::forget(&id);
                 dropped += 1;

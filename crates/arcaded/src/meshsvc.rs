@@ -1151,6 +1151,8 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
 #[allow(clippy::too_many_arguments)]
 /// Most frames a link's loop reads in a row before it sends again (pings and pongs keep going between runs).
 const READ_RUN: usize = 64;
+/// Most bytes a link's loop reads in a row before it sends again: about what one send turn moves (crvia::TURN_BYTES).
+const READ_RUN_BYTES: usize = 64 * 1024;
 
 fn serve_loop(
     node: &Node,
@@ -1176,9 +1178,14 @@ fn serve_loop(
     // (up to READ_RUN): two arcades that each sent before reading, with a large backlog for the other, both blocked in
     // their writes and every link timed out (GX10 and txtok.app, 2026-11-19).
     let mut run = 0usize;
+    // Bytes read in this run: a run ends after READ_RUN_BYTES too, so a peer streaming large frames (a lender's blocks
+    // to a borrower) doesn't starve this side's own sends (its asks went unanswered in time: swaps refunded on
+    // v0.1.143's closed-net test, 2026-11-20).
+    let mut run_bytes = 0usize;
     loop {
-        if run == 0 || run >= READ_RUN {
+        if run == 0 || run >= READ_RUN || run_bytes >= READ_RUN_BYTES {
             run = 0;
+            run_bytes = 0;
             // Queued frames: every link sends every frame once (those still in the ring).
             let pending: Vec<Value> = {
                 let (v, next) = node.mesh_outbox.lock().unwrap().since_budget(*sent_outbox, crate::crvia::TURN_BYTES);
@@ -1253,6 +1260,7 @@ fn serve_loop(
         };
         heard = std::time::Instant::now();
         run += 1;
+        run_bytes += f.blob.len() + 256;
         match f.kind() {
             "ping" => link.send(&Frame::pong(&f))?,
             "pong" => crate::linkrtt::on_pong(peer, f.head["n"].as_str().unwrap_or(""), crate::relaysvc::is_relayed(link)),

@@ -77,7 +77,7 @@ pub fn peer_of(lender: &str) -> Option<&str> {
 /// neither reading, every link timed out after ~20 s and the next did the same (GX10 and txtok.app, 2026-11-19).
 /// Below a new link's receive window (~80-110 KB at the start, 2026-11-19), each turn's writes finish and the loop
 /// reads before sending more.
-pub const TURN_BYTES: usize = 32 * 1024;
+pub const TURN_BYTES: usize = 64 * 1024;
 
 /// Whether frames are still queued for `peer` (its link's loop doesn't wait before its next turn).
 pub fn queued(peer: &str) -> bool {

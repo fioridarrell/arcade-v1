@@ -122,6 +122,7 @@ mod sysinfo;
 mod linkrtt;
 mod udpsvc;
 mod relaysvc;
+mod samerouter;
 mod svcmesh;
 mod walletproofs;
 mod turnsvc;

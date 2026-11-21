@@ -28,7 +28,7 @@ curl -s -u "$(cat <home>/.cookie)" -X POST http://127.0.0.1:8420/rpc \
 
 Named parameters only (`params` is an object). Batches work. Errors: `-32700` parse, `-32600` bad
 request, `-32601` unknown method, `-32602` bad params, `-32000` the command's own error (message says why).
-`rpc.help` lists every method.
+`rpc.help` lists every method; `{"method": "tx.wait"}` or `{"prefix": "tx."}` lists only those.
 
 ## Web API
 
@@ -445,10 +445,10 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 
 | method | route | needs | params | what |
 |---|---|---|---|---|
-| `rpc.help` | `/api/v1/rpc/help` | public | — | Every command, its parameters and what it needs. |
+| `rpc.help` | `/api/v1/rpc/help` | public | method?, prefix? | Every command, its parameters and what it needs. method (one exact command name) or prefix (the start of command names, e.g. tx. or ledger.item) answers only the matching ones. |
 | `arc.status` | `/api/v1/arc/status` | public | — | The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here. |
 | `rpc.info` | `/api/v1/rpc/info` | local | — | Where the RPC and the web API are, and the cookie file. |
-| `rpc.openapi` | `/api/v1/rpc/openapi` | public | — | The OpenAPI 3.1 document of the web API (also GET /api/v1/openapi.json): every command, its typed parameters and result shape. |
+| `rpc.openapi` | `/api/v1/rpc/openapi` | public | prefix? | The OpenAPI 3.1 document of the web API (also GET /api/v1/openapi.json): every command, its typed parameters and result shape. prefix (the start of command names, e.g. tx. or ledger.item) keeps only those commands' paths; components stay whole. |
 | `rpc.guide` | `/api/v1/rpc/guide` | public | — | The short guide for AI agents and scripts (also GET /api/v1/agents.md), as Markdown text. |
 
 ### Svc
@@ -474,7 +474,7 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | `ledger.repo_maintainer` | `/api/v1/ledger/repo_maintainer` | wallet | name, tag, add?, client_ref? | Add or remove a maintainer of your repository. |
 | `ledger.repo_fork` | `/api/v1/ledger/repo_fork` | wallet | from, name, client_ref? | Fork @owner/name under your @tag. |
 | `ledger.item_state` | `/api/v1/ledger/item_state` | wallet | repo, number, state, manifest?, client_ref? | Close, reopen or merge an issue or pull request. |
-| `ledger.items` | `/api/v1/ledger/items` | read | repo, number?, state?, kind?, since?, summary?, pending?, cursor?, limit? | A repository's issues and pull requests with their comments and reviews, by number. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items or comments at or after it); summary: true leaves out the events and keeps the title. Items, comments, reviews and state changes still waiting in the pool come too, marked pending: true (a pending item has no number yet; pending: false leaves them out). Paged: limit (default 50, at most 500) and cursor (the next of the page before; opaque); next is null on the last page, which also carries the pending items. count: how many on this page. |
+| `ledger.items` | `/api/v1/ledger/items` | read | repo, number?, state?, kind?, since?, summary?, pending?, cursor?, limit? | A repository's issues and pull requests with their comments and reviews, by number. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items with anything at or after it, and each item's events trimmed to those at or after it); summary: true leaves out the events and keeps the title, plus last_by (who made the newest event). Every item carries last_height (its newest event's height, before since trims). Items, comments, reviews and state changes still waiting in the pool come too, marked pending: true (a pending item has no number yet; pending: false leaves them out). Paged: limit (default 50, at most 500) and cursor (the next of the page before; opaque); next is null on the last page, which also carries the pending items. count: how many on this page. |
 | `ledger.book` | `/api/v1/ledger/book` | public | network?, base?, quote? | The market's open orders on the arcade ledger (docs/MARKET.md). |
 | `ledger.trades` | `/api/v1/ledger/trades` | public | network?, base?, quote?, before? | The market's recent trades on the arcade ledger. |
 | `ledger.pairs` | `/api/v1/ledger/pairs` | public | q? | The market's pairs on the arcade ledger. |
@@ -615,6 +615,9 @@ Part 2 (ARCADE Git #25):
     `rules`, `invalid`, `refused_recently`, `unreachable`.
 - **`ledger.items`** includes items, comments and state changes still in the pool (`pending: true`; pending
   items come on the last page). It pages with `limit` and `cursor`/`next`.
+  - Every item has `last_height`, its newest event's height. With `since`, each item's `events` keep only those
+    at or after it (pending ones too); `comments` still counts them all.
+  - With `summary: true` an item also has `last_by`, who made that newest event.
 - **No polling.**
   - `explorer.blocks order=asc from=` is a block feed, oldest first (`next_from`).
   - `chains.wait {chain, height, timeout}` waits for a height.

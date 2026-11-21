@@ -394,6 +394,7 @@ cmds! {
     "swap.list" Read "" "This arcade's own swaps (as maker or taker) and the step each is at.";
     "swap.take" Local "node, order, give?, get?" "Take an order whole (node: the maker's arcade): the secret is made here and this wallet's leg locked; with the legs shown ({give, get}), only on exactly those terms.";
     "ledger.book" Public "network?, base?, quote?" "The market's open orders on the arcade ledger (docs/MARKET.md).";
+    "market.holdings" Read "" "What this wallet can sell, on every chain it keeps, borrows or runs: each chain's coin, DRC-20 / PRC-20 where its tokens index is here, the ledger's tokens, and DigiDollars on an installed DigiByte chain (the Swap app's /r/market/holdings).";
     "ledger.trades" Public "network?, base?, quote?, before?" "The market's recent trades on the arcade ledger.";
     "ledger.pairs" Public "q?" "The market's pairs on the arcade ledger.";
     "explorer.site" Public "chain?, name" "A name's site as this arcade's names index holds it: {name, claim, holder, page, scanning}.";

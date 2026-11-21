@@ -492,38 +492,83 @@ fn holdings(node: &Node) -> Value {
                             "amount": (free / 10u128.pow(18)).to_string()}));
         }
     }
-    // The coin of every other installed chain, the ARCADE chain's too when it runs here.
-    let mut extra: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
-    extra.extend(crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).map(|p| p.key.to_string()));
-    for key in &extra {
-        let Some(p) = crate::chains::find(key) else { continue };
-        if let Ok((_, pk)) = node.app.tag_key(p, 0).map(|(k, sk)| (k, arcade_wallet::secp256k1::PublicKey::from_secret_key(arcade_wallet::secp256k1::SECP256K1, &sk))) {
-            let mut sum = 0u64;
-            for (_, script) in crate::coinsend::key_scripts(p, &pk) {
-                for (op, value, _) in node.chain.coins_for_script(p, &script).unwrap_or_default() {
-                    let waiting = if crate::arcsvc::runs(p) { crate::arcsvc::spender(&op) } else { node.chain.mempool_spender(p.chain_no, &op).ok().flatten() };
-                    if waiting.is_none() {
-                        sum += value;
-                    }
+    // The coin of every other chain this arcade keeps, borrows or runs (Martin 2026-11-21: "They should be able to sell
+    // any asset in any of their wallets"): what a swap order on it can spend (crate::swaps::coins: the key's every
+    // address, through the lenders on a borrowed chain), and on a chain with its tokens index the key's DRC-20 /
+    // PRC-20. Chains read at once; one whose lenders don't answer in HOLDINGS_WAIT is left out.
+    let mut keys: Vec<String> = node.extra.lock().unwrap().keys().cloned().collect();
+    keys.extend(crate::borrow::borrowed_keys());
+    keys.extend(crate::arcsvc::defined().filter(|p| crate::arcsvc::runs(p)).map(|p| p.key.to_string()));
+    keys.retain(|k| k != node.params.key);
+    keys.sort();
+    keys.dedup();
+    // Threads not tied to this call (the node handle), so a chain still waiting on its lenders after HOLDINGS_WAIT
+    // doesn't hold the answer up; without a runner (tests) the chains are read in turn.
+    match crate::borrow::node_handle() {
+        Some(h) => {
+            let (tx, rx) = std::sync::mpsc::channel::<Vec<Value>>();
+            let mut n = 0;
+            for key in &keys {
+                let Some(p) = crate::chains::find(key) else { continue };
+                let (tx, h) = (tx.clone(), h.clone());
+                let spawned = std::thread::Builder::new().name("market holdings".into()).spawn(move || {
+                    let _ = tx.send(chain_holdings(&h, p));
+                });
+                n += usize::from(spawned.is_ok());
+            }
+            drop(tx);
+            let until = std::time::Instant::now() + HOLDINGS_WAIT;
+            for _ in 0..n {
+                match rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
+                    Ok(v) => out.extend(v),
+                    Err(_) => break,
                 }
             }
-            if !matches!(p.key, "dgb" | "dgbtest") {
-                out.push(json!({"network": p.key, "kind": "coin", "asset": crate::explorer::unit(p), "name": crate::explorer::unit(p), "amount": sum}));
+        }
+        None => {
+            for key in &keys {
+                if let Some(p) = crate::chains::find(key) {
+                    out.extend(chain_holdings(node, p));
+                }
             }
-        }
-    }
-    for chain in ["dgbtest", "dgb"] {
-        let Some(p) = crate::ddmarket::dd_chain(chain) else { continue };
-        if !node.extra.lock().unwrap().contains_key(chain) {
-            continue;
-        }
-        if let Ok((_, held, dgb, ..)) = crate::ddsvc::trade_coins(node, p) {
-            let unit = if chain == "dgb" { "DGB" } else { "DGBtest" };
-            out.push(json!({"network": chain, "kind": "dd", "asset": "DD", "name": "DigiDollar", "divisible": false, "decimals": 0, "unit_cents": 100, "amount": held.iter().map(|h| h.cents).sum::<i64>()}));
-            out.push(json!({"network": chain, "kind": "coin", "asset": unit, "name": unit, "amount": dgb.iter().map(|u| u.value).sum::<u64>()}));
         }
     }
     json!(out)
+}
+
+/// How long holdings waits for the chains it reads through lenders (the Swap app gives up on holdings after 8 s).
+const HOLDINGS_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// One chain's part of holdings: its coin (and on DigiByte, DigiDollars while it is installed: a DigiDollar trade
+/// needs the chain installed), and its DRC-20 / PRC-20 where its tokens index is kept here.
+fn chain_holdings(node: &Node, p: &'static arcade_chain::params::ChainParams) -> Vec<Value> {
+    let mut out = Vec::new();
+    let Ok((_, pk)) = crate::swaps::wallet_key(node, p) else { return out };
+    let unit = crate::explorer::unit(p);
+    if let Some(dd) = crate::ddmarket::dd_chain(p.key).filter(|_| node.extra.lock().unwrap().contains_key(p.key)) {
+        if let Ok((_, held, dgb, ..)) = crate::ddsvc::trade_coins(node, dd) {
+            out.push(json!({"network": p.key, "kind": "dd", "asset": "DD", "name": "DigiDollar", "divisible": false, "decimals": 0, "unit_cents": 100, "amount": held.iter().map(|h| h.cents).sum::<i64>()}));
+            out.push(json!({"network": p.key, "kind": "coin", "asset": unit, "name": unit, "amount": dgb.iter().map(|u| u.value).sum::<u64>()}));
+            return out;
+        }
+    }
+    let sum: u64 = crate::swaps::coins(node, p, &pk).iter().map(|u| u.value).sum();
+    out.push(json!({"network": p.key, "kind": "coin", "asset": unit, "name": unit, "amount": sum}));
+    let tokens_here = node.extra.lock().unwrap().get(p.key).is_some_and(|r| r.indexes.iter().any(|i| i == "tokens"));
+    if tokens_here {
+        let mut ticks: std::collections::BTreeMap<String, u128> = Default::default();
+        for (a, _) in crate::coinsend::key_scripts(p, &pk) {
+            for (tick, overall, transferable) in arcade_ledger::tokens::balances(&node.chain, p.chain_no, &a) {
+                let free = overall.parse::<u128>().unwrap_or(0).saturating_sub(transferable.parse::<u128>().unwrap_or(0));
+                *ticks.entry(tick).or_default() += free;
+            }
+        }
+        for (tick, free) in ticks.into_iter().filter(|(_, f)| *f > 0) {
+            out.push(json!({"network": p.key, "kind": "token20", "asset": tick, "name": tick.trim().to_uppercase(), "units": free.to_string(), "decimals": 18,
+                            "amount": (free / 10u128.pow(18)).to_string()}));
+        }
+    }
+    out
 }
 
 /// One read by name, with its arguments (the socket API and /r/market/<name>).
@@ -628,6 +673,7 @@ pub fn handle(node: &Node, cmd: &str, req: &Value) -> Result<Value, String> {
         "ledger.book" => read(node, "book", &q),
         "ledger.trades" => read(node, "trades", &q),
         "ledger.pairs" => read(node, "markets", &q),
+        "market.holdings" => Ok(holdings(node)),
         _ => Err(format!("unknown command {cmd}")),
     }
 }

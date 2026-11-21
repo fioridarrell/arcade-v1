@@ -422,6 +422,12 @@ fn on_push(addr: &str, f: &Frame) {
 /// Spent-by-mempool check needs the coin rows; set by the runner (a node handle for on_push).
 static NODE: std::sync::OnceLock<std::sync::Weak<Node>> = std::sync::OnceLock::new();
 
+/// The running node, for work that must outlive the call that started it (crate::marketsvc's holdings: a chain whose
+/// lenders are slow is left out after a while, its read finishing on its own). None in tests without a runner.
+pub(crate) fn node_handle() -> Option<Arc<Node>> {
+    NODE.get().and_then(|w| w.upgrade())
+}
+
 fn spends_ours(p: &ChainParams, tx: &Tx) -> bool {
     let Some(node) = NODE.get().and_then(|w| w.upgrade()) else { return false };
     tx.inputs.iter().any(|i| coin(&node, p, &i.prevout).is_some())

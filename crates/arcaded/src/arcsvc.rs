@@ -947,7 +947,11 @@ fn prove_in_pieces_of(dir: &std::path::Path, challenge: &arcade_arc::merkle::Has
 /// its tip is no longer wanted. Made in one run, a proof for a tip that moved on ran to its end at the lowest priority:
 /// on a 4-thread laptop 31 of them ran at once, the load stayed near 32 and arcaded was killed for memory 6 times in
 /// 3 days (2026-11-18..20).
-const BLOCK_POT_PIECES: u64 = 4;
+const BLOCK_POT_PIECES: u64 = 8;
+
+/// The most proofs of time for blocks this arcade runs at once: the tip's and the parent raced on (see `PROOF_THREADS`'s
+/// use: a stopped proof ends only at its next piece, so without a cap they piled up on slower machines).
+const PROOF_THREADS: usize = 2;
 
 /// `prove_in_pieces_of`, giving up (None) before a piece when `stop` says the proof is no longer wanted.
 fn prove_in_pieces_until(dir: &std::path::Path, challenge: &arcade_arc::merkle::Hash, steps: u64, most: usize, piece: u64, stop: &dyn Fn() -> bool) -> Option<TimeProof> {
@@ -1197,6 +1201,13 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                             continue;
                         }
                         None => {
+                            // At most PROOF_THREADS of our own proofs at once (2026-11-21: on slower x86 arcades a piece
+                            // took longer than a block, each new tip started one more while the old ones were still in
+                            // a piece: 28 threads and 10.8 GB on txtok.app, OOM kills on a ThinkPad). The ones whose tip
+                            // moved on stop at their next piece; this tip's starts on a later turn of the loop.
+                            if running.lock().unwrap().len() >= PROOF_THREADS {
+                                continue;
+                            }
                             p.insert(tip, None);
                             // Older tips' proofs only get spare CPU from now on, but the race's.
                             push_down(racing);

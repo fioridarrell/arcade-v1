@@ -1147,7 +1147,7 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         // This arcade's ARCADE pay and Earn progress, read only (arc.earn without the switch).
         "explorer.earn" => crate::arcsvc::earn_read(node, &req),
         c if c.starts_with("explorer.") => crate::explorer::handle_with(node, c, &req, req["img"] == "links"),
-        c @ ("ledger.book" | "ledger.trades" | "ledger.pairs") => crate::marketsvc::handle(node, c, &req),
+        c @ ("ledger.book" | "ledger.trades" | "ledger.pairs" | "market.holdings") => crate::marketsvc::handle(node, c, &req),
         // Token sends from this wallet (tokensend.rs): arcade tokens in one transaction; PRC-20 / DRC-20 as a job.
         "token.send" => crate::tokensend::ledger_send(node, req["propertyid"].as_u64().or_else(|| s("propertyid").and_then(|x| x.parse().ok())).ok_or("propertyid required")? as u32,
             req["units"].as_u64().or_else(|| s("units").and_then(|x| x.parse().ok())).ok_or("units required (base units)")?, &s("to").ok_or("to required")?, req["send"] == true, s("chain").as_deref()),

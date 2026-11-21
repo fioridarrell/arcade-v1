@@ -24,6 +24,32 @@ const HEADER_PEERS: usize = 8;
 static LOCK: Mutex<()> = Mutex::new(());
 /// Chains whose build failed on something no retry fixes (a rule broken): left until a restart.
 static FAILED: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+/// Chains whose init phases are running in their chain thread (they write the chain's store
+/// directly: chains.remove waits for them to leave before it deletes the chain).
+static RUNNING: Mutex<Vec<u16>> = Mutex::new(Vec::new());
+
+/// Whether chain `c`'s init phases are still running (chains.remove waits on this).
+pub fn running(c: u16) -> bool {
+    RUNNING.lock().unwrap().contains(&c)
+}
+
+struct Running(u16);
+
+impl Running {
+    fn enter(c: u16) -> Running {
+        RUNNING.lock().unwrap().push(c);
+        Running(c)
+    }
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let mut v = RUNNING.lock().unwrap();
+        if let Some(i) = v.iter().position(|x| *x == self.0) {
+            v.swap_remove(i);
+        }
+    }
+}
 
 fn requests(node: &Node) -> Vec<String> {
     node.app.store.read(|r| r.get(arcade_app::META, REQUESTS)).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
@@ -56,10 +82,20 @@ pub fn take_request(node: &Node, key: &str) -> bool {
     had
 }
 
-/// Can a chain be installed with init in `mode`? (Every block is kept and built from.)
-pub fn check(mode: &str) -> Result<(), String> {
+/// Can a chain be installed with init in `mode`? Every block is kept and built from (mode full
+/// or chain). Not on a proof-of-stake chain: its stake proofs are checked only when a block is
+/// connected, and an init install never connects the blocks it builds. Only on a chain with a
+/// minimum chain work: the sources that agree on the headers can be few and could be one party,
+/// so the headers must also carry real work no one can make up.
+pub fn check(p: &arcade_chain::params::ChainParams, mode: &str) -> Result<(), String> {
     if !matches!(mode, "full" | "chain") {
         return Err("an init install keeps every block: mode full or chain".into());
+    }
+    if matches!(p.pow, arcade_chain::pow::PowRule::PowThenStake { .. }) || p.value_rules.is_some_and(|v| v.stake_reward.is_some()) {
+        return Err(format!("{} has proof-of-stake blocks: an init install can't check stake (install it without --init)", p.name));
+    }
+    if p.min_chain_work().is_zero() {
+        return Err(format!("{} has no minimum chain work set for init installs yet (only Bitcoin has one): install it without --init", p.name));
     }
     Ok(())
 }
@@ -68,6 +104,7 @@ pub fn check(mode: &str) -> Result<(), String> {
 pub fn run(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) -> bool {
     let p = run.params;
     let c = p.chain_no;
+    let _running = Running::enter(c);
     loop {
         if run.stop.load(Ordering::Relaxed) {
             return false;
@@ -103,18 +140,41 @@ fn rest(run: &ChainRun, secs: u64) {
     }
 }
 
-/// The independence key of a P2P peer: its network group (/16 for IPv4, /32 for IPv6), so a
-/// handful of addresses in one range count once.
+/// The independence key of a source: its network group (/16 for IPv4, /32 for IPv6), the same
+/// for a P2P peer and an arcade, so a handful of addresses in one range, or one host offering
+/// the chain both over P2P and as an arcade (under any number of arcade ids), count once.
 pub fn group(addr: &std::net::SocketAddr) -> String {
     match addr.ip() {
         std::net::IpAddr::V4(a) => {
             let o = a.octets();
-            format!("p2p {}.{}.0.0/16", o[0], o[1])
+            format!("net {}.{}.0.0/16", o[0], o[1])
         }
-        std::net::IpAddr::V6(a) => {
-            let s = a.segments();
-            format!("p2p {:x}:{:x}::/32", s[0], s[1])
-        }
+        std::net::IpAddr::V6(a) => match a.to_ipv4_mapped() {
+            Some(v4) => group(&std::net::SocketAddr::new(v4.into(), addr.port())),
+            None => {
+                let s = a.segments();
+                format!("net {:x}:{:x}::/32", s[0], s[1])
+            }
+        },
+    }
+}
+
+/// [`group`] of an arcade's dial address ("host:port", or a ws(s):// URL): its host resolved.
+/// One that doesn't resolve is keyed by its name.
+pub fn addr_group(addr: &str) -> String {
+    let rest = addr.split_once("://").map(|x| x.1).unwrap_or(addr);
+    let hostport = rest.split('/').next().unwrap_or(rest);
+    if let Ok(sa) = hostport.parse::<std::net::SocketAddr>() {
+        return group(&sa);
+    }
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) if p.parse::<u16>().is_ok() => (h.trim_matches(|c| c == '[' || c == ']'), p.parse::<u16>().unwrap_or(443)),
+        _ => (hostport, 443),
+    };
+    use std::net::ToSocketAddrs;
+    match (host, port).to_socket_addrs().ok().and_then(|mut a| a.next()) {
+        Some(sa) => group(&sa),
+        None => format!("host {}", host.to_ascii_lowercase()),
     }
 }
 
@@ -170,7 +230,7 @@ fn headers(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
         .into_iter()
         .filter(|o| o.2 == "bk")
         .take(HEADER_PEERS)
-        .filter_map(|(id, addr, _, _)| crate::meshsource::MeshSource::dial_chain(node, &addr, p).ok().map(|s| (format!("arcade {}", &id[..id.len().min(12)]), s)))
+        .filter_map(|(_, addr, _, _)| crate::meshsource::MeshSource::dial_chain(node, &addr, p).ok().map(|s| (addr_group(&addr), s)))
         .collect();
     if peers.is_empty() && mesh.is_empty() {
         set(run, format!("init · headers (round {round}): no {} peer or arcade reachable; retrying", p.name));
@@ -261,6 +321,28 @@ fn coins_budget() -> usize {
     std::env::var("ARCADE_INIT_COINS_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096) << 20
 }
 
+/// The build's scratch folder: beside the chain's own folder, on the drive the chain was put on
+/// (Bitcoin's coin set derived on disk takes ~350 GB there). Removed with the chain.
+pub fn scratch(node: &Node, c: u16) -> std::path::PathBuf {
+    let own = node.chain.own_dir(c);
+    let name = own.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_else(|| format!("chain-{c}"));
+    own.with_file_name(format!("{name}.initsync"))
+}
+
+/// Scratch space the build's next steps may take, from the chain file's size (its blocks): the
+/// tx index sort ~6% of it, the coin set derived on disk ~55% (when it won't fit in memory:
+/// about 1/32 of the blocks' bytes).
+fn scratch_need(chain_bytes: u64, built: &[String], budget: usize) -> u64 {
+    let mut need = 0u64;
+    if !built.iter().any(|s| s == "txs") {
+        need += chain_bytes / 16;
+    }
+    if !built.iter().any(|s| s == "coins") && (budget as u64) < chain_bytes / 32 {
+        need += chain_bytes / 100 * 55;
+    }
+    need + (2 << 30)
+}
+
 fn build(node: &Arc<Node>, run: &ChainRun) {
     let p = run.params;
     let c = p.chain_no;
@@ -276,12 +358,31 @@ fn build(node: &Arc<Node>, run: &ChainRun) {
         }
         _ => {}
     }
-    let tmp = node.home.join("initsync").join(p.key);
+    let tmp = scratch(node, c);
+    let _ = std::fs::create_dir_all(&tmp);
+    let budget = coins_budget();
+    // Enough room for the scratch first: a full drive would stop the chain's own writes (and
+    // every other file on it) half way.
+    let chain_bytes = std::fs::metadata(node.chain.own_dir(c).join("chain.mdbx")).map(|m| m.len()).unwrap_or(0);
+    let need = scratch_need(chain_bytes, &node.chain.init_built(c), budget);
+    if let Some((free, _)) = crate::chaindrive::free_bytes(&tmp) {
+        // The scratch of an earlier run is removed when the build starts: it counts as free.
+        let old = dir_bytes(&tmp);
+        if free + old < need {
+            set(run, format!("init · build: needs about {} GB of scratch space in {}, {} GB free there; waiting (free some space, or set ARCADE_INIT_COINS_MB higher to derive the coins in memory)",
+                need >> 30, tmp.display(), (free + old) >> 30));
+            rest(run, 60);
+            return;
+        }
+    }
     let threads = arcade_chaindb::rules::script_threads();
     set(run, "init · build: starting".into());
     let t0 = std::time::Instant::now();
-    let r = node.chain.init_build(p, TAIL, threads, coins_budget(), &tmp, &run.stop, &mut |s| set(run, format!("init · {s}")));
+    let r = node.chain.init_build(p, TAIL, threads, budget, &tmp, &run.stop, &mut |s| set(run, format!("init · {s}")));
     match r {
+        Ok(b) if b.refetch > 0 => {
+            let _ = node.app.event("chains", &format!("{}: init build: the rules refused {} blocks; dropped and fetched again (a source may have sent damaged copies)", p.name, b.refetch));
+        }
         Ok(b) => {
             let _ = node.app.event("chains", &format!(
                 "{}: init install built to block {} in {:.1} h: {} coins{}, {} transactions indexed, {} blocks' rules checked; the normal sync carries on",
@@ -289,13 +390,37 @@ fn build(node: &Arc<Node>, run: &ChainRun) {
             ));
         }
         Err(e) if run.stop.load(Ordering::Relaxed) => set(run, format!("init · build stopped ({e}); it carries on at the next start")),
-        Err(e) => {
+        // The chain breaks the rules (even fetched again) or spends coins it never made: no retry fixes that.
+        Err(e @ arcade_store::StoreError::InvalidBlock { .. }) => {
+            let _ = std::fs::remove_dir_all(&tmp);
             let _ = node.app.event("chains", &format!("{}: init build failed: {e}", p.name));
             let _ = node.chain.set_state_text(c, arcade_chaindb::initsync::INIT_NOTE, Some(&format!("build failed: {e}")));
             set(run, format!("init · build failed: {e} (left as it is until the arcade restarts)"));
             FAILED.lock().unwrap().push(c);
         }
+        // Anything else (the disk, a read) may pass on a later try.
+        Err(e) => {
+            let _ = std::fs::remove_dir_all(&tmp);
+            let _ = node.app.event("chains", &format!("{}: init build stopped: {e}; trying again in 10 minutes", p.name));
+            let _ = node.chain.set_state_text(c, arcade_chaindb::initsync::INIT_NOTE, Some(&format!("build stopped: {e}; trying again")));
+            set(run, format!("init · build stopped: {e}; trying again in 10 minutes"));
+            rest(run, 600);
+        }
     }
+}
+
+/// Bytes in the files of a folder (and its folders).
+fn dir_bytes(dir: &std::path::Path) -> u64 {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.flatten()
+                .map(|e| match e.file_type() {
+                    Ok(t) if t.is_dir() => dir_bytes(&e.path()),
+                    _ => e.metadata().map(|m| m.len()).unwrap_or(0),
+                })
+                .sum()
+        })
+        .unwrap_or(0)
 }
 
 /// Blocks stored of those on the best header chain above the tip (a walk down the headers:
@@ -355,8 +480,34 @@ mod tests {
         let v6: std::net::SocketAddr = "[2001:db8:1:2::5]:8333".parse().unwrap();
         assert_eq!(group(&a), group(&b));
         assert_ne!(group(&a), group(&x));
-        assert_eq!(group(&v6), "p2p 2001:db8::/32");
-        assert!(check("full").is_ok() && check("chain").is_ok());
-        assert!(check("light").is_err() && check("shared").is_err());
+        assert_eq!(group(&v6), "net 2001:db8::/32");
+        // A P2P peer and an arcade on the same host (or range) count once.
+        assert_eq!(addr_group("203.0.113.7:7530"), group(&a));
+        assert_eq!(addr_group("wss://203.0.9.1:443/mesh"), group(&a));
+        assert_eq!(group(&"[::ffff:203.0.1.1]:8333".parse().unwrap()), group(&a));
+        assert_ne!(addr_group("198.51.100.9:7530"), group(&a));
+    }
+
+    #[test]
+    fn init_only_where_it_can_be_checked() {
+        use arcade_chain::params::{BITCOIN_MAIN, DOGECOIN_MAIN, KOTIA_MAIN};
+        assert!(check(&BITCOIN_MAIN, "full").is_ok() && check(&BITCOIN_MAIN, "chain").is_ok());
+        assert!(check(&BITCOIN_MAIN, "light").is_err() && check(&BITCOIN_MAIN, "shared").is_err());
+        // Bitcoin's floor is set and parses (a typo would turn it off).
+        assert!(!BITCOIN_MAIN.min_chain_work().is_zero());
+        // Proof of stake: refused, whatever else.
+        assert!(check(&KOTIA_MAIN, "full").unwrap_err().contains("proof-of-stake"));
+        // No minimum chain work: refused.
+        assert!(check(&DOGECOIN_MAIN, "full").unwrap_err().contains("minimum chain work"));
+    }
+
+    #[test]
+    fn scratch_need_follows_the_steps_left() {
+        let gb = 1u64 << 30;
+        let all = scratch_need(720 * gb, &[], 4096 << 20);
+        assert!(all > 400 * gb, "{}", all >> 30);
+        // Coins in memory (a budget over 1/32 of the blocks): the tx sort only.
+        assert!(scratch_need(720 * gb, &[], 24_000 << 20) < 50 * gb);
+        assert!(scratch_need(720 * gb, &["txs".into(), "coins".into()], 0) < 3 * gb);
     }
 }

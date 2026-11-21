@@ -1103,9 +1103,17 @@ pub fn remove(node: &Arc<Node>, key: &str) -> Result<Value, String> {
     let n = node.clone();
     let c = r.params.chain_no;
     let name = r.params.name;
+    let scratch = crate::initsync::scratch(node, c);
     std::thread::spawn(move || {
         // Let the chain's threads see the stop first: a chain's own file is deleted whole.
         std::thread::sleep(std::time::Duration::from_secs(10));
+        // An init install writes the store from its own thread (blocks, the build): wait until
+        // it has left (it stops between writes), at most half an hour.
+        let t0 = std::time::Instant::now();
+        while crate::initsync::running(c) && t0.elapsed() < std::time::Duration::from_secs(1800) {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+        }
+        let _ = std::fs::remove_dir_all(&scratch);
         while n.chain.remove_chain_batch(c, 20_000).map(|x| x > 0).unwrap_or(false) {}
         let _ = n.app.event("chains", &format!("removed {name} and its data"));
     });

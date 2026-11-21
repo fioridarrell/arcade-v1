@@ -263,7 +263,7 @@ system notification, and rings to or from an original arcade.
   the room's route whose media relay is on (as the original's media went through a node's TURN relay);
 - the other window decodes them and draws each picture where its page placed it, and plays each voice
   the page hears.
-- Ops: start, stop, screen, share, hear, volume, place, mute, frames, levels, spatial, shown, cutout.
+- Ops: start, stop, screen, share, hear, volume, place, mute, frames, levels, spatial, shown, cutout, draw, play.
   Events: media, media-off, state, speaking, frame, levels, cutout.
 - The pill with Stop shows while anything is open. The app's card switches (Camera & microphone,
   Pictures in the app) gate it.
@@ -317,6 +317,31 @@ the page still gets no camera frames:
   picture by the video's own buffer delay (its jitter buffer, from `getStats`), not exactly.
 - Nothing goes while a cutout is asked for and not yet drawing (the model loads in well under a second),
   so the background it hides is never sent.
+
+**Drawn media** (2026-11-21, for an app that goes live with a picture and a voice it makes itself, a virtual
+streamer on TxTOK Live say). The page draws and speaks; the window carries it as the host's camera and
+microphone, so viewers, windows and websites alike, need nothing new:
+- `room.media.start({drawn: {width, height, fps}, sound: 'drawn'})`. The window makes a canvas of its own
+  (at most 1280x1280, at most 24 a second) and a sound context whose only output is a stream
+  (`createMediaStreamDestination`), and their tracks go down the camera's and the microphone's path: share,
+  place, frames, levels and speaking work as for a camera. What goes out is cut as a camera's is (at most
+  640 wide, 20 a second). Either half alone: `{drawn}` with `audio: true` (a real microphone) or without
+  it (no sound), or `{video: true, sound: 'drawn'}` (a real camera). `drawn` with `screen` is refused. The
+  answer adds `drawn: {width, height, fps}` (after the limits) and `drawnSound: true`.
+- `room.media.draw(bitmap) -> {ok, dropped?}`: an `ImageBitmap` (a canvas, image or ImageData is made one
+  first), transferred to the window, which draws it on its canvas scaled to fit (black around it) and closes
+  it. One goes at a time: a newer one waits, and one that a newer one overtakes before it went is closed
+  and answers `{ok: true, dropped: true}`. Refused unless drawn video is on.
+- `room.media.play(samples, rate) -> {ok, queued_ms}`: mono PCM in a `Float32Array` (-1 to 1, transferred:
+  the page's array is empty afterwards; a view into a bigger buffer is copied first), at any rate from 8000
+  to 48000. The window plays it after what is queued, starting about 80 ms ahead when nothing is (a small
+  jitter buffer), into the call only: never this window's speakers. `queued_ms` is how much is waiting, to
+  pace by. At most 10 s in one call and 20 s queued. `play(null)` drops what is queued (a viewer cut in).
+  Refused unless drawn sound is on.
+- The same Camera & microphone switch on the app's card, the same pill (it says "The app's picture" and
+  "the app's sound") and Stop. `stop()` ends drawn media too: its tracks stop, the sound context closes
+  and the canvas goes. The cutout is refused on drawn pictures ("the cutout is for a camera").
+- `typeof room.media.draw === 'function'` tells a page this window has it.
 
 Findings:
 - **Room frames were lost across a relaying arcade (on main too).** An arcade that borrows blocks or

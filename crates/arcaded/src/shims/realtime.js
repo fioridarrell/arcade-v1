@@ -8,7 +8,7 @@
      room.fast (a room joined with {fast: true}): on('message' | 'peer'), send(value, {reliable, to}),
        routes(), link(ids, {max}), peers()
      room.media (on a fast room): start, stop, showScreen, hideScreen, share, frames, levels, spatial,
-       hear, volume, place, mute, cutout; on('media' | 'media-off' | 'state' | 'speaking' | 'frame' | 'levels' | 'cutout')
+       hear, volume, place, mute, cutout, draw, play; on('media' | 'media-off' | 'state' | 'speaking' | 'frame' | 'levels' | 'cutout')
      arcade.realtime.area('world', {cell, view, x, y})  -> Area: on, move(x, y), send, members, leave
      arcade.realtime.ring(address, {line, link})  arcade.realtime.ringed()
 
@@ -22,7 +22,8 @@
   // A window that is waiting on the person says {pending: why} first: the wait grows to PENDING_WAIT.
   var PENDING_WAIT = 600000;
 
-  function ask(message, wait) {
+  // transfer: what goes with the message without a copy (draw's ImageBitmap, play's samples).
+  function ask(message, wait, transfer) {
     return new Promise(function (resolve, reject) {
       message.arcade = 'realtime';
       message.seq = ++seq;
@@ -38,7 +39,10 @@
         }, after);
       };
       w.giveUp(wait || 20000);
-      window.parent.postMessage(message, '*');
+      if (!transfer) { window.parent.postMessage(message, '*'); return; }
+      // 2026-11-21: a browser that cannot transfer one of these sends a copy instead.
+      try { window.parent.postMessage(message, '*', transfer); }
+      catch (err) { window.parent.postMessage(message, '*'); }
     });
   }
 
@@ -78,16 +82,18 @@
     this.room = room;
     this.screen = screen;                           // this window can share its screen
     this._on = { media: [], 'media-off': [], state: [], speaking: [], frame: [], levels: [], cutout: [] };
+    this._drawing = false;                          // a draw is on its way to the window
+    this._drawNext = null;                          // the newest one waiting behind it: {bitmap, done}
   }
   Media.prototype.on = function (type, fn) {
     if (!this._on[type]) throw new Error('media events are: media, media-off, state, speaking, frame, levels, cutout');
     this._on[type].push(fn);
     return this;
   };
-  Media.prototype._ask = function (what, extra, wait) {
+  Media.prototype._ask = function (what, extra, wait, transfer) {
     var m = { op: 'media', room: this.room.name, do: what };
     for (var k in extra || {}) m[k] = extra[k];
-    return ask(m, wait);
+    return ask(m, wait, transfer);
   };
   function okOrError(promise) {
     return promise.then(function () { return { ok: true }; }, function (err) { return { ok: false, error: err.message }; });
@@ -101,11 +107,25 @@
   }
   Media.prototype.start = function (options) {
     options = options || { video: true, audio: true };
-    var m = { video: !!options.video, audio: !!options.audio, screen: !!options.screen, sound: !!options.sound,
+    // 2026-11-21: drawn media. {drawn: {width, height, fps}} puts the app's own pictures (draw) where the camera's
+    // go, and sound: 'drawn' its own sound (play) where the microphone's goes. Viewers see the host's camera.
+    var drawnSound = options.sound === 'drawn';
+    var m = { video: !!options.video, audio: !!options.audio, screen: !!options.screen, sound: !drawnSound && !!options.sound,
               facing: options.facing === 'environment' ? 'environment' : options.facing === 'user' ? 'user' : '' };
+    if (options.drawn) {
+      var d = typeof options.drawn === 'object' ? options.drawn : {};
+      m.drawn = { width: Number(d.width) || 640, height: Number(d.height) || 360, fps: Number(d.fps) || 24 };
+    }
+    if (drawnSound) m.drawnSound = true;
     if (options.cutout !== undefined) m.cutout = options.cutout ? String(options.cutout) : '';
     return this._ask('start', m, 600000)
-      .then(function (said) { var r = { ok: true, video: !!said.video, audio: !!said.audio, screen: !!said.screen }; if (said.sound) r.sound = true; return withCutout(said, r); },
+      .then(function (said) {
+              var r = { ok: true, video: !!said.video, audio: !!said.audio, screen: !!said.screen };
+              if (said.sound) r.sound = true;
+              if (said.drawn) r.drawn = said.drawn;
+              if (said.drawnSound) r.drawnSound = true;
+              return withCutout(said, r);
+            },
             function (err) { return { ok: false, error: err.message }; });
   };
   // The cutout on the camera now on, changed, or (null) off: {ok, cutout, cutoutWhy?}.
@@ -115,6 +135,45 @@
             function (err) { return { ok: false, error: err.message }; });
   };
   Media.prototype.stop = function () { return this._ask('stop'); };
+  // draw(bitmap): one picture for drawn video (an ImageBitmap; a canvas, image or ImageData is made one first).
+  // It is transferred, so it is gone from the page afterwards. The newest wins: while one is on its way, the
+  // next waits, and one that comes before it went is dropped (closed, {ok: true, dropped: true}).
+  Media.prototype.draw = function (bitmap) {
+    var self = this;
+    return new Promise(function (done) {
+      if (!bitmap) { done({ ok: false, error: 'draw takes an ImageBitmap' }); return; }
+      if (self._drawNext) { closeBitmap(self._drawNext.bitmap); self._drawNext.done({ ok: true, dropped: true }); }
+      self._drawNext = { bitmap: bitmap, done: done };
+      self._drawPump();
+    });
+  };
+  Media.prototype._drawPump = function () {
+    var self = this, next = this._drawNext;
+    if (this._drawing || !next) return;
+    this._drawNext = null;
+    this._drawing = true;
+    var bm = next.bitmap;
+    var made = typeof ImageBitmap !== 'undefined' && bm instanceof ImageBitmap ? Promise.resolve(bm)
+      : typeof createImageBitmap === 'function' ? createImageBitmap(bm) : Promise.reject(new Error('draw takes an ImageBitmap'));
+    made.then(function (b) { return self._ask('draw', { bitmap: b }, 20000, [b]); })
+      .then(function () { next.done({ ok: true }); }, function (err) { next.done({ ok: false, error: err.message }); })
+      .then(function () { self._drawing = false; self._drawPump(); });
+  };
+  function closeBitmap(b) { try { if (b && b.close) b.close(); } catch (err) {} }
+  // play(samples, rate): mono PCM (a Float32Array, -1 to 1) for drawn sound, at any rate from 8000 to 48000. It is
+  // transferred (the page's array is empty afterwards) and plays after what is queued. -> {ok, queued_ms}: how much
+  // is waiting, to pace by. play(null) drops what is queued (a viewer cut in).
+  Media.prototype.play = function (samples, rate) {
+    if (samples == null) {
+      return this._ask('play', { flush: true }).then(function (said) { return { ok: true, queued_ms: said.queued_ms | 0 }; },
+                                                     function (err) { return { ok: false, error: err.message }; });
+    }
+    if (!(samples instanceof Float32Array)) return Promise.resolve({ ok: false, error: 'play takes a Float32Array of mono samples' });
+    var whole = samples.byteOffset === 0 && samples.byteLength === samples.buffer.byteLength ? samples : samples.slice();
+    return this._ask('play', { samples: whole, rate: Number(rate) || 48000 }, 20000, [whole.buffer])
+      .then(function (said) { return { ok: true, queued_ms: said.queued_ms | 0 }; },
+            function (err) { return { ok: false, error: err.message }; });
+  };
   Media.prototype.showScreen = function (options) {
     return this._ask('screen', { on: true, sound: !!(options && options.sound) }, 600000)
       .then(function (said) { return said.sound ? { ok: true, sound: true } : { ok: true }; }, function (err) { return { ok: false, error: err.message }; });

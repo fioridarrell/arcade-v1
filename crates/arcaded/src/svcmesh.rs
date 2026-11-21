@@ -124,7 +124,7 @@ pub fn attach(node: Arc<Node>, lines: &mut dyn Iterator<Item = std::io::Result<S
     };
     let _ = node.app.event("svc", &format!("a helper attached for {service}"));
     // Who this arcade is, for the helper: its node id, and the ARCADE address payments come to (and its @tag).
-    let (pay_to, tag) = match crate::arcledger::chain().ok().and_then(|p| crate::arcledger::sender(&node, p).ok()) {
+    let (pay_to, tag) = match crate::arcledger::write_chain().ok().and_then(|p| crate::arcledger::sender(&node, p).ok()) {
         Some((a, t, _)) => (Some(a), t),
         None => (None, None),
     };
@@ -297,7 +297,7 @@ fn deliver(node: &Node, service: &str, from: &str, who: Option<String>, body: Va
 // ---------------------------------------------------------------- offers
 
 fn sign_offer(node: &Node, service: &str, body: Option<&Value>) -> Value {
-    let tag = crate::arcledger::chain().ok().and_then(|p| crate::arcledger::sender(node, p).ok()).and_then(|s| s.1);
+    let tag = crate::arcledger::write_chain().ok().and_then(|p| crate::arcledger::sender(node, p).ok()).and_then(|s| s.1);
     let mut o = json!({
         "t": "sv", "op": "offer", "s": service, "o": node.id_hex(), "at": now_s(), "tag": tag,
         "name": crate::meshsvc::public_name(node), "pay_to": crate::arcledger::own_address(node).ok(), "body": body,
@@ -484,8 +484,11 @@ fn grant_ok(g: &Value, service: &str, me: &str) -> Result<String, String> {
 }
 
 /// This wallet's grant for `service` at `arcade` (made once, kept a year), or None with no ARCADE wallet.
+/// Signed with this arcade's ARCADE key whether ARCADE is installed here or only borrowed (Martin 2026-11-21:
+/// "identifying a buyer needs ARCADE installed locally should not be. it should work borrowed"): a grant needs the key
+/// and the chain's params, not its ledger tables.
 fn my_grant(node: &Node, service: &str, arcade: &str) -> Option<Value> {
-    let p = crate::arcledger::chain().ok()?;
+    let p = crate::arcledger::write_chain().ok()?;
     let (address, _, sk) = crate::arcledger::sender(node, p).ok()?;
     let key = format!("svc_grant:{service}:{arcade}");
     if let Some(g) = node.app.store.read(|r| r.get(arcade_app::META, key.as_bytes())).ok().flatten().and_then(|b| serde_json::from_slice::<Value>(&b).ok()) {
@@ -544,7 +547,7 @@ pub fn ask(node: &Node, to: &str, service: &str, body: Value, total: Duration, e
     let me = node.id_hex();
     if to == me {
         let (tx, rx) = mpsc::channel();
-        let who = crate::arcledger::chain().ok().and_then(|p| crate::arcledger::sender(node, p).ok()).map(|s| s.0);
+        let who = crate::arcledger::write_chain().ok().and_then(|p| crate::arcledger::sender(node, p).ok()).map(|s| s.0);
         deliver(node, service, &me, who, body, Target::Local(tx));
         return answers(&mut |until| match rx.recv_timeout(until.saturating_duration_since(Instant::now())) {
             Ok(f) => Ok(f),

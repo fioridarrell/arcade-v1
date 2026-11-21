@@ -18,7 +18,7 @@
 use crate::db::{decode_tip, ChainDb, UNDO_DEPTH};
 use crate::ixfile::{self, Kind, Meta, Reader, Writer};
 use crate::addrbuild::{OFF, PENDING, TXS_PENDING};
-use crate::ixset::{addr_epoch, list, marker, marker_name};
+use crate::ixset::{addr_epoch, generation_name, list, marker, marker_name};
 use crate::schema::*;
 use arcade_chain::hash::sha256;
 use arcade_chain::params::ChainParams;
@@ -237,7 +237,11 @@ impl Checkpoint {
             let mut f = std::fs::File::create(&tmp)?;
             f.write_all(&self.encode())?;
             f.sync_all()?;
-            std::fs::rename(&tmp, path)
+            std::fs::rename(&tmp, path)?;
+            if let Some(d) = path.parent() {
+                ixfile::sync_dir(d);
+            }
+            Ok(())
         };
         write().map_err(other)
     }
@@ -380,6 +384,12 @@ fn not_ready<R: crate::db::Rd>(r: &R, c: u16, kind: Kind, upto: u32, epoch: Opti
     Ok(None)
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Tests: a pass fails right before it would set the marker (as a crash would leave it).
+    pub(crate) static FAIL_BEFORE_MARKER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 /// What a pass did.
 enum Pass {
     /// Nothing new is settled, or the files now reach this height.
@@ -424,6 +434,14 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
         Some((ck, _)) => (ck.target, ck.epoch),
         None => {
             clear_unfinished(&dir, kind);
+            if from.is_none() {
+                // From scratch: no reader uses any file of this kind, and every one it needs
+                // is written again. Whatever is there (left by an earlier install, another
+                // layout, a pass that never switched) goes, so nothing stale is adopted.
+                for (_, _, path) in list(&dir, kind)? {
+                    std::fs::remove_file(&path).map_err(other)?;
+                }
+            }
             // Settled: deep below the tip, and below where the coins are complete (a tip
             // past that point is wound back to it when the arcade starts).
             let (tip, coins_at) = store.read(|r| Ok((r.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)), r.get(STATE, &k_state(c, "coins_at"))?.map(|v| decode_tip(&v)))))?;
@@ -482,6 +500,11 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
                 }
             }
             if let Some(l) = rows.last() {
+                // A full chunk of one key's values (a dup table) would be read again and
+                // again: scan_after resumes at the key, not inside its values.
+                if rows.len() == chunk && after.as_deref() == Some(&l.0[..]) {
+                    return Err(other(format!("more than {chunk} values under one {table} key; convert with bigger chunks")));
+                }
                 after = Some(l.0.clone());
             }
             Ok(rows.len())
@@ -514,7 +537,7 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
     }
     let _ = std::fs::remove_file(&ck_path);
     note(format!("index files {tag}: {rows} rows in {bytes} bytes, read back and checked"));
-    merge_eras(&dir, kind, &o.layout, target, o.level, o.threads, note)?;
+    merge_eras(&dir, kind, &o.layout, target, from, o.level, o.threads, note)?;
 
     // Switch the readers, unless the chain changed under the files meanwhile (it cannot,
     // that deep; checked all the same, in the transaction that sets the marker).
@@ -527,7 +550,14 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
         if let Some(why) = not_ready(w, c, kind, target, Some(epoch))? {
             return Err(other(format!("{tag}: {why}; the files were written but nothing was switched")));
         }
-        let gen = marker(w, c, kind)?.filter(|m| m.len() >= 8).map(|m| be_u32(&m, 4)).unwrap_or(0).wrapping_add(1);
+        #[cfg(test)]
+        if FAIL_BEFORE_MARKER.with(|f| f.get()) {
+            return Err(other("test: stopped before the marker"));
+        }
+        let old = marker(w, c, kind)?.filter(|m| m.len() >= 8).map(|m| be_u32(&m, 4)).unwrap_or(0);
+        let last = w.get(STATE, &k_state(c, &generation_name(kind)))?.filter(|v| v.len() >= 4).map(|v| be_u32(&v, 0)).unwrap_or(0);
+        let gen = old.max(last).wrapping_add(1);
+        w.put(STATE, &k_state(c, &generation_name(kind)), &gen.to_be_bytes())?;
         w.put(STATE, &k_state(c, &marker_name(kind)), &[target.to_be_bytes(), gen.to_be_bytes()].concat())
     })?;
     // The marker must be on disk before any file it no longer uses goes: chain.mdbx does not
@@ -548,12 +578,28 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
 
 /// Merge each era's ranges into the era's file, where every range is there and settled.
 /// The ranges stay until the readers have switched (the caller removes them).
-fn merge_eras(dir: &Path, kind: Kind, layout: &Layout, upto: u32, level: i32, threads: usize, note: &mut dyn FnMut(String)) -> Result<()> {
+/// Eras ending at or below `switched` (the marker before this pass) are in use already and
+/// were checked when first adopted.
+#[allow(clippy::too_many_arguments)]
+fn merge_eras(dir: &Path, kind: Kind, layout: &Layout, upto: u32, switched: Option<u32>, level: i32, threads: usize, note: &mut dyn FnMut(String)) -> Result<()> {
     let files = list(dir, kind)?;
     let mut first = 0u64;
     while first + layout.era() - 1 <= upto as u64 {
         let last = first + layout.era() - 1;
-        if !files.iter().any(|f| (f.0 as u64, f.1 as u64) == (first, last)) {
+        // An era file already there (merged by a pass that stopped before switching) is
+        // read whole before it is used; a bad one is merged again.
+        let mut have = false;
+        if let Some(f) = files.iter().find(|f| (f.0 as u64, f.1 as u64) == (first, last)) {
+            let in_use = switched.is_some_and(|s| last <= s as u64);
+            match if in_use { Ok(()) } else { Reader::open(&f.2).and_then(|r| r.verify()) } {
+                Ok(()) => have = true,
+                Err(e) => {
+                    note(format!("index files {}: era {first}..={last} is not usable ({e}); merging it again", kind.tag() as char));
+                    std::fs::remove_file(&f.2).map_err(other)?;
+                }
+            }
+        }
+        if !have {
             let parts: Vec<&PathBuf> = (0..layout.era_ranges as u64)
                 .filter_map(|i| {
                     let a = first + i * layout.range as u64;
@@ -565,6 +611,8 @@ fn merge_eras(dir: &Path, kind: Kind, layout: &Layout, upto: u32, level: i32, th
                 let info = ixfile::merge(dir, &readers, level, threads)?;
                 Reader::open(&info.path)?.verify()?;
                 note(format!("index files {}: era {first}..={last} merged from its ranges ({} rows)", kind.tag() as char, info.rows));
+            } else if files.iter().any(|f| (f.0 as u64, f.1 as u64) == (first, last)) {
+                return Err(other(format!("era {first}..={last} was not usable and its ranges are gone; switch the files off and convert again")));
             }
         }
         first += layout.era();
@@ -582,6 +630,11 @@ impl ChainDb {
         let c = params.chain_no;
         if o.layout.range == 0 || o.layout.era_ranges == 0 || o.layout.depth < UNDO_DEPTH {
             return Err(other(format!("a range must have heights, an era ranges, and the sealing depth be at least {UNDO_DEPTH}")));
+        }
+        // Files cut another way would not equal other arcades' (and could not be tiled with
+        // standard ones): only the tests use small layouts.
+        if o.layout != Layout::STANDARD && !cfg!(test) {
+            return Err(other("index files are cut by the standard layout only (10,000-height ranges, eras of ten)"));
         }
         // Rows still in the address log or the tx index runs are in no table yet.
         if self.addresses_pending(c)? || self.txs_pending(c)? || crate::txruns::of(self.store(c).id(), c).is_some() {

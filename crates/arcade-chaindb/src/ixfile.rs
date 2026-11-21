@@ -32,9 +32,13 @@ pub const MAGIC: &[u8; 8] = b"ARCIXF\r\n";
 pub const END_MAGIC: &[u8; 8] = b"ARCIXEND";
 /// The format version. A change to the row layouts, the block sizes or the column coding
 /// is a new version: files of different versions never mix (their ids differ).
-pub const FMT: u16 = 1;
+/// Version 2: the file id also covers every block's first key.
+pub const FMT: u16 = 2;
 pub const HEADER_LEN: usize = 64;
 const TRAILER_LEN: usize = 8 + 4 + 8 + 32 + 32 + 8;
+/// The largest footer a reader accepts (all of Bitcoin's history in one era file would be
+/// well under it).
+const MAX_FOOTER: u64 = 256 << 20;
 /// The zstd level of sealed files: they are written once and read for years.
 pub const LEVEL: i32 = 19;
 /// File name ending.
@@ -82,6 +86,13 @@ impl Kind {
     }
     /// Rows per block: fixed per kind (not a size target), so every arcade cuts alike.
     pub fn block_rows(self) -> usize {
+        #[cfg(test)]
+        if SMALL_BLOCKS.with(|s| s.get()) {
+            return self.std_block_rows() / 64;
+        }
+        self.std_block_rows()
+    }
+    fn std_block_rows(self) -> usize {
         match self {
             Kind::Hist => 8192,
             Kind::Spends => 16384,
@@ -102,6 +113,33 @@ impl Kind {
             Kind::Txs => 16,
         }
     }
+    /// The most bytes a stored block of this kind can take: per column its two lengths and
+    /// a zstd frame of at most 32 bytes a row (zstd's worst-case bound, rounded up). A file
+    /// whose block is longer is refused before anything is allocated for it.
+    pub fn max_block_bytes(self) -> u64 {
+        let raw = (self.block_rows() * 32) as u64;
+        self.columns() as u64 * (8 + raw + raw / 128 + 4096)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests: blocks of 1/64 the rows, so small test chains give files of many blocks.
+    /// Per thread: a file is written and read on the thread that set it.
+    static SMALL_BLOCKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Tests: use small blocks on this thread while the guard lives.
+#[cfg(test)]
+pub(crate) fn small_blocks() -> impl Drop {
+    struct G;
+    impl Drop for G {
+        fn drop(&mut self) {
+            SMALL_BLOCKS.with(|s| s.set(false));
+        }
+    }
+    SMALL_BLOCKS.with(|s| s.set(true));
+    G
 }
 
 /// A history row.
@@ -461,12 +499,16 @@ fn unpack(kind: Kind, first: u32, n: usize, data: &[u8]) -> Option<Vec<u8>> {
     decode(kind, first, n, &cols)
 }
 
-/// The id of a file's content: its header, row count and every block's row hash.
-fn file_id(header: &[u8; HEADER_LEN], rows: u64, hashes: &[[u8; 32]]) -> [u8; 32] {
-    let mut v = Vec::with_capacity(HEADER_LEN + 8 + hashes.len() * 32);
+/// The id of a file's content: its header, row count, and every block's first key and row
+/// hash. The first keys are in it because the readers search them: a file with the same id
+/// cannot steer a lookup to another block.
+fn file_id(header: &[u8; HEADER_LEN], rows: u64, keys: &[u8], hashes: &[[u8; 32]]) -> [u8; 32] {
+    let kl = keys.len() / hashes.len().max(1);
+    let mut v = Vec::with_capacity(HEADER_LEN + 8 + keys.len() + hashes.len() * 32);
     v.extend_from_slice(header);
     v.extend_from_slice(&rows.to_be_bytes());
-    for h in hashes {
+    for (i, h) in hashes.iter().enumerate() {
+        v.extend_from_slice(&keys[i * kl..(i + 1) * kl]);
         v.extend_from_slice(h);
     }
     sha256(&v)
@@ -670,7 +712,7 @@ impl Writer {
             foot.extend_from_slice(&self.offsets[i].to_be_bytes());
             foot.extend_from_slice(h);
         }
-        let id = file_id(&header, self.rows, &self.hashes);
+        let id = file_id(&header, self.rows, &self.keys, &self.hashes);
         foot.extend_from_slice(&self.rows.to_be_bytes());
         foot.extend_from_slice(&(self.hashes.len() as u32).to_be_bytes());
         foot.extend_from_slice(&self.offset.to_be_bytes());
@@ -746,6 +788,11 @@ impl Reader {
         if blocks != rows.div_ceil(meta.kind.block_rows() as u64) || foot_off < HEADER_LEN as u64 || foot_off.checked_add(blocks * entry + TRAILER_LEN as u64) != Some(bytes) {
             return Err(bad(path, "footer does not fit the file"));
         }
+        // Nothing is allocated from a length the file states before it is checked: the
+        // footer is at most MAX_FOOTER, a block at most the kind's largest.
+        if blocks * entry > MAX_FOOTER {
+            return Err(bad(path, "footer larger than any index file has"));
+        }
         let mut foot = vec![0u8; (blocks * entry) as usize];
         read_at(&file, &mut foot, foot_off).map_err(|e| bad(path, e))?;
         if sha256(&[&header[..], &foot[..], &t[..52]].concat())[..] != t[52..84] {
@@ -758,11 +805,15 @@ impl Reader {
             hashes.push(e[kl + 8..].try_into().unwrap());
         }
         offsets.push(foot_off);
-        if offsets[0] < HEADER_LEN as u64 || offsets.windows(2).any(|w| w[0] >= w[1]) {
+        let max = meta.kind.max_block_bytes();
+        if offsets[0] != HEADER_LEN as u64 || offsets.windows(2).any(|w| w[0] >= w[1] || w[1] - w[0] > max) {
             return Err(bad(path, "bad block offsets"));
         }
+        if keys.chunks_exact(kl).zip(keys.chunks_exact(kl).skip(1)).any(|(a, b)| a >= b) {
+            return Err(bad(path, "block first keys out of order"));
+        }
         let id: [u8; 32] = t[20..52].try_into().unwrap();
-        if file_id(&header, rows, &hashes) != id {
+        if file_id(&header, rows, &keys, &hashes) != id {
             return Err(bad(path, "file id mismatch"));
         }
         Ok(Reader { meta, rows, bytes, id, path: path.to_path_buf(), file, keys, offsets, hashes })
@@ -785,11 +836,18 @@ impl Reader {
     pub fn block(&self, i: usize) -> Result<Vec<u8>> {
         let k = self.meta.kind;
         let n = if i + 1 == self.blocks() { self.rows as usize - i * k.block_rows() } else { k.block_rows() };
-        let mut data = vec![0u8; (self.offsets[i + 1] - self.offsets[i]) as usize];
+        let len = self.offsets[i + 1] - self.offsets[i];
+        if len > k.max_block_bytes() {
+            return Err(bad(&self.path, format!("block {i} is longer than a block can be")));
+        }
+        let mut data = vec![0u8; len as usize];
         read_at(&self.file, &mut data, self.offsets[i]).map_err(|e| bad(&self.path, e))?;
         let rows = unpack(k, self.meta.first, n, &data).ok_or_else(|| bad(&self.path, format!("block {i} is damaged (does not decode)")))?;
         if rows.len() != n * k.row_len() || sha256(&rows) != self.hashes[i] {
             return Err(bad(&self.path, format!("block {i} is damaged (row hash mismatch)")));
+        }
+        if rows[..k.key_len()] != *self.first_key(i) {
+            return Err(bad(&self.path, format!("block {i} does not start with its listed key")));
         }
         Ok(rows)
     }

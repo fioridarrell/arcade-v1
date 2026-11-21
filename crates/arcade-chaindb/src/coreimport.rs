@@ -1001,8 +1001,12 @@ impl DiskReplay {
                         let tx = Tx::parse_with(&raw, &params.format).map_err(err)?;
                         if !tx.is_coinbase() {
                             for i in &tx.inputs {
+                                // Where it is spent: height and position, so a spend of an output a later
+                                // transaction of the same block makes is no spend (as Replay, as Core).
+                                let mut at = h.to_be_bytes().to_vec();
+                                at.extend_from_slice(&p.to_be_bytes());
                                 match crate::db::locate(r, params, &i.prevout.txid)? {
-                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &h.to_be_bytes())?,
+                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &at)?,
                                     None => self.missing += 1,
                                 }
                             }
@@ -1013,6 +1017,7 @@ impl DiskReplay {
                                 continue;
                             }
                             let mut v = h.to_be_bytes().to_vec();
+                            v.extend_from_slice(&p.to_be_bytes());
                             v.extend_from_slice(&encode_coin(o.value, h, coinbase, &o.script_pubkey));
                             self.made.push(&k_pos(c, b, p, vout as u32), &v)?;
                         }
@@ -1029,9 +1034,14 @@ impl DiskReplay {
     /// The derived set, read in key order from `DiskRows::next_kv`.
     pub fn finish(self) -> Result<DiskRows> {
         let mut spent = self.spent.finish()?;
-        let next_spend = spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        let next_spend = spent.next_kv()?.map(|(k, v)| (k, at_of(&v)));
         Ok(DiskRows { made: self.made.finish()?, spent, next_spend, missing: self.missing })
     }
+}
+
+/// (height, position) at the front of a DiskReplay row.
+fn at_of(v: &[u8]) -> (u32, u32) {
+    (be_u32(v, 0), be_u32(v, 4))
 }
 
 /// The coin set a DiskReplay derived: outputs made and not spent by a later input, as OUTPUTS
@@ -1039,7 +1049,7 @@ impl DiskReplay {
 pub struct DiskRows {
     made: Sorted,
     spent: Sorted,
-    next_spend: Option<(Vec<u8>, u32)>,
+    next_spend: Option<(Vec<u8>, (u32, u32))>,
     /// Inputs that spent a coin not made before them (a broken chain: never expected); complete
     /// once `next_kv` returned None.
     pub missing: u64,
@@ -1047,7 +1057,7 @@ pub struct DiskRows {
 
 impl DiskRows {
     fn pull(&mut self) -> Result<()> {
-        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, at_of(&v)));
         Ok(())
     }
 
@@ -1060,19 +1070,20 @@ impl DiskRows {
                 }
                 return Ok(None);
             };
-            let made_at = be_u32(&v, 0);
+            let made_at = at_of(&v);
             let mut spent = false;
             while let Some((sk, at)) = &self.next_spend {
                 match sk.as_slice().cmp(k.as_slice()) {
                     std::cmp::Ordering::Greater => break,
-                    // Spent once, at or after it was made; any other spend of it finds nothing (as Replay).
-                    std::cmp::Ordering::Equal if !spent && *at >= made_at => spent = true,
+                    // Spent once, by a transaction after the one that made it (a later block, or
+                    // later in the same block); any other spend of it finds nothing (as Replay).
+                    std::cmp::Ordering::Equal if !spent && *at > made_at => spent = true,
                     _ => self.missing += 1,
                 }
                 self.pull()?;
             }
             if !spent {
-                return Ok(Some((k, v[4..].to_vec())));
+                return Ok(Some((k, v[8..].to_vec())));
             }
         }
     }

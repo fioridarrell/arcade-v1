@@ -2354,12 +2354,15 @@ pub fn status(node: &Node, key: &str) -> Option<Value> {
 pub fn status_all(node: &Node) -> Value {
     let c = cfg(node);
     let installed: BTreeSet<String> = node.extra.lock().unwrap().keys().cloned().collect();
+    // Every chain alike, the home chain included (Martin 2026-11-20): it has its Borrow switch too (manage() already
+    // honors it; borrowing it off on an arcade that hasn't installed it leaves that arcade without its home chain).
     let chains: Vec<Value> = crate::chains::all()
-        .filter(|p| p.chain_no != node.params.chain_no)
         .map(|p| {
+            let home = p.chain_no == node.params.chain_no;
             let mut v = status(node, p.key).unwrap_or_else(|| json!({"key": p.key, "name": p.name, "borrowed": false}));
             v["on"] = json!(chain_on(&c, p.key));
-            v["installed"] = json!(installed.contains(p.key) || crate::arcsvc::runs(p));
+            v["installed"] = json!(installed.contains(p.key) || crate::arcsvc::runs(p) || (home && crate::homeinst::installed()));
+            v["home"] = json!(home);
             v["lendable"] = json!(!node.cr_offerers(p.key).is_empty());
             v
         })

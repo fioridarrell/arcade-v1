@@ -54,18 +54,13 @@
     const d = document.createElement("div"); d.className = "bd";
     const l = document.createElement("div"); l.className = "bl";
     info.append(nm, d);
-    if (c.arcade && c.installed) {
-      // The ARCADE chain: installed, removed and borrowed as any coin; its blocks come over
-      // the arcade mesh, so there is no storage mode or index to choose.
-      d.textContent = `Installed · block ${(c.tip || 0).toLocaleString()}`;
-      if (borrowed) {
-        l.textContent = `Until it catches up, the borrowed copy answers balances and sends (${String(bc.state || "").replace(/^Borrowed · /, "")}).`;
-        info.append(l);
-      }
-    } else if (c.installed) {
-      const pct = Math.floor(c.overall || 0);
-      d.textContent = c.home ? `Installed · home chain · ${c.mode} · ${(c.indexes || []).join(", ")}` : `Installed · ${pct}% · ${String(c.state || "").split(" [")[0]} · ${c.mode}`;
-      if (!c.home && pct < 100) { const bar = document.createElement("div"); bar.className = "bar"; const i = document.createElement("i"); i.style.width = pct + "%"; bar.append(i); info.append(bar); }
+    // Every chain the same row (Martin 2026-11-20: "all coins and chains should be treated identically"): the home
+    // chain and the ARCADE chain are no longer worded or laid out apart.
+    if (c.installed) {
+      const pct = c.arcade ? (c.overall == null ? 100 : Math.floor(c.overall)) : Math.floor(c.overall || 0);
+      const st = String(c.state || (pct >= 100 ? "synced" : "syncing")).split(" [")[0];
+      d.textContent = `Installed · ${pct}% · ${st} · ${c.mode || "full"} · block ${(c.tip || 0).toLocaleString()}`;
+      if (pct < 100) { const bar = document.createElement("div"); bar.className = "bar"; const i = document.createElement("i"); i.style.width = pct + "%"; bar.append(i); info.append(bar); }
       if (borrowed) {
         const nl = (bc.lenders || []).length;
         l.textContent = `Until it catches up, the borrowed copy answers balances and sends (${nl} lender${nl === 1 ? "" : "s"}, ${String(bc.state || "").replace(/^Borrowed · /, "")}).`;
@@ -87,7 +82,11 @@
     if (!c.installed && bc.key) {
       const sw = document.createElement("label"); sw.className = "sw";
       const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = !!bc.on; cb.disabled = !globalOn;
-      cb.onchange = () => setBorrow({ chain: c.key, on: cb.checked }, cb.checked ? `Borrowing ${c.name}.` : `Stopped borrowing ${c.name}; its borrowed data is removed.`);
+      cb.onchange = () => {
+        // The home chain not installed here: borrowing is all this arcade has of it (balances, the test coin, @handles).
+        if (!cb.checked && c.home && !confirm(`${c.name} is this arcade's home chain and it isn't installed here: borrowing it is how this arcade reads your balances, gets its test coin and claims @handles. Stop borrowing it anyway?`)) { cb.checked = true; return; }
+        setBorrow({ chain: c.key, on: cb.checked }, cb.checked ? `Borrowing ${c.name}.` : `Stopped borrowing ${c.name}; its borrowed data is removed.`);
+      };
       sw.append(cb, document.createTextNode(" Borrow"));
       act.append(sw);
     }
@@ -103,7 +102,7 @@
         () => pauseChain(c.key, !paused).then(() => msg(paused ? `${c.name} resumes.` : `${c.name} is paused; it stays paused until you resume it.`))));
     }
     const btn = document.createElement("button");
-    if (c.installed) { btn.textContent = c.home ? "Manage indexes…" : "Manage…"; btn.onclick = () => { manage(c.key); reveal(); }; }
+    if (c.installed) { btn.textContent = "Manage…"; btn.onclick = () => { manage(c.key); reveal(); }; }
     else if (c.queued) {
       // One install at a time: this one waits its turn.
       btn.textContent = `Queued #${c.queued} · Cancel`;
@@ -111,8 +110,8 @@
     }
     else { btn.textContent = "Install…"; btn.className = "primary"; btn.onclick = () => { choose(c); reveal(); }; }
     act.append(btn);
-    // Hide / Unhide (chains.hide): display only. The home chain and the ARCADE chain are always shown.
-    if (!c.home && !c.arcade) {
+    // Hide / Unhide (chains.hide): display only, for every chain alike.
+    {
       const hb = document.createElement("button"); hb.className = "linkish";
       hb.textContent = c.hidden ? "Unhide" : "Hide";
       hb.title = c.hidden ? `Show ${c.name} in the list again.` : `Hide ${c.name} from this list. Hiding only hides it: an installed chain keeps running, and nothing is removed or paused. "Show hidden chains" below brings it back.`;
@@ -651,8 +650,8 @@
   };
   $("cp-modal").addEventListener("keydown", (e) => { if (e.key === "Escape") $("cp-skip").click(); });
   $("c-plan-open").onclick = () => openPlan(false);
-  // First start: ask which chains to use.
-  api("chains.queue").then((q) => { if (q && !q.plan_done) openPlan(true); }).catch(() => {});
+  // First start goes straight to Home's wallet and @handle steps (Martin 2026-11-20: "It should not ask you what chain
+  // you want to install"); the chooser opens from "Choose chains…" only.
 
   document.querySelector('nav button[data-tab="chains"]').addEventListener("click", refresh);
   clearInterval(poll); poll = setInterval(() => { if (!document.getElementById("chains").hidden && document.getElementById("chains").classList.contains("on")) refresh(); }, 2500);

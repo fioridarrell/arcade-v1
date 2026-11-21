@@ -598,21 +598,17 @@ fn set_plan_done(node: &Node) {
     let _ = node.app.store.write(|w| w.put(arcade_app::META, PLAN_DONE, b"1"));
 }
 
-/// The chains that are always shown: the home chain and the ARCADE chain.
-fn always_shown(node: &Node) -> Vec<&'static str> {
-    std::iter::once(node.params.key).chain(crate::arcsvc::defined().map(|p| p.key)).collect()
+/// The chains that are always shown: none now (Martin 2026-11-20: every chain is treated the same; the home and ARCADE
+/// chains are hidden or shown like any other). Kept so plan_hidden's rule stays in one place.
+fn always_shown(_node: &Node) -> Vec<&'static str> {
+    Vec::new()
 }
 
 /// chains.hide: leave a chain out of the Coins & chains list, or show it again. Display only:
 /// an installed chain keeps running, nothing is removed or paused.
 pub fn hide(node: &Node, key: &str, hide: bool) -> Result<Value, String> {
-    if crate::arcsvc::defines(key) {
-        return Err("the ARCADE chain is always shown".into());
-    }
-    let p = by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
-    if p.chain_no == node.params.chain_no {
-        return Err(format!("{} is this arcade's home chain and is always shown", p.name));
-    }
+    // Display only, for every chain alike (Martin 2026-11-20): the home and ARCADE chains too.
+    let p = by_key(key).or_else(|| crate::chains::find(key)).ok_or_else(|| format!("unknown chain {key}"))?;
     let list = with_hidden(hidden(node), p.key, hide);
     save_hidden(node, &list);
     Ok(json!({"key": p.key, "hidden": hide, "hidden_chains": list}))
@@ -2355,7 +2351,8 @@ mod plan_queue_tests {
         let node = &crate::sitesvc::tests::shared().node;
         let home = node.params.key;
         let other = ALL_CHAINS.iter().map(|p| p.key).find(|k| *k != home).unwrap();
-        assert!(hide(node, home, true).unwrap_err().contains("always shown"));
+        assert_eq!(hide(node, home, true).unwrap()["hidden"], true, "the home chain too, like any other");
+        assert_eq!(hide(node, home, false).unwrap()["hidden"], false);
         assert_eq!(hide(node, other, true).unwrap()["hidden"], true);
         assert!(hidden(node).iter().any(|k| k == other));
         assert_eq!(hide(node, &other.to_uppercase(), false).unwrap()["key"], other, "any capitalisation");

@@ -142,9 +142,12 @@ fn load_key(node: &Node, p: &'static ChainParams, pk: PublicKey, key_index: u32)
         // so its coins come from a lender's address index (each checked against its block), from any height.
         whole = true;
         let addr = lent_address(p, &script).ok_or("no address form for this DigiDollar output")?;
-        for c in crate::borrow::lender_coins(node, p, &[addr])? {
+        for c in crate::borrow::lender_dd_coins(node, p, &[addr])? {
             let op = c.op;
-            let cents = match cents_cache().get(&(op.txid, op.vout)).copied() {
+            // The cache's lock is let go before the transaction is fetched (a `match` on it held it to the insert below:
+            // the lookup waited on itself for ever once a coin got this far, 2026-11-20).
+            let cached = cents_cache().get(&(op.txid, op.vout)).copied();
+            let cents = match cached {
                 Some(x) => x,
                 None => match crate::borrow::raw_tx(node, p, &op.txid) {
                     Ok(tx) => {
@@ -182,14 +185,15 @@ fn load_key(node: &Node, p: &'static ChainParams, pk: PublicKey, key_index: u32)
         // This wallet's own coins from before the borrow floor (watching starts there): a lender's address index has
         // them from any height (coins received before the floor showed as $0 without this).
         if let Some(addr) = lent_address(p, &script) {
-            if let Ok(lent) = crate::borrow::lender_coins(node, p, &[addr]) {
+            if let Ok(lent) = crate::borrow::lender_dd_coins(node, p, &[addr]) {
                 whole = true;
                 for c in lent {
                     let op = c.op;
                     if held.iter().any(|h| h.0.outpoint == op) {
                         continue;
                     }
-                    let cents = match cents_cache().get(&(op.txid, op.vout)).copied() {
+                    let cached = cents_cache().get(&(op.txid, op.vout)).copied();
+                    let cents = match cached {
                         Some(x) => x,
                         None => match crate::borrow::raw_tx(node, p, &op.txid) {
                             Ok(tx) => {

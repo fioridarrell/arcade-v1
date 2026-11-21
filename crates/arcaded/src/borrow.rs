@@ -1965,6 +1965,13 @@ fn scan_ask(node: &Node, p: &'static ChainParams, w: &[&Watched]) -> Result<(Str
 ///    "waiting": [addresses not read yet], "next": seconds until its next scan may start}
 /// An address under "coins" is answered (its list may be empty); one under "waiting" is not yet.
 fn parse_scan(v: &Value, addrs: &[&str]) -> Result<ScanAnswer, String> {
+    parse_scan_of(v, addrs, false)
+}
+
+/// parse_scan; `keep_zero`: also zero-value coins (a DigiDollar coin is a zero-value Taproot output, its dollars in the
+/// transaction's DD record). Left out otherwise: a zero-value coin is no use to a coin send, and spending a DigiDollar
+/// in a plain send would lose its dollars.
+fn parse_scan_of(v: &Value, addrs: &[&str], keep_zero: bool) -> Result<ScanAnswer, String> {
     let coins = v["coins"].as_object().ok_or_else(|| format!("unexpected coin scan answer {}", v.to_string().chars().take(200).collect::<String>()))?;
     let waiting = v["waiting"].as_array().is_some_and(|a| a.iter().any(|x| x.as_str().is_some_and(|s| addrs.contains(&s))));
     if waiting {
@@ -1977,7 +1984,7 @@ fn parse_scan(v: &Value, addrs: &[&str]) -> Result<ScanAnswer, String> {
         }
         for c in list.as_array().into_iter().flatten() {
             let (Some(t), Some(vout), Some(sats), Some(h)) = (c[0].as_str().and_then(|s| Hash256::from_hex(s).ok()), c[1].as_u64(), c[2].as_u64(), c[3].as_u64()) else { continue };
-            if sats > 0 {
+            if sats > 0 || keep_zero {
                 out.push(Found { op: OutPoint { txid: t, vout: vout as u32 }, height: h as u32, value: sats, address: a.clone() });
             }
         }
@@ -2723,6 +2730,16 @@ pub struct LentCoin {
 /// transaction sent from here are left out. At most RPC_MAX_COINS new coins are checked per
 /// call (the largest first); a lender names at most 5,000 per address (the oldest).
 pub fn lender_coins(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<Vec<LentCoin>, String> {
+    lender_coins_of(node, p, addrs, false)
+}
+
+/// lender_coins with zero-value coins too (DigiDollar coins, crate::ddsvc): a lender named a wallet's DigiDollar coin
+/// every time and it was dropped as worth 0 satoshis, so the wallet showed $0 (2026-11-20).
+pub fn lender_dd_coins(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<Vec<LentCoin>, String> {
+    lender_coins_of(node, p, addrs, true)
+}
+
+fn lender_coins_of(node: &Node, p: &'static ChainParams, addrs: &[String], keep_zero: bool) -> Result<Vec<LentCoin>, String> {
     if addrs.len() > SCAN_ADDRESSES * SCAN_PARTS {
         return Err(format!("at most {} addresses on a borrowed chain", SCAN_ADDRESSES * SCAN_PARTS));
     }
@@ -2734,7 +2751,7 @@ pub fn lender_coins(node: &Node, p: &'static ChainParams, addrs: &[String]) -> R
     if addrs.is_empty() {
         return Ok(Vec::new());
     }
-    let (lender, found) = scan_any(node, p, addrs)?;
+    let (lender, found) = scan_any(node, p, addrs, keep_zero)?;
     // Check the coins not checked before against their blocks (the largest first, when there are many).
     let known = |c: &Found| CHECKED.lock().unwrap().contains_key(&(p.key.to_string(), c.op));
     let mut fresh: Vec<&Found> = found.iter().filter(|c| c.height > 0 && !known(c)).collect();
@@ -3086,7 +3103,7 @@ fn unspent(node: &Node, p: &'static ChainParams, tip: u32, minconf: &Value, maxc
 /// Lenders that answer "no coins" after the first one, before "no coins" is believed (lenders that fail aren't counted).
 const EMPTY_RETRIES: usize = 2;
 
-fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(String, Vec<Found>), String> {
+fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String], keep_zero: bool) -> Result<(String, Vec<Found>), String> {
     let refs: Vec<&str> = addrs.iter().map(String::as_str).collect();
     let parts: Vec<Value> = refs.chunks(SCAN_ADDRESSES).map(|c| json!(["arcade_coinscan", [{"addresses": c}]])).collect();
     // Every lender's answer, for the error when none could: "a shared Core does not answer" is an
@@ -3113,7 +3130,7 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
         };
         let mut found = Vec::new();
         for x in &a {
-            match r(x).and_then(|v| parse_scan(v, &refs)) {
+            match r(x).and_then(|v| parse_scan_of(v, &refs, keep_zero)) {
                 Ok(ScanAnswer::Coins(f)) => found.extend(f),
                 Ok(ScanAnswer::Waiting(n)) => {
                     why.push(format!("{l}: still reading these addresses (ask again in about {n} s)"));
@@ -3281,6 +3298,10 @@ mod tests {
         }
         assert!(matches!(parse_scan(&json!({"coins": {"DK8Z": []}, "height": {"DK8Z": 9}, "waiting": [], "next": 0}), &a).unwrap(), ScanAnswer::Coins(v) if v.is_empty()));
         assert!(parse_scan(&json!("what"), &a).is_err());
+        // A zero-value coin (a DigiDollar's): kept only when asked for.
+        let zero = json!({"coins": {"DK8Z": [["11".repeat(32), 0, 0, 7]]}, "height": {"DK8Z": 9}, "waiting": [], "next": 0});
+        assert!(matches!(parse_scan(&zero, &a).unwrap(), ScanAnswer::Coins(c) if c.is_empty()), "left out for coin sends");
+        assert!(matches!(parse_scan_of(&zero, &a, true).unwrap(), ScanAnswer::Coins(c) if c.len() == 1 && c[0].value == 0), "kept for DigiDollars");
     }
 
     fn hash(n: u8) -> Hash256 {

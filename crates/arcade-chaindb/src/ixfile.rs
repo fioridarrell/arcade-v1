@@ -32,7 +32,8 @@ pub const MAGIC: &[u8; 8] = b"ARCIXF\r\n";
 pub const END_MAGIC: &[u8; 8] = b"ARCIXEND";
 /// The format version. A change to the row layouts, the block sizes or the column coding
 /// is a new version: files of different versions never mix (their ids differ).
-/// Version 2: the file id also covers every block's first key.
+/// Version 2: the file id also covers every block's first key, and every block starts with
+/// a membership filter of its lookup keys.
 pub const FMT: u16 = 2;
 pub const HEADER_LEN: usize = 64;
 const TRAILER_LEN: usize = 8 + 4 + 8 + 32 + 32 + 8;
@@ -118,8 +119,59 @@ impl Kind {
     /// whose block is longer is refused before anything is allocated for it.
     pub fn max_block_bytes(self) -> u64 {
         let raw = (self.block_rows() * 32) as u64;
-        self.columns() as u64 * (8 + raw + raw / 128 + 4096)
+        self.filter_len() as u64 + self.columns() as u64 * (8 + raw + raw / 128 + 4096)
     }
+    /// The bytes of a key a lookup gives whole, which a block's filter holds: a script id,
+    /// a txid prefix, a coin (height | position | vout).
+    pub fn filter_key_len(self) -> usize {
+        match self {
+            Kind::Hist => 21,
+            Kind::Spends => 12,
+            Kind::Txs => 8,
+        }
+    }
+    /// A block's filter: 10 bits a row (about 1% false positives), the same size for every
+    /// block of a kind.
+    pub fn filter_len(self) -> usize {
+        self.block_rows() * 10 / 8
+    }
+}
+
+const FILTER_PROBES: u64 = 7;
+
+fn mix(mut z: u64) -> u64 {
+    z = (z ^ (z >> 30)).wrapping_mul(0xbf58476d1ce4e5b9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94d049bb133111eb);
+    z ^ (z >> 31)
+}
+
+/// The filter bits of a key (the same on every machine: fixed arithmetic, no std hasher).
+fn filter_bits(key: &[u8], bits: u64) -> impl Iterator<Item = u64> {
+    let mut h = 0x9e3779b97f4a7c15u64 ^ key.len() as u64;
+    for c in key.chunks(8) {
+        let mut b = [0u8; 8];
+        b[..c.len()].copy_from_slice(c);
+        h = mix(h ^ u64::from_be_bytes(b));
+    }
+    let h2 = mix(h ^ 0x5851f42d4c957f2d) | 1;
+    (0..FILTER_PROBES).map(move |i| h.wrapping_add(i.wrapping_mul(h2)) % bits)
+}
+
+/// The filter of a block's rows.
+fn make_filter(kind: Kind, rows: &[u8]) -> Vec<u8> {
+    let mut f = vec![0u8; kind.filter_len()];
+    let bits = f.len() as u64 * 8;
+    for r in rows.chunks_exact(kind.row_len()) {
+        for b in filter_bits(&r[..kind.filter_key_len()], bits) {
+            f[(b / 8) as usize] |= 1 << (b % 8);
+        }
+    }
+    f
+}
+
+fn filter_has(f: &[u8], key: &[u8]) -> bool {
+    let bits = f.len() as u64 * 8;
+    bits == 0 || filter_bits(key, bits).all(|b| f[(b / 8) as usize] & (1 << (b % 8)) != 0)
 }
 
 #[cfg(test)]
@@ -454,8 +506,13 @@ fn decode(kind: Kind, first: u32, n: usize, c: &[Vec<u8>]) -> Option<Vec<u8>> {
 
 /// A block as it is stored: per column, raw length u32 | stored length u32 | zstd frame.
 /// A column of nothing but zero bytes is stored as no bytes at all.
-fn pack(kind: Kind, first: u32, rows: &[u8], level: i32) -> Result<(Vec<u8>, [u8; 32])> {
-    let mut out = Vec::with_capacity(rows.len() / 3);
+/// A stored block: its filter (uncompressed: near-random bits), then its columns. Returns
+/// the bytes, the row hash and the filter's hash.
+fn pack(kind: Kind, first: u32, rows: &[u8], level: i32) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
+    let filter = make_filter(kind, rows);
+    let fhash = sha256(&filter);
+    let mut out = filter;
+    out.reserve(rows.len() / 3);
     for col in encode(kind, first, rows) {
         out.extend_from_slice(&(col.len() as u32).to_be_bytes());
         if col.iter().all(|b| *b == 0) {
@@ -466,7 +523,7 @@ fn pack(kind: Kind, first: u32, rows: &[u8], level: i32) -> Result<(Vec<u8>, [u8
         out.extend_from_slice(&(z.len() as u32).to_be_bytes());
         out.extend_from_slice(&z);
     }
-    Ok((out, sha256(rows)))
+    Ok((out, sha256(rows), fhash))
 }
 
 /// The rows of a stored block. Each column is decompressed under a hard size cap (its
@@ -502,14 +559,15 @@ fn unpack(kind: Kind, first: u32, n: usize, data: &[u8]) -> Option<Vec<u8>> {
 /// The id of a file's content: its header, row count, and every block's first key and row
 /// hash. The first keys are in it because the readers search them: a file with the same id
 /// cannot steer a lookup to another block.
-fn file_id(header: &[u8; HEADER_LEN], rows: u64, keys: &[u8], hashes: &[[u8; 32]]) -> [u8; 32] {
+fn file_id(header: &[u8; HEADER_LEN], rows: u64, keys: &[u8], hashes: &[[u8; 32]], fhashes: &[[u8; 32]]) -> [u8; 32] {
     let kl = keys.len() / hashes.len().max(1);
-    let mut v = Vec::with_capacity(HEADER_LEN + 8 + keys.len() + hashes.len() * 32);
+    let mut v = Vec::with_capacity(HEADER_LEN + 8 + keys.len() + hashes.len() * 64);
     v.extend_from_slice(header);
     v.extend_from_slice(&rows.to_be_bytes());
-    for (i, h) in hashes.iter().enumerate() {
+    for (i, (h, fh)) in hashes.iter().zip(fhashes).enumerate() {
         v.extend_from_slice(&keys[i * kl..(i + 1) * kl]);
         v.extend_from_slice(h);
+        v.extend_from_slice(fh);
     }
     sha256(&v)
 }
@@ -542,6 +600,7 @@ pub struct Writer {
     keys: Vec<u8>,
     offsets: Vec<u64>,
     hashes: Vec<[u8; 32]>,
+    fhashes: Vec<[u8; 32]>,
     rows: u64,
     last: Vec<u8>,
 }
@@ -556,7 +615,7 @@ pub fn tmp_path(path: &Path) -> PathBuf {
     PathBuf::from(s)
 }
 
-fn sync_dir(dir: &Path) {
+pub(crate) fn sync_dir(dir: &Path) {
     if let Ok(d) = File::open(dir) {
         let _ = d.sync_all();
     }
@@ -582,6 +641,7 @@ impl Writer {
             keys: Vec::new(),
             offsets: Vec::new(),
             hashes: Vec::new(),
+            fhashes: Vec::new(),
             rows: 0,
             last: Vec::new(),
         })
@@ -628,7 +688,7 @@ impl Writer {
             return Ok(());
         }
         let (kind, first, level) = (self.meta.kind, self.meta.first, self.level);
-        let packed: Vec<Result<(Vec<u8>, [u8; 32])>> = if blocks.len() == 1 {
+        let packed: Vec<Result<(Vec<u8>, [u8; 32], [u8; 32])>> = if blocks.len() == 1 {
             vec![pack(kind, first, &blocks[0], level)]
         } else {
             std::thread::scope(|s| {
@@ -637,11 +697,12 @@ impl Writer {
             })
         };
         for (rows, p) in blocks.iter().zip(packed) {
-            let (data, hash) = p?;
+            let (data, hash, fhash) = p?;
             self.file.write_all(&data).map_err(io)?;
             self.keys.extend_from_slice(&rows[..kind.key_len()]);
             self.offsets.push(self.offset);
             self.hashes.push(hash);
+            self.fhashes.push(fhash);
             self.offset += data.len() as u64;
         }
         Ok(())
@@ -652,7 +713,7 @@ impl Writer {
     pub fn save_state(&mut self) -> Result<Vec<u8>> {
         self.flush_pending()?;
         self.file.sync_data().map_err(io)?;
-        let mut v = Vec::with_capacity(64 + self.keys.len() + self.hashes.len() * 40 + self.buf.len());
+        let mut v = Vec::with_capacity(64 + self.keys.len() + self.hashes.len() * 72 + self.buf.len());
         v.extend_from_slice(&self.offset.to_be_bytes());
         v.extend_from_slice(&self.rows.to_be_bytes());
         v.extend_from_slice(&(self.last.len() as u32).to_be_bytes());
@@ -662,7 +723,7 @@ impl Writer {
         for o in &self.offsets {
             v.extend_from_slice(&o.to_be_bytes());
         }
-        for h in &self.hashes {
+        for h in self.hashes.iter().chain(&self.fhashes) {
             v.extend_from_slice(h);
         }
         v.extend_from_slice(&(self.buf.len() as u32).to_be_bytes());
@@ -684,18 +745,19 @@ impl Writer {
             let keys = t.bytes(blocks.checked_mul(meta.kind.key_len())?)?.to_vec();
             let offsets: Vec<u64> = t.bytes(blocks.checked_mul(8)?)?.chunks_exact(8).map(|x| be_u64(x, 0)).collect();
             let hashes: Vec<[u8; 32]> = t.bytes(blocks.checked_mul(32)?)?.chunks_exact(32).map(|x| x.try_into().unwrap()).collect();
+            let fhashes: Vec<[u8; 32]> = t.bytes(blocks.checked_mul(32)?)?.chunks_exact(32).map(|x| x.try_into().unwrap()).collect();
             let n = t.u32()? as usize;
             let buf = t.bytes(n)?.to_vec();
-            t.0.is_empty().then_some((offset, rows, last, keys, offsets, hashes, buf))
+            t.0.is_empty().then_some((offset, rows, last, keys, offsets, hashes, fhashes, buf))
         };
-        let (offset, rows, last, keys, offsets, hashes, buf) = parse().ok_or_else(|| bad(&path, "bad saved writer state"))?;
+        let (offset, rows, last, keys, offsets, hashes, fhashes, buf) = parse().ok_or_else(|| bad(&path, "bad saved writer state"))?;
         let mut file = std::fs::OpenOptions::new().write(true).open(&tmp).map_err(io)?;
         if file.metadata().map_err(io)?.len() < offset {
             return Err(bad(&tmp, "shorter than its saved state"));
         }
         file.set_len(offset).map_err(io)?;
         file.seek(SeekFrom::Start(offset)).map_err(io)?;
-        Ok(Writer { meta, level, threads: threads.max(1), path, tmp, file, offset, buf, pending: Vec::new(), keys, offsets, hashes, rows, last })
+        Ok(Writer { meta, level, threads: threads.max(1), path, tmp, file, offset, buf, pending: Vec::new(), keys, offsets, hashes, fhashes, rows, last })
     }
 
     /// Write the last block, the footer and the trailer; sync; give the file its name.
@@ -706,13 +768,14 @@ impl Writer {
         self.flush_pending()?;
         let kl = self.meta.kind.key_len();
         let header = self.meta.header();
-        let mut foot = Vec::with_capacity(self.hashes.len() * (kl + 40) + TRAILER_LEN);
-        for (i, h) in self.hashes.iter().enumerate() {
+        let mut foot = Vec::with_capacity(self.hashes.len() * (kl + 72) + TRAILER_LEN);
+        for (i, (h, fh)) in self.hashes.iter().zip(&self.fhashes).enumerate() {
             foot.extend_from_slice(&self.keys[i * kl..(i + 1) * kl]);
             foot.extend_from_slice(&self.offsets[i].to_be_bytes());
             foot.extend_from_slice(h);
+            foot.extend_from_slice(fh);
         }
-        let id = file_id(&header, self.rows, &self.keys, &self.hashes);
+        let id = file_id(&header, self.rows, &self.keys, &self.hashes, &self.fhashes);
         foot.extend_from_slice(&self.rows.to_be_bytes());
         foot.extend_from_slice(&(self.hashes.len() as u32).to_be_bytes());
         foot.extend_from_slice(&self.offset.to_be_bytes());
@@ -751,7 +814,7 @@ fn read_at(f: &File, buf: &mut [u8], off: u64) -> std::io::Result<()> {
 }
 
 /// An open file: its header and block list in memory (one entry per block: first key,
-/// offset, row hash), its blocks read and checked one at a time.
+/// offset, row hash, filter hash), its blocks read and checked one at a time.
 pub struct Reader {
     pub meta: Meta,
     pub rows: u64,
@@ -763,6 +826,7 @@ pub struct Reader {
     /// One more than there are blocks: the last entry is where the footer starts.
     offsets: Vec<u64>,
     hashes: Vec<[u8; 32]>,
+    fhashes: Vec<[u8; 32]>,
 }
 
 impl Reader {
@@ -784,7 +848,7 @@ impl Reader {
         }
         let (rows, blocks, foot_off) = (be_u64(&t, 0), be_u32(&t, 8) as u64, be_u64(&t, 12));
         let kl = meta.kind.key_len();
-        let entry = (kl + 40) as u64;
+        let entry = (kl + 72) as u64;
         if blocks != rows.div_ceil(meta.kind.block_rows() as u64) || foot_off < HEADER_LEN as u64 || foot_off.checked_add(blocks * entry + TRAILER_LEN as u64) != Some(bytes) {
             return Err(bad(path, "footer does not fit the file"));
         }
@@ -798,25 +862,28 @@ impl Reader {
         if sha256(&[&header[..], &foot[..], &t[..52]].concat())[..] != t[52..84] {
             return Err(bad(path, "checksum mismatch"));
         }
-        let (mut keys, mut offsets, mut hashes) = (Vec::with_capacity(blocks as usize * kl), Vec::with_capacity(blocks as usize + 1), Vec::with_capacity(blocks as usize));
+        let (mut keys, mut offsets) = (Vec::with_capacity(blocks as usize * kl), Vec::with_capacity(blocks as usize + 1));
+        let (mut hashes, mut fhashes) = (Vec::with_capacity(blocks as usize), Vec::with_capacity(blocks as usize));
         for e in foot.chunks_exact(entry as usize) {
             keys.extend_from_slice(&e[..kl]);
             offsets.push(be_u64(e, kl));
-            hashes.push(e[kl + 8..].try_into().unwrap());
+            hashes.push(e[kl + 8..kl + 40].try_into().unwrap());
+            fhashes.push(e[kl + 40..].try_into().unwrap());
         }
         offsets.push(foot_off);
         let max = meta.kind.max_block_bytes();
-        if offsets[0] != HEADER_LEN as u64 || offsets.windows(2).any(|w| w[0] >= w[1] || w[1] - w[0] > max) {
+        let fl = meta.kind.filter_len() as u64;
+        if offsets[0] != HEADER_LEN as u64 || offsets.windows(2).any(|w| w[0] >= w[1] || w[1] - w[0] > max || w[1] - w[0] < fl) {
             return Err(bad(path, "bad block offsets"));
         }
         if keys.chunks_exact(kl).zip(keys.chunks_exact(kl).skip(1)).any(|(a, b)| a >= b) {
             return Err(bad(path, "block first keys out of order"));
         }
         let id: [u8; 32] = t[20..52].try_into().unwrap();
-        if file_id(&header, rows, &keys, &hashes) != id {
+        if file_id(&header, rows, &keys, &hashes, &fhashes) != id {
             return Err(bad(path, "file id mismatch"));
         }
-        Ok(Reader { meta, rows, bytes, id, path: path.to_path_buf(), file, keys, offsets, hashes })
+        Ok(Reader { meta, rows, bytes, id, path: path.to_path_buf(), file, keys, offsets, hashes, fhashes })
     }
 
     pub fn path(&self) -> &Path {
@@ -842,7 +909,11 @@ impl Reader {
         }
         let mut data = vec![0u8; len as usize];
         read_at(&self.file, &mut data, self.offsets[i]).map_err(|e| bad(&self.path, e))?;
-        let rows = unpack(k, self.meta.first, n, &data).ok_or_else(|| bad(&self.path, format!("block {i} is damaged (does not decode)")))?;
+        let (filter, data) = data.split_at(k.filter_len());
+        if sha256(filter) != self.fhashes[i] {
+            return Err(bad(&self.path, format!("block {i} is damaged (filter hash mismatch)")));
+        }
+        let rows = unpack(k, self.meta.first, n, data).ok_or_else(|| bad(&self.path, format!("block {i} is damaged (does not decode)")))?;
         if rows.len() != n * k.row_len() || sha256(&rows) != self.hashes[i] {
             return Err(bad(&self.path, format!("block {i} is damaged (row hash mismatch)")));
         }
@@ -852,8 +923,22 @@ impl Reader {
         Ok(rows)
     }
 
-    /// Every row whose key starts with `prefix`, in order. Reads one block, and the next
-    /// ones only while the rows run on.
+    /// Whether block `i` may hold rows whose key starts with `prefix` (false: it holds
+    /// none). Reads and checks only the block's filter; a prefix shorter than the filter's
+    /// keys can't be told and may always be there.
+    fn may_hold(&self, i: usize, prefix: &[u8]) -> Result<bool> {
+        let k = self.meta.kind;
+        let Some(key) = prefix.get(..k.filter_key_len()) else { return Ok(true) };
+        let mut filter = vec![0u8; k.filter_len()];
+        read_at(&self.file, &mut filter, self.offsets[i]).map_err(|e| bad(&self.path, e))?;
+        if sha256(&filter) != self.fhashes[i] {
+            return Err(bad(&self.path, format!("block {i} is damaged (filter hash mismatch)")));
+        }
+        Ok(filter_has(&filter, key))
+    }
+
+    /// Every row whose key starts with `prefix`, in order. Asks a block's filter before
+    /// reading the block; reads the next blocks only while the rows run on.
     pub fn scan_prefix(&self, prefix: &[u8], mut f: impl FnMut(&[u8])) -> Result<()> {
         let k = self.meta.kind;
         let n = self.blocks();
@@ -867,10 +952,16 @@ impl Reader {
                 hi = mid;
             }
         }
-        for i in lo.saturating_sub(1)..n {
+        // A block that starts with exactly this key: the block before it holds only
+        // smaller keys.
+        let start = if lo < n && self.first_key(lo) == prefix { lo } else { lo.saturating_sub(1) };
+        for i in start..n {
             let fk = self.first_key(i);
             if fk > prefix && !fk.starts_with(prefix) {
                 break;
+            }
+            if !self.may_hold(i, prefix)? {
+                continue;
             }
             for row in self.block(i)?.chunks_exact(k.row_len()) {
                 let key = &row[..k.key_len()];
@@ -909,8 +1000,8 @@ impl Reader {
         let mut seen = 0u64;
         for i in 0..self.blocks() {
             let rows = self.block(i)?;
-            if rows[..k.key_len()] != *self.first_key(i) {
-                return Err(bad(&self.path, format!("block {i} does not start with its listed key")));
+            if sha256(&make_filter(k, &rows)) != self.fhashes[i] {
+                return Err(bad(&self.path, format!("block {i}'s filter is not its rows' filter")));
             }
             for row in rows.chunks_exact(k.row_len()) {
                 let key = &row[..k.key_len()];
@@ -1143,6 +1234,36 @@ mod tests {
     }
 
     #[test]
+    fn filters_turn_away_absent_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        for kind in Kind::ALL {
+            let rows = sample(kind, kind.block_rows() * 3, 0, 9_999, 41);
+            let r = Reader::open(&write(dir.path(), meta(kind, 0, 9_999), &rows, 3, 2).path).unwrap();
+            let fl = kind.filter_key_len();
+            // Every key of a block is in its filter (no false negatives).
+            for i in 0..r.blocks() {
+                for row in r.block(i).unwrap().chunks_exact(kind.row_len()) {
+                    assert!(r.may_hold(i, &row[..fl]).unwrap());
+                }
+            }
+            // Keys that are not there: the filter of the block they would be in says so
+            // nearly always (10 bits a row: about 1% false positives).
+            let mut s = 5u64;
+            let (mut asked, mut passed) = (0, 0);
+            while asked < 2000 {
+                let key: Vec<u8> = (0..fl).map(|_| rnd(&mut s) as u8).collect();
+                if rows.iter().any(|x| x.starts_with(&key)) {
+                    continue;
+                }
+                let i = (0..r.blocks()).rev().find(|i| r.first_key(*i) <= &key[..]).unwrap_or(0);
+                asked += 1;
+                passed += r.may_hold(i, &key).unwrap() as u32;
+            }
+            assert!(passed < 80, "{kind:?}: {passed} of 2000 absent keys passed the filter");
+        }
+    }
+
+    #[test]
     fn same_rows_same_bytes_whatever_the_threads() {
         let dir = tempfile::tempdir().unwrap();
         for kind in Kind::ALL {
@@ -1172,7 +1293,7 @@ mod tests {
             let info = write(dir.path(), meta(kind, 0, 9_999), &rows, 3, 2);
             let good = std::fs::read(&info.path).unwrap();
             Reader::open(&info.path).unwrap().verify().unwrap();
-            let entry = kind.key_len() + 40;
+            let entry = kind.key_len() + 72;
             let foot = good.len() - TRAILER_LEN - 3 * entry;
             // One flipped bit anywhere: in the header, a block, the footer, the trailer.
             let mut s = 99u64;

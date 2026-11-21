@@ -6,6 +6,11 @@
 //!   arcade on the mesh that offers the chain (existing arcades' Core nodes over coreshare,
 //!   V1.0 arcades over bk) plus a few of the coin's P2P peers. A fast source takes more jobs;
 //!   a source that fails gives its job back and, after repeated failures, stops.
+//! * Store-only mode ([`run_store`], init installs, docs/INITSYNC.md): the jobs are the blocks
+//!   our checked headers name that we don't have, done in ANY order; each worker stores what it
+//!   fetched itself (ChainDb::init_store: the block asked for, merkle root, witness commitment),
+//!   so the checks run on every worker at once and nothing is connected or indexed. A block
+//!   refused goes back in the queue for another source.
 //! * The chain's own thread pulls finished jobs in height order through [`Prefetched`], a
 //!   BlockSource the normal Syncer reads: so every header is checked (proof of work, links,
 //!   AuxPoW) and every block connected (merkle, byte-identical, in-commit indexes) exactly as
@@ -70,6 +75,13 @@ struct State {
     avg_block: usize,
     /// P2P peers (by IP) found too slow: the recruiter rests them.
     slow: std::collections::HashSet<String>,
+    /// Store-only mode: jobs stored (a late copy of one is dropped), blocks stored and refused,
+    /// the next id for a job fetched again, and an error that ends the round.
+    taken: std::collections::HashSet<u32>,
+    stored: u64,
+    refused: u64,
+    next_id: u32,
+    failed: Option<String>,
 }
 
 /// Bytes one job should carry: one source must finish it well within the connector's wait,
@@ -92,7 +104,13 @@ pub struct Pool {
     cv: Condvar,
     stop: AtomicBool,
     top: u32,
+    /// Store-only mode: jobs in any order, each worker stores its own (run_store).
+    any_order: bool,
 }
+
+/// A job fetched again more often than this (refused or failed by every source it went to)
+/// ends a store-only round with an error.
+const MAX_TRIES: u32 = 12;
 
 impl Pool {
     fn put_back(&self, job: Job) {
@@ -242,7 +260,8 @@ impl BlockSource for Prefetched<'_> {
     }
 }
 
-fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) {
+/// `store`: store-only mode (the node and chain to store into).
+fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, store: Option<(&Node, &'static ChainParams)>) {
     let mut fails = 0;
     while !pool.stop.load(Ordering::Relaxed) {
         let job = {
@@ -256,11 +275,17 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) 
                 // Don't run too far ahead of the connector (memory).
                 // The memory bound never holds back the jobs the connector needs next (a job
                 // put back after a failure goes to the front): those always go out.
-                let ahead_ok = st.queue.front().is_some_and(|j| j.start < st.want + AHEAD && (st.ready_bytes < READY_BYTES || j.start < st.want + 8 * JOB));
+                let ahead_ok = if pool.any_order {
+                    !st.queue.is_empty()
+                } else {
+                    st.queue.front().is_some_and(|j| j.start < st.want + AHEAD && (st.ready_bytes < READY_BYTES || j.start < st.want + 8 * JOB))
+                };
                 // First help with the oldest jobs still in flight: the connector waits on them
                 // while later ones pile up done (first copy wins).
                 let want = st.want;
-                let steal = st.inflight.iter_mut().filter(|(s, _)| **s >= want).take(2).find(|(_, (_, since, copies))| copies.0 == 1 && since.elapsed() > STEAL_AFTER).map(|(s, (h, _, d))| {
+                // (In any order, only once nothing is left in the queue: the last jobs.)
+                let steal_ok = !pool.any_order || st.queue.is_empty();
+                let steal = st.inflight.iter_mut().filter(|_| steal_ok).filter(|(s, _)| **s >= want).take(2).find(|(_, (_, since, copies))| copies.0 == 1 && since.elapsed() > STEAL_AFTER).map(|(s, (h, _, d))| {
                     *d = (2, Instant::now());
                     Job { start: *s, hashes: h.clone(), tries: 0 }
                 });
@@ -270,7 +295,7 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) 
                 if ahead_ok {
                     let mut j = st.queue.pop_front().unwrap();
                     // A doubled job that another source already delivered: skip it.
-                    if j.start < st.want || st.ready.contains_key(&j.start) {
+                    if j.start < st.want || st.ready.contains_key(&j.start) || st.taken.contains(&j.start) {
                         continue;
                     }
                     // Jobs are cut ahead of time; blocks may have grown since: take a job's
@@ -292,6 +317,64 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) 
             }
         };
         let t_job = Instant::now();
+        if let Some((node, p)) = store {
+            // Store-only: this worker checks and stores what it fetched (any order).
+            let got = src.get_blocks(&job.hashes);
+            if pool.s.lock().unwrap().taken.contains(&job.start) {
+                continue;
+            }
+            let res = match got {
+                Ok(raws) => node.chain.init_store(p, &job.hashes, &raws).map(|r| (r, raws.iter().map(|x| x.len()).sum::<usize>())).map_err(|e| Some(e.to_string())),
+                Err(_) => Err(None),
+            };
+            let mut st = pool.s.lock().unwrap();
+            match res {
+                Ok((r, bytes)) => {
+                    st.inflight.remove(&job.start);
+                    st.taken.insert(job.start);
+                    st.stored += r.stored as u64;
+                    st.refused += r.refused.len() as u64;
+                    if r.stored > 0 {
+                        let per = bytes / r.stored.max(1);
+                        st.avg_block = if st.avg_block == 0 { per } else { (st.avg_block * 4 + per) / 5 };
+                        *st.stats.entry(name.clone()).or_insert(0) += r.stored as u64;
+                    }
+                    if !r.again.is_empty() {
+                        if job.tries + 1 >= MAX_TRIES {
+                            st.failed = Some(format!("block {} was refused or not sent by every source tried ({}x){}", r.again[0], job.tries + 1,
+                                r.refused.first().map(|(_, why)| format!(": {why}")).unwrap_or_default()));
+                        }
+                        let id = st.next_id;
+                        st.next_id += r.again.len() as u32;
+                        st.queue.push_front(Job { start: id, hashes: r.again, tries: job.tries + 1 });
+                        // A source that sends damaged or other blocks steps aside after a few.
+                        fails += usize::from(!r.refused.is_empty());
+                    } else {
+                        fails = 0;
+                    }
+                    pool.cv.notify_all();
+                    if fails >= 3 {
+                        break;
+                    }
+                }
+                Err(Some(e)) => {
+                    // The store itself failed (the disk): no other source helps.
+                    st.failed = Some(e);
+                    pool.cv.notify_all();
+                    break;
+                }
+                Err(None) => {
+                    drop(st);
+                    pool.put_back(job);
+                    fails += 1;
+                    if fails >= 3 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_secs(2));
+                }
+            }
+            continue;
+        }
         match src.get_blocks(&job.hashes) {
             Ok(raws) if raws.len() == job.hashes.len() => {
                 fails = 0;
@@ -414,6 +497,85 @@ fn recruit_peer(node: &Node, p: &'static ChainParams, tried: &[String]) -> Optio
     node.coin_candidates(p).iter().filter(|a| !tried.contains(a)).take(6).find_map(|a| arcade_chain::p2p::Peer::connect(p, a, Duration::from_secs(6)).ok())
 }
 
+/// Every arcade offering the chain (at `min_h` or above), then P2P_WANT P2P peers kept working
+/// (a peer that drops out is replaced; one that failed rests 10 minutes). `store`: the workers
+/// store what they fetch (run_store) instead of handing it to the ordered side.
+fn spawn_sources<'scope, 'env>(
+    sc: &'scope std::thread::Scope<'scope, 'env>,
+    node: &'env Node,
+    p: &'static ChainParams,
+    pool: &'env Pool,
+    offers: &'env [(String, String, &'static str, u64)],
+    min_h: u32,
+    store: bool,
+) {
+    let short = |id: &str| id[..id.len().min(8)].to_string();
+    // Every arcade offering the chain, then a few P2P peers.
+    for (id, addr, kind, their) in offers.iter() {
+        if (*their as u32) < min_h {
+            continue;
+        }
+        let src: Option<Box<dyn BlockSource + Send>> = match *kind {
+            "bk" => crate::meshsource::MeshSource::dial_chain(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
+            _ => crate::crsource::CoreShareSource::dial(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
+        };
+        if let Some(src) = src {
+            pool.s.lock().unwrap().workers += 1;
+            let name = format!("arcade {}", short(id));
+            sc.spawn(move || worker(pool, name, src, store.then_some((node, p))));
+        }
+    }
+    // P2P peers: keep P2P_WANT of them working; when one drops out, recruit a fresh one.
+    // A peer that failed rests for 10 minutes before it is tried again.
+    let pool_r = pool;
+    sc.spawn(move || {
+        let mut resting: HashMap<String, Instant> = HashMap::new();
+        let mut busy: std::collections::HashSet<String> = Default::default();
+        while !pool_r.stop.load(Ordering::Relaxed) {
+            let p2p_now = pool_r.s.lock().unwrap().p2p;
+            if p2p_now < P2P_WANT {
+                resting.retain(|_, t| t.elapsed() < Duration::from_secs(600));
+                // Peers that stepped aside for being slow rest too (and leave the busy list).
+                let slow: Vec<String> = pool_r.s.lock().unwrap().slow.drain().collect();
+                let ip_of = |a: &str| a.rsplit_once(':').map(|x| x.0.trim_matches(|c| c == '[' || c == ']').to_string()).unwrap_or_default();
+                for a in busy.iter().filter(|a| slow.contains(&ip_of(a))).cloned().collect::<Vec<_>>() {
+                    busy.remove(&a);
+                    resting.insert(a, Instant::now());
+                }
+                let cand = node.coin_candidates(p).into_iter().find(|a| !resting.contains_key(a) && !busy.contains(a));
+                match cand {
+                    Some(a) => match arcade_chain::p2p::Peer::connect(p, &a, Duration::from_secs(8)) {
+                        Ok(peer) if (peer.version.start_height.max(0) as u32) >= min_h => {
+                            node.note_coin_peer(p.net, &a);
+                            {
+                                let mut st = pool_r.s.lock().unwrap();
+                                st.workers += 1;
+                                st.p2p += 1;
+                            }
+                            busy.insert(a.clone());
+                            let name = format!("P2P {}", peer.addr.ip());
+                            sc.spawn(move || {
+                                worker(pool_r, name, Box::new(peer), store.then_some((node, p)));
+                                pool_r.s.lock().unwrap().p2p -= 1;
+                            });
+                        }
+                        _ => {
+                            resting.insert(a, Instant::now());
+                        }
+                    },
+                    None => {
+                        // Everyone is busy or resting: free the busy list of peers that left.
+                        busy.clear();
+                        std::thread::sleep(Duration::from_secs(5));
+                    }
+                }
+            } else {
+                std::thread::sleep(Duration::from_secs(3));
+            }
+        }
+    });
+}
+
 /// Bring a chain up to `top` from every source at once. Returns blocks connected.
 pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_progress: &dyn Fn(String), stop: &AtomicBool) -> Result<u32, String> {
     let c = p.chain_no;
@@ -434,75 +596,10 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
         .or_else(|| cr.iter().find_map(|o| crate::crsource::CoreShareSource::dial(node, &o.1, p).ok()).map(HashSource::Core))
         .ok_or("no source for block hashes")?;
     syncer.known_top.set(syncer.known_top.get().max(top));
-    let pool = Pool { s: Mutex::new(State { next: tip + 1, want: tip + 1, ..Default::default() }), cv: Condvar::new(), stop: AtomicBool::new(false), top };
-    let short = |id: &str| id[..id.len().min(8)].to_string();
+    let pool = Pool { s: Mutex::new(State { next: tip + 1, want: tip + 1, ..Default::default() }), cv: Condvar::new(), stop: AtomicBool::new(false), top, any_order: false };
     std::thread::scope(|sc| -> Result<(), String> {
         sc.spawn(|| feeder(node, &pool, feeder_src, tip_hash));
-        // Every arcade offering the chain, then a few P2P peers.
-        for (id, addr, kind, their) in offers.iter() {
-            if (*their as u32) < tip + 10 {
-                continue;
-            }
-            let src: Option<Box<dyn BlockSource + Send>> = match *kind {
-                "bk" => crate::meshsource::MeshSource::dial_chain(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
-                _ => crate::crsource::CoreShareSource::dial(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
-            };
-            if let Some(src) = src {
-                pool.s.lock().unwrap().workers += 1;
-                let name = format!("arcade {}", short(id));
-                let pool = &pool;
-                sc.spawn(move || worker(pool, name, src));
-            }
-        }
-        // P2P peers: keep P2P_WANT of them working; when one drops out, recruit a fresh one.
-        // A peer that failed rests for 10 minutes before it is tried again.
-        let pool_r = &pool;
-        sc.spawn(move || {
-            let mut resting: HashMap<String, Instant> = HashMap::new();
-            let mut busy: std::collections::HashSet<String> = Default::default();
-            while !pool_r.stop.load(Ordering::Relaxed) {
-                let p2p_now = pool_r.s.lock().unwrap().p2p;
-                if p2p_now < P2P_WANT {
-                    resting.retain(|_, t| t.elapsed() < Duration::from_secs(600));
-                    // Peers that stepped aside for being slow rest too (and leave the busy list).
-                    let slow: Vec<String> = pool_r.s.lock().unwrap().slow.drain().collect();
-                    let ip_of = |a: &str| a.rsplit_once(':').map(|x| x.0.trim_matches(|c| c == '[' || c == ']').to_string()).unwrap_or_default();
-                    for a in busy.iter().filter(|a| slow.contains(&ip_of(a))).cloned().collect::<Vec<_>>() {
-                        busy.remove(&a);
-                        resting.insert(a, Instant::now());
-                    }
-                    let cand = node.coin_candidates(p).into_iter().find(|a| !resting.contains_key(a) && !busy.contains(a));
-                    match cand {
-                        Some(a) => match arcade_chain::p2p::Peer::connect(p, &a, Duration::from_secs(8)) {
-                            Ok(peer) if (peer.version.start_height.max(0) as u32) >= tip + 10 => {
-                                node.note_coin_peer(p.net, &a);
-                                {
-                                    let mut st = pool_r.s.lock().unwrap();
-                                    st.workers += 1;
-                                    st.p2p += 1;
-                                }
-                                busy.insert(a.clone());
-                                let name = format!("P2P {}", peer.addr.ip());
-                                sc.spawn(move || {
-                                    worker(pool_r, name, Box::new(peer));
-                                    pool_r.s.lock().unwrap().p2p -= 1;
-                                });
-                            }
-                            _ => {
-                                resting.insert(a, Instant::now());
-                            }
-                        },
-                        None => {
-                            // Everyone is busy or resting: free the busy list of peers that left.
-                            busy.clear();
-                            std::thread::sleep(Duration::from_secs(5));
-                        }
-                    }
-                } else {
-                    std::thread::sleep(Duration::from_secs(3));
-                }
-            }
-        });
+        spawn_sources(sc, node, p, &pool, &offers, tip + 10, false);
         // The ordered side, on this thread.
         let mut pre = Prefetched { pool: &pool, cache: HashMap::new(), p, heads: VecDeque::new(), last_diag: Instant::now(), stop };
         let mut last_note = Instant::now();
@@ -562,4 +659,65 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
     })?;
     let now = node.chain.tip(c).map_err(|e| e.to_string())?.map(|t| t.height).unwrap_or(0);
     Ok(now.saturating_sub(tip))
+}
+
+/// Store-only download (init installs, docs/INITSYNC.md): every block of `hashes` (our checked
+/// headers' blocks not stored yet), from every source at once, in any order; each worker
+/// checks and stores its own job (ChainDb::init_store) and a refused block goes back in the
+/// queue for another source. Nothing is connected. `min_h`: the lowest height asked for (a
+/// source must be at least there). Returns blocks stored; some may still be missing after an
+/// error or a stop (the caller looks again: ChainDb::init_missing).
+pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h: u32, on_progress: &dyn Fn(String), stop: &AtomicBool) -> Result<u64, String> {
+    if hashes.is_empty() {
+        return Ok(0);
+    }
+    let n = hashes.len() as u32;
+    let mut st = State { next_id: n, ..Default::default() };
+    // Jobs by position in `hashes` (a job split later keeps its range); refetches get ids past n.
+    for (i, chunk) in hashes.chunks(JOB as usize).enumerate() {
+        st.queue.push_back(Job { start: i as u32 * JOB, hashes: chunk.to_vec(), tries: 0 });
+    }
+    let pool = Pool { s: Mutex::new(st), cv: Condvar::new(), stop: AtomicBool::new(false), top: n, any_order: true };
+    let offers = node.offers_for(p.key);
+    let t0 = Instant::now();
+    let res = std::thread::scope(|sc| -> Result<(), String> {
+        spawn_sources(sc, node, p, &pool, &offers, min_h, true);
+        let mut last_note = Instant::now() - Duration::from_secs(10);
+        let mut idle_since: Option<Instant> = None;
+        let r = loop {
+            if stop.load(Ordering::Relaxed) {
+                break Ok(());
+            }
+            {
+                let st = pool.s.lock().unwrap();
+                if let Some(e) = &st.failed {
+                    break Err(e.clone());
+                }
+                if st.queue.is_empty() && st.inflight.is_empty() {
+                    break Ok(());
+                }
+                // Nobody working for a while (the recruiter keeps trying meanwhile).
+                if st.workers == 0 {
+                    if idle_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(360) {
+                        break Err("every source stopped".into());
+                    }
+                } else {
+                    idle_since = None;
+                }
+            }
+            if last_note.elapsed() > Duration::from_secs(2) {
+                let (stored, refused) = { let st = pool.s.lock().unwrap(); (st.stored, st.refused) };
+                let mb_s = pool.s.lock().unwrap().avg_block as f64 * stored as f64 / t0.elapsed().as_secs_f64().max(1.0) / 1e6;
+                on_progress(format!("stored {stored} of {n} blocks{} · ~{mb_s:.0} MB/s · {}", if refused > 0 { format!(" ({refused} refused and fetched again)") } else { String::new() }, pool.summary()));
+                last_note = Instant::now();
+            }
+            let st = pool.s.lock().unwrap();
+            drop(pool.cv.wait_timeout(st, Duration::from_millis(500)).unwrap());
+        };
+        pool.stop.store(true, Ordering::Relaxed);
+        pool.cv.notify_all();
+        r
+    });
+    let stored = pool.s.lock().unwrap().stored;
+    res.map(|_| stored)
 }

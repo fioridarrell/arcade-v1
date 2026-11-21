@@ -1138,7 +1138,8 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     let mut nets = serde_json::Map::new();
     nets.insert(node.params.net.into(), json!({"h": our_tip(node)}));
     for r in node.extra.lock().unwrap().values() {
-        if let Ok(Some(t)) = node.chain.tip(r.params.chain_no) {
+        // (A chain in an init install isn't offered until it is built: crate::initsync.)
+        if let Ok(Some(t)) = node.chain.tip(r.params.chain_no).map(|t| t.filter(|_| !node.chain.init_active(r.params.chain_no))) {
             nets.insert(r.params.net.into(), json!({"h": t.height}));
         }
     }
@@ -1538,11 +1539,11 @@ fn serve_bk(node: &Node, link: &mut Link, addr: &str, h: &Value) -> Result<(), L
                 }
             }
         }
-        "hq" if h["net"] == p.net => {
+        "hq" if h["net"] == p.net && !node.chain.init_active(p.chain_no) => {
             let r = node.chain.headers_payload(p, &hashes("loc"), 2000).map_err(|e| e.to_string());
             bk::send_answer(link, id, r)?;
         }
-        "bq" if h["net"] == p.net => {
+        "bq" if h["net"] == p.net && !node.chain.init_active(p.chain_no) => {
             let want = hashes("h");
             let r = if want.len() > bk::MAX_BLOCKS {
                 Err("too many blocks asked".to_string())

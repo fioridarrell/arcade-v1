@@ -399,6 +399,10 @@ impl Node {
     /// source tell it): addresses and protocol indexes are put off until then.
     pub fn far_behind(&self, p: &arcade_chain::params::ChainParams) -> bool {
         let c = p.chain_no;
+        // An init install isn't usable until it is built (crate::initsync).
+        if self.chain.init_active(c) {
+            return true;
+        }
         let tip = self.chain.tip(c).ok().flatten().map(|t| t.height).unwrap_or(0);
         let best = self.chain.best_header(c).ok().flatten().and_then(|h| self.chain.header(c, &h).ok().flatten()).map(|r| r.height).unwrap_or(0);
         let told = self.extra.lock().unwrap().values().find(|r| r.params.chain_no == c).map(|r| r.peer_tip.load(std::sync::atomic::Ordering::Relaxed));

@@ -423,6 +423,9 @@ pub fn unqueue(node: &Node, key: &str) -> Result<Value, String> {
         return Err(format!("{key} isn't waiting to be installed"));
     }
     save_queue(node, &q);
+    if !resume {
+        crate::initsync::request(node, &queued_key(key), false);
+    }
     // A drive chosen for it is forgotten with it (crate::chaindrive); an installed chain keeps its own.
     if let Some(p) = by_key(key).filter(|_| !resume) {
         let _ = node.chain.set_place(p.chain_no, None);
@@ -785,9 +788,14 @@ fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     }
     let r = if indexes.iter().any(|i| i == "addresses") { node.chain.set_addresses_on(p.chain_no) } else { node.chain.set_addresses_off(p.chain_no) };
     r.map_err(|e| e.to_string())?;
+    // An init install (docs/INITSYNC.md), asked for with chains.add init: set before the thread starts.
+    let init = crate::initsync::take_request(node, key);
+    if init {
+        node.chain.init_start(p.chain_no).map_err(|e| e.to_string())?;
+    }
     launch(node, key, mode, indexes, arcade_app::now(), false, share)?;
     save(node);
-    let _ = node.app.event("chains", &format!("installing {} ({mode})", p.name));
+    let _ = node.app.event("chains", &format!("installing {} ({mode}{})", p.name, if init { ", init: headers, then blocks stored only, then built in bulk" } else { "" }));
     status(node, key)
 }
 
@@ -1163,6 +1171,18 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
         json!({"name": "Blocks", "detail": "stored once, from the mesh or P2P", "pct": pct(tip, peer.max(1)), "at": tip, "of": peer}),
         json!({"name": "Coins", "detail": "every unspent coin", "pct": pct(tip, peer.max(1)), "at": tip, "of": peer}),
     ];
+    // An init install (crate::initsync): a row per phase, after Source, while it runs.
+    let init = node.chain.init_phase(c).ok().flatten();
+    if node.chain.init_active(c) {
+        if let Some(rows) = crate::initsync::stages(node, c, best, peer) {
+            for (i, r) in rows.into_iter().enumerate() {
+                stages.insert(1 + i, r);
+            }
+        }
+        for st in stages.iter_mut().filter(|s| s["name"] == "Blocks" || s["name"] == "Coins") {
+            st["detail"] = json!("after the init build (blocks are stored first, then built in bulk)");
+        }
+    }
     // A Core-data copy (crate::coreboot): its fetch and import, or the trust note.
     let copy = if home { Value::Null } else { crate::coreboot::chain_status(node, key) };
     if let Some(j) = copy.get("job").filter(|j| !j.is_null()) {
@@ -1332,7 +1352,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     // Borrowed while it catches up (from copies or syncing), so balances and the Explorer
     // work meanwhile.
     let borrowed = crate::borrow::is_borrowed(p.key);
-    Ok(json!({"key": key, "name": p.name, "installed": true, "home": home, "mode": mode, "indexes": indexes,
+    Ok(json!({"key": key, "name": p.name, "installed": true, "home": home, "mode": mode, "indexes": indexes, "init": init.map(|x| x.as_str()),
               "state": state, "overall": overall, "stages": stages, "tip": tip, "copy": copy, "borrowed": borrowed, "watch": crate::watchdog::status(key),
               "borrow_state": if borrowed { crate::borrow::state_text(p.key) } else { None }}))
 }
@@ -1866,6 +1886,11 @@ fn follow(node: Arc<Node>, run: Arc<ChainRun>) {
     if run.mode == "light" {
         return follow_headers(&node, &run, &syncer);
     }
+    // An init install: its phases first (crate::initsync); the normal sync takes over at the end.
+    if node.chain.init_active(p.chain_no) && !crate::initsync::run(&node, &run, &syncer) {
+        set("stopped".into());
+        return;
+    }
     mesh_first(&node, &run, &syncer);
     let mut last_mesh = std::time::Instant::now();
     let mut last_p2p_parallel: Option<std::time::Instant> = None;
@@ -2124,7 +2149,7 @@ pub(crate) fn watch_obs(node: &Node, run: &ChainRun) -> Vec<crate::watchdog::Obs
     use crate::watchdog::Obs;
     let p = run.params;
     let c = p.chain_no;
-    let held = run.paused.load(Ordering::Relaxed) || run.stop.load(Ordering::Relaxed) || crate::coreboot::held(p.key);
+    let held = run.paused.load(Ordering::Relaxed) || run.stop.load(Ordering::Relaxed) || crate::coreboot::held(p.key) || node.chain.init_active(c);
     let tip = node.chain.tip(c).ok().flatten().map(|t| t.height as u64).unwrap_or(0);
     let best = node.chain.best_header(c).ok().flatten().and_then(|h| node.chain.header(c, &h).ok().flatten()).map(|r| r.height as u64).unwrap_or(0);
     let offered = node.offers_for(p.key).iter().map(|o| o.3).max().unwrap_or(0);

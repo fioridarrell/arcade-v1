@@ -3080,7 +3080,7 @@ fn unspent(node: &Node, p: &'static ChainParams, tip: u32, minconf: &Value, maxc
 
 /// Every coin of these addresses from the first lender whose address index answers at once;
 /// a lender still reading them (an older arcade's background scan) is passed over.
-/// Lenders asked after one that found no coins, before "no coins" is believed.
+/// Lenders that answer "no coins" after the first one, before "no coins" is believed (lenders that fail aren't counted).
 const EMPTY_RETRIES: usize = 2;
 
 fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(String, Vec<Found>), String> {
@@ -3092,14 +3092,14 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
     // An empty answer isn't the last word: an older arcade's index may not know an address form (a DigiDollar's
     // Taproot address, dgb1p...) and answers "no coins" (2026-11-20: a DD wallet showed $0 from such a lender while
     // another lender held its coin). The first answer with coins wins; else the first empty one, after a few more asked.
+    // Only lenders that answer count toward that: one that fails (a link that doesn't answer in time) is passed over,
+    // or the lender holding the coins could be left unasked (v0.1.146: two failures after an empty answer, and the
+    // V1 lender on the same router was never reached).
     let mut empty: Option<String> = None;
-    let mut asked_after_empty = 0;
+    let mut empties = 0usize;
     'lenders: for l in lenders(node, p) {
-        if empty.is_some() {
-            if asked_after_empty >= EMPTY_RETRIES {
-                break;
-            }
-            asked_after_empty += 1;
+        if empties > EMPTY_RETRIES {
+            break;
         }
         let a = match call(node, &l, p, json!(parts)) {
             Ok(a) => a,
@@ -3124,6 +3124,7 @@ fn scan_any(node: &Node, p: &'static ChainParams, addrs: &[String]) -> Result<(S
         }
         if found.is_empty() {
             empty.get_or_insert(l);
+            empties += 1;
             continue;
         }
         return Ok((l, found));

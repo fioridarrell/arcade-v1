@@ -8,7 +8,7 @@ Code: `crates/arcade-chaindb/src/ixfile.rs` (format), `ixset.rs` (a chain's file
 
 The address tables (`core.v2.script_hist`, `core.v2.spends`) and the tx index (`core.v1.txs`) are almost entirely history that never changes, kept uncompressed in B-trees built for random inserts. On Bitcoin they are an estimated 0.7–0.95 TB. The same rows, sorted, cut into blocks and compressed by column, take roughly a sixth of that (§6), and a file of them is the same bytes on every arcade, so it can later be shared and checked by a hash.
 
-## 2. The format (version 1)
+## 2. The format (version 2)
 
 One file holds the rows of one **kind** for one span of heights: a **range** (10,000 heights) or an **era** (100,000 heights, ten ranges merged). A file is written once and never changed.
 
@@ -26,8 +26,8 @@ All integers are big-endian. File name: `<kind>-<first height, 8 digits>-<last h
 
 - **Canonical rows** are fixed-size and big-endian, so their bytes sort as their keys do. They name a block by **height** and a transaction by its **position in the block**, never by the local block number, so every arcade on the same chain has the same rows.
 - **Rows per block are fixed per kind**, not a size target, so every arcade cuts the same blocks.
-- **Hashes are over canonical rows**, not compressed bytes. The **file id** is sha256(header | row count | every block's row hash): it does not depend on the zstd version or level. With the same zstd version and level (19; the version is pinned by `Cargo.lock`) the whole file is byte-identical, which the tests check across builders, thread counts, interrupted writes and merged-versus-direct eras.
-- **Checksum**: sha256(header | footer | trailer up to the file id). It is checked when a file is opened. Each block is checked against its row hash every time it is read, after being decompressed under a hard size cap (32 bytes a row and column).
+- **Hashes are over canonical rows**, not compressed bytes. The **file id** is sha256(header | row count | every block's first key and row hash): it does not depend on the zstd version or level. The first keys are in it because the readers search them: a file with the right id cannot steer a lookup to another block (version 2; version 1 left them out). With the same zstd version and level (19; the version is pinned by `Cargo.lock`) the whole file is byte-identical, which the tests check across builders, thread counts, interrupted writes and merged-versus-direct eras.
+- **Checksum**: sha256(header | footer | trailer up to the file id). It is checked when a file is opened, with the first keys rising and no block longer than a block of its kind can be (so no stated length makes a reader allocate more than that). Each block is checked against its row hash and its listed first key every time it is read, after being decompressed under a hard size cap (32 bytes a row and column).
 - The footer (one entry per block) is held in memory while a file is open. For all of Bitcoin that is about 85 MB (about 1.3 M blocks of rows across the three kinds); the first keys alone would be about 30 MB.
 
 ### Kinds
@@ -60,7 +60,7 @@ Each block is turned into columns, and each column is compressed on its own (its
   - `txs`: a row's block number becomes its height; rows sharing 8 prefix bytes are sorted by height and position.
   - `spends`: block numbers become heights, and the row goes to the spender's span. This relies on block numbers rising with height on the main chain (true by construction: a block gets its number when it is first connected); it is checked first, and a chain where it does not hold is refused.
   - `script_hist`: the txid prefix becomes a position through one lookup in `txs` per row, then the rows of one (address, height) are sorted by position. **This lookup is random, not sequential** (see §8).
-- **Checked before use.** Every finished file is read back whole (`Reader::verify`). The marker is set in a write transaction that checks the chain still has the same block at the sealed height.
+- **Checked before use.** Every finished file is read back whole (`Reader::verify`). The marker is set in a write transaction that checks the chain still has the same block at the sealed height, and checks again that every row was in its table: nothing waits in the address log or the tx index runs, and (history, spends) the Addresses index is on and was not turned off or on since the pass began (a STATE counter, `ixf:addr_epoch`). The marker is flushed to disk (chain.mdbx does not flush every commit) before any range it no longer uses is deleted.
 - **Resumable.** Every 50 M table rows, and when asked to stop, a pass saves a checkpoint (`index/convert-<kind>.ckpt`): where the scan is, and each open file's state (its block list and its open block's rows). The next run carries on from it and ends with the same bytes. A finished kind is skipped. A checkpoint of another job (another layout, level, or chain) is discarded.
 - **Running it again later** converts the ranges that have settled since, merges ten ranges into their era, switches the marker, then deletes the merged ranges. In this part that costs a full scan of each table again (the tables still hold everything); with the tail-only tables of part 2 it is a scan of about two ranges.
 - **The tables are not changed.** `ChainDb::set_index_files_off(c)` (or `ixfiles off`) removes the markers and the tables answer alone again.
@@ -74,12 +74,12 @@ Per kind, STATE `ixf:<H|P|T>` = sealed height u32 | generation u32. **No marker:
 |---|---|
 | `history_for_script` | Each file: binary search of the in-memory first keys, read one block (the next only while the address's rows run on). Then the table's rows above `F`. The txid prefix of a file row is read from the stored block (one read per row); rows are returned in the table's order (height, then txid prefix) |
 | `history_count_for_script` (new) | The same without reading any transaction. Used by the profile API, which only counts |
-| `tx_raw`, `tx_location`, `txids_by_t12`, `coin` | The `txs` table first; when it has no match, the T files: one block read per file, full txid confirmed on the stored transaction |
-| `spender` | `txs`/T to find the coin, then the `spends` table; when it has no row and the coin is not unspent, the P files from the coin's height on, first hit wins |
+| `tx_raw`, `tx_location`, `txids_by_t12`, `coin` | The `txs` table first; when it has no match and the table is flagged trimmed (`ixf:trim:T`), the T files: one block read per file, full txid confirmed on the stored transaction. The mempool's "in a block yet?" checks use `tx_raw_tables`, never the files |
+| `spender` | `txs`/T to find the coin, then the `spends` table; when it has no row, the table is flagged trimmed (`ixf:trim:P`) and the coin is not unspent, the P files from the coin's height on, first hit wins |
 | `balance_for_script`, `coins_for_script` | Unchanged (`by_script` stays in MDBX) |
 | Connecting blocks (`connect_one`, `locate`, `locate_c`) | **Unchanged: tables only.** See §8 |
 
-While the tables still hold the converted rows (all of this part), tx and spend lookups are answered by the tables and the files are only read for history. The tests also delete the settled rows from the tables and check that every answer stays the same from the files alone.
+While the tables still hold the converted rows (all of this part), a tx or spend lookup that misses the table is a miss: no step sets the trimmed flags yet, so the T and P files are never read and a damaged one breaks no lookup. History reads its files from the marker on. The tests also delete the settled rows from the tables and check that every answer stays the same from the files alone.
 
 ### Reorgs
 
@@ -88,6 +88,8 @@ Index files only cover heights at least 1,000 blocks below the tip. That is the 
 ### Errors
 
 A missing, shortened, damaged or foreign file is an error from the reader that needs it, never a wrong or silently shorter answer. Other kinds keep working.
+
+Turning the Addresses index off (or on) removes the history and spends markers: their tables are emptied, and files alone would give a part of the answer. They come back with the next conversion after the rows are built again.
 
 ## 5. Eras
 
@@ -115,7 +117,6 @@ Notes: run files hold one history row per output or input; a file row is one per
 - **Mesh sharing** of files, manifests, checkpoints.
 - A live trigger in the arcade (settings or admin action), progress in chain status, and the explorer reading history by position page by page (today `history_for_script` resolves every row's txid, which is slow for an address with a very long history once its chain is converted).
 - Moving index files with a chain (`ChainDb::relocate` refuses a chain that has them), and deleting them when a chain is removed.
-- Address history files while the Addresses index is off but files exist: they keep answering.
 
 ## 8. What the design got wrong or left open
 

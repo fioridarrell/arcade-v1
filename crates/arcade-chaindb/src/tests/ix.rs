@@ -130,7 +130,8 @@ fn names(f: &Fixture) -> Vec<String> {
 }
 
 /// What removing converted rows from the tables will do (a later step): every settled row
-/// of the three tables goes, so only the files can answer for those heights.
+/// of the three tables goes, so only the files can answer for those heights, and the tx
+/// index and spends tables are flagged trimmed (their lookups read the files on a miss).
 fn remove_settled_rows(f: &Fixture, upto: u32) -> [usize; 3] {
     let c = f.p.chain_no;
     let settled = |b: u32| f.db.block_height_of(c, b).unwrap().is_some_and(|h| h <= upto);
@@ -149,6 +150,9 @@ fn remove_settled_rows(f: &Fixture, upto: u32) -> [usize; 3] {
             for (k, v) in &txs {
                 w.del_dup(TXS, k, v)?;
             }
+            for k in [Kind::Txs, Kind::Spends] {
+                w.put(STATE, &k_state(c, &crate::ixset::trimmed_name(k)), b"1")?;
+            }
             Ok(())
         })
         .unwrap();
@@ -161,6 +165,23 @@ fn be(b: &[u8], at: usize) -> u32 {
 
 #[test]
 fn files_answer_exactly_as_the_tables() {
+    files_against_tables(false);
+}
+
+/// The same with blocks of 1/64 the rows: every file has many blocks, so lookups run across
+/// block edges and long address histories span several blocks.
+#[test]
+fn files_of_many_blocks_answer_exactly_as_the_tables() {
+    let _small = crate::ixfile::small_blocks();
+    files_against_tables(true);
+}
+
+/// Blocks per file of each kind's files.
+fn blocks_per_file(f: &Fixture) -> Vec<(String, usize)> {
+    names(f).into_iter().map(|n| (n.clone(), crate::ixfile::Reader::open(&f.db.index_dir(f.p.chain_no).join(&n)).unwrap().blocks())).collect()
+}
+
+fn files_against_tables(small: bool) {
     let c = fixture().p.chain_no;
     let (f, classic) = (fixture(), fixture());
     let blocks = ix_chain(&f.g, 1560);
@@ -186,6 +207,10 @@ fn files_answer_exactly_as_the_tables() {
     let info = f.db.index_files_info(c).unwrap();
     assert!(info.iter().all(|(_, upto, n, rows, _)| (*upto, *n) == (299, 2) && *rows > 300), "{info:?}");
     same(&answers(&f, &blocks), &want, "files up to 299, tables above");
+    if small {
+        let b = blocks_per_file(&f);
+        assert!(b.iter().all(|(_, n)| *n >= 3), "{b:?}");
+    }
     // Nothing more is settled: running it again changes nothing.
     let before = files(&f);
     assert!(convert(&f, &opts()).is_empty());
@@ -278,6 +303,17 @@ fn damaged_or_missing_files_are_errors_not_wrong_answers() {
     let s1 = script(1);
     assert!(!f.db.history_for_script(c, &s1).unwrap().is_empty());
 
+    // Until the tx index table is trimmed its files are never read: a lookup that misses the
+    // table reads none, so a missing file breaks nothing.
+    let tpath = dir.join(crate::ixfile::file_name(Kind::Txs, 0, 199));
+    let tgood = std::fs::read(&tpath).unwrap();
+    std::fs::remove_file(&tpath).unwrap();
+    f.db.ixsets.lock().unwrap().clear();
+    assert!(f.db.tx_raw(f.p, &Hash256([0xee; 32])).unwrap().is_none());
+    assert!(f.db.coin(f.p, &OutPoint { txid: Hash256([0xee; 32]), vout: 0 }).unwrap().is_none());
+    assert!(f.db.spender(f.p, &OutPoint { txid: blocks[5].txs[0].txid, vout: 9 }).unwrap().is_none());
+    std::fs::write(&tpath, &tgood).unwrap();
+
     // Bytes changed inside a history file's block: the read fails.
     let path = dir.join(crate::ixfile::file_name(Kind::Hist, 0, 199));
     let good = std::fs::read(&path).unwrap();
@@ -301,11 +337,27 @@ fn damaged_or_missing_files_are_errors_not_wrong_answers() {
     reload();
     let e = f.db.history_for_script(c, &s1).unwrap_err().to_string();
     assert!(e.contains("none starts at height 0"), "{e}");
-    let mut alien = good.clone();
-    alien[40] ^= 1; // the hash of the block the file ends on (and with it the checksum)
-    std::fs::write(&path, &alien).unwrap();
+    // A whole, valid file that ends on another block at its last height (another chain or
+    // fork): it reads back fine on its own, and the set refuses it when loading.
+    std::fs::write(&path, &good).unwrap();
+    let r = crate::ixfile::Reader::open(&path).unwrap();
+    let mut rows = Vec::new();
+    r.for_each_row(|x| {
+        rows.push(x.to_vec());
+        Ok(())
+    })
+    .unwrap();
+    let alien = crate::ixfile::Meta { last_hash: [0x5a; 32], ..r.meta };
+    drop(r);
+    let mut w = crate::ixfile::Writer::create(&dir, alien, 3, 1).unwrap();
+    for x in &rows {
+        w.push(x).unwrap();
+    }
+    w.finish().unwrap();
+    crate::ixfile::Reader::open(&path).unwrap().verify().unwrap();
     reload();
-    assert!(f.db.history_for_script(c, &s1).is_err());
+    let e = f.db.history_for_script(c, &s1).unwrap_err().to_string();
+    assert!(e.contains("not of this chain"), "{e}");
     // The other kinds are not touched by it.
     assert!(f.db.tx_raw(f.p, &blocks[5].txs[0].txid).unwrap().is_some());
 
@@ -341,4 +393,70 @@ fn nothing_is_converted_before_it_is_settled() {
     assert_eq!(h.db.index_files_upto(c, Kind::Hist).unwrap(), None);
     assert_eq!(h.db.index_files_upto(c, Kind::Spends).unwrap(), None);
     assert_eq!(names(&h), [crate::ixfile::file_name(Kind::Txs, 0, 199)]);
+}
+
+#[test]
+fn turning_addresses_off_stops_history_and_spends_files() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    f.db.connect_blocks(f.p, &ix_chain(&f.g, 1360)).unwrap();
+    convert(&f, &opts());
+    assert!(!f.db.history_for_script(c, &script(1)).unwrap().is_empty());
+    // Off: the address tables are emptied, so history and spends no longer answer from
+    // files (a part of the answer would be a wrong one). The tx index keeps its files.
+    f.db.set_addresses_off(c).unwrap();
+    assert_eq!(f.db.index_files_upto(c, Kind::Hist).unwrap(), None);
+    assert_eq!(f.db.index_files_upto(c, Kind::Spends).unwrap(), None);
+    assert_eq!(f.db.index_files_upto(c, Kind::Txs).unwrap(), Some(299));
+    while f.db.clear_address_rows_batch(c, 10_000).unwrap() > 0 {}
+    assert!(f.db.history_for_script(c, &script(1)).unwrap().is_empty());
+    // On again: the rows are built again first; a conversion before that is refused.
+    f.db.set_addresses_on(c).unwrap();
+    assert!(f.db.convert_to_index_files(f.p, &opts(), &AtomicBool::new(false), &mut |_| {}).is_err());
+}
+
+/// A reorg as deep as the undo window allows, just above the files: the files stay right,
+/// and the next conversion seals heights of the new branch.
+#[test]
+fn a_deep_reorg_just_above_the_files() {
+    let _small = crate::ixfile::small_blocks();
+    let c = fixture().p.chain_no;
+    let (f, classic) = (fixture(), fixture());
+    let blocks = ix_chain(&f.g, 1360);
+    for x in [&f, &classic] {
+        x.db.connect_blocks(x.p, &blocks).unwrap();
+    }
+    convert(&f, &opts());
+    assert_eq!(f.db.index_files_upto(c, Kind::Hist).unwrap(), Some(299));
+    // 990 blocks go: the tip is 370, only 71 above the files.
+    for x in [&f, &classic] {
+        for _ in 0..990 {
+            x.db.disconnect_tip(c).unwrap();
+        }
+        assert_eq!(x.db.tip(c).unwrap().unwrap().height, 370);
+    }
+    same(&answers(&f, &blocks), &answers(&classic, &blocks), "990 blocks disconnected");
+    // Nothing more is settled on the shorter chain.
+    assert!(convert(&f, &opts()).is_empty());
+    // Another branch from 370, longer than the old one: blocks paying other addresses.
+    let mut prev = blocks[369].hash();
+    let mut alt = Vec::new();
+    for h in 371..=1500u32 {
+        let cb = tx(&[], &[(7 + h as u64, script(h + 7))], h + 5_000_000);
+        let b = block(prev, vec![cb], 20_000 + h);
+        prev = b.hash();
+        alt.push(b);
+    }
+    for x in [&f, &classic] {
+        x.db.connect_blocks(x.p, &alt).unwrap();
+    }
+    let all: Vec<Block> = blocks.iter().chain(&alt).cloned().collect();
+    let want = answers(&classic, &all);
+    same(&answers(&f, &all), &want, "on the other branch, files up to 299");
+    // Tip 1500: 300..=499 settle, partly old blocks (to 370), partly the new branch.
+    convert(&f, &opts());
+    assert_eq!(f.db.index_files_upto(c, Kind::Hist).unwrap(), Some(499));
+    same(&answers(&f, &all), &want, "files up to 499 across the fork point");
+    remove_settled_rows(&f, 499);
+    same(&answers(&f, &all), &want, "settled rows only in files");
 }

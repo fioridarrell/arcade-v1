@@ -251,7 +251,7 @@ cmds! {
     "ledger.item_open" Wallet "repo, kind, title, body, from?, manifest?, head?, client_ref?" "Open an issue or a pull request on a repository. client_ref: a key of yours; sent again with the same key, the first answer comes back (replayed: true) and nothing is signed twice. The answer's receipt names what tx.status follows.";
     "ledger.item_comment" Wallet "repo, number, body, review?, client_ref?" "Comment on, or review (approve | changes), an issue or pull request. client_ref as for ledger.item_open.";
     "ledger.item_state" Wallet "repo, number, state, manifest?, client_ref?" "Close, reopen or merge an issue or pull request.";
-    "ledger.items" Read "repo, number?, state?, kind?, since?, summary?, pending?, cursor?, limit?" "A repository's issues and pull requests with their comments and reviews, by number. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items or comments at or after it); summary: true leaves out the events and keeps the title. Items, comments, reviews and state changes still waiting in the pool come too, marked pending: true (a pending item has no number yet; pending: false leaves them out). Paged: limit (default 50, at most 500) and cursor (the next of the page before; opaque); next is null on the last page, which also carries the pending items. count: how many on this page." => "{repo, items: [{number, kind, by, state, height, txid, text, events, comments, pending}], count, next, limit}";
+    "ledger.items" Read "repo, number?, state?, kind?, since?, summary?, pending?, cursor?, limit?" "A repository's issues and pull requests with their comments and reviews, by number. Filters: state (open, closed, merged), kind (issue, pull), since (a height: items with anything at or after it, and each item's events trimmed to those at or after it); summary: true leaves out the events and keeps the title, plus last_by (who made the newest event). Every item carries last_height (its newest event's height, before since trims). Items, comments, reviews and state changes still waiting in the pool come too, marked pending: true (a pending item has no number yet; pending: false leaves them out). Paged: limit (default 50, at most 500) and cursor (the next of the page before; opaque); next is null on the last page, which also carries the pending items. count: how many on this page." => "{repo, items: [{number, kind, by, state, height, txid, text, events, comments, last_height, last_by?, pending}], count, next, limit}";
     "arc.earn" Admin "chain, on?" "The Earn ARCADE switch for a chain kept here in full (docs/EARN.md), and where it stands: sealing, the catalog, replicas waiting to register, this arcade's turn and next payout.";
     "arc.earning" Read "" "Whether this arcade earns ARCADE: a light (green, yellow, grey, red) and why, pay built up, audits, the next payout turn, and the account paid.";
     "ord.chunks" Public "from?, chain?" "Ord fingerprint chunks (as other arcades compare them).";
@@ -409,7 +409,7 @@ cmds! {
     // Agents never poll (ARCADE #25 part 2).
     "events.since" Read "cursor?, kinds?, limit?, wait?" "The arcade's event log, oldest first, after cursor (from events.since's next; none: from now, \"0\": from the oldest kept), of kinds (comma list or array) only; limit (default 100, at most 1,000); wait: seconds (at most 60) to wait for the first new event. {events: [{cursor, at, kind, text}], next, waited}." => "{events: [{cursor, at, kind, text}], next, waited, timed_out}";
     "chains.wait" Public "chain, height, timeout?" "Answered once chain's tip (as this arcade reads it: own copy or borrowed) reaches height, or after timeout seconds (default 60, at most 600): {chain, height, tip: {height, hash}, source, reached, timed_out}." => "{chain, height, tip: {height, hash}, source, reached, timed_out}";
-    "rpc.openapi" Public "" "The OpenAPI 3.1 document of the web API (also GET /api/v1/openapi.json): every command, its typed parameters and result shape." => "OpenAPI 3.1 document (object)";
+    "rpc.openapi" Public "prefix?" "The OpenAPI 3.1 document of the web API (also GET /api/v1/openapi.json): every command, its typed parameters and result shape. prefix (the start of command names, e.g. tx. or ledger.item) keeps only those commands' paths; components stay whole." => "OpenAPI 3.1 document (object)";
     "rpc.guide" Public "" "The short guide for AI agents and scripts (also GET /api/v1/agents.md), as Markdown text." => "string (Markdown)";
     // Apps (app cards)
     "apps.store" Public "sort?, q?, flagged?, category?, withdrawn?" "The App Store: app cards from every chain with the arcade ledger (popular or new; starred first), in categories (counts in \"categories\"; category = one of them). Apps their publishers withdrew are left out; withdrawn: true lists only those.";
@@ -456,6 +456,7 @@ cmds! {
     "referee.get" Read "" "The referee arcade this one asks for seeds when a page names none, and whose key /r/verified trusts by default: {url, pubkey}, or {} when none is set.";
     "referee.set" Admin "url" "Name the referee arcade (https://...): its key is read from its /r/referee. An empty url clears it.";
     "realtime.lanes" Local "token" "Which players of the seat's room the fast lane reaches now (up), and how (routes: direct link or relay).";
+    "realtime.routes" Local "origin?" "For finding why a room doesn't connect: per arcade heard (origin: a node id or its start), the link its room sub came in on, the links up to it and the one room frames go out on, frames queued, and the rooms routed to it; and this arcade's own rooms with their ids.";
     "realtime.rtc" Local "token, peer, op, signal?" "A WebRTC link made by this arcade between an app window's seat (a room joined with fast) and a website viewer in its room, on the viewer's own wire (rtcsvc.rs): op offer (this seat's compact offer, when its id is the lower), signal (the viewer's compact offer or answer; an offer is answered), close. Once up (realtime.lanes: rtc), the window's realtime.media pieces and realtime.fast sends for that viewer go over it as RTP and data channels, and the viewer's come back as mchunk and fast events.";
     "realtime.rtc_status" Read "" "This arcade's WebRTC side: its UDP socket, candidates (host, STUN-mapped, relayed), relays and links.";
     "realtime.status" Read "" "Rooms this arcade has players in, and the routes it knows to other arcades' rooms.";
@@ -478,10 +479,10 @@ cmds! {
     "apikey.list" Local "" "API keys (not their secrets).";
     "apikey.create" Local "name, perms, tip_limit?" "Make an API key; the secret is shown once.";
     "apikey.revoke" Local "id" "Revoke an API key.";
-    "rpc.help" Public "" "Every command, its parameters and what it needs.";
+    "rpc.help" Public "method?, prefix?" "Every command, its parameters and what it needs. method (one exact command name) or prefix (the start of command names, e.g. tx. or ledger.item) answers only the matching ones.";
     "arc.status" Public "" "The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here.";
     "tx.status" Read "chain, txid | client_ref" "Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding, peers_acked, peers_refused}), broadcast_failed (refused here or by every peer that answered: broadcast.refusals [{peer, code, error}], code fee_too_low, conflict, missing_coin, dust, not_yet_valid, blob_missing, pool_full, invalid, rules or unreachable), signed (signed here: the receipt is written the moment it is signed, before any network step; in no pool or block yet), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, error (what the send answered, when it failed after signing), and code not_found when this arcade never signed it." => "{chain, txid, state, ever_signed_here, signed_at, client_ref, cmd, confirmed?, broadcast?, error?, as_of?}";
-    "tx.wait" Read "chain, txid | client_ref, until?, timeout?" "tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped or broadcast_failed, or after timeout seconds (default 60, at most 600) with timed_out: true." => "tx.status's answer + {timed_out}";
+    "tx.wait" Read "chain, txid | client_ref, until?, timeout?" "tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped or broadcast_failed, or after timeout seconds (default 60, at most 300: keep it under your client's socket timeout) with timed_out: true; reached (the milestone itself, not a failure first) and ended (until, broadcast_failed, dropped or timeout). Every tx.status answer carries milestones [{name, reached, by}] in order and milestone, the furthest reached." => "tx.status's answer + {timed_out, reached, ended}";
     "rpc.info" Local "" "Where the RPC and the web API are, and the cookie file.";
 }
 
@@ -618,6 +619,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("memo", "string", "A memo (up to 80 bytes)."),
     ("mentions", "array", "@tags mentioned."),
     ("message", "string", "The signed message."),
+    ("method", "string", "One exact command name (rpc.help)."),
     ("mode", "string", "How a chain is kept: full, shared or chain; for fog.keep: segment or pin."),
     ("level", "string", "A CPU level: low, balanced or full."),
     ("msg", "string", "A sealed message."),
@@ -628,6 +630,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("nonce", "string", "A sign-in nonce."),
     ("note", "string", "A note."),
     ("undo", "boolean", "Give back what was counted."),
+    ("origin", "string", "An arcade's node id, or its first hex digits."),
     ("notes", "string", "Notes."),
     ("number", "integer", "An issue or pull request number."),
     ("offset", "integer", "Rows to skip (from the newest unless the command says)."),
@@ -653,7 +656,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("phrase", "string", "12 words."),
     ("picture", "string", "A picture inscription id or URL."),
     ("pool", "string", "A prize pool id."),
-    ("prefix", "string", "A signed-message prefix."),
+    ("prefix", "string", "A signed-message prefix; for rpc.help and rpc.openapi, the start of command names (e.g. tx.)."),
     ("price_per_gb", "number", "ARCADE per GB."),
     ("propertyid", "integer", "An arcade token's property id."),
     ("psbt", "string", "A PSBT (base64 or hex)."),
@@ -742,7 +745,7 @@ pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
     ("fog.keep", "mode", "segment,pin", "\"segment\"", 0),
     ("cpu.set", "level", "low,balanced,full", "", 0),
     ("tx.wait", "until", "accepted_local,broadcast_ok,seen_in_peer_mempool,confirmed", "\"confirmed\"", 0),
-    ("tx.wait", "timeout", "", "60", 600),
+    ("tx.wait", "timeout", "", "60", 300),
     ("chains.wait", "timeout", "", "60", 600),
     ("events.since", "limit", "", "100", 1000),
     ("events.since", "wait", "", "0", 60),
@@ -900,8 +903,21 @@ pub fn route_of(name: &str) -> String {
 }
 
 pub fn help() -> serde_json::Value {
+    help_for(None, None)
+}
+
+/// Whether a command passes rpc.help's (and rpc.openapi's) filters: `method` names it exactly, `prefix` starts it.
+/// Neither given: every command (2026-11-21, ARCADE #13: the whole list is about 300 KB, too much for an agent that
+/// wants one command).
+pub fn matches(c: &Cmd, method: Option<&str>, prefix: Option<&str>) -> bool {
+    method.is_none_or(|m| c.name == m) && prefix.is_none_or(|p| c.name.starts_with(p))
+}
+
+/// rpc.help with its optional filters (see [`matches`]); no filter answers exactly what [`help`] always did.
+pub fn help_for(method: Option<&str>, prefix: Option<&str>) -> serde_json::Value {
     serde_json::json!(COMMANDS
         .iter()
+        .filter(|c| matches(c, method, prefix))
         .map(|c| serde_json::json!({"method": c.name, "route": route_of(c.name), "needs": c.perm.name(), "params": c.params,
                                     "summary": c.summary, "schema": params_of(c), "result": result_of(c), "sends": is_send(c)}))
         .collect::<Vec<_>>())
@@ -976,6 +992,25 @@ mod tests {
         }
     }
 
+    /// 2026-11-21 (ARCADE #13): rpc.help's method and prefix filters answer a strict subset holding what was asked.
+    #[test]
+    fn help_filters_by_method_or_prefix() {
+        let all = help();
+        let n = all.as_array().unwrap().len();
+        assert_eq!(help_for(None, None), all, "no filter: the same answer as before");
+        let names = |v: &serde_json::Value| v.as_array().unwrap().iter().map(|c| c["method"].as_str().unwrap().to_string()).collect::<Vec<_>>();
+        let one = help_for(Some("ledger.items"), None);
+        assert_eq!(names(&one), vec!["ledger.items"]);
+        let tx = help_for(None, Some("tx."));
+        let t = names(&tx);
+        assert!(t.len() < n && t.contains(&"tx.wait".to_string()) && t.iter().all(|m| m.starts_with("tx.")));
+        let li = names(&help_for(None, Some("ledger.item")));
+        assert!(li.contains(&"ledger.items".to_string()) && li.contains(&"ledger.item_open".to_string()) && li.len() < n);
+        assert!(help_for(Some("no.such"), None).as_array().unwrap().is_empty());
+        let (a, b, c) = (all.to_string().len(), tx.to_string().len(), one.to_string().len());
+        println!("rpc.help: {a} bytes; prefix tx.: {b}; method ledger.items: {c}");
+    }
+
     #[test]
     fn every_param_is_typed() {
         for c in COMMANDS {
@@ -990,7 +1025,7 @@ mod tests {
         }
         let t = |c: &str, p: &str| params_of(find(c).unwrap()).into_iter().find(|x| x["name"] == p).unwrap();
         assert_eq!(t("tx.wait", "until")["enum"][0], "accepted_local");
-        assert_eq!(t("tx.wait", "timeout")["maximum"], 600);
+        assert_eq!(t("tx.wait", "timeout")["maximum"], 300);
         assert_eq!(t("tx.status", "txid")["one_of"], serde_json::json!(["txid", "client_ref"]));
         assert_eq!(t("tx.status", "chain")["required"], true);
         assert_eq!(t("explorer.arc_payouts", "blocks")["default"], 300);

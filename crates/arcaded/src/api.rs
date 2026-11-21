@@ -104,7 +104,8 @@ pub fn error_code(e: &str) -> &'static str {
         "stopping"
     } else if l.contains("needs an api key") || l.contains("malformed api key") || l.contains("only available on this computer") || l.contains("not allowed") {
         "forbidden"
-    } else if l.contains(" required") || l.starts_with("bad request") || l.contains("is not a ") || l.contains(" must be ") || l.starts_with("give ") {
+    // "state is open, closed or merged, not bogus", "until: a, b or c, not x" (ARCADE #13: they came back as `error`).
+    } else if l.contains(" required") || l.starts_with("bad request") || l.contains("is not a ") || l.contains(" must be ") || l.starts_with("give ") || l.contains(", not ") {
         "bad_args"
     } else if l.contains("not installed") || l.contains("isn't running here") || (l.contains("borrowed") && l.contains("install")) {
         "not_installed"
@@ -261,8 +262,13 @@ fn chain_status_short(node: &Node, key: &str) -> Result<Value, String> {
     };
     let installed = st["installed"] == true;
     let borrowed = st["borrowed"] == true || st["mode"] == "borrowed";
+    // Nothing heard of this chain: no block of it here and no peer or lender telling a height (ARCADE #13: a borrowed
+    // chain nobody lends answered "synced", behind 0, with tip 0 and no hash). Borrowed and nobody lending: waiting.
+    let heard = tip_hash.is_some() || !from.is_null() || best.is_some_and(|b| b > 0);
     let sync = if !installed && !borrowed {
         "not_kept"
+    } else if !heard {
+        if borrowed && lenders.is_empty() { "waiting" } else { "unknown" }
     } else {
         match behind {
             None => "unknown",
@@ -308,18 +314,47 @@ fn filter_items(mut v: Value, req: &Value) -> Result<Value, String> {
         });
         for it in items.iter_mut() {
             it["comments"] = json!(it["events"].as_array().map(|a| a.iter().filter(|e| e["w"] == "comment" || e["w"] == "review").count()).unwrap_or(0));
+            // 2026-11-21 (ARCADE #13): every item says when it last moved, so an agent can tell whether to read it again.
+            // last_height is the newest confirmed event's height (the item's own height when it has none yet), taken
+            // before since trims the events; pending events have no height and do not count.
+            let (last_height, last_by) = last_activity(it);
+            it["last_height"] = last_height;
             if summary {
                 if let Some(o) = it.as_object_mut() {
                     o.remove("events");
                 }
                 let title = it["text"]["title"].clone();
                 it["text"] = json!({"title": title});
+                // 2026-11-21 (ARCADE #13): a summary also names who made that newest event.
+                it["last_by"] = last_by;
+            } else if let Some(h) = since {
+                // 2026-11-21 (ARCADE #13): with since, keep only the events at or after it (pending ones are newer than
+                // any height, so they stay). The item itself is still chosen as before, and comments still counts all.
+                if let Some(ev) = it["events"].as_array_mut() {
+                    ev.retain(|e| e["pending"] == true || e["height"].as_u64().is_none_or(|eh| eh >= h));
+                }
             }
         }
         let n = items.len();
         v["count"] = json!(n);
     }
     Ok(v)
+}
+
+/// An item's newest confirmed event: (its height, its author), or the item's own height and author when no event has
+/// a height yet (2026-11-21, ARCADE #13). Ties go to the later event in the list, the order the ledger keeps them in.
+fn last_activity(it: &Value) -> (Value, Value) {
+    let mut best: (Value, Value) = (it["height"].clone(), it["by"].clone());
+    let mut top = it["height"].as_u64();
+    for e in it["events"].as_array().into_iter().flatten() {
+        if let Some(h) = e["height"].as_u64() {
+            if top.is_none_or(|t| h >= t) {
+                top = Some(h);
+                best = (json!(h), e["by"].clone());
+            }
+        }
+    }
+    best
 }
 
 /// Most ledger.items on one page.
@@ -404,7 +439,9 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
     match req["cmd"].as_str().unwrap_or("") {
         // The link that opens the desktop app's window in a browser (crate::webui; `arcade web`).
         "ui.link" => crate::webui::link(node, node.http_port.get().copied().unwrap_or(8420)),
-        "status" if req["chain"].as_str().is_some_and(|k| crate::chains::find(k).is_none_or(|x| x.chain_no != c)) => chain_status_short(node, req["chain"].as_str().unwrap()),
+        // Every chain named gets the same short answer, the first one too (ARCADE #13, 2026-11-21: `status {chain:
+        // peptest}` came back in the old shape, with no behind, mode, source or peer_tips).
+        "status" if req["chain"].as_str().is_some() => chain_status_short(node, req["chain"].as_str().unwrap()),
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
@@ -420,9 +457,14 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
                 .iter()
                 .map(|(a, t)| json!({"peer": a, "height": t.height, "names_digest": t.names_digest}))
                 .collect();
+            // The first chain's sync as `status {chain}` says it (ARCADE #13: "starting" while phase was "ready").
+            let short = chain_status_short(node, p.key).ok();
+            let sync_state = node.sync_state.lock().unwrap().clone();
+            let sync = short.as_ref().and_then(|v| v["sync"].as_str().map(String::from)).filter(|_| phase() == "ready").unwrap_or(sync_state);
             Ok(json!({
                 "chain": p.name,
-                "sync": *node.sync_state.lock().unwrap(),
+                "sync": sync,
+                "behind": short.as_ref().map(|v| v["behind"].clone()),
                 "tip": tip.map(|t| json!({"height": t.height, "hash": t.hash.to_hex()})),
                 "best_known": best,
                 "tags": {"indexed_to": indexed_to, "count": tag_count, "names_digest": digest},
@@ -795,6 +837,7 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
                 _ => crate::oplist::copy(node, p, &s("slug").ok_or("slug required")?),
             }
         }
+        "realtime.routes" => Ok(crate::realtime::routes(s("origin").as_deref())),
         "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
         "realtime.rtc" => crate::rtcsvc::api(node, &s("token").ok_or("token required")?, &s("peer").ok_or("peer required")?, &s("op").ok_or("op required")?, &req["signal"]),
         "realtime.rtc_status" => Ok(crate::rtcsvc::status()),
@@ -810,8 +853,9 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         },
         "apps.storage" => crate::appsvc::storage(node, &s("page").ok_or("page required")?, &s("op").ok_or("op required")?, req["key"].as_str(), req["value"].as_str()),
         "apps.launch" => crate::appsvc::launch(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
-        "rpc.help" => Ok(crate::commands::help()),
-        "rpc.openapi" => Ok(crate::openapi::document()),
+        // 2026-11-21 (ARCADE #13): optional filters; an empty string counts as none.
+        "rpc.help" => Ok(crate::commands::help_for(s("method").filter(|m| !m.is_empty()).as_deref(), s("prefix").filter(|x| !x.is_empty()).as_deref())),
+        "rpc.openapi" => Ok(crate::openapi::document_for(s("prefix").filter(|x| !x.is_empty()).as_deref())),
         "rpc.guide" => Ok(json!(crate::openapi::GUIDE)),
         "events.since" => events_since(node, req),
         "chains.wait" => crate::explorer::chain_wait(node, req),
@@ -1454,6 +1498,8 @@ mod agent_tests {
         assert_eq!(error_code("not enough coins for 5 DOGE"), "insufficient_funds");
         assert_eq!(error_code("no transaction 55dd on ARCADE testnet (asked the mesh too: x)"), "not_found");
         assert_eq!(error_code("repo required"), "bad_args");
+        assert_eq!(error_code("state is open, closed or merged, not bogus"), "bad_args");
+        assert_eq!(error_code("until: accepted_local, broadcast_ok, seen_in_peer_mempool or confirmed, not x"), "bad_args");
         assert_eq!(error_code("ARCADE testnet is not installed"), "not_installed");
         assert_eq!(error_code("unknown chain zzz"), "unknown_chain");
         assert_eq!(error_code("something else"), "error");
@@ -1477,6 +1523,42 @@ mod agent_tests {
         assert!(s["items"][0].get("events").is_none() && s["items"][0]["text"] == json!({"title": "one"}) && s["items"][0]["comments"] == 1);
         assert_eq!(s["count"], 3);
         assert!(filter_items(v.clone(), &json!({"state": "shut"})).is_err());
+    }
+
+    /// 2026-11-21 (ARCADE #13): since trims each item's events, every item says its last_height, and a summary also
+    /// says last_by. An item with 11 comments read with since keeps only the newer ones.
+    #[test]
+    fn since_trims_events_and_items_say_their_last_activity() {
+        let body = "x".repeat(1800);
+        let mut events: Vec<Value> = (0..11u64).map(|i| json!({"w": "comment", "by": format!("@user{i}"), "height": 3000 + i * 70, "text": {"body": body}})).collect();
+        events.push(json!({"w": "comment", "by": "@waiting", "height": null, "pending": true, "text": {"body": "soon"}}));
+        let v = json!({"repo": "@a/b", "items": [
+            {"number": 13, "kind": "issue", "by": "@opener", "state": "open", "height": 2900, "text": {"title": "t", "body": body}, "events": events},
+            {"number": 14, "kind": "issue", "by": "@quiet", "state": "open", "height": 2950, "text": {"title": "q"}, "events": []},
+        ]});
+        // No since: every event stays, and last_height is the newest confirmed event's.
+        let all = filter_items(v.clone(), &json!({})).unwrap();
+        assert_eq!(all["items"][0]["events"].as_array().unwrap().len(), 12);
+        assert_eq!(all["items"][0]["last_height"], 3700);
+        assert_eq!(all["items"][1]["last_height"], 2950, "no events: the item's own height");
+        assert!(all["items"][0].get("last_by").is_none(), "last_by only in summaries");
+        // since 3700: only the comment at 3700 and the pending one are left; comments and last_height are unchanged.
+        let t = filter_items(v.clone(), &json!({"since": 3700})).unwrap();
+        let it = &t["items"][0];
+        assert_eq!(t["count"], 1, "items are chosen as before");
+        let hs: Vec<Value> = it["events"].as_array().unwrap().iter().map(|e| e["height"].clone()).collect();
+        assert_eq!(hs, vec![json!(3700), Value::Null]);
+        assert_eq!(it["comments"], 12);
+        assert_eq!(it["last_height"], 3700);
+        let (a, b) = (serde_json::to_vec(&all["items"][0]).unwrap().len(), serde_json::to_vec(it).unwrap().len());
+        println!("item 13: {a} bytes without since, {b} with since 3700");
+        assert!(b * 4 < a);
+        // A summary names who made the newest event.
+        let s = filter_items(v, &json!({"summary": true})).unwrap();
+        assert_eq!(s["items"][0]["last_height"], 3700);
+        assert_eq!(s["items"][0]["last_by"], "@user10");
+        assert_eq!(s["items"][1]["last_by"], "@quiet", "no events: the item's author");
+        assert!(s["items"][0].get("events").is_none());
     }
 
     #[test]
@@ -1528,6 +1610,12 @@ mod agent_tests {
         assert_eq!(error_code(&e), "unknown_command", "service.stop is the socket's own line, never dispatched");
         assert!(dispatch(&t.node, &json!({"cmd": "rpc.openapi"})).unwrap()["paths"].is_object());
         assert!(dispatch(&t.node, &json!({"cmd": "rpc.guide"})).unwrap().as_str().unwrap().contains("client_ref"));
+        // 2026-11-21 (ARCADE #13): the filters reach the socket.
+        let h = dispatch(&t.node, &json!({"cmd": "rpc.help", "method": "tx.wait"})).unwrap();
+        assert_eq!(h.as_array().unwrap().len(), 1);
+        let o = dispatch(&t.node, &json!({"cmd": "rpc.openapi", "prefix": "tx."})).unwrap();
+        assert!(o["paths"].as_object().unwrap().keys().all(|k| k.starts_with("/api/v1/tx/")));
+        assert_eq!(dispatch(&t.node, &json!({"cmd": "rpc.help", "prefix": ""})).unwrap(), crate::commands::help(), "empty is no filter");
         for c in ERROR_CODES {
             assert!(!c.is_empty());
         }

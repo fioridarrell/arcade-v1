@@ -861,7 +861,22 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             Ok(json!(blocks(&x, before, n(20, 100) as u32)))
         }
         "explorer.block" => block(&x, &s("id").ok_or("give a height or block hash")?),
-        "explorer.tx" => tx(&x, &s("txid").ok_or("give a txid")?),
+        "explorer.tx" => {
+            let id = s("txid").ok_or("give a txid")?;
+            match tx(&x, &id) {
+                // No chain given and not on the first one: which chain has it (ARCADE #13, 2026-11-21: an ARCADE txid
+                // answered not_found "on Pepecoin testnet" with no hint).
+                Err(e) if req["chain"].is_null() && e.starts_with("no transaction") => {
+                    let h = Hash256::from_hex(id.trim()).map_err(|_| e.clone())?;
+                    let found = elsewhere(&x, move |n, p| (hex_kind(n, p, &h) == Some("tx")).then(|| ("tx", String::new())));
+                    match found.first() {
+                        Some((p, _, _)) => Err(format!("{e}; it is on {} (try_chain: {}): ask again with chain \"{}\"", p.name, p.key, p.key)),
+                        None => Err(e),
+                    }
+                }
+                r => r,
+            }
+        }
         "explorer.address" => addr(&x, &s("address").ok_or("give an address")?, req),
         "explorer.held" => {
             x.need("ord")?;
@@ -1634,6 +1649,26 @@ fn out_json(x: &Ctx, txid: &Hash256, vout: u32, value: u64, script: &[u8]) -> Va
     o
 }
 
+/// A repository record as JSON fields (ARCADE #13, 2026-11-21: it was a Rust debug string): op, repo, and per op its
+/// number, kind, state, verdict, tag, and the hashes in hex (a comment's or issue's body is the sha256 of its text, held as
+/// a blob; ledger.items has the text).
+fn repo_op_json(op: &arcade_ledger::repos::RepoOp) -> Value {
+    use arcade_ledger::repos::RepoOp as O;
+    let kind = |k: u8| match k { arcade_ledger::repos::KIND_ISSUE => "issue", arcade_ledger::repos::KIND_PULL => "pull", _ => "unknown" };
+    let state = |s: u8| match s { arcade_ledger::repos::STATE_OPEN => "open", arcade_ledger::repos::STATE_CLOSED => "closed", arcade_ledger::repos::STATE_MERGED => "merged", _ => "unknown" };
+    let mut v = match op {
+        O::Push { name, manifest } => json!({"op": "push", "repo": name, "manifest": hex::encode(manifest)}),
+        O::PushOnto { name, manifest, base, force } => json!({"op": "push_onto", "repo": name, "manifest": hex::encode(manifest), "base": hex::encode(base), "force": force}),
+        O::Maintainer { name, add, tag } => json!({"op": "maintainer", "repo": name, "add": add, "tag": tag}),
+        O::Fork { name, from } => json!({"op": "fork", "repo": name, "from": from}),
+        O::Open { name, kind: k, body } => json!({"op": "open", "repo": name, "kind": kind(*k), "body_sha256": hex::encode(body)}),
+        O::Comment { name, number, verdict, body } => json!({"op": "comment", "repo": name, "number": number, "verdict": verdict, "body_sha256": hex::encode(body)}),
+        O::State { name, number, state: st, manifest } => json!({"op": "state", "repo": name, "number": number, "state": state(*st), "manifest": hex::encode(manifest)}),
+    };
+    v["record"] = json!("repository");
+    v
+}
+
 /// An OP_RETURN output's data (hex) and, when it is an arcade record, what it says (ARCADE #25): the record kind
 /// (repository, A://, or another arcade record by its type number) and the op as this arcade reads it.
 pub fn op_return_view(script: &[u8]) -> (Option<String>, Value) {
@@ -1643,12 +1678,17 @@ pub fn op_return_view(script: &[u8]) -> (Option<String>, Value) {
     let ty = (payload.len() >= 4).then(|| u16::from_be_bytes([payload[2], payload[3]]));
     let decoded = if let Some(r) = arcade_ledger::repos::parse(payload) {
         match r {
-            Ok(op) => json!({"record": "repository", "op": format!("{op:?}")}),
+            Ok(op) => repo_op_json(&op),
             Err(e) => json!({"record": "repository", "error": e}),
         }
     } else if let Some(r) = arcade_ledger::aproto::parse(payload) {
         match r {
-            Ok(op) => json!({"record": "A://", "op": format!("{op:?}")}),
+            // Its kind by name (ARCADE #13: the whole op was a Rust debug string); the details as this arcade reads them.
+            Ok(op) => {
+                let d = format!("{op:?}");
+                let kind = d.split(|c: char| !c.is_alphanumeric() && c != '_').next().unwrap_or("").to_string();
+                json!({"record": "A://", "op": kind, "detail": d})
+            }
             Err(e) => json!({"record": "A://", "error": e}),
         }
     } else {
@@ -2489,7 +2529,10 @@ mod op_return_tests {
         let (d, v) = op_return_view(&script(&rec));
         assert_eq!(d, Some(hex::encode(&rec)));
         assert_eq!(v["record"], "repository");
-        assert!(v["op"].as_str().unwrap().contains("25"), "{v}");
+        assert_eq!(v["op"], "comment", "{v}");
+        assert_eq!(v["number"], 25);
+        assert_eq!(v["repo"], "arcade-v1");
+        assert_eq!(v["body_sha256"], hex::encode([7u8; 32]));
         // Another arcade record: its type.
         let mut other = arcade_ledger::extract::MARKER.to_vec();
         other.extend([0, 0, 0, 9, 1, 2]);

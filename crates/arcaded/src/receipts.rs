@@ -457,7 +457,45 @@ pub fn status(node: &Node, req: &Value) -> Result<Value, String> {
             }
         }
     }
+    with_milestones(&mut out);
     Ok(out)
+}
+
+/// The lifecycle in order, each with the field that proves it (ARCADE #13, 2026-11-21: `tx.wait` took milestones
+/// `tx.status` never showed, so a client couldn't tell where it was): `milestones` [{name, reached, by}] and
+/// `milestone`, the furthest one reached. `state` stays as it was.
+fn with_milestones(out: &mut Value) {
+    let order: [(&str, &str); 5] = [
+        ("signed", "state signed or later"),
+        ("accepted_local", "this arcade's pool holds it (state accepted_local or later)"),
+        ("broadcast_ok", "broadcast.peers_sent >= 1 (offered to a linked arcade)"),
+        ("seen_in_peer_mempool", "broadcast.peers_holding >= 1 or broadcast.peers_acked >= 1"),
+        ("confirmed", "state confirmed (confirmed.height)"),
+    ];
+    let s = out["state"].as_str().unwrap_or("").to_string();
+    let ok = |name: &str| -> bool {
+        match name {
+            "signed" => matches!(s.as_str(), "signed" | "accepted_local" | "confirmed"),
+            "accepted_local" => matches!(s.as_str(), "accepted_local" | "confirmed"),
+            "broadcast_ok" | "seen_in_peer_mempool" => s == "confirmed" || milestone_reached(out, name),
+            "confirmed" => s == "confirmed",
+            _ => false,
+        }
+    };
+    let list: Vec<Value> = order.iter().map(|(n, by)| json!({"name": n, "reached": ok(n), "by": by})).collect();
+    let furthest = order.iter().rev().find(|(n, _)| ok(n)).map(|(n, _)| *n);
+    out["milestones"] = json!(list);
+    out["milestone"] = json!(furthest);
+}
+
+fn milestone_reached(st: &Value, name: &str) -> bool {
+    let b = &st["broadcast"];
+    let n = |k: &str| b[k].as_u64().unwrap_or(0);
+    match name {
+        "broadcast_ok" => n("peers_sent") > 0 || n("peers_holding") > 0 || n("peers_acked") > 0,
+        "seen_in_peer_mempool" => n("peers_holding") > 0 || n("peers_acked") > 0,
+        _ => false,
+    }
 }
 
 /// The order states come in, for `tx.wait until`: a later one satisfies an earlier one.
@@ -491,24 +529,35 @@ fn reached(st: &Value, until: &str) -> bool {
     }
 }
 
+/// The longest one tx.wait waits, in seconds.
+pub const WAIT_MOST: u64 = 300;
+
 /// `tx.wait {chain, txid | client_ref, until?, timeout?}`: tx.status, answered once the transaction reaches `until`
 /// (accepted_local, broadcast_ok, seen_in_peer_mempool or confirmed; default confirmed) or is dropped, or after
-/// `timeout` seconds (default 60, at most 600) with "timed_out": true.
+/// `timeout` seconds (default 60, at most WAIT_MOST) with "timed_out": true, `reached` (the milestone itself, not a failure first) and `ended` (until, broadcast_failed, dropped or timeout); every answer carries `milestones` with "timed_out": true.
 pub fn wait(node: &Node, req: &Value) -> Result<Value, String> {
     let until = req["until"].as_str().unwrap_or("confirmed");
     if !matches!(until, "accepted_local" | "broadcast_ok" | "seen_in_peer_mempool" | "confirmed") {
         return Err(format!("until: accepted_local, broadcast_ok, seen_in_peer_mempool or confirmed, not {until}"));
     }
-    let timeout = req["timeout"].as_u64().or_else(|| req["timeout"].as_str().and_then(|t| t.parse().ok())).unwrap_or(60).min(600);
+    // At most WAIT_MOST: keep `timeout` under your client's socket timeout (ARCADE #13: a wait of 540 s outlasted one).
+    let timeout = req["timeout"].as_u64().or_else(|| req["timeout"].as_str().and_then(|t| t.parse().ok())).unwrap_or(60).min(WAIT_MOST);
     let end = std::time::Instant::now() + std::time::Duration::from_secs(timeout);
     loop {
         let mut st = status(node, req)?;
         if reached(&st, until) {
             st["timed_out"] = json!(false);
+            // Why the wait ended (ARCADE #13): the milestone itself, or the transaction failing or being dropped
+            // first (then `reached` is false).
+            let failed = matches!(st["state"].as_str(), Some("broadcast_failed" | "dropped"));
+            st["reached"] = json!(!failed);
+            st["ended"] = json!(if failed { st["state"].as_str().unwrap_or("").to_string() } else { until.to_string() });
             return Ok(st);
         }
         if std::time::Instant::now() >= end || crate::STOP_ASKED.load(std::sync::atomic::Ordering::Relaxed) {
             st["timed_out"] = json!(true);
+            st["reached"] = json!(false);
+            st["ended"] = json!("timeout");
             return Ok(st);
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
@@ -634,5 +683,26 @@ mod tests {
         assert!(reached(&st("broadcast_failed"), "broadcast_ok"));
         let acked = json!({"state": "accepted_local", "broadcast": {"peers_sent": 0, "peers_holding": 0, "peers_acked": 1}});
         assert!(reached(&acked, "seen_in_peer_mempool"));
+    }
+}
+
+#[cfg(test)]
+mod milestone_tests {
+    use super::*;
+    #[test]
+    fn milestones_follow_the_broadcast_counts() {
+        let mut v = json!({"state": "accepted_local", "broadcast": {"peers_sent": 1, "peers_holding": 0, "peers_acked": 0}});
+        with_milestones(&mut v);
+        assert_eq!(v["milestone"], "broadcast_ok");
+        let mut v = json!({"state": "accepted_local", "broadcast": {"peers_sent": 0, "peers_holding": 0, "peers_acked": 1}});
+        with_milestones(&mut v);
+        assert_eq!(v["milestone"], "seen_in_peer_mempool");
+        let mut v = json!({"state": "confirmed"});
+        with_milestones(&mut v);
+        assert_eq!(v["milestone"], "confirmed");
+        assert!(v["milestones"].as_array().unwrap().iter().all(|m| m["reached"] == true));
+        let mut v = json!({"state": "unknown"});
+        with_milestones(&mut v);
+        assert!(v["milestone"].is_null());
     }
 }

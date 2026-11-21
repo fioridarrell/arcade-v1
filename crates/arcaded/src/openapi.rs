@@ -104,8 +104,15 @@ fn operation(c: &Cmd, get: bool) -> Value {
 
 /// The OpenAPI 3.1 document.
 pub fn document() -> Value {
+    document_for(None)
+}
+
+/// The OpenAPI 3.1 document, only the paths of commands whose names start with `prefix` when one is given
+/// (2026-11-21, ARCADE #13: the whole document is about 800 KB). The components (the error answers and the API key
+/// scheme) are small and every path refers to them, so they always come whole.
+pub fn document_for(prefix: Option<&str>) -> Value {
     let mut paths = Map::new();
-    for c in commands::COMMANDS {
+    for c in commands::COMMANDS.iter().filter(|c| commands::matches(c, None, prefix)) {
         // POST for every command (a JSON body); GET too for reads (query fields: numbers and true/false are parsed).
         let mut item = json!({"post": operation(c, false)});
         if matches!(c.perm, Perm::Public | Perm::Read) {
@@ -167,6 +174,30 @@ mod tests {
         assert!(paths["/api/v1/explorer/blocks"]["get"]["parameters"].as_array().unwrap().iter().any(|p| p["name"] == "order"));
         assert_eq!(paths["/api/v1/status"]["get"]["security"], json!([]));
         assert_eq!(paths["/api/v1/ledger/item_open"]["post"]["security"], json!([{"apiKey": []}]));
+    }
+
+    /// 2026-11-21 (ARCADE #13): a prefix keeps only those commands' paths, and the components they refer to.
+    #[test]
+    fn a_prefix_keeps_only_its_paths() {
+        let all = document();
+        assert_eq!(document_for(None), all, "no prefix: the same document as before");
+        let d = document_for(Some("ledger.item"));
+        let paths = d["paths"].as_object().unwrap();
+        assert!(paths.len() < all["paths"].as_object().unwrap().len());
+        assert!(paths.contains_key("/api/v1/ledger/items") && paths.contains_key("/api/v1/ledger/item_open"));
+        assert!(paths.keys().all(|k| k.starts_with("/api/v1/ledger/item")));
+        assert_eq!(d["components"], all["components"]);
+        // Every $ref the kept paths use resolves in the components.
+        let text = d["paths"].to_string();
+        for r in text.match_indices("#/components/").map(|(i, _)| text[i + 2..].split('"').next().unwrap()) {
+            let mut at = &d;
+            for part in r.split('/') {
+                at = &at[part];
+            }
+            assert!(!at.is_null(), "{r} is missing");
+        }
+        let tx = document_for(Some("tx."));
+        println!("rpc.openapi: {} bytes; prefix tx.: {}; prefix ledger.item: {}", all.to_string().len(), tx.to_string().len(), d.to_string().len());
     }
 
     #[test]

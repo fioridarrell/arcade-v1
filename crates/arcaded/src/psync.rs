@@ -716,14 +716,23 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
 /// queue for another source. Nothing is connected. `min_h`: the lowest height asked for (a
 /// source must be at least there). Returns blocks stored; some may still be missing after an
 /// error or a stop (the caller looks again: ChainDb::init_missing).
-pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h: u32, on_progress: &dyn Fn(String), stop: &AtomicBool) -> Round {
+/// `room`: asked every half minute; an error (the drive too full) ends the round with it.
+pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h: u32, on_progress: &dyn Fn(String), room: &dyn Fn() -> Result<(), String>, stop: &AtomicBool) -> Round {
     if hashes.is_empty() {
         return Round::default();
     }
     let offers = node.offers_for(p.key);
     let arcades = dial_offers(node, p, &offers, min_h);
-    store_round(&node.chain, p, hashes, arcades, Some((node, min_h)), Duration::from_secs(360), on_progress, stop)
+    store_round(&node.chain, p, hashes, arcades, Some((node, min_h)), Duration::from_secs(360), on_progress, room, stop)
 }
+
+/// How often a store-only round writes its in-progress timing line (blocks/s, MB/s, totals,
+/// STATE init_timing), so a stop or an error never loses the measurement.
+const PROGRESS_EVERY: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(180) };
+/// How often a store-only round asks whether the drive still has room.
+const ROOM_EVERY: Duration = if cfg!(test) { Duration::ZERO } else { Duration::from_secs(30) };
+/// The in-progress line's start (one kept: each replaces the one before).
+pub const PROGRESS_PREFIX: &str = "blocks round in progress";
 
 /// A store-only round over `sources` (and, with `recruit`, the coin's P2P peers kept working):
 /// see [`run_store`]. Ends when every block was stored, at a stop, when the store fails, or
@@ -737,6 +746,7 @@ pub(crate) fn store_round<'a>(
     recruit: Option<(&'a Node, u32)>,
     idle: Duration,
     on_progress: &dyn Fn(String),
+    room: &dyn Fn() -> Result<(), String>,
     stop: &AtomicBool,
 ) -> Round {
     if hashes.is_empty() {
@@ -760,10 +770,30 @@ pub(crate) fn store_round<'a>(
             spawn_recruiter(sc, node, p, pool, min_h, true);
         }
         let mut last_note = Instant::now() - Duration::from_secs(10);
+        let (mut last_room, mut last_line) = (Instant::now(), Instant::now());
         let mut idle_since: Option<Instant> = None;
+        let progress_line = |pool: &Pool| {
+            let (stored, bytes) = { let st = pool.s.lock().unwrap(); (st.stored, st.bytes) };
+            if stored > 0 {
+                let d = t0.elapsed();
+                let line = format!("{PROGRESS_PREFIX}: {stored} of {n} blocks, {:.1} MB stored in {} · {} blocks/s · {:.1} MB/s",
+                    bytes as f64 / 1e6, arcade_chaindb::initsync::took(d), arcade_chaindb::initsync::per_s(stored, d), bytes as f64 / 1e6 / d.as_secs_f64().max(0.001));
+                let _ = db.init_set_progress(p.chain_no, PROGRESS_PREFIX, &line);
+            }
+        };
         let r = loop {
             if stop.load(Ordering::Relaxed) {
                 break Ok(());
+            }
+            if last_line.elapsed() >= PROGRESS_EVERY {
+                progress_line(pool);
+                last_line = Instant::now();
+            }
+            if last_room.elapsed() >= ROOM_EVERY {
+                last_room = Instant::now();
+                if let Err(e) = room() {
+                    break Err(e);
+                }
             }
             {
                 let st = pool.s.lock().unwrap();
@@ -793,6 +823,7 @@ pub(crate) fn store_round<'a>(
         };
         pool.stop.store(true, Ordering::Relaxed);
         pool.cv.notify_all();
+        progress_line(pool);
         r
     });
     let st = pool.s.lock().unwrap();
@@ -913,10 +944,12 @@ pub(crate) mod tests {
         let (mute, mute_asked) = src(&blocks, 1);
         let (bad, bad_asked) = src(&blocks, 2);
         let sources: Vec<(String, Box<dyn BlockSource + Send>)> = vec![("mute".into(), Box::new(mute)), ("bad".into(), Box::new(bad)), ("good".into(), Box::new(good))];
-        let r = store_round(&db, p, &missing, sources, None, Duration::from_secs(5), &|_| {}, &AtomicBool::new(false));
+        let r = store_round(&db, p, &missing, sources, None, Duration::from_secs(5), &|_| {}, &|| Ok(()), &AtomicBool::new(false));
         assert!(r.error.is_none(), "{:?}", r.error);
         assert_eq!(r.stored, 1200);
         assert!(r.bytes >= 1200 * 80, "{}", r.bytes);
+        // The in-progress timing line, kept with the chain.
+        assert!(db.init_timing(p.chain_no).iter().any(|l| l.starts_with(PROGRESS_PREFIX) && l.contains("1200 of 1200 blocks") && l.contains("MB/s")), "{:?}", db.init_timing(p.chain_no));
         assert!(db.init_missing(p.chain_no).unwrap().is_empty());
         for b in &blocks[1..] {
             assert_eq!(db.block_raw(p.chain_no, &b.hash()).unwrap(), Some(b.encode()));
@@ -932,15 +965,20 @@ pub(crate) mod tests {
         let missing = db.init_missing(p.chain_no).unwrap();
         let sources: Vec<(String, Box<dyn BlockSource + Send>)> = (0..3).map(|i| (format!("mute{i}"), Box::new(src(&blocks, 1).0) as Box<dyn BlockSource + Send>)).collect();
         let t0 = Instant::now();
-        let r = store_round(&db, p, &missing, sources, None, Duration::from_secs(1), &|_| {}, &AtomicBool::new(false));
+        let r = store_round(&db, p, &missing, sources, None, Duration::from_secs(1), &|_| {}, &|| Ok(()), &AtomicBool::new(false));
         assert_eq!(r.error.as_deref(), Some("every source stopped"));
         assert!(t0.elapsed() < Duration::from_secs(60));
         assert_eq!(db.init_missing(p.chain_no).unwrap().len(), 300);
         // A stop ends a round at once, with nothing written after it.
         let (good, _) = src(&blocks, 0);
         let stop = AtomicBool::new(true);
-        let r = store_round(&db, p, &missing, vec![("good".into(), Box::new(good) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(1), &|_| {}, &stop);
+        let r = store_round(&db, p, &missing, vec![("good".into(), Box::new(good) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(1), &|_| {}, &|| Ok(()), &stop);
         assert!(r.error.is_none());
         assert_eq!(r.stored, db.init_missing(p.chain_no).map(|m| 300 - m.len() as u64).unwrap());
+        // A drive too full ends a round with why.
+        let (good, _) = src(&blocks, 0);
+        let missing = db.init_missing(p.chain_no).unwrap();
+        let r = store_round(&db, p, &missing, vec![("good".into(), Box::new(good) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(1), &|_| {}, &|| Err("drive full".into()), &AtomicBool::new(false));
+        assert_eq!(r.error.as_deref(), Some("drive full"));
     }
 }

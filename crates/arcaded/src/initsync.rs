@@ -120,7 +120,12 @@ pub(crate) trait Env {
     /// Wait up to `secs` (waking for a stop).
     fn rest(&self, secs: u64);
     /// ARCADE_INIT_UPTO (testing only): store blocks up to this height, then hold; no build.
-    fn upto(&self) -> Option<u32>;
+    /// An error: the value doesn't parse (the install stops, never runs uncapped).
+    fn upto(&self) -> Result<Option<u32>, String>;
+    /// Room on the chain's drive for the next batches (an error: hold, and why).
+    fn room(&self) -> Result<(), String> {
+        Ok(())
+    }
     /// One headers round over the sources reachable now.
     fn headers_round(&mut self, round: u32) -> Result<arcade_chaindb::initsync::Agreement, String>;
     /// Store `missing` (store only, any order) from every source.
@@ -132,6 +137,23 @@ pub(crate) trait Env {
 /// [`run`] over any [`Env`]: the phase loop itself (STATE "init" says where it is).
 pub(crate) fn run_with(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env) -> bool {
     let c = p.chain_no;
+    let upto = match env.upto() {
+        Ok(u) => u,
+        Err(e) => {
+            env.event(format!("{}: init stopped: {e}", p.name));
+            loop {
+                env.status(format!("init · stopped: {e}"));
+                if env.stopped() {
+                    return false;
+                }
+                env.rest(30);
+            }
+        }
+    };
+    if let Some(u) = upto {
+        env.event(format!("{}: init: storing up to {u} (ARCADE_INIT_UPTO, testing only: no build)", p.name));
+        env.status(format!("init: storing up to {u} (ARCADE_INIT_UPTO, testing only)"));
+    }
     loop {
         if env.stopped() {
             return false;
@@ -142,7 +164,7 @@ pub(crate) fn run_with(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::p
         }
         let phase = db.init_phase(c);
         // A smoke test's stopping height reached: every block up to it stored; nothing built.
-        if let (Some(u), Ok(Some(Phase::Headers | Phase::Blocks))) = (env.upto(), &phase) {
+        if let (Some(u), Ok(Some(Phase::Headers | Phase::Blocks))) = (upto, &phase) {
             if db.init_round(c) >= 1 && db.init_missing_upto(c, Some(u)).is_ok_and(|m| m.is_empty()) {
                 env.status(format!("init · stopped at block {u} (ARCADE_INIT_UPTO, testing only): every block up to it stored; no build. Timing: {}",
                     db.init_timing(c).last().cloned().unwrap_or_default()));
@@ -151,8 +173,8 @@ pub(crate) fn run_with(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::p
             }
         }
         match phase {
-            Ok(Some(Phase::Headers)) => headers_step(db, p, env),
-            Ok(Some(Phase::Blocks)) => blocks_step(db, p, env),
+            Ok(Some(Phase::Headers)) => headers_step(db, p, env, upto),
+            Ok(Some(Phase::Blocks)) => blocks_step(db, p, env, upto),
             Ok(Some(Phase::Build)) => build_step(db, p, env),
             Ok(Some(Phase::Done)) | Ok(None) => return true,
             Err(e) => {
@@ -169,14 +191,13 @@ fn timing(db: &arcade_chaindb::ChainDb, p: &arcade_chain::params::ChainParams, e
     env.event(format!("{}: init timing: {line}", p.name));
 }
 
-fn headers_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env) {
+fn headers_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env, upto: Option<u32>) {
     use arcade_chaindb::initsync::{per_s, took, INIT_ROUND};
     let c = p.chain_no;
     let round = db.init_round(c) + 1;
     let t0 = std::time::Instant::now();
     match env.headers_round(round) {
         Ok(a) if a.done() => {
-            let upto = env.upto();
             let missing = db.init_missing_upto(c, upto).map(|m| m.len()).unwrap_or(1);
             let _ = db.set_state_text(c, INIT_ROUND, Some(&round.to_string()));
             timing(db, p, env, format!("headers round {round}: {} new headers to {} in {} · {} headers/s", a.new_headers, a.height, took(t0.elapsed()), per_s(a.new_headers as u64, t0.elapsed())));
@@ -200,11 +221,10 @@ fn headers_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::
     }
 }
 
-fn blocks_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env) {
+fn blocks_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env, upto: Option<u32>) {
     use arcade_chaindb::initsync::{per_s, took};
     let c = p.chain_no;
     let round = db.init_round(c).max(1);
-    let upto = env.upto();
     let missing = match db.init_missing_upto(c, upto) {
         Ok(m) => m,
         Err(e) => {
@@ -215,6 +235,12 @@ fn blocks_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::C
     };
     if missing.is_empty() {
         let _ = db.set_init_phase(c, Phase::Headers);
+        return;
+    }
+    // Room on the chain's drive first: held (and said so) below the floor.
+    if let Err(e) = env.room() {
+        env.status(e);
+        env.rest(60);
         return;
     }
     let t0 = std::time::Instant::now();
@@ -288,6 +314,39 @@ fn build_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::Ch
     }
 }
 
+/// ARCADE_INIT_UPTO's value: unset = no cap; anything but a block height over 0 is an error.
+fn parse_upto(v: Option<&str>) -> Result<Option<u32>, String> {
+    match v {
+        None => Ok(None),
+        Some(s) => match s.trim().parse::<u32>() {
+            Ok(h) if h > 0 => Ok(Some(h)),
+            _ => Err(format!("ARCADE_INIT_UPTO={s:?} is not a block height (a whole number over 0): the init install stops here; unset it or give a height")),
+        },
+    }
+}
+
+/// Free space kept on the chain's drive while blocks are stored (ARCADE_INIT_FREE_GB, default 50).
+const FREE_GB: u64 = 50;
+/// Room the next batches take on top: 24 P2P peers and the arcades, 250 blocks a job, ~2 MB a block.
+const NEXT_BATCHES: u64 = 12 << 30;
+
+fn parse_free_gb(v: Option<&str>) -> Result<u64, String> {
+    match v {
+        None => Ok(FREE_GB << 30),
+        Some(s) => s.trim().parse::<u64>().map(|g| g << 30).map_err(|_| format!("init · blocks held: ARCADE_INIT_FREE_GB={s:?} is not a number of GB")),
+    }
+}
+
+/// Whether the chain's drive (`free` bytes) still has the floor plus the next batches' room.
+fn room_left(free: Option<u64>, floor: u64, dir: &std::path::Path) -> Result<(), String> {
+    match free {
+        Some(f) if f < floor + NEXT_BATCHES => Err(format!(
+            "init · blocks held: {} GB free on the chain's drive ({}), under the floor of {} GB plus {} GB for the next batches (ARCADE_INIT_FREE_GB); free some space, it carries on by itself",
+            f >> 30, dir.display(), floor >> 30, NEXT_BATCHES >> 30)),
+        _ => Ok(()),
+    }
+}
+
 /// The arcade's side of [`Env`].
 struct NodeEnv<'a, 'b> {
     node: &'a Arc<Node>,
@@ -311,8 +370,13 @@ impl Env for NodeEnv<'_, '_> {
     fn rest(&self, secs: u64) {
         rest(self.run, secs);
     }
-    fn upto(&self) -> Option<u32> {
-        std::env::var("ARCADE_INIT_UPTO").ok().and_then(|v| v.trim().parse::<u32>().ok())
+    fn upto(&self) -> Result<Option<u32>, String> {
+        parse_upto(std::env::var("ARCADE_INIT_UPTO").ok().as_deref())
+    }
+    fn room(&self) -> Result<(), String> {
+        let dir = self.node.chain.own_dir(self.run.params.chain_no);
+        let floor = parse_free_gb(std::env::var("ARCADE_INIT_FREE_GB").ok().as_deref())?;
+        room_left(crate::chaindrive::free_bytes(&dir).map(|f| f.0), floor, &dir)
     }
     fn headers_round(&mut self, round: u32) -> Result<arcade_chaindb::initsync::Agreement, String> {
         headers_round(self.node, self.run, self.syncer, round)
@@ -322,12 +386,12 @@ impl Env for NodeEnv<'_, '_> {
         let best = node.chain.best_header(p.chain_no).ok().flatten().and_then(|h| node.chain.header(p.chain_no, &h).ok().flatten()).map(|r| r.height).unwrap_or(0);
         // Sources near our best header (one far behind can't serve the newest blocks); with
         // ARCADE_INIT_UPTO, near that height.
-        let min_h = self.upto().unwrap_or(best).min(best).saturating_sub(10);
+        let min_h = self.upto().ok().flatten().unwrap_or(best).min(best).saturating_sub(10);
         let progress = |s: String| {
             *run.source.lock().unwrap() = format!("init, store only: {}", s.split(" · ").skip(2).collect::<Vec<_>>().join(" · "));
             set(run, format!("init · blocks (round {round}): {s}"));
         };
-        crate::psync::run_store(node, p, missing, min_h, &progress, &run.stop)
+        crate::psync::run_store(node, p, missing, min_h, &progress, &|| self.room(), &run.stop)
     }
     fn build(&mut self) -> arcade_store::Result<Option<arcade_chaindb::initsync::Built>> {
         build_here(self.node, self.run)
@@ -635,6 +699,8 @@ mod tests {
         stop: Arc<AtomicBool>,
         stop_in: Option<&'static str>,
         upto: Option<u32>,
+        upto_err: Option<String>,
+        full: bool,
         tmp: std::path::PathBuf,
         events: RefCell<Vec<String>>,
         statuses: RefCell<Vec<String>>,
@@ -642,7 +708,7 @@ mod tests {
 
     impl<'a> FakeEnv<'a> {
         fn new(db: &'a ChainDb, p: &'static arcade_chain::params::ChainParams, blocks: &[Block], tmp: &std::path::Path, stop_in: Option<&'static str>) -> FakeEnv<'a> {
-            FakeEnv { db, p, blocks: blocks.to_vec(), stop: Default::default(), stop_in, upto: None, tmp: tmp.to_path_buf(), events: Default::default(), statuses: Default::default() }
+            FakeEnv { db, p, blocks: blocks.to_vec(), stop: Default::default(), stop_in, upto: None, upto_err: None, full: false, tmp: tmp.to_path_buf(), events: Default::default(), statuses: Default::default() }
         }
     }
 
@@ -652,7 +718,7 @@ mod tests {
         }
         fn status(&self, s: String) {
             // A smoke test held at its height: that's where this test ends.
-            if s.contains("ARCADE_INIT_UPTO") {
+            if s.contains("stopped at block") {
                 self.stop.store(true, Ordering::Relaxed);
             }
             self.statuses.borrow_mut().push(s);
@@ -661,8 +727,15 @@ mod tests {
             self.events.borrow_mut().push(s);
         }
         fn rest(&self, _secs: u64) {}
-        fn upto(&self) -> Option<u32> {
-            self.upto
+        fn upto(&self) -> Result<Option<u32>, String> {
+            self.upto_err.clone().map_or(Ok(self.upto), Err)
+        }
+        fn room(&self) -> Result<(), String> {
+            if self.full {
+                self.stop.store(true, Ordering::Relaxed);
+                return Err("init · blocks held: drive full".into());
+            }
+            Ok(())
         }
         fn headers_round(&mut self, _round: u32) -> Result<arcade_chaindb::initsync::Agreement, String> {
             let syncer = Syncer::new(self.db, self.p);
@@ -677,7 +750,7 @@ mod tests {
         fn store(&mut self, _round: u32, missing: &[Hash256]) -> crate::psync::Round {
             let after = (self.stop_in == Some("blocks")).then_some(1);
             let src = Stopper::new(&self.blocks, after, &self.stop);
-            crate::psync::store_round(self.db, self.p, missing, vec![("net 10.0.0.0/16".into(), Box::new(src) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(2), &|_| {}, &self.stop)
+            crate::psync::store_round(self.db, self.p, missing, vec![("net 10.0.0.0/16".into(), Box::new(src) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(2), &|_| {}, &|| self.room(), &self.stop)
         }
         fn build(&mut self) -> arcade_store::Result<Option<arcade_chaindb::initsync::Built>> {
             let (stop, stop_here) = (self.stop.clone(), self.stop_in == Some("build"));
@@ -732,6 +805,40 @@ mod tests {
     }
 
     #[test]
+    fn a_bad_cap_stops_the_install_and_a_full_drive_holds_the_blocks() {
+        assert_eq!(parse_upto(None), Ok(None));
+        assert_eq!(parse_upto(Some(" 700000 ")), Ok(Some(700_000)));
+        for bad in ["", "0", "-5", "70k", "1e6"] {
+            assert!(parse_upto(Some(bad)).unwrap_err().contains("not a block height"), "{bad}");
+        }
+        assert_eq!(parse_free_gb(None), Ok(50 << 30));
+        assert!(parse_free_gb(Some("lots")).is_err());
+        let dir = std::path::Path::new("/x");
+        assert!(room_left(Some(61 << 30), 50 << 30, dir).is_err());
+        assert!(room_left(Some(63 << 30), 50 << 30, dir).is_ok());
+        assert!(room_left(None, 50 << 30, dir).is_ok());
+        let (p, blocks) = test_chain(100);
+        let c = p.chain_no;
+        let d = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(d.path().join("chain.mdbx")).unwrap();
+        db.init_start(c).unwrap();
+        // A cap that doesn't parse: nothing runs, and the status says why.
+        let mut env = FakeEnv::new(&db, p, &blocks, &d.path().join("scratch"), None);
+        env.upto_err = parse_upto(Some("12x")).err();
+        env.stop.store(true, Ordering::Relaxed);
+        assert!(!run_with(&db, p, &mut env));
+        assert!(env.statuses.borrow()[0].contains("ARCADE_INIT_UPTO=\"12x\""), "{:?}", env.statuses.borrow());
+        assert_eq!(db.tip(c).unwrap(), None, "not even the headers round ran");
+        // The drive under its floor: the blocks phase holds, nothing stored.
+        let mut env = FakeEnv::new(&db, p, &blocks, &d.path().join("scratch"), None);
+        env.full = true;
+        assert!(!run_with(&db, p, &mut env));
+        assert_eq!(db.init_phase(c).unwrap(), Some(Phase::Blocks));
+        assert_eq!(db.init_missing(c).unwrap().len(), 100);
+        assert!(env.statuses.borrow().last().unwrap().contains("drive full"));
+    }
+
+    #[test]
     fn a_smoke_test_stops_storing_at_its_height_and_builds_nothing() {
         let (p, blocks) = test_chain(300);
         let c = p.chain_no;
@@ -741,6 +848,7 @@ mod tests {
         let mut env = FakeEnv::new(&db, p, &blocks, &d.path().join("scratch"), None);
         env.upto = Some(120);
         assert!(!run_with(&db, p, &mut env));
+        assert!(env.events.borrow().iter().any(|e| e.contains("init: storing up to 120")), "{:?}", env.events.borrow());
         assert!(env.statuses.borrow().last().unwrap().contains("stopped at block 120"), "{:?}", env.statuses.borrow());
         assert_eq!(db.init_missing(c).unwrap().len(), 180, "blocks 1..=120 stored, none above");
         assert!(db.init_missing_upto(c, Some(120)).unwrap().is_empty());

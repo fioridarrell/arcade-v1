@@ -885,8 +885,10 @@ fn run_as(node: Arc<Node>, addr: String, heard: Option<&'static str>, redial: bo
                 // redialling; look again in half an hour.
                 // A link at an arcade's home address (behind our router) stays beside one through a relay or over UDP
                 // only: it is the better way, and the relayed one ends itself once this is up (relaysvc).
-                let only_indirect = heard == Some(LAN) && !direct_up(&id);
-                if !only_indirect && node.links.lock().unwrap().values().any(|l| l.node_id == id && l.addr != addr) {
+                // Only another direct link counts (2026-11-21): a link through a relay or over UDP to the same arcade
+                // closed a working direct dial, which then waited half an hour; an arcade reached only that way (a
+                // rebuilt server with a new node id) never got its direct link, and the indirect ones kept dropping.
+                if direct_up(&id) && node.links.lock().unwrap().values().any(|l| l.node_id == id && l.addr != addr) {
                     drop(link);
                     if heard.is_some() {
                         parked().remove(&addr);

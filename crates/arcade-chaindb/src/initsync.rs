@@ -54,6 +54,71 @@ pub const INIT_REFETCHED: &str = "init_refetched";
 /// STATE: timing lines of the phases so far (newline separated, the last 40), comparable
 /// between runs: blocks/s stored, tx index rows/s, coin derivation and rules blocks/s.
 pub const INIT_TIMING: &str = "init_timing";
+/// STATE: the block number under height 1's (be u32): a block at height h on the best header
+/// chain is stored as block number base + h.
+pub const INIT_B_BASE: &str = "init_b_base";
+
+/// The block number an init install stores a block of height `h` (>= 1) at: base + h, so the
+/// main chain's block numbers run in height order whatever order the blocks arrive in. The
+/// base is fixed at the first block stored (the next free number, under it); the counter of
+/// block numbers moves past every number handed out, so nothing else takes one. A number
+/// already held by a block of the same height on another branch (the best header chain moved
+/// between rounds) is freed: that block is off the chain an init install builds, its body is
+/// dropped (its header stays; a normal sync fetches it again should it be needed).
+pub(crate) fn init_slot(w: &arcade_store::WriteTxn, params: &ChainParams, h: u32) -> Result<u32> {
+    let c = params.chain_no;
+    if h == 0 {
+        return Err(err("an init install doesn't store the genesis block"));
+    }
+    let counter = w.get(STATE, &k_state(c, "next_b"))?.map(|v| be_u32(&v, 0)).unwrap_or(1);
+    let base = match w.get(STATE, &k_state(c, INIT_B_BASE))? {
+        Some(v) => be_u32(&v, 0),
+        None => {
+            let base = counter.saturating_sub(1);
+            w.put(STATE, &k_state(c, INIT_B_BASE), &base.to_be_bytes())?;
+            base
+        }
+    };
+    let b = base.checked_add(h).ok_or_else(|| err("block numbers run out"))?;
+    if let Some(meta) = w.get(BLOCK_META, &k_block(c, b))? {
+        let h80: [u8; 80] = meta.get(..80).and_then(|x| x.try_into().ok()).ok_or_else(|| err("short block meta"))?;
+        let other = params.block_id(&arcade_chain::Header::parse(&h80));
+        match header_rec(w, c, &other)? {
+            Some(r) if r.height == h && r.b == b => drop_body_in(w, params, &other)?,
+            _ => return Err(err(format!("block number {b} (height {h}) is held by a block not at that height; the init install can't number its blocks by height"))),
+        }
+    }
+    if counter <= b {
+        w.put(STATE, &k_state(c, "next_b"), &(b + 1).to_be_bytes())?;
+    }
+    Ok(b)
+}
+
+/// Forget a stored block's body (its rows, its tx index rows, its height row); its header stays.
+fn drop_body_in(w: &arcade_store::WriteTxn, params: &ChainParams, hash: &Hash256) -> Result<()> {
+    let c = params.chain_no;
+    let Some(mut rec) = header_rec(w, c, hash)? else { return Ok(()) };
+    if rec.b == 0 {
+        return Ok(());
+    }
+    let b = rec.b;
+    for (k, raw) in w.scan_prefix(BLOCK_TX, &k_block(c, b))? {
+        let p = be_u32(&k, k.len() - 4);
+        if let Ok(txid) = row_txid(&raw, params) {
+            let mut bp = b.to_be_bytes().to_vec();
+            bp.extend_from_slice(&p.to_be_bytes());
+            w.del_dup(TXS, &k_txs(c, &txid.t12()), &bp)?;
+        }
+        w.del(BLOCK_TX, &k)?;
+    }
+    w.del(BLOCK_META, &k_block(c, b))?;
+    if w.get(HEIGHT, &k_height(c, rec.height))?.is_some_and(|v| be_u32(&v, 32) == b) {
+        w.del(HEIGHT, &k_height(c, rec.height))?;
+    }
+    rec.b = 0;
+    w.put(HEADERS, &k_header(c, &hash.0), &rec.index_value())?;
+    Ok(())
+}
 
 /// Independent sources that must agree on the best header.
 pub const MIN_AGREE: usize = 3;
@@ -223,7 +288,7 @@ impl ChainDb {
                 return Err(err(format!("an init install starts from nothing; this chain is at block {} already", t.height)));
             }
         }
-        for k in [INIT_ROUND, INIT_NOTE, INIT_BUILT, INIT_TO, INIT_RULES_TO, INIT_REFETCHED, INIT_TIMING] {
+        for k in [INIT_ROUND, INIT_NOTE, INIT_BUILT, INIT_TO, INIT_RULES_TO, INIT_REFETCHED, INIT_TIMING, INIT_B_BASE] {
             self.set_state_text(c, k, None)?;
         }
         self.set_init_phase(c, Phase::Headers)
@@ -248,6 +313,15 @@ impl ChainDb {
     /// Add a timing line (STATE INIT_TIMING keeps the last 40).
     pub fn init_add_timing(&self, c: u16, line: &str) -> Result<()> {
         let mut v = self.init_timing(c);
+        v.push(line.replace('\n', " "));
+        let skip = v.len().saturating_sub(40);
+        self.set_state_text(c, INIT_TIMING, Some(&v[skip..].join("\n")))
+    }
+
+    /// Set the in-progress line of a running round (starts with `prefix`): it replaces the one
+    /// before, so a long round keeps one up-to-date line, not hundreds.
+    pub fn init_set_progress(&self, c: u16, prefix: &str, line: &str) -> Result<()> {
+        let mut v: Vec<String> = self.init_timing(c).into_iter().filter(|l| !l.starts_with(prefix)).collect();
         v.push(line.replace('\n', " "));
         let skip = v.len().saturating_sub(40);
         self.set_state_text(c, INIT_TIMING, Some(&v[skip..].join("\n")))
@@ -437,7 +511,7 @@ impl ChainDb {
             }
         }
         if !good.is_empty() {
-            self.write_stored(params, &good)?;
+            self.write_stored_as(params, &good, true)?;
         }
         out.stored = good.len();
         out.again = wanted.iter().filter(|h| !got.contains(h)).copied().collect();
@@ -701,30 +775,7 @@ impl ChainDb {
 
     /// Forget a stored block's body (its rows, its tx index rows, its height row); its header stays.
     fn init_drop_body(&self, params: &ChainParams, hash: &Hash256) -> Result<()> {
-        let c = params.chain_no;
-        self.wstore(c)?.write(|w| {
-            let Some(mut rec) = header_rec(w, c, hash)? else { return Ok(()) };
-            if rec.b == 0 {
-                return Ok(());
-            }
-            let b = rec.b;
-            for (k, raw) in w.scan_prefix(BLOCK_TX, &k_block(c, b))? {
-                let p = be_u32(&k, k.len() - 4);
-                if let Ok(txid) = row_txid(&raw, params) {
-                    let mut bp = b.to_be_bytes().to_vec();
-                    bp.extend_from_slice(&p.to_be_bytes());
-                    w.del_dup(TXS, &k_txs(c, &txid.t12()), &bp)?;
-                }
-                w.del(BLOCK_TX, &k)?;
-            }
-            w.del(BLOCK_META, &k_block(c, b))?;
-            if w.get(HEIGHT, &k_height(c, rec.height))?.is_some_and(|v| be_u32(&v, 32) == b) {
-                w.del(HEIGHT, &k_height(c, rec.height))?;
-            }
-            rec.b = 0;
-            w.put(HEADERS, &k_header(c, &hash.0), &rec.index_value())?;
-            Ok(())
-        })
+        self.wstore(params.chain_no)?.write(|w| drop_body_in(w, params, hash))
     }
 
     /// The coin set of heights 1..=to derived from the stored main chain (in memory while it

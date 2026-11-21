@@ -263,6 +263,11 @@ fn blocks_stored_in_any_order_give_the_same_coins() {
         let raws = a.get_blocks(ch).unwrap();
         assert_eq!(db.init_store(p, ch, &raws).unwrap().stored, ch.len());
     }
+    // Stored in any order, numbered by height: the main chain's block numbers run in height
+    // order, as a block-by-block sync leaves them (the compressed index needs that).
+    let bs: Vec<u32> = blocks[1..].iter().map(|b| db.stored_b(c, &b.hash()).unwrap().unwrap()).collect();
+    assert!(bs.windows(2).all(|w| w[1] == w[0] + 1), "{bs:?}");
+    assert!(bs[0] > db.stored_b(c, &blocks[0].hash()).unwrap().unwrap());
     build(&db, p, &d.path().join("tmp"), 0);
     let (x, y) = (db.tip(c).unwrap().unwrap(), r.tip(c).unwrap().unwrap());
     assert_eq!((x.hash, x.height), (y.hash, y.height));
@@ -602,4 +607,50 @@ fn junk_after_the_transactions_or_a_bad_auxpow_is_refused() {
     let r = db.init_store(pa, &[blk.hash()], &[raw]).unwrap();
     assert_eq!(r.stored, 0);
     assert!(r.refused[0].1.contains("AuxPoW"), "{:?}", r.refused);
+}
+
+#[test]
+fn block_numbers_follow_heights_even_when_the_best_chain_moves() {
+    let blocks = chain(12);
+    let p = params(&blocks[0], |_| {});
+    let c = p.chain_no;
+    // A longer branch from 8: once its headers arrive it is the best chain.
+    let mut fork = blocks[..=8].to_vec();
+    for h in 9..=13 {
+        let prev = fork.last().unwrap().hash();
+        fork.push(mine(prev, &[coinbase(900 + h, None, false)], h));
+    }
+    let d = tempfile::tempdir().unwrap();
+    let r = reference(d.path(), p, &fork);
+    let db = open(d.path());
+    let mut a = Src::new(&blocks);
+    begin(&db, p, &mut a);
+    round(&db, p, &mut [("a", &mut a)]);
+    // Stored newest first.
+    let mut todo = db.init_missing(c).unwrap();
+    todo.reverse();
+    let raws = a.get_blocks(&todo).unwrap();
+    assert_eq!(db.init_store(p, &todo, &raws).unwrap().stored, 12);
+    let b9 = db.stored_b(c, &blocks[9].hash()).unwrap().unwrap();
+    // The branch: its blocks take the numbers of their heights, the old ones' bodies go.
+    let mut f = Src::new(&fork);
+    let ag = round(&db, p, &mut [("f", &mut f)]);
+    assert_eq!(ag.height, 13);
+    assert_eq!(db.init_fetch_blocks(p, &mut [&mut f as &mut dyn BlockSource], 2, &AtomicBool::new(false)).unwrap(), 5);
+    assert_eq!(db.stored_b(c, &fork[9].hash()).unwrap(), Some(b9));
+    for old in &blocks[9..=12] {
+        assert_eq!(db.stored_b(c, &old.hash()).unwrap(), Some(0), "off the best chain: body dropped");
+    }
+    let bs: Vec<u32> = fork[1..].iter().map(|b| db.stored_b(c, &b.hash()).unwrap().unwrap()).collect();
+    assert!(bs.windows(2).all(|w| w[1] == w[0] + 1), "{bs:?}");
+    // And it builds as a block-by-block sync of the branch.
+    db.set_init_phase(c, Phase::Build).unwrap();
+    build(&db, p, &d.path().join("tmp"), 0);
+    assert_eq!(db.tip(c).unwrap().unwrap().hash, fork[13].hash());
+    assert_eq!(db.coin_totals(c).unwrap(), r.coin_totals(c).unwrap());
+    for b in &fork[1..] {
+        for t in &b.txs {
+            assert_eq!(db.tx_location(p, &t.txid).unwrap().map(|x| x.0), db.stored_b(c, &b.hash()).unwrap());
+        }
+    }
 }

@@ -252,6 +252,13 @@ impl ChainDb {
 
     /// Store checked blocks (check_stored_block) without connecting them; their block numbers.
     pub(crate) fn write_stored(&self, params: &ChainParams, blocks: &[Block]) -> Result<Vec<u32>> {
+        self.write_stored_as(params, blocks, false)
+    }
+
+    /// [`ChainDb::write_stored`]; `by_height`: an init install's blocks, which arrive in any
+    /// order, take the block number of their height (crate::initsync::init_slot), so the main
+    /// chain's block numbers run in height order as a block-by-block sync leaves them.
+    pub(crate) fn write_stored_as(&self, params: &ChainParams, blocks: &[Block], by_height: bool) -> Result<Vec<u32>> {
         let c = params.chain_no;
         self.wstore(c)?.write(|w| {
             let mut out = Vec::with_capacity(blocks.len());
@@ -259,7 +266,7 @@ impl ChainDb {
                 let hash = blk.hash();
                 let mut rec = header_rec(w, c, &hash)?.ok_or_else(|| err(format!("block {hash}: its header is not in our header chain")))?;
                 if rec.b == 0 {
-                    rec.b = next_b(w, c)?;
+                    rec.b = if by_height { crate::initsync::init_slot(w, params, rec.height)? } else { next_b(w, c)? };
                     w.put(BLOCK_META, &k_block(c, rec.b), &block_meta(blk))?;
                     for (p, tx) in blk.txs.iter().enumerate() {
                         w.put(BLOCK_TX, &k_block_tx(c, rec.b, p as u32), &tx.raw)?;

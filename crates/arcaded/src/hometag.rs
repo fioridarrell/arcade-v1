@@ -222,8 +222,43 @@ pub fn find(node: &Node, input: &str) -> Result<Found, String> {
     let (name, chain) = parse(node, input)?;
     match chain {
         Some(p) => Ok(owner_on_checked(node, p, &name)?.map_or(Found::None, |(a, _)| Found::One(p, a))),
-        None => Ok(one_of(tag_chains(node).into_iter().filter_map(|p| owner_on(node, p, &name).map(|(a, _)| (p, a))).collect())),
+        None => Ok(one_of(owners_everywhere(node, &name))),
     }
+}
+
+/// How long a bare @name waits for chains whose tags are borrowed (asked over the mesh): one chain whose keepers don't
+/// answer made every unknown name wait ~31 s on an arcade borrowing its tags (txtok.app, 2026-11-20).
+const FIND_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// Each tag chain's holder of `name`, the chains asked at once: kept here answers at once; one borrowed whose keepers
+/// haven't answered in FIND_WAIT is left out (its answer lands in the caches for the next ask).
+fn owners_everywhere(node: &Node, name: &str) -> Vec<(&'static ChainParams, String)> {
+    let chains = tag_chains(node);
+    // A node not yet shared (unit tests): one chain after another, as before.
+    let Some(me) = node.me.get().and_then(|w| w.upgrade()) else {
+        return chains.into_iter().filter_map(|p| owner_on(node, p, name).map(|(a, _)| (p, a))).collect();
+    };
+    let (tx, rx) = std::sync::mpsc::channel();
+    for (i, p) in chains.iter().copied().enumerate() {
+        let (tx, n, name) = (tx.clone(), me.clone(), name.to_string());
+        std::thread::spawn(move || {
+            let _ = tx.send((i, owner_on(&n, p, &name).map(|(a, _)| (p, a))));
+        });
+    }
+    drop(tx);
+    let until = std::time::Instant::now() + FIND_WAIT;
+    let mut got: Vec<(usize, (&'static ChainParams, String))> = Vec::new();
+    for _ in 0..chains.len() {
+        let Some(left) = until.checked_duration_since(std::time::Instant::now()) else { break };
+        match rx.recv_timeout(left) {
+            Ok((i, Some(hit))) => got.push((i, hit)),
+            Ok((_, None)) => {}
+            Err(_) => break,
+        }
+    }
+    // The order tag_chains gives (home first), as before.
+    got.sort_by_key(|(i, _)| *i);
+    got.into_iter().map(|(_, h)| h).collect()
 }
 
 /// The "which @alice?" answer for a name held on several chains: each as {tag, chain, label, address, name}, the

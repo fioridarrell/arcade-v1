@@ -102,27 +102,235 @@ pub fn check(p: &arcade_chain::params::ChainParams, mode: &str) -> Result<(), St
 
 /// The init phases, until done (true) or the chain stops (false). Pausing waits here.
 pub fn run(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) -> bool {
-    let p = run.params;
+    let _running = Running::enter(run.params.chain_no);
+    run_with(&node.chain, run.params, &mut NodeEnv { node, run, syncer })
+}
+
+/// What the phase loop needs from the world: the arcade (P2P peers, the mesh, psync, the chain's
+/// status line and journal) or, in the tests, a few made-up sources.
+pub(crate) trait Env {
+    fn stopped(&self) -> bool;
+    fn paused(&self) -> bool {
+        false
+    }
+    /// The chain's status line.
+    fn status(&self, s: String);
+    /// A line in the journal (events).
+    fn event(&self, s: String);
+    /// Wait up to `secs` (waking for a stop).
+    fn rest(&self, secs: u64);
+    /// ARCADE_INIT_UPTO (testing only): store blocks up to this height, then hold; no build.
+    fn upto(&self) -> Option<u32>;
+    /// One headers round over the sources reachable now.
+    fn headers_round(&mut self, round: u32) -> Result<arcade_chaindb::initsync::Agreement, String>;
+    /// Store `missing` (store only, any order) from every source.
+    fn store(&mut self, round: u32, missing: &[arcade_chain::Hash256]) -> crate::psync::Round;
+    /// The build; Ok(None): not started (waiting, e.g. for scratch space).
+    fn build(&mut self) -> arcade_store::Result<Option<arcade_chaindb::initsync::Built>>;
+}
+
+/// [`run`] over any [`Env`]: the phase loop itself (STATE "init" says where it is).
+pub(crate) fn run_with(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env) -> bool {
     let c = p.chain_no;
-    let _running = Running::enter(c);
     loop {
-        if run.stop.load(Ordering::Relaxed) {
+        if env.stopped() {
             return false;
         }
-        if run.paused.load(Ordering::Relaxed) || FAILED.lock().unwrap().contains(&c) {
-            std::thread::sleep(Duration::from_secs(2));
+        if env.paused() || FAILED.lock().unwrap().contains(&c) {
+            env.rest(2);
             continue;
         }
-        match node.chain.init_phase(c) {
-            Ok(Some(Phase::Headers)) => headers(node, run, syncer),
-            Ok(Some(Phase::Blocks)) => blocks(node, run),
-            Ok(Some(Phase::Build)) => build(node, run),
-            Ok(Some(Phase::Done)) | Ok(None) => return true,
-            Err(e) => {
-                set(run, format!("init: {e}"));
-                std::thread::sleep(Duration::from_secs(10));
+        let phase = db.init_phase(c);
+        // A smoke test's stopping height reached: every block up to it stored; nothing built.
+        if let (Some(u), Ok(Some(Phase::Headers | Phase::Blocks))) = (env.upto(), &phase) {
+            if db.init_round(c) >= 1 && db.init_missing_upto(c, Some(u)).is_ok_and(|m| m.is_empty()) {
+                env.status(format!("init · stopped at block {u} (ARCADE_INIT_UPTO, testing only): every block up to it stored; no build. Timing: {}",
+                    db.init_timing(c).last().cloned().unwrap_or_default()));
+                env.rest(60);
+                continue;
             }
         }
+        match phase {
+            Ok(Some(Phase::Headers)) => headers_step(db, p, env),
+            Ok(Some(Phase::Blocks)) => blocks_step(db, p, env),
+            Ok(Some(Phase::Build)) => build_step(db, p, env),
+            Ok(Some(Phase::Done)) | Ok(None) => return true,
+            Err(e) => {
+                env.status(format!("init: {e}"));
+                env.rest(10);
+            }
+        }
+    }
+}
+
+/// A timing line: kept with the chain (STATE, shown in its status) and in the journal.
+fn timing(db: &arcade_chaindb::ChainDb, p: &arcade_chain::params::ChainParams, env: &dyn Env, line: String) {
+    let _ = db.init_add_timing(p.chain_no, &line);
+    env.event(format!("{}: init timing: {line}", p.name));
+}
+
+fn headers_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env) {
+    use arcade_chaindb::initsync::{per_s, took, INIT_ROUND};
+    let c = p.chain_no;
+    let round = db.init_round(c) + 1;
+    let t0 = std::time::Instant::now();
+    match env.headers_round(round) {
+        Ok(a) if a.done() => {
+            let upto = env.upto();
+            let missing = db.init_missing_upto(c, upto).map(|m| m.len()).unwrap_or(1);
+            let _ = db.set_state_text(c, INIT_ROUND, Some(&round.to_string()));
+            timing(db, p, env, format!("headers round {round}: {} new headers to {} in {} · {} headers/s", a.new_headers, a.height, took(t0.elapsed()), per_s(a.new_headers as u64, t0.elapsed())));
+            if missing == 0 && upto.is_some() {
+                // ARCADE_INIT_UPTO: held at the top of the loop, never built.
+                return;
+            }
+            let next = if missing == 0 { Phase::Build } else { Phase::Blocks };
+            env.event(format!("{}: init headers round {round}: {} → {}{}", p.name, a.text(), next.as_str(),
+                if missing > 0 { format!(" ({missing} blocks to fetch)") } else { String::new() }));
+            let _ = db.set_init_phase(c, next);
+        }
+        Ok(a) => {
+            env.status(format!("init · headers (round {round}): waiting for agreement: {}", a.text()));
+            env.rest(30);
+        }
+        Err(e) => {
+            env.status(format!("init · headers (round {round}): {e}"));
+            env.rest(10);
+        }
+    }
+}
+
+fn blocks_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env) {
+    use arcade_chaindb::initsync::{per_s, took};
+    let c = p.chain_no;
+    let round = db.init_round(c).max(1);
+    let upto = env.upto();
+    let missing = match db.init_missing_upto(c, upto) {
+        Ok(m) => m,
+        Err(e) => {
+            env.status(format!("init · blocks: {e}"));
+            env.rest(10);
+            return;
+        }
+    };
+    if missing.is_empty() {
+        let _ = db.set_init_phase(c, Phase::Headers);
+        return;
+    }
+    let t0 = std::time::Instant::now();
+    let r = env.store(round, &missing);
+    let d = t0.elapsed();
+    if r.stored > 0 {
+        timing(db, p, env, format!("blocks round {round}: {} blocks, {:.1} MB stored in {} · {} blocks/s · {:.1} MB/s", r.stored, r.bytes as f64 / 1e6, took(d), per_s(r.stored, d),
+            r.bytes as f64 / 1e6 / d.as_secs_f64().max(0.001)));
+    }
+    let left = db.init_missing_upto(c, upto).map(|m| m.len()).unwrap_or(missing.len());
+    match r.error {
+        None if left == 0 => {
+            env.event(format!("{}: init blocks round {round}: {} blocks stored; headers again", p.name, r.stored));
+            let _ = db.set_init_phase(c, Phase::Headers);
+        }
+        None => env.rest(2),
+        Some(e) => {
+            env.event(format!("{}: init blocks round {round} stopped with {left} blocks left: {e}", p.name));
+            env.status(format!("init · blocks (round {round}): {left} left · {e}; retrying"));
+            env.rest(10);
+        }
+    }
+}
+
+fn build_step(db: &arcade_chaindb::ChainDb, p: &'static arcade_chain::params::ChainParams, env: &mut dyn Env) {
+    use arcade_chaindb::initsync::took;
+    let c = p.chain_no;
+    match db.init_missing(c) {
+        Ok(m) if !m.is_empty() && db.init_built(c).is_empty() => {
+            let _ = db.set_init_phase(c, Phase::Blocks);
+            return;
+        }
+        Err(e) => {
+            env.status(format!("init · build: {e}"));
+            env.rest(10);
+            return;
+        }
+        _ => {}
+    }
+    let t0 = std::time::Instant::now();
+    match env.build() {
+        Ok(None) => {}
+        Ok(Some(b)) => {
+            for line in &b.timing {
+                env.event(format!("{}: init timing: {line}", p.name));
+            }
+            if b.refetch > 0 {
+                env.event(format!("{}: init build: the rules refused {} blocks; dropped and fetched again (a source may have sent damaged copies)", p.name, b.refetch));
+            } else {
+                let line = format!("build: to block {} in {}: {} coins{}, {} transactions indexed, {} blocks' rules checked", b.height, took(t0.elapsed()), b.coins,
+                    if b.on_disk { " (derived on disk)" } else { "" }, b.txs, b.rules_checked);
+                timing(db, p, env, line.clone());
+                env.event(format!("{}: init install built ({line}); the normal sync carries on", p.name));
+            }
+        }
+        Err(e) if env.stopped() => env.status(format!("init · build stopped ({e}); it carries on at the next start")),
+        // The chain breaks the rules (even fetched again) or spends coins it never made: no retry fixes that.
+        Err(e @ arcade_store::StoreError::InvalidBlock { .. }) => {
+            env.event(format!("{}: init build failed: {e}", p.name));
+            let _ = db.set_state_text(c, arcade_chaindb::initsync::INIT_NOTE, Some(&format!("build failed: {e}")));
+            env.status(format!("init · build failed: {e} (left as it is until the arcade restarts)"));
+            FAILED.lock().unwrap().push(c);
+        }
+        // Anything else (the disk, a read) may pass on a later try.
+        Err(e) => {
+            env.event(format!("{}: init build stopped: {e}; trying again in 10 minutes", p.name));
+            let _ = db.set_state_text(c, arcade_chaindb::initsync::INIT_NOTE, Some(&format!("build stopped: {e}; trying again")));
+            env.status(format!("init · build stopped: {e}; trying again in 10 minutes"));
+            env.rest(600);
+        }
+    }
+}
+
+/// The arcade's side of [`Env`].
+struct NodeEnv<'a, 'b> {
+    node: &'a Arc<Node>,
+    run: &'a ChainRun,
+    syncer: &'a Syncer<'b>,
+}
+
+impl Env for NodeEnv<'_, '_> {
+    fn stopped(&self) -> bool {
+        self.run.stop.load(Ordering::Relaxed)
+    }
+    fn paused(&self) -> bool {
+        self.run.paused.load(Ordering::Relaxed)
+    }
+    fn status(&self, s: String) {
+        set(self.run, s);
+    }
+    fn event(&self, s: String) {
+        let _ = self.node.app.event("chains", &s);
+    }
+    fn rest(&self, secs: u64) {
+        rest(self.run, secs);
+    }
+    fn upto(&self) -> Option<u32> {
+        std::env::var("ARCADE_INIT_UPTO").ok().and_then(|v| v.trim().parse::<u32>().ok())
+    }
+    fn headers_round(&mut self, round: u32) -> Result<arcade_chaindb::initsync::Agreement, String> {
+        headers_round(self.node, self.run, self.syncer, round)
+    }
+    fn store(&mut self, round: u32, missing: &[arcade_chain::Hash256]) -> crate::psync::Round {
+        let (node, run, p) = (self.node, self.run, self.run.params);
+        let best = node.chain.best_header(p.chain_no).ok().flatten().and_then(|h| node.chain.header(p.chain_no, &h).ok().flatten()).map(|r| r.height).unwrap_or(0);
+        // Sources near our best header (one far behind can't serve the newest blocks); with
+        // ARCADE_INIT_UPTO, near that height.
+        let min_h = self.upto().unwrap_or(best).min(best).saturating_sub(10);
+        let progress = |s: String| {
+            *run.source.lock().unwrap() = format!("init, store only: {}", s.split(" · ").skip(2).collect::<Vec<_>>().join(" · "));
+            set(run, format!("init · blocks (round {round}): {s}"));
+        };
+        crate::psync::run_store(node, p, missing, min_h, &progress, &run.stop)
+    }
+    fn build(&mut self) -> arcade_store::Result<Option<arcade_chaindb::initsync::Built>> {
+        build_here(self.node, self.run)
     }
 }
 
@@ -207,21 +415,17 @@ fn dial_peers(node: &Node, p: &'static arcade_chain::params::ChainParams, want: 
     out
 }
 
-fn headers(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
+/// One headers round from the P2P peers and arcades reachable now (headers_step decides).
+fn headers_round(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer, round: u32) -> Result<arcade_chaindb::initsync::Agreement, String> {
     let p = run.params;
     let c = p.chain_no;
-    let round = node.chain.init_round(c) + 1;
     set(run, format!("init · headers (round {round}): dialing sources"));
     let mut peers = dial_peers(node, p, HEADER_PEERS);
     for pr in &peers {
         run.peer_tip.fetch_max(pr.version.start_height.max(0) as u32, Ordering::Relaxed);
     }
     if let Some(first) = peers.first_mut() {
-        if let Err(e) = syncer.ensure_genesis(first) {
-            set(run, format!("init · headers: genesis: {e}"));
-            rest(run, 10);
-            return;
-        }
+        syncer.ensure_genesis(first).map_err(|e| format!("genesis: {e}"))?;
     }
     // Arcades offering the chain over bk answer headers from their own checked chain. (Those
     // answering through a Core node send headers only with their blocks: no use here.)
@@ -233,17 +437,11 @@ fn headers(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
         .filter_map(|(_, addr, _, _)| crate::meshsource::MeshSource::dial_chain(node, &addr, p).ok().map(|s| (addr_group(&addr), s)))
         .collect();
     if peers.is_empty() && mesh.is_empty() {
-        set(run, format!("init · headers (round {round}): no {} peer or arcade reachable; retrying", p.name));
-        rest(run, 20);
-        return;
+        return Err(format!("no {} peer or arcade reachable; retrying", p.name));
     }
     if node.chain.tip(c).ok().flatten().is_none() {
         if let Some((_, m)) = mesh.first_mut() {
-            if let Err(e) = syncer.ensure_genesis(m) {
-                set(run, format!("init · headers: genesis: {e}"));
-                rest(run, 10);
-                return;
-            }
+            syncer.ensure_genesis(m).map_err(|e| format!("genesis: {e}"))?;
         }
     }
     *run.source.lock().unwrap() = format!("init: headers from {} P2P peers and {} arcades", peers.len(), mesh.len());
@@ -255,63 +453,7 @@ fn headers(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) {
     for (k, m) in mesh.iter_mut() {
         v.push((k.clone(), m as &mut dyn BlockSource));
     }
-    match node.chain.init_headers_round(syncer, &mut v, &run.stop) {
-        Ok(a) if a.done() => {
-            let missing = node.chain.init_missing(c).map(|m| m.len()).unwrap_or(1);
-            let _ = node.chain.set_state_text(c, arcade_chaindb::initsync::INIT_ROUND, Some(&round.to_string()));
-            let next = if missing == 0 { Phase::Build } else { Phase::Blocks };
-            let _ = node.app.event("chains", &format!("{}: init headers round {round}: {} → {}{}", p.name, a.text(), next.as_str(),
-                if missing > 0 { format!(" ({missing} blocks to fetch)") } else { String::new() }));
-            let _ = node.chain.set_init_phase(c, next);
-        }
-        Ok(a) => {
-            set(run, format!("init · headers (round {round}): waiting for agreement: {}", a.text()));
-            rest(run, 30);
-        }
-        Err(e) => {
-            set(run, format!("init · headers (round {round}): {e}"));
-            rest(run, 10);
-        }
-    }
-}
-
-fn blocks(node: &Arc<Node>, run: &ChainRun) {
-    let p = run.params;
-    let c = p.chain_no;
-    let round = node.chain.init_round(c).max(1);
-    let missing = match node.chain.init_missing(c) {
-        Ok(m) => m,
-        Err(e) => {
-            set(run, format!("init · blocks: {e}"));
-            rest(run, 10);
-            return;
-        }
-    };
-    if missing.is_empty() {
-        let _ = node.chain.set_init_phase(c, Phase::Headers);
-        return;
-    }
-    let best = node.chain.best_header(c).ok().flatten().and_then(|h| node.chain.header(c, &h).ok().flatten()).map(|r| r.height).unwrap_or(0);
-    // Sources near our best header (one far behind can't serve the newest blocks).
-    let min_h = best.saturating_sub(10);
-    let progress = |s: String| {
-        *run.source.lock().unwrap() = format!("init, store only: {}", s.split(" · ").skip(2).collect::<Vec<_>>().join(" · "));
-        set(run, format!("init · blocks (round {round}): {s}"));
-    };
-    let r = crate::psync::run_store(node, p, &missing, min_h, &progress, &run.stop);
-    let left = node.chain.init_missing(c).map(|m| m.len()).unwrap_or(missing.len());
-    match r {
-        Ok(n) if left == 0 => {
-            let _ = node.app.event("chains", &format!("{}: init blocks round {round}: {n} blocks stored; headers again", p.name));
-            let _ = node.chain.set_init_phase(c, Phase::Headers);
-        }
-        Ok(_) => rest(run, 2),
-        Err(e) => {
-            let _ = node.app.event("chains", &format!("{}: init blocks round {round} stopped with {left} blocks left: {e}", p.name));
-            set(run, format!("init · blocks (round {round}): {left} left · {e}; retrying"));
-            rest(run, 10);
-        }
-    }
+    node.chain.init_headers_round(syncer, &mut v, &run.stop).map_err(|e| e.to_string())
 }
 
 /// Bytes the coin derivation may hold in memory before it goes on on disk (ARCADE_INIT_COINS_MB,
@@ -343,21 +485,10 @@ fn scratch_need(chain_bytes: u64, built: &[String], budget: usize) -> u64 {
     need + (2 << 30)
 }
 
-fn build(node: &Arc<Node>, run: &ChainRun) {
+/// The build here: its scratch beside the chain, room for it first (Ok(None) while waiting).
+fn build_here(node: &Arc<Node>, run: &ChainRun) -> arcade_store::Result<Option<arcade_chaindb::initsync::Built>> {
     let p = run.params;
     let c = p.chain_no;
-    match node.chain.init_missing(c) {
-        Ok(m) if !m.is_empty() && node.chain.init_built(c).is_empty() => {
-            let _ = node.chain.set_init_phase(c, Phase::Blocks);
-            return;
-        }
-        Err(e) => {
-            set(run, format!("init · build: {e}"));
-            rest(run, 10);
-            return;
-        }
-        _ => {}
-    }
     let tmp = scratch(node, c);
     let _ = std::fs::create_dir_all(&tmp);
     let budget = coins_budget();
@@ -372,41 +503,16 @@ fn build(node: &Arc<Node>, run: &ChainRun) {
             set(run, format!("init · build: needs about {} GB of scratch space in {}, {} GB free there; waiting (free some space, or set ARCADE_INIT_COINS_MB higher to derive the coins in memory)",
                 need >> 30, tmp.display(), (free + old) >> 30));
             rest(run, 60);
-            return;
+            return Ok(None);
         }
     }
     let threads = arcade_chaindb::rules::script_threads();
     set(run, "init · build: starting".into());
-    let t0 = std::time::Instant::now();
     let r = node.chain.init_build(p, TAIL, threads, budget, &tmp, &run.stop, &mut |s| set(run, format!("init · {s}")));
-    match r {
-        Ok(b) if b.refetch > 0 => {
-            let _ = node.app.event("chains", &format!("{}: init build: the rules refused {} blocks; dropped and fetched again (a source may have sent damaged copies)", p.name, b.refetch));
-        }
-        Ok(b) => {
-            let _ = node.app.event("chains", &format!(
-                "{}: init install built to block {} in {:.1} h: {} coins{}, {} transactions indexed, {} blocks' rules checked; the normal sync carries on",
-                p.name, b.height, t0.elapsed().as_secs_f64() / 3600.0, b.coins, if b.on_disk { " (derived on disk)" } else { "" }, b.txs, b.rules_checked
-            ));
-        }
-        Err(e) if run.stop.load(Ordering::Relaxed) => set(run, format!("init · build stopped ({e}); it carries on at the next start")),
-        // The chain breaks the rules (even fetched again) or spends coins it never made: no retry fixes that.
-        Err(e @ arcade_store::StoreError::InvalidBlock { .. }) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            let _ = node.app.event("chains", &format!("{}: init build failed: {e}", p.name));
-            let _ = node.chain.set_state_text(c, arcade_chaindb::initsync::INIT_NOTE, Some(&format!("build failed: {e}")));
-            set(run, format!("init · build failed: {e} (left as it is until the arcade restarts)"));
-            FAILED.lock().unwrap().push(c);
-        }
-        // Anything else (the disk, a read) may pass on a later try.
-        Err(e) => {
-            let _ = std::fs::remove_dir_all(&tmp);
-            let _ = node.app.event("chains", &format!("{}: init build stopped: {e}; trying again in 10 minutes", p.name));
-            let _ = node.chain.set_state_text(c, arcade_chaindb::initsync::INIT_NOTE, Some(&format!("build stopped: {e}; trying again")));
-            set(run, format!("init · build stopped: {e}; trying again in 10 minutes"));
-            rest(run, 600);
-        }
+    if r.is_err() && !run.stop.load(Ordering::Relaxed) {
+        let _ = std::fs::remove_dir_all(&tmp);
     }
+    r.map(Some)
 }
 
 /// Bytes in the files of a folder (and its folders).
@@ -458,19 +564,194 @@ pub fn stages(node: &Node, c: u16, best: u64, peer: u64) -> Option<Vec<Value>> {
     let bpct = if total > 0 { stored as f64 * 100.0 / total as f64 } else { 0.0 };
     let steps = ["main", "txs", "coins", "rules"];
     let upct = built.iter().filter(|s| steps.contains(&s.as_str())).count() as f64 * 100.0 / steps.len() as f64;
+    // Each phase's timing lines (blocks/s, rows/s ...), the newest last.
+    let lines = node.chain.init_timing(c);
+    let timing = |w: &str| lines.iter().filter(|l| l.starts_with(w)).cloned().collect::<Vec<_>>();
     Some(vec![
         serde_json::json!({"name": "Init · headers", "detail": detail(0, format!("round {} · {}", round + 1, if note.is_empty() { "asking several sources".into() } else { note.clone() }), "agreed by at least 3 independent sources, enough work", "waiting"),
-                           "pct": pct(0, hpct), "at": best, "of": peer}),
-        serde_json::json!({"name": "Init · blocks", "detail": detail(1, format!("round {round} · stored only, any order, checked against their headers"), "every header's block stored", "waiting for the headers"),
-                           "pct": pct(1, bpct), "at": stored, "of": total}),
+                           "pct": pct(0, hpct), "at": best, "of": peer, "timing": timing("headers")}),
+        serde_json::json!({"name": "Init · blocks", "detail": detail(1, format!("round {round} · stored only, any order, checked against their headers{}", timing("blocks").last().map(|l| format!(" · last {l}")).unwrap_or_default()), "every header's block stored", "waiting for the headers"),
+                           "pct": pct(1, bpct), "at": stored, "of": total, "timing": timing("blocks")}),
         serde_json::json!({"name": "Init · build", "detail": detail(2, format!("{} · done: {}", note, if built.is_empty() { "nothing yet".into() } else { built.join(", ") }), "tx index, coin set and rules done; the normal sync carries on", "waiting for the blocks"),
-                           "pct": pct(2, upct), "at": null}),
+                           "pct": pct(2, upct), "at": null, "timing": timing("build")}),
     ])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::psync::tests::{test_chain, Src};
+    use arcade_chain::{Block, Hash256};
+    use arcade_chaindb::ChainDb;
+    use std::cell::RefCell;
+    use std::sync::atomic::AtomicBool;
+
+    /// A source that sets `stop` once it was asked `after` times (None: never).
+    struct Stopper {
+        inner: Src,
+        after: Option<usize>,
+        asked: usize,
+        stop: Arc<AtomicBool>,
+    }
+
+    impl Stopper {
+        fn new(blocks: &[Block], after: Option<usize>, stop: &Arc<AtomicBool>) -> Stopper {
+            Stopper { inner: Src { blocks: blocks.to_vec(), kind: 0, asked: Default::default() }, after, asked: 0, stop: stop.clone() }
+        }
+        /// Counts a question; true when this one stops the run.
+        fn tick(&mut self) -> bool {
+            self.asked += 1;
+            let now = self.after.is_some_and(|a| self.asked > a);
+            if now {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            now
+        }
+    }
+
+    impl BlockSource for Stopper {
+        fn get_headers(&mut self, locator: &[Hash256]) -> Result<Vec<arcade_chain::p2p::HeaderEntry>, String> {
+            let _ = self.tick();
+            self.inner.get_headers(locator)
+        }
+        fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>, String> {
+            if self.tick() {
+                return Err("stopped".into());
+            }
+            self.inner.get_blocks(hashes)
+        }
+        fn describe(&self) -> String {
+            "test".into()
+        }
+    }
+
+    /// The smallest world the phase loop runs in: three sources (three networks), store_round
+    /// over one of them, the build in a temp folder. `stop_in` stops it part way through that
+    /// phase, as an arcade stopped (or restarted) there.
+    struct FakeEnv<'a> {
+        db: &'a ChainDb,
+        p: &'static arcade_chain::params::ChainParams,
+        blocks: Vec<Block>,
+        stop: Arc<AtomicBool>,
+        stop_in: Option<&'static str>,
+        upto: Option<u32>,
+        tmp: std::path::PathBuf,
+        events: RefCell<Vec<String>>,
+        statuses: RefCell<Vec<String>>,
+    }
+
+    impl<'a> FakeEnv<'a> {
+        fn new(db: &'a ChainDb, p: &'static arcade_chain::params::ChainParams, blocks: &[Block], tmp: &std::path::Path, stop_in: Option<&'static str>) -> FakeEnv<'a> {
+            FakeEnv { db, p, blocks: blocks.to_vec(), stop: Default::default(), stop_in, upto: None, tmp: tmp.to_path_buf(), events: Default::default(), statuses: Default::default() }
+        }
+    }
+
+    impl Env for FakeEnv<'_> {
+        fn stopped(&self) -> bool {
+            self.stop.load(Ordering::Relaxed)
+        }
+        fn status(&self, s: String) {
+            // A smoke test held at its height: that's where this test ends.
+            if s.contains("ARCADE_INIT_UPTO") {
+                self.stop.store(true, Ordering::Relaxed);
+            }
+            self.statuses.borrow_mut().push(s);
+        }
+        fn event(&self, s: String) {
+            self.events.borrow_mut().push(s);
+        }
+        fn rest(&self, _secs: u64) {}
+        fn upto(&self) -> Option<u32> {
+            self.upto
+        }
+        fn headers_round(&mut self, _round: u32) -> Result<arcade_chaindb::initsync::Agreement, String> {
+            let syncer = Syncer::new(self.db, self.p);
+            let stop_at = |i: usize| (self.stop_in == Some("headers") && i == 1).then_some(0);
+            let mut srcs: Vec<Stopper> = (0..3).map(|i| Stopper::new(&self.blocks, stop_at(i), &self.stop)).collect();
+            if self.db.tip(self.p.chain_no).map_err(|e| e.to_string())?.is_none() {
+                syncer.ensure_genesis(&mut srcs[0]).map_err(|e| e.to_string())?;
+            }
+            let mut v: Vec<(String, &mut dyn BlockSource)> = srcs.iter_mut().enumerate().map(|(i, s)| (format!("net 10.{i}.0.0/16"), s as &mut dyn BlockSource)).collect();
+            self.db.init_headers_round(&syncer, &mut v, &self.stop).map_err(|e| e.to_string())
+        }
+        fn store(&mut self, _round: u32, missing: &[Hash256]) -> crate::psync::Round {
+            let after = (self.stop_in == Some("blocks")).then_some(1);
+            let src = Stopper::new(&self.blocks, after, &self.stop);
+            crate::psync::store_round(self.db, self.p, missing, vec![("net 10.0.0.0/16".into(), Box::new(src) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(2), &|_| {}, &self.stop)
+        }
+        fn build(&mut self) -> arcade_store::Result<Option<arcade_chaindb::initsync::Built>> {
+            let (stop, stop_here) = (self.stop.clone(), self.stop_in == Some("build"));
+            self.db
+                .init_build(self.p, 5, 2, usize::MAX, &self.tmp, &self.stop, &mut |s| {
+                    if stop_here && s.contains("coin set") {
+                        stop.store(true, Ordering::Relaxed);
+                    }
+                })
+                .map(Some)
+        }
+    }
+
+    #[test]
+    fn the_phase_loop_goes_through_every_phase_and_carries_on_after_a_restart_in_each() {
+        let (p, blocks) = test_chain(600);
+        let c = p.chain_no;
+        let d = tempfile::tempdir().unwrap();
+        let path = d.path().join("chain.mdbx");
+        let tmp = d.path().join("scratch");
+        {
+            let db = ChainDb::open(&path).unwrap();
+            db.init_start(c).unwrap();
+        }
+        // Stopped in each phase in turn, the chain's file closed and opened again ("restart").
+        for (stop_in, phase_after) in [("headers", Phase::Headers), ("blocks", Phase::Blocks), ("build", Phase::Build)] {
+            let db = ChainDb::open(&path).unwrap();
+            let mut env = FakeEnv::new(&db, p, &blocks, &tmp, Some(stop_in));
+            assert!(!run_with(&db, p, &mut env), "stopped in {stop_in}");
+            assert_eq!(db.init_phase(c).unwrap(), Some(phase_after), "stopped in {stop_in}: {:?}", env.statuses.borrow());
+            assert_eq!(db.tip(c).unwrap().unwrap().height, 0, "nothing usable before the build is done");
+            if stop_in == "blocks" {
+                let left = db.init_missing(c).unwrap().len();
+                assert!(left > 0 && left < 600, "part of the blocks stored: {left} left");
+            }
+        }
+        // The last start runs to the end.
+        let db = ChainDb::open(&path).unwrap();
+        let mut env = FakeEnv::new(&db, p, &blocks, &tmp, None);
+        assert!(run_with(&db, p, &mut env));
+        assert_eq!(db.init_phase(c).unwrap(), Some(Phase::Done));
+        assert_eq!(db.tip(c).unwrap().unwrap().height, 600 - TAIL.min(5), "built to best - tail");
+        assert!(db.init_missing(c).unwrap().is_empty());
+        // Comparable timing lines for every phase, kept with the chain and in the journal.
+        let t = db.init_timing(c);
+        for w in ["headers round", "blocks round", "build main", "build txs", "build coins:", "build coins written", "build: to block"] {
+            assert!(t.iter().any(|l| l.starts_with(w)), "no {w:?} line in {t:?}");
+        }
+        assert!(t.iter().any(|l| l.starts_with("blocks round") && l.contains("blocks/s") && l.contains("MB/s")), "{t:?}");
+        assert!(t.iter().any(|l| l.starts_with("build txs") && l.contains("rows/s")), "{t:?}");
+        assert!(env.events.borrow().iter().any(|e| e.contains("init timing: build coins written") && e.contains("coins/s")), "{:?}", env.events.borrow());
+    }
+
+    #[test]
+    fn a_smoke_test_stops_storing_at_its_height_and_builds_nothing() {
+        let (p, blocks) = test_chain(300);
+        let c = p.chain_no;
+        let d = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(d.path().join("chain.mdbx")).unwrap();
+        db.init_start(c).unwrap();
+        let mut env = FakeEnv::new(&db, p, &blocks, &d.path().join("scratch"), None);
+        env.upto = Some(120);
+        assert!(!run_with(&db, p, &mut env));
+        assert!(env.statuses.borrow().last().unwrap().contains("stopped at block 120"), "{:?}", env.statuses.borrow());
+        assert_eq!(db.init_missing(c).unwrap().len(), 180, "blocks 1..=120 stored, none above");
+        assert!(db.init_missing_upto(c, Some(120)).unwrap().is_empty());
+        assert!(matches!(db.init_phase(c).unwrap(), Some(Phase::Headers | Phase::Blocks)));
+        assert!(db.init_built(c).is_empty());
+        assert!(db.init_timing(c).iter().any(|l| l.starts_with("blocks round 1: 120 blocks")), "{:?}", db.init_timing(c));
+        // Its coins aren't answered meanwhile.
+        let op = arcade_chain::OutPoint { txid: blocks[3].txs[0].txid, vout: 0 };
+        assert!(db.coin(p, &op).is_err());
+        assert!(db.balance_for_script(c, &[0x51]).is_err());
+    }
 
     #[test]
     fn peers_count_once_per_network_group() {

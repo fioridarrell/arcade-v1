@@ -87,6 +87,18 @@ struct State {
     /// failed to send): the job goes to another source; one that failed every job left steps
     /// aside.
     tried: HashMap<u32, std::collections::HashSet<String>>,
+    /// Store-only mode: bytes of the blocks stored.
+    bytes: u64,
+}
+
+/// What a store-only round did (run_store).
+#[derive(Debug, Default)]
+pub struct Round {
+    /// Blocks stored, and their bytes.
+    pub stored: u64,
+    pub bytes: u64,
+    /// Why it ended early (None: every block stored, or stopped).
+    pub error: Option<String>,
 }
 
 /// Bytes one job should carry: one source must finish it well within the connector's wait,
@@ -346,15 +358,16 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                 }
             }
             let res = match got {
-                Ok(raws) => db.init_store(p, &job.hashes, &raws).map(|r| (r, raws.iter().map(|x| x.len()).sum::<usize>())).map_err(|e| Some(e.to_string())),
+                Ok(raws) => db.init_store(p, &job.hashes, &raws).map(|r| (r, raws.iter().map(|x| x.len()).sum::<usize>(), raws.len())).map_err(|e| Some(e.to_string())),
                 Err(_) => Err(None),
             };
             let mut st = pool.s.lock().unwrap();
             match res {
-                Ok((r, bytes)) => {
+                Ok((r, bytes, sent)) => {
                     st.inflight.remove(&job.start);
                     st.taken.insert(job.start);
                     st.stored += r.stored as u64;
+                    st.bytes += bytes as u64 * r.stored as u64 / sent.max(1) as u64;
                     st.refused += r.refused.len() as u64;
                     if r.stored > 0 {
                         let per = bytes / r.stored.max(1);
@@ -703,9 +716,9 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
 /// queue for another source. Nothing is connected. `min_h`: the lowest height asked for (a
 /// source must be at least there). Returns blocks stored; some may still be missing after an
 /// error or a stop (the caller looks again: ChainDb::init_missing).
-pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h: u32, on_progress: &dyn Fn(String), stop: &AtomicBool) -> Result<u64, String> {
+pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h: u32, on_progress: &dyn Fn(String), stop: &AtomicBool) -> Round {
     if hashes.is_empty() {
-        return Ok(0);
+        return Round::default();
     }
     let offers = node.offers_for(p.key);
     let arcades = dial_offers(node, p, &offers, min_h);
@@ -716,7 +729,7 @@ pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h
 /// see [`run_store`]. Ends when every block was stored, at a stop, when the store fails, or
 /// when no source worked for `idle`.
 #[allow(clippy::too_many_arguments)]
-fn store_round<'a>(
+pub(crate) fn store_round<'a>(
     db: &'a ChainDb,
     p: &'static ChainParams,
     hashes: &[Hash256],
@@ -725,9 +738,9 @@ fn store_round<'a>(
     idle: Duration,
     on_progress: &dyn Fn(String),
     stop: &AtomicBool,
-) -> Result<u64, String> {
+) -> Round {
     if hashes.is_empty() {
-        return Ok(0);
+        return Round::default();
     }
     let n = hashes.len() as u32;
     let mut st = State { next_id: n, ..Default::default() };
@@ -782,12 +795,12 @@ fn store_round<'a>(
         pool.cv.notify_all();
         r
     });
-    let stored = pool.s.lock().unwrap().stored;
-    res.map(|_| stored)
+    let st = pool.s.lock().unwrap();
+    Round { stored: st.stored, bytes: st.bytes, error: res.err() }
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use arcade_chain::encode::write_varint;
     use arcade_chain::hash::merkle_root;
@@ -796,7 +809,7 @@ mod tests {
 
     const EASY: u32 = 0x207fffff;
 
-    fn mine(prev: Hash256, tag: u32) -> Block {
+    pub(crate) fn mine(prev: Hash256, tag: u32) -> Block {
         let mut o = 1i32.to_le_bytes().to_vec();
         write_varint(&mut o, 1);
         o.extend_from_slice(&[0; 32]);
@@ -822,10 +835,10 @@ mod tests {
 
     /// A source: honest, mute (sends no blocks) or one that damages every block.
     #[derive(Clone)]
-    struct Src {
-        blocks: Vec<Block>,
-        kind: u8,
-        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    pub(crate) struct Src {
+        pub(crate) blocks: Vec<Block>,
+        pub(crate) kind: u8,
+        pub(crate) asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     }
 
     impl BlockSource for Src {
@@ -856,7 +869,8 @@ mod tests {
         }
     }
 
-    fn setup(n: u32) -> (tempfile::TempDir, ChainDb, &'static ChainParams, Vec<Block>) {
+    /// A made-up chain of `n` blocks on genesis, and params for it (no rules, easy work).
+    pub(crate) fn test_chain(n: u32) -> (&'static ChainParams, Vec<Block>) {
         let mut blocks = vec![mine(Hash256::ZERO, 0)];
         for h in 1..=n {
             let prev = blocks.last().unwrap().hash();
@@ -869,7 +883,12 @@ mod tests {
         p.genesis_header = "";
         p.pow_limit_bits = EASY;
         p.checkpoints = &[];
-        let p: &'static ChainParams = Box::leak(Box::new(p));
+        p.min_chain_work = "";
+        (Box::leak(Box::new(p)), blocks)
+    }
+
+    fn setup(n: u32) -> (tempfile::TempDir, ChainDb, &'static ChainParams, Vec<Block>) {
+        let (p, blocks) = test_chain(n);
         let d = tempfile::tempdir().unwrap();
         let db = ChainDb::open(d.path().join("chain.mdbx")).unwrap();
         let mut src = Src { blocks: blocks.clone(), kind: 0, asked: Default::default() };
@@ -879,7 +898,7 @@ mod tests {
         (d, db, p, blocks)
     }
 
-    fn src(blocks: &[Block], kind: u8) -> (Src, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    pub(crate) fn src(blocks: &[Block], kind: u8) -> (Src, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
         let s = Src { blocks: blocks.to_vec(), kind, asked: Default::default() };
         let a = s.asked.clone();
         (s, a)
@@ -894,8 +913,10 @@ mod tests {
         let (mute, mute_asked) = src(&blocks, 1);
         let (bad, bad_asked) = src(&blocks, 2);
         let sources: Vec<(String, Box<dyn BlockSource + Send>)> = vec![("mute".into(), Box::new(mute)), ("bad".into(), Box::new(bad)), ("good".into(), Box::new(good))];
-        let n = store_round(&db, p, &missing, sources, None, Duration::from_secs(5), &|_| {}, &AtomicBool::new(false)).unwrap();
-        assert_eq!(n, 1200);
+        let r = store_round(&db, p, &missing, sources, None, Duration::from_secs(5), &|_| {}, &AtomicBool::new(false));
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.stored, 1200);
+        assert!(r.bytes >= 1200 * 80, "{}", r.bytes);
         assert!(db.init_missing(p.chain_no).unwrap().is_empty());
         for b in &blocks[1..] {
             assert_eq!(db.block_raw(p.chain_no, &b.hash()).unwrap(), Some(b.encode()));
@@ -912,13 +933,14 @@ mod tests {
         let sources: Vec<(String, Box<dyn BlockSource + Send>)> = (0..3).map(|i| (format!("mute{i}"), Box::new(src(&blocks, 1).0) as Box<dyn BlockSource + Send>)).collect();
         let t0 = Instant::now();
         let r = store_round(&db, p, &missing, sources, None, Duration::from_secs(1), &|_| {}, &AtomicBool::new(false));
-        assert_eq!(r.unwrap_err(), "every source stopped");
+        assert_eq!(r.error.as_deref(), Some("every source stopped"));
         assert!(t0.elapsed() < Duration::from_secs(60));
         assert_eq!(db.init_missing(p.chain_no).unwrap().len(), 300);
         // A stop ends a round at once, with nothing written after it.
         let (good, _) = src(&blocks, 0);
         let stop = AtomicBool::new(true);
-        let n = store_round(&db, p, &missing, vec![("good".into(), Box::new(good) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(1), &|_| {}, &stop).unwrap();
-        assert_eq!(n, db.init_missing(p.chain_no).map(|m| 300 - m.len() as u64).unwrap());
+        let r = store_round(&db, p, &missing, vec![("good".into(), Box::new(good) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(1), &|_| {}, &stop);
+        assert!(r.error.is_none());
+        assert_eq!(r.stored, db.init_missing(p.chain_no).map(|m| 300 - m.len() as u64).unwrap());
     }
 }

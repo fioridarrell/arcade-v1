@@ -1361,6 +1361,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     // work meanwhile.
     let borrowed = crate::borrow::is_borrowed(p.key);
     Ok(json!({"key": key, "name": p.name, "installed": true, "home": home, "mode": mode, "indexes": indexes, "init": init.map(|x| x.as_str()),
+              "init_timing": if init.is_some() { json!(node.chain.init_timing(c)) } else { Value::Null },
               "state": state, "overall": overall, "stages": stages, "tip": tip, "copy": copy, "borrowed": borrowed, "watch": crate::watchdog::status(key),
               "borrow_state": if borrowed { crate::borrow::state_text(p.key) } else { None }}))
 }

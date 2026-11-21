@@ -157,9 +157,10 @@ fn filter_bits(key: &[u8], bits: u64) -> impl Iterator<Item = u64> {
     (0..FILTER_PROBES).map(move |i| h.wrapping_add(i.wrapping_mul(h2)) % bits)
 }
 
-/// The filter of a block's rows.
-fn make_filter(kind: Kind, rows: &[u8]) -> Vec<u8> {
-    let mut f = vec![0u8; kind.filter_len()];
+/// The filter of a block's rows (`len`: the kind's filter_len, taken by the caller's thread:
+/// tests make blocks smaller per thread, and blocks are packed on helper threads).
+fn make_filter(kind: Kind, rows: &[u8], len: usize) -> Vec<u8> {
+    let mut f = vec![0u8; len];
     let bits = f.len() as u64 * 8;
     for r in rows.chunks_exact(kind.row_len()) {
         for b in filter_bits(&r[..kind.filter_key_len()], bits) {
@@ -508,8 +509,11 @@ fn decode(kind: Kind, first: u32, n: usize, c: &[Vec<u8>]) -> Option<Vec<u8>> {
 /// A column of nothing but zero bytes is stored as no bytes at all.
 /// A stored block: its filter (uncompressed: near-random bits), then its columns. Returns
 /// the bytes, the row hash and the filter's hash.
-fn pack(kind: Kind, first: u32, rows: &[u8], level: i32) -> Result<(Vec<u8>, [u8; 32], [u8; 32])> {
-    let filter = make_filter(kind, rows);
+/// A packed block: its bytes, row hash and filter hash.
+type Packed = (Vec<u8>, [u8; 32], [u8; 32]);
+
+fn pack(kind: Kind, first: u32, rows: &[u8], level: i32, filter_len: usize) -> Result<Packed> {
+    let filter = make_filter(kind, rows, filter_len);
     let fhash = sha256(&filter);
     let mut out = filter;
     out.reserve(rows.len() / 3);
@@ -688,11 +692,12 @@ impl Writer {
             return Ok(());
         }
         let (kind, first, level) = (self.meta.kind, self.meta.first, self.level);
-        let packed: Vec<Result<(Vec<u8>, [u8; 32], [u8; 32])>> = if blocks.len() == 1 {
-            vec![pack(kind, first, &blocks[0], level)]
+        let fl = kind.filter_len();
+        let packed: Vec<Result<Packed>> = if blocks.len() == 1 {
+            vec![pack(kind, first, &blocks[0], level, fl)]
         } else {
             std::thread::scope(|s| {
-                let hs: Vec<_> = blocks.iter().map(|b| s.spawn(move || pack(kind, first, b, level))).collect();
+                let hs: Vec<_> = blocks.iter().map(|b| s.spawn(move || pack(kind, first, b, level, fl))).collect();
                 hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err(StoreError::Other("index file: a compression thread failed".into())))).collect()
             })
         };
@@ -1000,7 +1005,7 @@ impl Reader {
         let mut seen = 0u64;
         for i in 0..self.blocks() {
             let rows = self.block(i)?;
-            if sha256(&make_filter(k, &rows)) != self.fhashes[i] {
+            if sha256(&make_filter(k, &rows, k.filter_len())) != self.fhashes[i] {
                 return Err(bad(&self.path, format!("block {i}'s filter is not its rows' filter")));
             }
             for row in rows.chunks_exact(k.row_len()) {

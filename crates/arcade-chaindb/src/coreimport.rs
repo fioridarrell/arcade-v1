@@ -243,14 +243,19 @@ impl ChainDb {
     /// no witness data: txids don't cover witnesses, so a copy with them stripped would
     /// otherwise pass. Returns their block numbers.
     pub fn store_blocks_only(&self, params: &ChainParams, raws: &[Vec<u8>]) -> Result<Vec<u32>> {
-        let c = params.chain_no;
         let mut blocks = Vec::with_capacity(raws.len());
         for raw in raws {
             blocks.push(check_stored_block(self, params, raw)?);
         }
+        self.write_stored(params, &blocks)
+    }
+
+    /// Store checked blocks (check_stored_block) without connecting them; their block numbers.
+    pub(crate) fn write_stored(&self, params: &ChainParams, blocks: &[Block]) -> Result<Vec<u32>> {
+        let c = params.chain_no;
         self.wstore(c)?.write(|w| {
             let mut out = Vec::with_capacity(blocks.len());
-            for blk in &blocks {
+            for blk in blocks {
                 let hash = blk.hash();
                 let mut rec = header_rec(w, c, &hash)?.ok_or_else(|| err(format!("block {hash}: its header is not in our header chain")))?;
                 if rec.b == 0 {
@@ -572,7 +577,7 @@ impl ChainDb {
     }
 
     /// Heights base+1.. of `path` become the main chain (HEIGHT rows, header status).
-    fn join_main(&self, params: &ChainParams, path: &[Hash256], base: u32) -> Result<()> {
+    pub(crate) fn join_main(&self, params: &ChainParams, path: &[Hash256], base: u32) -> Result<()> {
         let c = params.chain_no;
         for (i, chunk) in path.chunks(50_000).enumerate() {
             self.wstore(c)?.write(|w| {

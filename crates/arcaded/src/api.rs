@@ -439,6 +439,8 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         }
         "mesh.udp" => Ok(crate::udpsvc::status(node)),
         "mesh.sysinfo" => Ok(crate::sysinfo::read(node)),
+        "cpu.status" => Ok(crate::cpu::status()),
+        "cpu.set" => crate::cpu::set(&s("level").ok_or("level required: low, balanced or full")?),
         "sysinfo.status" => Ok(crate::sysinfo::status(node)),
         "sysinfo.set" => crate::sysinfo::set(node, &req),
         "mesh.relay" => Ok(crate::relaysvc::status(node)),

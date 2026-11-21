@@ -6,6 +6,7 @@
 //!           [--http-port N|0] [--http-bind ADDR] [--site DIR] [--stun-port N|0]
 
 mod accountsvc;
+mod cpu;
 mod largeblob;
 mod webui;
 mod rulecheck;
@@ -137,9 +138,18 @@ use node::Node;
 use std::sync::{Arc, Mutex};
 
 /// Run the service at low CPU and disk priority (threads made later inherit it), so games
-/// and the desktop stay smooth while chains catch up. Off unless ARCADE_NICE is set (e.g. 10).
+/// and the desktop stay smooth while chains catch up. ARCADE_NICE (0..19) decides it when set; otherwise the CPU level
+/// does once the home is known (crate::cpu::start: balanced, nice 10, by default since 2026-11-20).
 fn be_polite() {
-    let nice: i32 = std::env::var("ARCADE_NICE").ok().and_then(|v| v.parse().ok()).unwrap_or(0).clamp(0, 19);
+    if let Some(nice) = std::env::var("ARCADE_NICE").ok().and_then(|v| v.parse::<i32>().ok()) {
+        set_nice(nice);
+    }
+}
+
+/// This process at `nice` (0..19) for the CPU, and the lowest disk class when above 0. Called before other threads
+/// exist, so they inherit it.
+pub(crate) fn set_nice(nice: i32) {
+    let nice = nice.clamp(0, 19);
     if nice == 0 {
         return;
     }
@@ -158,6 +168,42 @@ fn be_polite() {
         // Windows has no ionice. Below-normal for a modest nice, idle for 11 through 19.
         let class: u32 = if nice >= 11 { 0x0000_0040 } else { 0x0000_4000 };
         set_priority_class(class);
+    }
+}
+
+/// A running arcade from the level at `from` to `to` (nice values): on Linux each thread still at `from` (Linux keeps
+/// a nice per thread; threads pushed lower on purpose, such as an older tip's proof at 19, keep theirs), the process on
+/// Windows and macOS. Whether every change took: a lower priority always does; a higher one is often refused to an
+/// ordinary program, and then it waits for the next start.
+pub(crate) fn renice_all(from: i32, to: i32) -> bool {
+    let (from, to) = (from.clamp(0, 19), to.clamp(0, 19));
+    #[cfg(target_os = "linux")]
+    {
+        let mut ok = true;
+        if let Ok(rd) = std::fs::read_dir("/proc/self/task") {
+            for e in rd.flatten() {
+                if let Some(tid) = e.file_name().to_str().and_then(|t| t.parse::<libc::id_t>().ok()) {
+                    let now = unsafe { libc::getpriority(libc::PRIO_PROCESS, tid) };
+                    if now != from && from != to {
+                        continue;
+                    }
+                    ok &= unsafe { libc::setpriority(libc::PRIO_PROCESS, tid, to) } == 0;
+                }
+            }
+        }
+        ok
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let _ = from;
+        unsafe { libc::setpriority(libc::PRIO_PROCESS, 0, to) == 0 }
+    }
+    #[cfg(windows)]
+    {
+        let _ = from;
+        let class: u32 = if to == 0 { 0x0000_0020 } else if to >= 11 { 0x0000_0040 } else { 0x0000_4000 };
+        unsafe { set_priority_class(class) };
+        true
     }
 }
 
@@ -465,6 +511,8 @@ fn main() {
         .and_then(|i| args.get(i + 1))
         .map(std::path::PathBuf::from)
         .unwrap_or_else(arcade_local::default_home);
+    // How much of the computer the arcade takes (balanced by default), before any other thread starts.
+    cpu::start(&home);
     let mesh = !args.iter().any(|a| a == "--no-mesh");
     let opt = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned();
     let mesh_port: Option<u16> = match opt("--mesh-port").map(|v| v.parse::<u16>().unwrap_or_else(|_| fail_start(&format!("--mesh-port {v}: give a port number")))) {

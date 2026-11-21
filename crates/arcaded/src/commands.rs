@@ -79,6 +79,8 @@ cmds! {
     "mesh.dials" Read "" "The last mesh dials (to a bare IP or a name, how long, why they failed), and a note when this network seems to refuse bare IPs while names connect (ARCADE #12).";
     "mesh.name" Read "" "The public name other arcades dial this one by, if set.";
     "mesh.sysinfo" Public "" "The machines behind the mesh, as their operators share them (opt-in, sysinfo.set): every other arcade's newest record heard in the last 24 h (CPU, cores, RAM, GPUs, disk, OS, version; seal speed in core-seconds per GiB, measured from its own seals), arcades sharing of arcades heard, network totals (cores, RAM, disk total and free, GPUs and VRAM where known, fastest, median and slowest seal speed), and this arcade's own. Reported, rounded, never on a chain.";
+    "cpu.status" Read "" "How much of the computer this arcade takes: its CPU level (low, balanced, full), the cores background work may use of all this machine's, its priority (nice), and the levels there are.";
+    "cpu.set" Admin "level" "Set the CPU level: low (lowest priority, a quarter of the cores), balanced (low priority, half the cores; the default) or full (normal priority, every core). Kept across restarts; a lower priority applies at once, a higher one may wait for the next start.";
     "sysinfo.status" Read "" "Whether this arcade shares its system info, and the exact record it sends (or would send), field by field: what is reported, what is measured (seal speed, after 64 MiB sealed) and what is never shared.";
     "sysinfo.set" Admin "on" "Share this arcade's system info with the mesh (on: true) or stop (on: false; every arcade drops it at once). Off by default; kept across restarts and updates.";
     "mesh.name_set" Admin "name" "Set the public name other arcades may dial this arcade by (wss://host/mesh or host:port, a host name): shared with every link, so networks that reach only names can find it. \"\" clears it.";
@@ -319,7 +321,7 @@ cmds! {
     "chains.unqueue" Admin "key" "Take a chain out of the install queue.";
     "chains.queue_first" Admin "key" "Move a queued chain to the front of the queue: it is next.";
     "chains.start_now" Admin "key" "Start a queued chain now: the chain being installed is paused and goes back into the queue right after it (a resume entry). Refused while the home chain or the ARCADE chain is catching up.";
-    "chains.hide" Admin "key, hidden?" "Leave a chain out of the Coins & chains list (hidden: true, the default) or show it again (false). Display only: an installed chain keeps running; nothing is removed or paused. The home chain and the ARCADE chain are always shown.";
+    "chains.hide" Admin "key, hidden?" "Leave a chain out of the Coins & chains list (hidden: true, the default) or show it again (false). Display only, any chain alike: an installed chain keeps running; nothing is removed or paused.";
     "chains.plan" Admin "keys?, mode?, skip?" "The startup chooser: keys = the chains to use. Every other chain is hidden; the chosen ones not installed or queued yet are queued, smallest reported size for mode (full, shared or chain; default full) first, unknown sizes last, with no indexes. The ARCADE chain (arctest) is installed when it is among keys and syncs first; left out, it stays borrowed from arcades that keep it. Never removes a chain. skip: true only marks the chooser as answered.";
     "chains.pause" Admin "key" "Pause a chain (by hand: the queue never resumes it).";
     "ui.link" Local "" "The link that opens the app's window in a browser (/ui/, with this start's key) and the SSH tunnel command for another computer (docs/WEBUI.md).";
@@ -605,6 +607,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("mentions", "array", "@tags mentioned."),
     ("message", "string", "The signed message."),
     ("mode", "string", "How a chain is kept: full, shared or chain; for fog.keep: segment or pin."),
+    ("level", "string", "A CPU level: low, balanced or full."),
     ("msg", "string", "A sealed message."),
     ("n", "integer", "How many."),
     ("name", "string", "A name."),
@@ -724,6 +727,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
 /// "" none), most (a number's limit, 0 none)).
 pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
     ("fog.keep", "mode", "segment,pin", "\"segment\"", 0),
+    ("cpu.set", "level", "low,balanced,full", "", 0),
     ("tx.wait", "until", "accepted_local,broadcast_ok,seen_in_peer_mempool,confirmed", "\"confirmed\"", 0),
     ("tx.wait", "timeout", "", "60", 600),
     ("chains.wait", "timeout", "", "60", 600),

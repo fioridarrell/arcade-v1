@@ -285,18 +285,32 @@ pub fn wallet(node: &Node) -> Value {
     let p = crate::pagechain::params(node);
     let mut spendable = 0u64;
     let mut sums: std::collections::BTreeMap<u32, u64> = Default::default();
+    let home = p.chain_no == node.params.chain_no;
     for a in &addrs {
-        if let Some(script) = arcade_ledger::address::p2pkh_script_for_address(p, a) {
-            let coins = if p.chain_no == node.params.chain_no { crate::claims::spendable(node, &script) } else { crate::ordsafe::keep_free(node, p, crate::borrow::spendable(node, p, &script)) };
-            spendable += coins.iter().map(|u| u.value).sum::<u64>();
+        if home {
+            if let Some(script) = arcade_ledger::address::p2pkh_script_for_address(p, a) {
+                spendable += crate::claims::spendable(node, &script).iter().map(|u| u.value).sum::<u64>();
+            }
         }
         for (pid, u) in holdings(node, a) {
             *sums.entry(pid).or_default() += u;
         }
     }
+    // Another chain's page (one inscribed on ARCADE, say): this wallet's key there and the coins a send from it can
+    // spend, installed, borrowed or run here alike (crate::swaps::coins). It asked borrow::spendable with the first
+    // chain's addresses, which answers only for a borrowed chain: an app on ARCADE saw 0 with thousands in the wallet
+    // (2026-11-21).
+    let mut page_addrs: Vec<String> = Vec::new();
+    if !home {
+        if let Ok((_, pk)) = crate::swaps::wallet_key(node, p) {
+            spendable = crate::swaps::coins(node, p, &pk).iter().map(|u| u.value).sum::<u64>();
+            page_addrs = crate::coinsend::key_scripts(p, &pk).into_iter().map(|(a, _)| a).collect();
+        }
+    }
     let tag = addrs.iter().find_map(|a| tag_of(node, a));
     let insc = all_inscriptions(node).iter().filter(|v| v["owner"].as_str().is_some_and(|o| addrs.iter().any(|a| a == o))).count();
-    json!({"network": p.net, "mainnet": !p.key.ends_with("test"), "addresses": addrs, "tag": tag,
+    let shown = if home { addrs.clone() } else { page_addrs };
+    json!({"network": p.net, "mainnet": !p.key.ends_with("test"), "addresses": shown, "tag": tag,
            "coin": {"spendable": spendable as f64 / 1e8, "ticker": ""},
            "tokens": balance_rows(node, &sums.into_iter().collect::<Vec<_>>()), "inscriptions": insc, "wallet": "operator"})
 }

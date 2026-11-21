@@ -14,4 +14,5 @@ thiserror = "1"
 zstd = { version = "0.13", default-features = false }
 
 [dev-dependencies]
+libc = "0.2"
 tempfile = "3.27.0"

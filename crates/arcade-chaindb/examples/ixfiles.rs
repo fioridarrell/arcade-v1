@@ -1,6 +1,8 @@
 //! Index files by hand (docs/INDEXFILES.md), with the arcade stopped:
 //!
 //!   ixfiles convert <shared chain.mdbx> <chain key>   settled rows -> files, readers switched
+//!                                                     (Ctrl-C: stop at the next checkpoint
+//!                                                     and carry on next run; twice: quit)
 //!   ixfiles info    <shared chain.mdbx> <chain key>   what the readers use now
 //!   ixfiles off     <shared chain.mdbx> <chain key>   back to the tables alone
 //!   ixfiles verify  <file.ixf>...                     read files whole and check them
@@ -10,6 +12,24 @@ use arcade_chaindb::ixfile::{hist_row, spend_row, tx_row, Kind, Meta, Reader, Wr
 use arcade_chaindb::ChainDb;
 use std::collections::BTreeMap;
 use std::io::Read;
+
+/// Set by Ctrl-C: the conversion saves a checkpoint and stops.
+static STOP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn on_interrupt(_: libc::c_int) {
+    // A second Ctrl-C quits at once (only async-signal-safe calls here).
+    if STOP.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        unsafe { libc::_exit(130) };
+    }
+}
+
+fn catch_interrupt() {
+    #[cfg(unix)]
+    unsafe {
+        libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
+    }
+}
 
 fn be32(b: &[u8], at: usize) -> u32 {
     u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
@@ -144,8 +164,8 @@ fn main() {
             let c = p.chain_no;
             match cmd {
                 "convert" => {
-                    let stop = std::sync::atomic::AtomicBool::new(false);
-                    let done = db.convert_to_index_files(p, &Options::default(), &stop, &mut |s| println!("{s}")).unwrap();
+                    catch_interrupt();
+                    let done = db.convert_to_index_files(p, &Options::default(), &STOP, &mut |s| println!("{s}")).unwrap();
                     println!("{}", if done { "done" } else { "stopped" });
                 }
                 "off" => db.set_index_files_off(c).unwrap(),

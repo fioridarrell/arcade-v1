@@ -396,7 +396,7 @@ fn pay_estimate(bytes: u64, copies_after: usize) -> (u64, u64) {
 /// per GiB) over its cores. None until it has sealed enough to measure.
 fn seal_secs(bytes: u64) -> Option<u64> {
     let speed = crate::sysinfo::seal_speed()?;
-    let cores = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1) as f64;
+    let cores = crate::cpu::cores() as f64;
     Some((speed * bytes as f64 / (1u64 << 30) as f64 / cores).ceil() as u64)
 }
 

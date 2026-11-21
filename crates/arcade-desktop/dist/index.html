@@ -463,6 +463,15 @@
     <ul class="opt" id="o-pay-list"></ul>
     <p class="msg" id="o-pay-msg"></p>
 
+    <h2 id="o-cpu">How much of this computer the arcade uses</h2>
+    <div class="row"><select id="o-cpu-level" title="How much of this computer the arcade takes">
+      <option value="low">Low: lowest priority, a quarter of the cores</option>
+      <option value="balanced">Balanced: low priority, half the cores (default)</option>
+      <option value="full">Full: normal priority, every core</option>
+    </select></div>
+    <p class="opt">Your own programs always come first: at Low and Balanced the arcade runs below them, and its heavy work (sealing data it keeps) uses only part of the cores. Full is the fastest, for a computer that does little else.</p>
+    <p class="msg" id="o-cpu-msg"></p>
+
     <h2 id="o-sysinfo">Share system info</h2>
     <div class="row"><label class="sw"><input type="checkbox" id="o-si-on"> Share system info</label></div>
     <p class="opt">Off unless you turn it on. When on, this arcade tells the mesh what it runs on: the record below, exactly as it goes out, signed with this arcade's mesh key, at start, when a figure changes and about hourly. Other arcades show it beside this one on their Home tab, and the network adds it up. Figures are rounded and marked as reported; only the seal speed is measured, from this arcade's own seals. It is never written on a chain, and nothing that pays reads it. Never shared: this computer's name, user names, paths, serial numbers, MAC or IP addresses, other software. Turning it off tells every arcade to drop it at once.</p>

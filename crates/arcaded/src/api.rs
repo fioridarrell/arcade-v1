@@ -823,6 +823,7 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
                 _ => crate::oplist::copy(node, p, &s("slug").ok_or("slug required")?),
             }
         }
+        "realtime.routes" => Ok(crate::realtime::routes(s("origin").as_deref())),
         "realtime.lanes" => crate::realtime::fast::lanes(node, &s("token").ok_or("token required")?),
         "realtime.rtc" => crate::rtcsvc::api(node, &s("token").ok_or("token required")?, &s("peer").ok_or("peer required")?, &s("op").ok_or("op required")?, &req["signal"]),
         "realtime.rtc_status" => Ok(crate::rtcsvc::status()),

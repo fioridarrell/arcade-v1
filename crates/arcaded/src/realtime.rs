@@ -641,6 +641,26 @@ pub fn heard(secs: u64) -> Vec<(String, String)> {
     st.heard.iter().filter(|(_, (_, at))| now.saturating_sub(*at) < secs).map(|(o, (l, _))| (o.clone(), l.clone())).collect()
 }
 
+/// What this arcade knows of the way to other arcades' rooms, for finding why a room doesn't connect (2026-11-21: two
+/// arcades where one's room frames reached the other but not back): per arcade `origin` (or every one heard), the link
+/// its sub last came in on and how long ago, the links up to it and the one room frames go out on, and the rooms routed
+/// to it (room ids, blake2b-8 of "<game>/<room>").
+pub fn routes(origin: Option<&str>) -> Value {
+    let st = rt().st.lock().unwrap();
+    let now = now_s();
+    let mut out = Vec::new();
+    for (o, (via, at)) in st.heard.iter() {
+        if origin.is_some_and(|x| !o.starts_with(x)) {
+            continue;
+        }
+        let rooms: Vec<&String> = st.routes.iter().filter(|(_, r)| r.contains_key(o)).map(|(rid, _)| rid).collect();
+        out.push(json!({"origin": o, "sub_via": via, "heard_s_ago": now.saturating_sub(*at), "conns": st.conns.get(o), "carrier": carrier(&st, o),
+                        "queued": st.outq.get(o).map(|q| q.len()).unwrap_or(0), "rooms": rooms}));
+    }
+    let mine: Vec<Value> = st.locals.keys().map(|r| json!({"room": r, "id": room_id(r)})).collect();
+    json!({"origins": out, "my_rooms": mine})
+}
+
 /// The link toward arcade `origin`: the one its sub came in on, if heard within `secs`.
 pub fn route_to(origin: &str, secs: u64) -> Option<String> {
     let now = now_s();

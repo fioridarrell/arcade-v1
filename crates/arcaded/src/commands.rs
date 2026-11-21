@@ -454,6 +454,7 @@ cmds! {
     "referee.get" Read "" "The referee arcade this one asks for seeds when a page names none, and whose key /r/verified trusts by default: {url, pubkey}, or {} when none is set.";
     "referee.set" Admin "url" "Name the referee arcade (https://...): its key is read from its /r/referee. An empty url clears it.";
     "realtime.lanes" Local "token" "Which players of the seat's room the fast lane reaches now (up), and how (routes: direct link or relay).";
+    "realtime.routes" Local "origin?" "For finding why a room doesn't connect: per arcade heard (origin: a node id or its start), the link its room sub came in on, the links up to it and the one room frames go out on, frames queued, and the rooms routed to it; and this arcade's own rooms with their ids.";
     "realtime.rtc" Local "token, peer, op, signal?" "A WebRTC link made by this arcade between an app window's seat (a room joined with fast) and a website viewer in its room, on the viewer's own wire (rtcsvc.rs): op offer (this seat's compact offer, when its id is the lower), signal (the viewer's compact offer or answer; an offer is answered), close. Once up (realtime.lanes: rtc), the window's realtime.media pieces and realtime.fast sends for that viewer go over it as RTP and data channels, and the viewer's come back as mchunk and fast events.";
     "realtime.rtc_status" Read "" "This arcade's WebRTC side: its UDP socket, candidates (host, STUN-mapped, relayed), relays and links.";
     "realtime.status" Read "" "Rooms this arcade has players in, and the routes it knows to other arcades' rooms.";
@@ -626,6 +627,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("node", "string", "An arcade's node id (hex)."),
     ("nonce", "string", "A sign-in nonce."),
     ("note", "string", "A note."),
+    ("origin", "string", "An arcade's node id, or its first hex digits."),
     ("notes", "string", "Notes."),
     ("number", "integer", "An issue or pull request number."),
     ("offset", "integer", "Rows to skip (from the newest unless the command says)."),

@@ -1162,6 +1162,8 @@ fn web_api(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
         }
     }
     req.insert("cmd".into(), json!(cmd));
+    // Came over the web API (2026-11-21): a command that reads a path on this computer (apps.publish's file) refuses.
+    req.insert("_web".into(), json!(true));
     let req = Value::Object(req);
     let key = r.headers.get("authorization").and_then(|v| v.as_str()).and_then(|v| v.strip_prefix("Bearer ")).map(|v| v.trim().to_string());
     if let Err((code, e)) = crate::apikeys::allow(node, key.as_deref(), &req) {

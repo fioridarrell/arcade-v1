@@ -183,13 +183,13 @@ pub fn send_own(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<(), Str
 }
 
 #[derive(Debug, PartialEq)]
-enum Where {
+pub(crate) enum Where {
     Block,
     Pool,
     Neither,
 }
 
-fn where_is(node: &Node, p: &'static ChainParams, tx: &Tx) -> Where {
+pub(crate) fn where_is(node: &Node, p: &'static ChainParams, tx: &Tx) -> Where {
     if crate::borrow::is_borrowed(p.key) {
         return if crate::borrow::pooled(p, &tx.txid) { Where::Pool } else if crate::borrow::mined(node, p, tx) { Where::Block } else { Where::Neither };
     }

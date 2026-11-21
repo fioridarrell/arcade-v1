@@ -17,7 +17,18 @@
       await invoke("open_app", { id: l.id, title: l.title, frame: l.frame });
       // The version that opened is one arcade's word (apps on a chain whose ledger isn't kept here): it opens, said.
       if (l.caution) note(`⚠ ${a.card.name}: ${l.caution}`);
+      // Withdrawn by its publisher (2026-11-21): it still opens (an installed copy is never taken away); said, with the
+      // replacement looked up in the store when the publisher named one.
+      if (l.withdrawn) withdrawnNote(a.card.name, l.withdrawn);
     } catch (e) { note(e.message, true); }
+  }
+
+  function withdrawnNote(name, w) {
+    note(`${name} was withdrawn by its publisher${w.reason ? ": " + w.reason : "."}${w.replaced_by ? " Replaced by " + w.replaced_by + " (shown in the store)." : ""}`);
+    if (w.replaced_by) {
+      const q = $("ap2-q");
+      if (q) { q.value = String(w.replaced_by).replace(/^[a-z0-9]+:/, ""); q.dispatchEvent(new Event("input")); }
+    }
   }
 
   // A theme app (category "themes", theme.js): checked, installed if it isn't, then worn (the window reloads).
@@ -33,7 +44,7 @@
 
   function byline(a) {
     const s = a.social || {};
-    return [a.creator_tag ? "@" + a.creator_tag : a.creator.slice(0, 10) + "…", ago(a.time), a.card.version ? "v" + a.card.version : null,
+    return [a.withdrawn ? "withdrawn by its publisher" : null, a.creator_tag ? "@" + a.creator_tag : a.creator.slice(0, 10) + "…", ago(a.time), a.card.version ? "v" + a.card.version : null,
       a.card.players ? a.card.players + " players" : null, s.tips ? `tipped ${s.tips} time${s.tips === 1 ? "" : "s"}` : null].filter(Boolean).join(" · ");
   }
 

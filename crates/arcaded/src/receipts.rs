@@ -16,6 +16,9 @@ pub fn is_send(cmd: &str) -> bool {
     crate::commands::find(cmd).is_some_and(crate::commands::is_send)
 }
 
+/// Sends that resume themselves under one client_ref (crate::apppub's journal) rather than replay their first answer.
+const RESUMES: &[&str] = &["apps.publish", "apps.withdraw"];
+
 /// Receipts kept; past this the oldest go.
 const KEEP: usize = 5000;
 /// Longest client_ref taken.
@@ -230,6 +233,9 @@ pub fn run(node: &Node, cmd: &str, req: &Value, f: impl FnOnce() -> Result<Value
         return f();
     }
     let r = client_ref(req)?;
+    // A send that finishes itself when asked again with the same client_ref (its own journal, never paying twice) is run
+    // again rather than answered from its receipt (2026-11-21: apps.publish, whose pieces may wait for a block).
+    let resumes = RESUMES.contains(&cmd);
     if let Some(r) = &r {
         // One at a time per key: a retry sent while the first still runs answers what it has signed so far (or,
         // before it signed anything, waits for it).
@@ -238,7 +244,7 @@ pub fn run(node: &Node, cmd: &str, req: &Value, f: impl FnOnce() -> Result<Value
             if running().insert(r.clone()) {
                 break;
             }
-            if let Some(old) = by_ref(node, r) {
+            if let Some(old) = by_ref(node, r).filter(|_| !resumes) {
                 return replay(&old, r, true);
             }
             if std::time::Instant::now() > until {
@@ -246,7 +252,7 @@ pub fn run(node: &Node, cmd: &str, req: &Value, f: impl FnOnce() -> Result<Value
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        if let Some(old) = by_ref(node, r) {
+        if let Some(old) = by_ref(node, r).filter(|_| !resumes) {
             running().remove(r);
             return replay(&old, r, false);
         }

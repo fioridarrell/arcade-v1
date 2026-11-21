@@ -58,12 +58,44 @@ half an hour) for the init phases to leave before it deletes the chain's file.
 
 ## Until it is built the chain is not used
 
+- Its coins and addresses are not answered: `ChainDb::coin`, `coins_for_script`,
+  `balance_for_script`, `history_for_script` and `spender` return an error while STATE `init` is
+  not `done` (so balances, sends, claims, swaps and the rest refuse rather than read a coin set
+  whose rules aren't checked yet); the Explorer answers nothing from the chain and the RPC
+  (`call_on`, also what borrowers ask) answers -28 "in an init install".
+
 - Its tip stays at genesis: no coins, so no balances from it; `far_behind` is true, so the
   arcade borrows the chain (as any chain catching up).
 - It is not lent (coreshare `lent`), not announced in bk `hi`, and bk `hq`/`bq` answer "not held".
 - No copies: `chains.copy_start`, `copy_from_dir` and `share.install` refuse while it runs, and
   `v1copy::checkpoint` only runs in the normal loop after it.
 - The sync watchdog counts it as held (no stall alarms while it stores).
+
+## Timing
+
+Every phase writes a timing line, kept with the chain (STATE `init_timing`, the last 40, in
+`chains.status` as `init_timing` and per row as `timing`) and in the journal ("init timing: ..."):
+
+```
+headers round 1: 925012 new headers to 925012 in 9m 12s · 1675.4 headers/s
+blocks round 1: 925012 blocks, 721034.2 MB stored in 3h 10m 04s · 81.1 blocks/s · 63.2 MB/s
+build main: 924724 heights joined in 41.2s
+build txs: 1201234567 tx index rows in 58m 10s · 344123.0 rows/s
+build coins: 924724 blocks derived on disk in 1d ... · 9.8 blocks/s
+build rules: 924724 blocks checked (heights 1..924724) in ... · ... blocks/s
+build coins written: 183000000 coins in ... · ... coins/s
+build: to block 924724 in ...: ...
+```
+
+(Illustrative numbers.) Same lines on every run, so runs on different machines compare.
+
+## Smoke test: stop the store phase at a height (testing only)
+
+`ARCADE_INIT_UPTO=<height>` in the arcade's environment: the headers phase runs as usual, the
+blocks phase stores only blocks up to that height, then the install holds there ("stopped at
+block N (ARCADE_INIT_UPTO, testing only)" in its status, with the last timing line); the build
+never starts and the chain stays unusable. Meant to measure download and store speed on a real
+chain (Bitcoin) with limited disk; remove the chain afterwards. Not for real installs.
 
 ## What is not checked, and when
 

@@ -1353,7 +1353,9 @@ fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
                 _ => return Err((-32602, "params must be an object (named parameters)".to_string())),
             };
             if method == "rpc.help" {
-                return Ok(crate::commands::help());
+                // 2026-11-21 (ARCADE #13): the same optional method and prefix filters as on the socket.
+                let f = |k: &str| req.get(k).and_then(|v| v.as_str()).filter(|v| !v.is_empty());
+                return Ok(crate::commands::help_for(f("method"), f("prefix")));
             }
             if crate::commands::find(method).is_none() {
                 return Err((-32601, format!("unknown method {method}; see rpc.help")));

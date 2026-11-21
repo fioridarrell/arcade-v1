@@ -104,7 +104,8 @@ pub fn error_code(e: &str) -> &'static str {
         "stopping"
     } else if l.contains("needs an api key") || l.contains("malformed api key") || l.contains("only available on this computer") || l.contains("not allowed") {
         "forbidden"
-    } else if l.contains(" required") || l.starts_with("bad request") || l.contains("is not a ") || l.contains(" must be ") || l.starts_with("give ") {
+    // "state is open, closed or merged, not bogus", "until: a, b or c, not x" (ARCADE #13: they came back as `error`).
+    } else if l.contains(" required") || l.starts_with("bad request") || l.contains("is not a ") || l.contains(" must be ") || l.starts_with("give ") || l.contains(", not ") {
         "bad_args"
     } else if l.contains("not installed") || l.contains("isn't running here") || (l.contains("borrowed") && l.contains("install")) {
         "not_installed"
@@ -261,8 +262,13 @@ fn chain_status_short(node: &Node, key: &str) -> Result<Value, String> {
     };
     let installed = st["installed"] == true;
     let borrowed = st["borrowed"] == true || st["mode"] == "borrowed";
+    // Nothing heard of this chain: no block of it here and no peer or lender telling a height (ARCADE #13: a borrowed
+    // chain nobody lends answered "synced", behind 0, with tip 0 and no hash). Borrowed and nobody lending: waiting.
+    let heard = tip_hash.is_some() || !from.is_null() || best.is_some_and(|b| b > 0);
     let sync = if !installed && !borrowed {
         "not_kept"
+    } else if !heard {
+        if borrowed && lenders.is_empty() { "waiting" } else { "unknown" }
     } else {
         match behind {
             None => "unknown",
@@ -404,7 +410,9 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
     match req["cmd"].as_str().unwrap_or("") {
         // The link that opens the desktop app's window in a browser (crate::webui; `arcade web`).
         "ui.link" => crate::webui::link(node, node.http_port.get().copied().unwrap_or(8420)),
-        "status" if req["chain"].as_str().is_some_and(|k| crate::chains::find(k).is_none_or(|x| x.chain_no != c)) => chain_status_short(node, req["chain"].as_str().unwrap()),
+        // Every chain named gets the same short answer, the first one too (ARCADE #13, 2026-11-21: `status {chain:
+        // peptest}` came back in the old shape, with no behind, mode, source or peer_tips).
+        "status" if req["chain"].as_str().is_some() => chain_status_short(node, req["chain"].as_str().unwrap()),
         "status" => {
             let tip = node.chain.tip(c).map_err(|e| e.to_string())?;
             use arcade_ledger::index;
@@ -420,9 +428,14 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
                 .iter()
                 .map(|(a, t)| json!({"peer": a, "height": t.height, "names_digest": t.names_digest}))
                 .collect();
+            // The first chain's sync as `status {chain}` says it (ARCADE #13: "starting" while phase was "ready").
+            let short = chain_status_short(node, p.key).ok();
+            let sync_state = node.sync_state.lock().unwrap().clone();
+            let sync = short.as_ref().and_then(|v| v["sync"].as_str().map(String::from)).filter(|_| phase() == "ready").unwrap_or(sync_state);
             Ok(json!({
                 "chain": p.name,
-                "sync": *node.sync_state.lock().unwrap(),
+                "sync": sync,
+                "behind": short.as_ref().map(|v| v["behind"].clone()),
                 "tip": tip.map(|t| json!({"height": t.height, "hash": t.hash.to_hex()})),
                 "best_known": best,
                 "tags": {"indexed_to": indexed_to, "count": tag_count, "names_digest": digest},
@@ -1440,6 +1453,8 @@ mod agent_tests {
         assert_eq!(error_code("not enough coins for 5 DOGE"), "insufficient_funds");
         assert_eq!(error_code("no transaction 55dd on ARCADE testnet (asked the mesh too: x)"), "not_found");
         assert_eq!(error_code("repo required"), "bad_args");
+        assert_eq!(error_code("state is open, closed or merged, not bogus"), "bad_args");
+        assert_eq!(error_code("until: accepted_local, broadcast_ok, seen_in_peer_mempool or confirmed, not x"), "bad_args");
         assert_eq!(error_code("ARCADE testnet is not installed"), "not_installed");
         assert_eq!(error_code("unknown chain zzz"), "unknown_chain");
         assert_eq!(error_code("something else"), "error");

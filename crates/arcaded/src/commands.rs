@@ -479,7 +479,7 @@ cmds! {
     "rpc.help" Public "" "Every command, its parameters and what it needs.";
     "arc.status" Public "" "The ARCADE chain run here: height, tip, rules {now, known, protocol, update_needed, outdated_peers}, the pool, storage weights, owners, genesis earners and this arcade's pay (all from the chain). {on: false} when it doesn't run here.";
     "tx.status" Read "chain, txid | client_ref" "Where a transaction stands as this arcade can tell: state confirmed {height, block, confirmations}, accepted_local (in its pool; on the ARCADE chain broadcast {peers_linked, peers_sent, peers_holding, peers_acked, peers_refused}), broadcast_failed (refused here or by every peer that answered: broadcast.refusals [{peer, code, error}], code fee_too_low, conflict, missing_coin, dust, not_yet_valid, blob_missing, pool_full, invalid, rules or unreachable), signed (signed here: the receipt is written the moment it is signed, before any network step; in no pool or block yet), dropped (signed here, gone 30 min later) or unknown; ever_signed_here, error (what the send answered, when it failed after signing), and code not_found when this arcade never signed it." => "{chain, txid, state, ever_signed_here, signed_at, client_ref, cmd, confirmed?, broadcast?, error?, as_of?}";
-    "tx.wait" Read "chain, txid | client_ref, until?, timeout?" "tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped or broadcast_failed, or after timeout seconds (default 60, at most 600) with timed_out: true." => "tx.status's answer + {timed_out}";
+    "tx.wait" Read "chain, txid | client_ref, until?, timeout?" "tx.status, answered once the transaction reaches until (accepted_local, broadcast_ok, seen_in_peer_mempool, confirmed; default confirmed) or is dropped or broadcast_failed, or after timeout seconds (default 60, at most 300: keep it under your client's socket timeout) with timed_out: true; reached (the milestone itself, not a failure first) and ended (until, broadcast_failed, dropped or timeout). Every tx.status answer carries milestones [{name, reached, by}] in order and milestone, the furthest reached." => "tx.status's answer + {timed_out, reached, ended}";
     "rpc.info" Local "" "Where the RPC and the web API are, and the cookie file.";
 }
 
@@ -739,7 +739,7 @@ pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
     ("fog.keep", "mode", "segment,pin", "\"segment\"", 0),
     ("cpu.set", "level", "low,balanced,full", "", 0),
     ("tx.wait", "until", "accepted_local,broadcast_ok,seen_in_peer_mempool,confirmed", "\"confirmed\"", 0),
-    ("tx.wait", "timeout", "", "60", 600),
+    ("tx.wait", "timeout", "", "60", 300),
     ("chains.wait", "timeout", "", "60", 600),
     ("events.since", "limit", "", "100", 1000),
     ("events.since", "wait", "", "0", 60),
@@ -987,7 +987,7 @@ mod tests {
         }
         let t = |c: &str, p: &str| params_of(find(c).unwrap()).into_iter().find(|x| x["name"] == p).unwrap();
         assert_eq!(t("tx.wait", "until")["enum"][0], "accepted_local");
-        assert_eq!(t("tx.wait", "timeout")["maximum"], 600);
+        assert_eq!(t("tx.wait", "timeout")["maximum"], 300);
         assert_eq!(t("tx.status", "txid")["one_of"], serde_json::json!(["txid", "client_ref"]));
         assert_eq!(t("tx.status", "chain")["required"], true);
         assert_eq!(t("explorer.arc_payouts", "blocks")["default"], 300);

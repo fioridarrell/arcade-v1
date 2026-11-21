@@ -131,7 +131,7 @@ fn names(f: &Fixture) -> Vec<String> {
 
 /// What removing converted rows from the tables will do (a later step): every settled row
 /// of the three tables goes, so only the files can answer for those heights, and the tx
-/// index and spends tables are flagged trimmed (their lookups read the files on a miss).
+/// index, spends and history tables are flagged trimmed (their readers use the files).
 fn remove_settled_rows(f: &Fixture, upto: u32) -> [usize; 3] {
     let c = f.p.chain_no;
     let settled = |b: u32| f.db.block_height_of(c, b).unwrap().is_some_and(|h| h <= upto);
@@ -150,13 +150,33 @@ fn remove_settled_rows(f: &Fixture, upto: u32) -> [usize; 3] {
             for (k, v) in &txs {
                 w.del_dup(TXS, k, v)?;
             }
-            for k in [Kind::Txs, Kind::Spends] {
+            for k in Kind::ALL {
                 w.put(STATE, &k_state(c, &crate::ixset::trimmed_name(k)), b"1")?;
             }
             Ok(())
         })
         .unwrap();
     [hist.len(), spends.len(), txs.len()]
+}
+
+/// Flag the tables trimmed without removing rows: the readers use the files (where both
+/// hold the same rows, the answers must not change).
+fn flag_trimmed(f: &Fixture, kinds: &[Kind]) {
+    let c = f.p.chain_no;
+    f.db.wstore(c)
+        .unwrap()
+        .write(|w| {
+            for k in kinds {
+                w.put(STATE, &k_state(c, &crate::ixset::trimmed_name(*k)), b"1")?;
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+fn generation(f: &Fixture, k: Kind) -> u32 {
+    let c = f.p.chain_no;
+    f.db.store(c).read(|r| crate::ixset::marker(r, c, k)).unwrap().map(|m| be(&m, 4)).unwrap_or(0)
 }
 
 fn be(b: &[u8], at: usize) -> u32 {
@@ -195,6 +215,8 @@ fn files_against_tables(small: bool) {
 
     // Tip 1360: heights up to 299 are whole ranges 1000 deep. One era (two ranges), one range.
     convert(&f, &opts());
+    // Read as once the tables are trimmed (they still hold every row: the same answers).
+    flag_trimmed(&f, &Kind::ALL);
     for k in Kind::ALL {
         assert_eq!(f.db.index_files_upto(c, k).unwrap(), Some(299), "{k:?}");
     }
@@ -299,6 +321,8 @@ fn damaged_or_missing_files_are_errors_not_wrong_answers() {
     f.db.connect_blocks(f.p, &blocks).unwrap();
     let classic = answers(&f, &blocks);
     convert(&f, &opts());
+    // History as it will be read once its table is trimmed: from the files.
+    flag_trimmed(&f, &[Kind::Hist]);
     let dir = f.db.index_dir(c);
     let s1 = script(1);
     assert!(!f.db.history_for_script(c, &s1).unwrap().is_empty());
@@ -427,6 +451,7 @@ fn a_deep_reorg_just_above_the_files() {
         x.db.connect_blocks(x.p, &blocks).unwrap();
     }
     convert(&f, &opts());
+    flag_trimmed(&f, &Kind::ALL);
     assert_eq!(f.db.index_files_upto(c, Kind::Hist).unwrap(), Some(299));
     // 990 blocks go: the tip is 370, only 71 above the files.
     for x in [&f, &classic] {
@@ -459,4 +484,65 @@ fn a_deep_reorg_just_above_the_files() {
     same(&answers(&f, &all), &want, "files up to 499 across the fork point");
     remove_settled_rows(&f, 499);
     same(&answers(&f, &all), &want, "settled rows only in files");
+}
+
+/// A pass that wrote its files and merged an era, then stopped before switching the
+/// readers (as a crash there would leave it): the readers keep the old files, and the next
+/// pass checks the merged era before adopting it (merging it again when it is damaged).
+#[test]
+fn a_pass_stopped_before_the_marker_is_carried_through_by_the_next() {
+    let c = fixture().p.chain_no;
+    let (f, other) = (fixture(), fixture());
+    let blocks = ix_chain(&f.g, 1560);
+    f.db.connect_blocks(f.p, &blocks[..1360]).unwrap();
+    convert(&f, &opts());
+    let gen = generation(&f, Kind::Txs);
+    f.db.connect_blocks(f.p, &blocks[1360..]).unwrap();
+    let want = answers(&f, &blocks);
+
+    crate::ixconv::FAIL_BEFORE_MARKER.with(|x| x.set(true));
+    let e = f.db.convert_to_index_files(f.p, &opts(), &AtomicBool::new(false), &mut |_| {}).unwrap_err().to_string();
+    crate::ixconv::FAIL_BEFORE_MARKER.with(|x| x.set(false));
+    assert!(e.contains("before the marker"), "{e}");
+    for k in Kind::ALL {
+        assert_eq!(f.db.index_files_upto(c, k).unwrap(), Some(299), "{k:?}");
+    }
+    let t = |a: u32, b: u32| crate::ixfile::file_name(Kind::Txs, a, b);
+    let have = names(&f);
+    for n in [t(0, 199), t(200, 299), t(200, 399), t(300, 399), t(400, 499)] {
+        assert!(have.contains(&n), "{n} in {have:?}");
+    }
+    // The readers still use the files up to 299 (the new era reaches too far for them).
+    flag_trimmed(&f, &Kind::ALL);
+    same(&answers(&f, &blocks), &want, "stopped before the marker");
+
+    // The merged era is damaged meanwhile: the next pass does not adopt it as it is.
+    let era = f.db.index_dir(c).join(t(200, 399));
+    let mut v = std::fs::read(&era).unwrap();
+    let mid = v.len() / 2;
+    for b in &mut v[mid..mid + 16] {
+        *b ^= 0xff;
+    }
+    std::fs::write(&era, &v).unwrap();
+    let notes = convert(&f, &opts());
+    assert!(notes.iter().any(|n| n.contains("merging it again")), "{notes:?}");
+    for k in Kind::ALL {
+        assert_eq!(f.db.index_files_upto(c, k).unwrap(), Some(499), "{k:?}");
+    }
+    assert!(generation(&f, Kind::Txs) > gen);
+    same(&answers(&f, &blocks), &want, "carried through");
+    other.db.connect_blocks(other.p, &blocks).unwrap();
+    convert(&other, &opts());
+    assert_eq!(files(&f), files(&other));
+
+    // Off, then converted from scratch: the generation never comes back to an old value,
+    // and a stray file of the kind is gone.
+    let gen = generation(&f, Kind::Txs);
+    f.db.set_index_files_off(c).unwrap();
+    std::fs::write(f.db.index_dir(c).join(t(0, 49)), b"left by something else").unwrap();
+    convert(&f, &opts());
+    assert!(generation(&f, Kind::Txs) > gen);
+    assert_eq!(files(&f), files(&other));
+    flag_trimmed(&f, &Kind::ALL);
+    same(&answers(&f, &blocks), &want, "converted again from scratch");
 }

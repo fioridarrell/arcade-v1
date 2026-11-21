@@ -48,3 +48,18 @@ Frames are `{"t": "sv", ...}`; older arcades ignore the kind.
 
 A grant is a Core-style signmessage, by the asker's ARCADE address, of
 `arcade-svc grant <service> <arcade> <address> <expires>`. It lasts a year at most.
+
+## Spending allowances (2026-11-21)
+
+An app may be given an allowance for a service: up to N ARCADE a day that it spends without a card, so it can keep
+its own credit topped up while it runs unattended. Any app, any service.
+
+- `arcade.svc.askAllowance(service, perDay, reason?)` asks the person on a card ("<app> asks to spend up to N ARCADE
+  a day on AI models (reason)"); `arcade.svc.allowance(service)` reads `{per_day, spent_today, left, payments}`.
+- A payment the app asks for with `arcade.svc.local(service, {what: "buy", amount, ...})` that fits what is left today
+  (UTC) is counted at once (`apps.allowance_use`) and goes without a card; one beyond it asks as before. A payment that
+  fails is given back.
+- With an allowance for a service, the app's other uses of it (asks, chats, the helper's reads) need no
+  once-a-window card either. A new key still asks.
+- The person sees and changes it in the app's details (Apps → Details → Allowances; 0 takes it away), or with
+  `apps.perms {id, set: {allowances: {<service>: N}}}`.

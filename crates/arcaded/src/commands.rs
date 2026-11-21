@@ -419,7 +419,9 @@ cmds! {
     "apps.uninstall" Admin "id" "Uninstall an app.";
     "apps.star" Admin "chain, txid, on?" "Star or unstar an app (starred show first).";
     "apps.card" Public "chain, txid" "One app: card, versions, comments, permission switches.";
-    "apps.perms" Admin "id, set?" "An app's permission switches (wallet, contacts, groups, media, pictures, notify).";
+    "apps.perms" Admin "id, set?" "An app's permission switches (wallet, contacts, groups, media, pictures, notify), and its spending allowances: set {allowances: {<service>: ARCADE a day, or 0 to take it away}}.";
+    "apps.allowance" Read "id | page, service" "An app's spending allowance for a service: {per_day, spent_today, left, payments} in ARCADE, today (UTC).";
+    "apps.allowance_use" Admin "id | page, service, amount, note?, undo?" "Count a payment (amount in ARCADE, not satoshis) an app asks for against today's allowance: {within: true} when it fits (counted at once; the app window then pays without a card), {within: false} when not (nothing counted). undo: true gives it back.";
     "apps.review" Admin "chain, txid, verdict" "Clear or confirm an app flagged as a lookalike.";
     "apps.trust" Admin "address, on?" "Trust a publisher (never flagged as a lookalike).";
     "apps.storage" Local "page, op, key?, value?" "An app page's saves (load, set, remove, clear, history), as arcade.storage.";
@@ -625,6 +627,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("node", "string", "An arcade's node id (hex)."),
     ("nonce", "string", "A sign-in nonce."),
     ("note", "string", "A note."),
+    ("undo", "boolean", "Give back what was counted."),
     ("notes", "string", "Notes."),
     ("number", "integer", "An issue or pull request number."),
     ("offset", "integer", "Rows to skip (from the newest unless the command says)."),

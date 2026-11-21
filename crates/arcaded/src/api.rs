@@ -686,6 +686,20 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             let id = s("id").ok_or("id required")?;
             if req["set"].is_object() { crate::appsvc::set_perms(node, &id, &req["set"]) } else { Ok(crate::appsvc::perms(node, &id)) }
         }
+        // Spending allowances (appsvc): by the app's id, or a page of it (the app window asks by its page).
+        c @ ("apps.allowance" | "apps.allowance_use") => {
+            let id = match s("id") {
+                Some(id) => id,
+                None => crate::appsvc::of_page(node, &s("page").ok_or("id or page required")?).and_then(|a| a["id"].as_str().map(String::from)).ok_or("no app has that page")?,
+            };
+            let service = s("service").ok_or("service required")?;
+            if c == "apps.allowance" {
+                crate::appsvc::allowance(node, &id, &service)
+            } else {
+                let amount = req["amount"].as_f64().ok_or("amount required (ARCADE)")?;
+                crate::appsvc::allowance_use(node, &id, &service, amount, &s("note").unwrap_or_default(), req["undo"] == true)
+            }
+        }
         "apps.review" => crate::appsvc::review(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?, &s("verdict").ok_or("verdict required (clear or confirm)")?),
         "apps.trust" => crate::appsvc::trust(node, &s("address").ok_or("address required")?, req["on"] != false),
         "inscribe" | "inscribe.estimate" => {

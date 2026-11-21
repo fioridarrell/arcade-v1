@@ -777,8 +777,103 @@ pub fn set_perms(node: &Node, id: &str, set: &Value) -> Result<Value, String> {
             v[k] = json!(b);
         }
     }
+    // Spending allowances (2026-11-21, Martin): {service: ARCADE a day, or null/0 to take it away}.
+    if let Some(m) = set["allowances"].as_object() {
+        let mut al = v["allowances"].as_object().cloned().unwrap_or_default();
+        for (svc, n) in m {
+            if !svc_name_ok(svc) {
+                return Err(format!("allowances: {svc} is no service name"));
+            }
+            match n.as_f64().filter(|x| *x > 0.0) {
+                Some(x) if x <= ALLOWANCE_MOST => {
+                    al.insert(svc.clone(), json!((x * 1e8).round() as u64));
+                }
+                Some(_) => return Err(format!("allowances: at most {ALLOWANCE_MOST} ARCADE a day")),
+                None => {
+                    al.remove(svc);
+                }
+            }
+        }
+        v["allowances"] = json!(al);
+    }
     meta_put(node, &format!("appperm:{id}"), &v)?;
     Ok(v)
+}
+
+// ---------------- spending allowances (2026-11-21) ----------------
+//
+// Martin: an app "should be given an allowance to spend on her own inference". Any app, any service: the person gives
+// an app up to N ARCADE a day for one service (the AI models', say); a payment the app asks for within what is left today
+// goes without a card, one beyond it asks as before. The allowance is kept with the app's permissions (`allowances`,
+// satoshis a day per service); what was spent, per app, service and day (UTC), in `appspend:`. The window reserves a
+// payment here before it pays (`allowance_use`), so two payments at once can't both fit what only one does, and gives it
+// back when the payment fails (`undo`).
+
+/// The most a day an allowance may be, in ARCADE.
+const ALLOWANCE_MOST: f64 = 10_000.0;
+static SPENDING: Mutex<()> = Mutex::new(());
+
+fn svc_name_ok(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 32 && s.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+fn today() -> u64 {
+    arcade_app::now() / 86_400
+}
+
+fn spent_key(id: &str, service: &str, day: u64) -> String {
+    format!("appspend:{id}:{service}:{day}")
+}
+
+/// An app's allowance for a service: {service, per_day, spent_today, left, payments} (ARCADE; payments today, newest
+/// first, at most 50).
+pub fn allowance(node: &Node, id: &str, service: &str) -> Result<Value, String> {
+    if !svc_name_ok(service) {
+        return Err("service: 1-32 of a-z, 0-9 and -".into());
+    }
+    let per_day = perms(node, id)["allowances"][service].as_u64().unwrap_or(0);
+    let spent = meta_get(node, &spent_key(id, service, today()));
+    let sats = spent["sats"].as_u64().unwrap_or(0);
+    Ok(json!({"id": id, "service": service, "per_day": per_day as f64 / 1e8, "spent_today": sats as f64 / 1e8,
+              "left": per_day.saturating_sub(sats) as f64 / 1e8, "payments": spent["payments"].clone()}))
+}
+
+/// Reserve `amount` ARCADE of today's allowance for a payment the app asks for: {within: true, ...} when it fits (it
+/// counts at once), {within: false, ...} when not (nothing counted: the window asks on a card). `undo` gives a
+/// reservation back (the payment failed).
+pub fn allowance_use(node: &Node, id: &str, service: &str, amount: f64, note: &str, undo: bool) -> Result<Value, String> {
+    if !(amount > 0.0) || !amount.is_finite() {
+        return Err("amount: ARCADE above zero".into());
+    }
+    let want = (amount * 1e8).round() as u64;
+    let _one = SPENDING.lock().unwrap();
+    let per_day = perms(node, id)["allowances"][service].as_u64().unwrap_or(0);
+    let key = spent_key(id, service, today());
+    let mut spent = meta_get(node, &key);
+    let sats = spent["sats"].as_u64().unwrap_or(0);
+    if undo {
+        spent["sats"] = json!(sats.saturating_sub(want));
+        let mut p: Vec<Value> = spent["payments"].as_array().cloned().unwrap_or_default();
+        p.insert(0, json!({"at": arcade_app::now(), "amount": -amount, "note": "given back: the payment failed"}));
+        p.truncate(50);
+        spent["payments"] = json!(p);
+        meta_put(node, &key, &spent)?;
+        drop(_one);
+        return allowance(node, id, service);
+    }
+    let within = per_day > 0 && sats + want <= per_day;
+    if within {
+        spent["sats"] = json!(sats + want);
+        let mut p: Vec<Value> = spent["payments"].as_array().cloned().unwrap_or_default();
+        p.insert(0, json!({"at": arcade_app::now(), "amount": amount, "note": note.chars().take(140).collect::<String>()}));
+        p.truncate(50);
+        spent["payments"] = json!(p);
+        meta_put(node, &key, &spent)?;
+    }
+    drop(_one);
+    let mut a = allowance(node, id, service)?;
+    a["within"] = json!(within);
+    Ok(a)
 }
 
 /// Ids of the apps whose Notifications switch is on.
@@ -1203,5 +1298,39 @@ mod withdraw_tests {
         // A "withdrawal" of X's family by Y is Y's own group (and offers nothing): X's app still blocks.
         assert!(app(vec![ver(&t('6'), "Y", 30, WHOLE)]).is_none());
         assert!(flagged(app(vec![ver(&t('1'), "X", 10, F1)]).unwrap()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod allowance_tests {
+    use super::*;
+
+    #[test]
+    fn payments_within_the_allowance_count_and_beyond_it_do_not() {
+        let (_one, t) = crate::http::tests::node();
+        let n = &t.node;
+        let id = "test-app-id";
+        // No allowance: nothing fits.
+        assert_eq!(allowance_use(n, id, "models", 1.0, "", false).unwrap()["within"], false);
+        set_perms(n, id, &json!({"allowances": {"models": 5}})).unwrap();
+        let a = allowance_use(n, id, "models", 2.0, "credit", false).unwrap();
+        assert_eq!(a["within"], true);
+        assert_eq!(a["spent_today"], 2.0);
+        assert_eq!(a["left"], 3.0);
+        // More than is left: refused and not counted.
+        let b = allowance_use(n, id, "models", 3.5, "", false).unwrap();
+        assert_eq!(b["within"], false);
+        assert_eq!(b["spent_today"], 2.0);
+        // Given back after a failed payment.
+        let c = allowance_use(n, id, "models", 2.0, "", true).unwrap();
+        assert_eq!(c["spent_today"], 0.0);
+        // Another service has its own (none here), and taking it away stops it.
+        assert_eq!(allowance_use(n, id, "speech", 1.0, "", false).unwrap()["within"], false);
+        set_perms(n, id, &json!({"allowances": {"models": 0}})).unwrap();
+        assert_eq!(allowance_use(n, id, "models", 1.0, "", false).unwrap()["within"], false);
+        assert!(set_perms(n, id, &json!({"allowances": {"Bad Name": 1}})).is_err());
+        assert!(set_perms(n, id, &json!({"allowances": {"models": 1e9}})).is_err());
+        // The other switches are untouched.
+        assert_eq!(perms(n, id)["wallet"], false);
     }
 }

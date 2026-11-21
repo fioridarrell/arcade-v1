@@ -1245,3 +1245,5 @@ fn one_chain_busy_doesnt_stop_another() {
     assert!(t.elapsed() < std::time::Duration::from_secs(10));
     assert!(!db.coins_settled(pa.chain_no), "busy counts as not settled, without waiting");
 }
+
+mod ix;

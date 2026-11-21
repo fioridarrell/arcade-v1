@@ -1138,7 +1138,7 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
                     let v = crate::explorer::handle(node, "explorer.address", &json!({"chain": pc.key, "address": address, "inscriptions": false})).unwrap_or(Value::Null);
                     (v["balance"].as_u64().unwrap_or(0), v["tx_count"].as_u64().unwrap_or(0) as usize)
                 }
-                Some(sc) => (node.chain.balance_for_script(pc.chain_no, sc).unwrap_or(0), node.chain.history_for_script(pc.chain_no, sc).map(|h| h.len()).unwrap_or(0)),
+                Some(sc) => (node.chain.balance_for_script(pc.chain_no, sc).unwrap_or(0), node.chain.history_count_for_script(pc.chain_no, sc).unwrap_or(0)),
                 None => (0, 0),
             };
             // Does someone else's profile state this address as theirs?

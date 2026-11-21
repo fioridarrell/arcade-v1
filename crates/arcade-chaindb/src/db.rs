@@ -300,6 +300,21 @@ pub(crate) fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Resu
     Ok(found)
 }
 
+/// The block number of the main chain's block at `height`, for a row of an index file
+/// (files name blocks by height; they only cover settled heights, so the block is there).
+fn ix_block_no<R: Rd>(r: &R, c: u16, height: u32) -> Result<u32> {
+    let v = r.get(HEIGHT, &k_height(c, height))?.ok_or(StoreError::Corrupt { table: HEIGHT, why: "no block at an index file row's height" })?;
+    Ok(be_u32(&v, 32))
+}
+
+/// The height of block number `b`, when it is on the main chain.
+fn main_height_of<R: Rd>(r: &R, c: u16, b: u32) -> Result<Option<u32>> {
+    let Some(m) = r.get(BLOCK_META, &k_block(c, b))? else { return Ok(None) };
+    let h80: [u8; 80] = m.get(..80).and_then(|x| x.try_into().ok()).ok_or(StoreError::Corrupt { table: BLOCK_META, why: "short block meta" })?;
+    let Some(rec) = header_rec(r, c, &Header::parse(&h80).hash())? else { return Ok(None) };
+    Ok(r.get(HEIGHT, &k_height(c, rec.height))?.is_some_and(|v| be_u32(&v, 32) == b).then_some(rec.height))
+}
+
 pub(crate) fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Result<Option<Coin>> {
     let c = params.chain_no;
     let Some(v) = r.get(OUTPUTS, &k_pos(c, b, p, vout))? else { return Ok(None) };
@@ -531,6 +546,8 @@ pub struct ChainDb {
     /// Chains whose tip was wound back when the databases opened (a stop that left without
     /// writing the coin caches): chain -> (tip it had, height it was wound back to).
     recovered_at_start: std::sync::Mutex<std::collections::HashMap<u16, (u32, u32)>>,
+    /// Open index files of chains that answer settled heights from them (ixset).
+    pub(crate) ixsets: crate::ixset::Cache,
 }
 
 /// Reads a sealed block back: (chain number, block hash) -> its raw bytes.
@@ -661,6 +678,7 @@ impl ChainDb {
             sealed: Default::default(),
             sealed_journal: Default::default(),
             recovered_at_start: Default::default(),
+            ixsets: Default::default(),
         };
         db.open_own_files()?;
         for c in 0..=255u16 {
@@ -689,6 +707,7 @@ impl ChainDb {
             sealed: Default::default(),
             sealed_journal: Default::default(),
             recovered_at_start: Default::default(),
+            ixsets: Default::default(),
         };
         db.open_own_files()?;
         db.load_runs()?;
@@ -748,6 +767,10 @@ impl ChainDb {
         }
         let name = chain_dir_name(c);
         let src = self.files.read().unwrap().get(&c).cloned().ok_or_else(|| other(format!("{name} has no file of its own to move")))?;
+        if self.has_index_files(c)? {
+            // The move copies the chain file only; the index files would stay behind.
+            return Err(other(format!("{name} answers from index files, which a move does not carry yet (docs/INDEXFILES.md)")));
+        }
         let home_dir = self.dir.join(&name);
         let from = self.own_dir(c);
         let target = to.map(Path::to_path_buf).unwrap_or_else(|| home_dir.clone());
@@ -1570,13 +1593,21 @@ impl ChainDb {
         self.store(c).read(|r| {
             let mut cands: Vec<(u32, u32)> = r.scan_prefix(TXS, &k_txs(c, &txid.t12()))?.iter().map(|(_, bp)| (be_u32(bp, 0), be_u32(bp, 4))).collect();
             cands.extend(crate::txruns::find(r, r.store_id(), c, &txid.t12())?);
-            for (b, p) in cands {
-                let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? else { continue };
-                if row_txid(&raw, params)? == *txid {
-                    return Ok(if is_pruned(&raw) { Err((b, p)) } else { Ok((raw, b)) }.into());
+            let mut files_read = false;
+            loop {
+                for (b, p) in cands {
+                    let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? else { continue };
+                    if row_txid(&raw, params)? == *txid {
+                        return Ok(if is_pruned(&raw) { Err((b, p)) } else { Ok((raw, b)) }.into());
+                    }
                 }
+                if files_read {
+                    return Ok(None);
+                }
+                // Not in the table: the tx index files (settled heights), where this chain has them.
+                cands = self.ix_tx_cands(r, c, &txid.t12())?;
+                files_read = true;
             }
-            Ok(None)
         })
         .map(|found: Option<std::result::Result<(Vec<u8>, u32), (u32, u32)>>| match found {
             Some(Ok(x)) => Some(x),
@@ -1608,7 +1639,38 @@ impl ChainDb {
 
     /// Where a transaction is (block number, position), even when its body is pruned.
     pub fn tx_location(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
-        self.store(params.chain_no).read(|r| locate(r, params, txid))
+        self.store(params.chain_no).read(|r| self.locate_any(r, params, txid))
+    }
+
+    /// Where transactions whose id starts with `t12` are according to the tx index FILES:
+    /// (block number, position), lowest first. Empty when the chain has none. The files
+    /// keep 8 bytes of the txid: the caller confirms the id on the stored transaction.
+    fn ix_tx_cands<R: Rd>(&self, r: &R, c: u16, t12: &[u8; 12]) -> Result<Vec<(u32, u32)>> {
+        let Some(set) = self.ix(r, c, crate::ixfile::Kind::Txs)? else { return Ok(Vec::new()) };
+        let mut out = Vec::new();
+        for (h, p) in set.tx_candidates(t12)? {
+            out.push((ix_block_no(r, c, h)?, p));
+        }
+        Ok(out)
+    }
+
+    /// [`locate`] for the public readers: the tx index table first (everything, until rows
+    /// are removed from it; always the heights above the files), then the tx index files.
+    /// Block connection keeps to the table alone.
+    fn locate_any<R: Rd>(&self, r: &R, params: &ChainParams, txid: &Hash256) -> Result<Option<(u32, u32)>> {
+        if let Some(found) = locate(r, params, txid)? {
+            return Ok(Some(found));
+        }
+        let c = params.chain_no;
+        let mut found = None;
+        for (b, p) in self.ix_tx_cands(r, c, &txid.t12())? {
+            if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
+                if row_txid(&raw, params)? == *txid {
+                    found = Some((b, p)); // the latest stored copy wins, as in the table
+                }
+            }
+        }
+        Ok(found)
     }
 
     /// Txid at a block number and position (pruned or not).
@@ -1822,10 +1884,12 @@ impl ChainDb {
             let mut out = Vec::new();
             let mut cands: Vec<(u32, u32)> = r.scan_prefix(TXS, &k_txs(c, t12))?.iter().map(|(_, bp)| (be_u32(bp, 0), be_u32(bp, 4))).collect();
             cands.extend(crate::txruns::find(r, r.store_id(), c, t12)?);
+            cands.extend(self.ix_tx_cands(r, c, t12)?);
             for (b, p) in cands {
                 if let Some(raw) = r.get(BLOCK_TX, &k_block_tx(c, b, p))? {
                     let txid = row_txid(&raw, params)?;
-                    if !out.contains(&txid) {
+                    // (The tx index files match on 8 bytes only.)
+                    if txid.t12() == *t12 && !out.contains(&txid) {
                         out.push(txid);
                     }
                 }
@@ -1836,7 +1900,7 @@ impl ChainDb {
 
     /// An unspent output.
     pub fn coin(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<Coin>> {
-        self.store(params.chain_no).read(|r| match locate(r, params, &op.txid)? {
+        self.store(params.chain_no).read(|r| match self.locate_any(r, params, &op.txid)? {
             Some((b, p)) => coin_at(r, params, b, p, op.vout),
             None => Ok(None),
         })
@@ -1875,29 +1939,75 @@ impl ChainDb {
             .sum())
     }
 
-    /// An address's history rows: (height, txid prefix, received, spent).
+    /// An address's history rows: (height, txid prefix, received, spent), by height then
+    /// prefix. Settled heights come from the history files where the chain has them (the
+    /// files name a transaction by its position; its id is read from the stored block, one
+    /// read per row: [`history_count_for_script`](Self::history_count_for_script) counts
+    /// without), the heights above them from the table.
     pub fn history_for_script(&self, c: u16, script: &[u8]) -> Result<Vec<(u32, [u8; 12], u64, u64)>> {
         let sid = script_id(script);
         let pre = k_sid(c, &sid);
-        Ok(self
-            .store(c)
-            .read(|r| r.scan_prefix(SCRIPT_HIST, &pre))?
-            .iter()
-            .map(|(k, v)| {
-                let n = pre.len();
-                (be_u32(k, n), k[n + 4..n + 16].try_into().unwrap(), be_u64(v, 0), be_u64(v, 8))
-            })
-            .collect())
+        let n = pre.len();
+        let row = |(k, v): &(Vec<u8>, Vec<u8>)| (be_u32(k, n), k[n + 4..n + 16].try_into().unwrap(), be_u64(v, 0), be_u64(v, 8));
+        self.store(c).read(|r| {
+            let Some(set) = self.ix(r, c, crate::ixfile::Kind::Hist)? else {
+                return Ok(r.scan_prefix(SCRIPT_HIST, &pre)?.iter().map(row).collect());
+            };
+            let params = arcade_chain::params::ALL_CHAINS.iter().find(|p| p.chain_no == c).ok_or_else(|| other("history files on a chain without known params"))?;
+            let mut out: Vec<(u32, [u8; 12], u64, u64)> = Vec::new();
+            let mut at: Option<(u32, u32)> = None; // (height, its block number)
+            for (h, p, recv, spent) in set.history(&sid)? {
+                let b = match at {
+                    Some((ah, b)) if ah == h => b,
+                    _ => ix_block_no(r, c, h)?,
+                };
+                at = Some((h, b));
+                let raw = r.get(BLOCK_TX, &k_block_tx(c, b, p))?.ok_or(StoreError::Corrupt { table: BLOCK_TX, why: "a history row's tx is missing" })?;
+                out.push((h, row_txid(&raw, params)?.t12(), recv, spent));
+            }
+            out.sort_unstable_by_key(|x| (x.0, x.1)); // the table's order
+            out.extend(self.hist_tail(r, &pre, set.upto)?.iter().map(row));
+            Ok(out)
+        })
     }
 
-    /// Who spent an outpoint: (block number, position, input index).
+    /// The table's history rows of an address above height `upto`.
+    fn hist_tail(&self, r: &ReadTxn, pre: &[u8], upto: u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+        let Some(from) = upto.checked_add(1) else { return Ok(Vec::new()) };
+        r.scan_after(SCRIPT_HIST, pre, Some(&[pre, &from.to_be_bytes()[..]].concat()), usize::MAX)
+    }
+
+    /// How many history rows an address has (no transaction is read).
+    pub fn history_count_for_script(&self, c: u16, script: &[u8]) -> Result<usize> {
+        let sid = script_id(script);
+        let pre = k_sid(c, &sid);
+        self.store(c).read(|r| match self.ix(r, c, crate::ixfile::Kind::Hist)? {
+            Some(set) => Ok(set.history_len(&sid)? + self.hist_tail(r, &pre, set.upto)?.len()),
+            None => Ok(r.scan_prefix(SCRIPT_HIST, &pre)?.len()),
+        })
+    }
+
+    /// Who spent an outpoint: (block number, position, input index). The spends table
+    /// first; then, where the chain has spends files, the files from the coin's height on
+    /// (a spend is filed under the spender's height).
     pub fn spender(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<(u32, u32, u32)>> {
         let c = params.chain_no;
-        self.store(c).read(|r| match locate(r, params, &op.txid)? {
-            Some((b, p)) => Ok(r
-                .get(SPENDS, &k_pos(c, b, p, op.vout))?
-                .map(|v| (be_u32(&v, 0), be_u32(&v, 4), be_u32(&v, 8)))),
-            None => Ok(None),
+        self.store(c).read(|r| {
+            let Some((b, p)) = self.locate_any(r, params, &op.txid)? else { return Ok(None) };
+            let key = k_pos(c, b, p, op.vout);
+            if let Some(v) = r.get(SPENDS, &key)? {
+                return Ok(Some((be_u32(&v, 0), be_u32(&v, 4), be_u32(&v, 8))));
+            }
+            let Some(set) = self.ix(r, c, crate::ixfile::Kind::Spends)? else { return Ok(None) };
+            // A coin still unspent has no spender: no file is read for it.
+            if r.get(OUTPUTS, &key)?.is_some() {
+                return Ok(None);
+            }
+            let Some(h) = main_height_of(r, c, b)? else { return Ok(None) };
+            match set.spender(h, p, op.vout)? {
+                Some((sh, sp, vin)) => Ok(Some((ix_block_no(r, c, sh)?, sp, vin))),
+                None => Ok(None),
+            }
         })
     }
 

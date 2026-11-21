@@ -1,0 +1,344 @@
+//! Index files against the classic tables (docs/INDEXFILES.md): the same answers from
+//! every reader whether a chain's settled rows are read from the tables or from files.
+
+use super::*;
+use crate::ixconv::{Layout, Options};
+use crate::ixfile::Kind;
+use std::collections::BTreeMap;
+use std::sync::atomic::AtomicBool;
+
+fn script(i: u32) -> Vec<u8> {
+    let tag = (i % 40) as u8;
+    if tag % 4 == 3 {
+        let mut s = vec![0xa9, 0x14];
+        s.extend_from_slice(&[tag; 20]);
+        s.push(0x87);
+        s
+    } else {
+        p2pkh(tag)
+    }
+}
+
+/// A chain over 40 addresses: three spending transactions a block, coins spent in the block
+/// that made them and coins spent hundreds of blocks later, addresses paid and spending in
+/// one transaction.
+fn ix_chain(g: &Block, n: u32) -> Vec<Block> {
+    let mut coins: Vec<(Hash256, u32, u64, u32)> = Vec::new();
+    let mut prev = g.hash();
+    let mut out = Vec::new();
+    let mut seed = 11u32;
+    let mut rnd = || {
+        seed = seed.wrapping_mul(1103515245).wrapping_add(12345);
+        seed >> 8
+    };
+    for h in 1..=n {
+        let cb = tx(&[], &[(1000 + h as u64, script(h))], h);
+        let mut txs = vec![cb.clone()];
+        let mut fresh = vec![(cb.txid, 0, 1000 + h as u64, h)];
+        for k in 0..3 {
+            if coins.len() < 2 {
+                break;
+            }
+            // Mostly a recent coin (as on real chains), sometimes any coin.
+            let mut pick = |coins: &mut Vec<(Hash256, u32, u64, u32)>| {
+                let i = if rnd() % 3 == 0 { rnd() as usize % coins.len() } else { coins.len() - 1 - (rnd() as usize % coins.len().min(6)) };
+                coins.remove(i)
+            };
+            let a = pick(&mut coins);
+            let b = pick(&mut coins);
+            let total = a.2 + b.2;
+            let t1 = rnd() % 40;
+            let t2 = if k == 0 { a.3 } else { t1 };
+            let s = tx(&[(a.0, a.1), (b.0, b.1)], &[(total / 2, script(t1)), (total - total / 2, script(t2))], 0);
+            if k == 1 {
+                // Spendable by the next transaction of this same block.
+                coins.push((s.txid, 0, total / 2, t1));
+                coins.push((s.txid, 1, total - total / 2, t2));
+            } else {
+                fresh.push((s.txid, 0, total / 2, t1));
+                fresh.push((s.txid, 1, total - total / 2, t2));
+            }
+            txs.push(s);
+        }
+        coins.extend(fresh);
+        let blk = block(prev, txs, 10 + h);
+        prev = blk.hash();
+        out.push(blk);
+    }
+    out
+}
+
+/// The usual fixture, on params without block rules: these chains are longer than the
+/// height from which Pepecoin's testnet wants newer block versions.
+fn fixture() -> Fixture {
+    let mut f = super::fixture();
+    let mut p = f.p.clone();
+    p.block_rules = None;
+    f.p = Box::leak(Box::new(p));
+    f
+}
+
+fn opts() -> Options {
+    Options { layout: Layout { range: 100, era_ranges: 2, depth: UNDO_DEPTH }, level: 3, threads: 2, chunk_rows: 500, checkpoint_rows: 2000 }
+}
+
+fn convert(f: &Fixture, o: &Options) -> Vec<String> {
+    let mut notes = Vec::new();
+    assert!(f.db.convert_to_index_files(f.p, o, &AtomicBool::new(false), &mut |s| notes.push(s)).unwrap());
+    notes
+}
+
+/// Every reader's answer about every address, transaction and output of `blocks` (and
+/// about some that do not exist).
+fn answers(f: &Fixture, blocks: &[Block]) -> Vec<String> {
+    let c = f.p.chain_no;
+    let mut out = Vec::new();
+    for i in 0..41 {
+        let s = if i == 40 { vec![0x51] } else { script(i) };
+        let h = f.db.history_for_script(c, &s).unwrap();
+        assert_eq!(f.db.history_count_for_script(c, &s).unwrap(), h.len());
+        out.push(format!("hist {i}: {h:?}"));
+    }
+    let mut txids: Vec<(Hash256, usize)> = blocks.iter().flat_map(|b| b.txs.iter().map(|t| (t.txid, t.outputs.len()))).collect();
+    txids.push((Hash256([0xee; 32]), 1));
+    for (id, outs) in txids {
+        out.push(format!("raw {id}: {:?}", f.db.tx_raw(f.p, &id).unwrap()));
+        out.push(format!("loc {id}: {:?} {:?}", f.db.tx_location(f.p, &id).unwrap(), f.db.txids_by_t12(f.p, &id.t12()).unwrap()));
+        for vout in 0..outs as u32 + 1 {
+            let op = OutPoint { txid: id, vout };
+            out.push(format!("out {id}:{vout}: {:?} {:?}", f.db.spender(f.p, &op).unwrap(), f.db.coin(f.p, &op).unwrap().map(|x| (x.value, x.height, x.script))));
+        }
+    }
+    out
+}
+
+fn same(a: &[String], b: &[String], what: &str) {
+    assert_eq!(a.len(), b.len(), "{what}");
+    for (x, y) in a.iter().zip(b) {
+        assert_eq!(x, y, "{what}");
+    }
+}
+
+fn files(f: &Fixture) -> BTreeMap<String, Vec<u8>> {
+    std::fs::read_dir(f.db.index_dir(f.p.chain_no))
+        .map(|rd| rd.flatten().map(|e| (e.file_name().to_string_lossy().to_string(), std::fs::read(e.path()).unwrap())).collect())
+        .unwrap_or_default()
+}
+
+fn names(f: &Fixture) -> Vec<String> {
+    files(f).into_keys().collect()
+}
+
+/// What removing converted rows from the tables will do (a later step): every settled row
+/// of the three tables goes, so only the files can answer for those heights.
+fn remove_settled_rows(f: &Fixture, upto: u32) -> [usize; 3] {
+    let c = f.p.chain_no;
+    let settled = |b: u32| f.db.block_height_of(c, b).unwrap().is_some_and(|h| h <= upto);
+    let hist: Vec<_> = f.db.scan_all(SCRIPT_HIST).unwrap().into_iter().filter(|(k, _)| be(k, 23) <= upto).collect();
+    let spends: Vec<_> = f.db.scan_all(SPENDS).unwrap().into_iter().filter(|(_, v)| settled(be(v, 0))).collect();
+    let txs: Vec<_> = f.db.scan_all(TXS).unwrap().into_iter().filter(|(_, v)| settled(be(v, 0))).collect();
+    f.db.wstore(c)
+        .unwrap()
+        .write(|w| {
+            for (k, _) in &hist {
+                w.del(SCRIPT_HIST, k)?;
+            }
+            for (k, _) in &spends {
+                w.del(SPENDS, k)?;
+            }
+            for (k, v) in &txs {
+                w.del_dup(TXS, k, v)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    [hist.len(), spends.len(), txs.len()]
+}
+
+fn be(b: &[u8], at: usize) -> u32 {
+    u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
+}
+
+#[test]
+fn files_answer_exactly_as_the_tables() {
+    let c = fixture().p.chain_no;
+    let (f, classic) = (fixture(), fixture());
+    let blocks = ix_chain(&f.g, 1560);
+    for x in [&f, &classic] {
+        x.db.connect_blocks(x.p, &blocks[..1360]).unwrap();
+    }
+    let want = answers(&classic, &blocks);
+    same(&answers(&f, &blocks), &want, "before any files");
+    assert!(names(&f).is_empty());
+    assert!(!f.db.has_index_files(c).unwrap());
+
+    // Tip 1360: heights up to 299 are whole ranges 1000 deep. One era (two ranges), one range.
+    convert(&f, &opts());
+    for k in Kind::ALL {
+        assert_eq!(f.db.index_files_upto(c, k).unwrap(), Some(299), "{k:?}");
+    }
+    let expect = |spans: &[(u32, u32)]| -> Vec<String> {
+        let mut v: Vec<String> = Kind::ALL.iter().flat_map(|k| spans.iter().map(|(a, b)| crate::ixfile::file_name(*k, *a, *b))).collect();
+        v.sort();
+        v
+    };
+    assert_eq!(names(&f), expect(&[(0, 199), (200, 299)]));
+    let info = f.db.index_files_info(c).unwrap();
+    assert!(info.iter().all(|(_, upto, n, rows, _)| (*upto, *n) == (299, 2) && *rows > 300), "{info:?}");
+    same(&answers(&f, &blocks), &want, "files up to 299, tables above");
+    // Nothing more is settled: running it again changes nothing.
+    let before = files(&f);
+    assert!(convert(&f, &opts()).is_empty());
+    assert_eq!(files(&f), before);
+
+    // A reorg near the tip is the tables' business alone.
+    for x in [&f, &classic] {
+        for _ in 0..3 {
+            x.db.disconnect_tip(c).unwrap();
+        }
+    }
+    same(&answers(&f, &blocks), &answers(&classic, &blocks), "three blocks disconnected");
+
+    // The chain grows: two more ranges settle, and 200..=399 becomes an era.
+    for x in [&f, &classic] {
+        x.db.connect_blocks(x.p, &blocks[1357..]).unwrap();
+    }
+    let want = answers(&classic, &blocks);
+    same(&answers(&f, &blocks), &want, "grown, files still up to 299");
+    let notes = convert(&f, &opts());
+    assert!(notes.iter().any(|n| n.contains("era 200..=399 merged")), "{notes:?}");
+    assert_eq!(names(&f), expect(&[(0, 199), (200, 399), (400, 499)]));
+    for k in Kind::ALL {
+        assert_eq!(f.db.index_files_upto(c, k).unwrap(), Some(499));
+    }
+    same(&answers(&f, &blocks), &want, "files up to 499");
+
+    // Another arcade converting the same chain in one go writes the same bytes
+    // (its 200..=399 era is written directly, never merged).
+    let other = fixture();
+    other.db.connect_blocks(other.p, &blocks).unwrap();
+    convert(&other, &Options { threads: 5, chunk_rows: 64, ..opts() });
+    assert_eq!(files(&other), files(&f));
+
+    // With the settled rows gone from the tables, only the files can answer: the same.
+    let gone = remove_settled_rows(&f, 499);
+    assert!(gone.iter().all(|n| *n > 400), "{gone:?}");
+    same(&answers(&f, &blocks), &want, "settled rows only in files");
+
+    // Turned off, the tables answer alone (here: with their settled rows removed).
+    f.db.set_index_files_off(c).unwrap();
+    assert!(f.db.history_for_script(c, &script(1)).unwrap().iter().all(|r| r.0 > 499));
+    assert!(f.db.tx_raw(f.p, &blocks[10].txs[0].txid).unwrap().is_none());
+}
+
+#[test]
+fn a_stopped_conversion_carries_on_to_the_same_files() {
+    let (f, whole) = (fixture(), fixture());
+    let blocks = ix_chain(&f.g, 1360);
+    for x in [&f, &whole] {
+        x.db.connect_blocks(x.p, &blocks).unwrap();
+    }
+    convert(&whole, &opts());
+
+    // Stopped after every chunk of 64 table rows.
+    let o = Options { chunk_rows: 64, checkpoint_rows: 64, ..opts() };
+    let stop = AtomicBool::new(true);
+    let mut runs = 0;
+    let mut carried = 0;
+    while !f.db.convert_to_index_files(f.p, &o, &stop, &mut |s| carried += s.contains("carrying on") as u32).unwrap() {
+        runs += 1;
+        assert!(runs < 2000, "no progress");
+        // Until a kind is finished nothing reads its files.
+        if runs == 3 {
+            assert!(!f.db.has_index_files(f.p.chain_no).unwrap());
+        }
+    }
+    assert!(runs > 100 && carried > 100, "{runs} runs, {carried} carried on");
+    assert_eq!(files(&f), files(&whole));
+    same(&answers(&f, &blocks), &answers(&whole, &blocks), "after a conversion in pieces");
+
+    // A checkpoint of another job (another layout) is not carried on.
+    let g = fixture();
+    g.db.connect_blocks(g.p, &blocks).unwrap();
+    assert!(!g.db.convert_to_index_files(g.p, &Options { layout: Layout { range: 50, era_ranges: 2, depth: UNDO_DEPTH }, ..o }, &stop, &mut |_| {}).unwrap());
+    assert!(names(&g).iter().any(|n| n.ends_with(".tmp")));
+    convert(&g, &opts());
+    assert_eq!(files(&g), files(&whole));
+}
+
+#[test]
+fn damaged_or_missing_files_are_errors_not_wrong_answers() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    let blocks = ix_chain(&f.g, 1360);
+    f.db.connect_blocks(f.p, &blocks).unwrap();
+    let classic = answers(&f, &blocks);
+    convert(&f, &opts());
+    let dir = f.db.index_dir(c);
+    let s1 = script(1);
+    assert!(!f.db.history_for_script(c, &s1).unwrap().is_empty());
+
+    // Bytes changed inside a history file's block: the read fails.
+    let path = dir.join(crate::ixfile::file_name(Kind::Hist, 0, 199));
+    let good = std::fs::read(&path).unwrap();
+    let mut bad = good.clone();
+    for b in &mut bad[100..140] {
+        *b ^= 0xff;
+    }
+    std::fs::write(&path, &bad).unwrap();
+    let e = f.db.history_for_script(c, &s1).unwrap_err().to_string();
+    assert!(e.contains("damaged"), "{e}");
+    assert!(f.db.history_count_for_script(c, &s1).is_err());
+    std::fs::write(&path, &good).unwrap();
+    assert!(f.db.history_for_script(c, &s1).is_ok());
+
+    // A file of the set missing, cut short, or from another chain: the set does not load.
+    let reload = || f.db.ixsets.lock().unwrap().clear();
+    std::fs::write(&path, &good[..good.len() - 7]).unwrap();
+    reload();
+    assert!(f.db.history_for_script(c, &s1).is_err());
+    std::fs::remove_file(&path).unwrap();
+    reload();
+    let e = f.db.history_for_script(c, &s1).unwrap_err().to_string();
+    assert!(e.contains("none starts at height 0"), "{e}");
+    let mut alien = good.clone();
+    alien[40] ^= 1; // the hash of the block the file ends on (and with it the checksum)
+    std::fs::write(&path, &alien).unwrap();
+    reload();
+    assert!(f.db.history_for_script(c, &s1).is_err());
+    // The other kinds are not touched by it.
+    assert!(f.db.tx_raw(f.p, &blocks[5].txs[0].txid).unwrap().is_some());
+
+    // Back to the tables alone: every answer as before the conversion.
+    f.db.set_index_files_off(c).unwrap();
+    same(&answers(&f, &blocks), &classic, "files off");
+}
+
+#[test]
+fn nothing_is_converted_before_it_is_settled() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    let blocks = ix_chain(&f.g, 1098);
+    f.db.connect_blocks(f.p, &blocks).unwrap();
+    // Tip 1098: the first range (0..=99) is 999 deep.
+    assert!(convert(&f, &opts()).is_empty());
+    assert!(!f.db.has_index_files(c).unwrap());
+    assert!(names(&f).is_empty());
+    // A sealing depth inside the undo window is refused.
+    let shallow = Options { layout: Layout { range: 100, era_ranges: 2, depth: UNDO_DEPTH - 1 }, ..opts() };
+    assert!(f.db.convert_to_index_files(f.p, &shallow, &AtomicBool::new(false), &mut |_| {}).is_err());
+    // Address rows still waiting in the log: not yet.
+    let g = fixture();
+    g.db.connect_blocks_with(g.p, &blocks, true, true).unwrap();
+    assert!(g.db.addresses_pending(c).unwrap());
+    assert!(g.db.convert_to_index_files(g.p, &opts(), &AtomicBool::new(false), &mut |_| {}).is_err());
+    // Addresses off: the tx index alone is converted.
+    let h = fixture();
+    h.db.set_addresses_off(c).unwrap();
+    h.db.connect_blocks(h.p, &ix_chain(&h.g, 1199)).unwrap();
+    convert(&h, &opts());
+    assert_eq!(h.db.index_files_upto(c, Kind::Txs).unwrap(), Some(199));
+    assert_eq!(h.db.index_files_upto(c, Kind::Hist).unwrap(), None);
+    assert_eq!(h.db.index_files_upto(c, Kind::Spends).unwrap(), None);
+    assert_eq!(names(&h), [crate::ixfile::file_name(Kind::Txs, 0, 199)]);
+}

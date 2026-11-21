@@ -364,7 +364,7 @@ fn not_ready<R: crate::db::Rd>(r: &R, c: u16, kind: Kind, upto: u32, epoch: Opti
     if r.get(STATE, &k_state(c, TXS_PENDING))?.is_some() || (addr && r.get(STATE, &k_state(c, PENDING))?.is_some()) {
         return Ok(Some("address rows or tx index rows are still being built".into()));
     }
-    if let Some((k, _)) = r.first(ADDR_LOG, &k_chain(c))? {
+    if let Some((k, _)) = r.first(ADDR_LOG, &k_chain(c))?.as_ref() {
         if k.len() >= 6 && be_u32(k, 2) <= upto {
             return Ok(Some(format!("rows of height {} still wait in the address log", be_u32(k, 2))));
         }

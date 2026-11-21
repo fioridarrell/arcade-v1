@@ -731,7 +731,7 @@ impl ChainDb {
                 }
                 written += self.write_batch(c, kind, table, &batch)?;
                 writes += 1;
-                if writes % SAVE_EVERY == 0 {
+                if writes.is_multiple_of(SAVE_EVERY) {
                     saved(key_of(batch.last().unwrap()))?;
                 }
                 batch.clear();

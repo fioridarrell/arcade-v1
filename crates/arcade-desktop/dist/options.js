@@ -175,7 +175,24 @@ $("o-si-on").addEventListener("change", async (e) => {
   refreshSysinfo();
 });
 
+// How much of this computer the arcade uses (cpu.status / cpu.set; Martin 2026-11-20: "we need to chill out a bit").
+async function refreshCpu() {
+  let st;
+  try { st = await api("cpu.status"); } catch (e) { say("o-cpu-msg", e.message, true); return; }
+  if (document.activeElement !== $("o-cpu-level")) $("o-cpu-level").value = st.level;
+  if (!$("o-cpu-msg").dataset.kept) say("o-cpu-msg", `${st.cores} of this computer's ${st.all_cores} cores for heavy work${st.nice ? ", below your own programs" : ""}${st.nice_from_env != null ? " (priority set by ARCADE_NICE)" : ""}.`);
+}
+$("o-cpu-level").addEventListener("change", async (e) => {
+  try {
+    const r = await api("cpu.set", { level: e.target.value });
+    $("o-cpu-msg").dataset.kept = "1";
+    say("o-cpu-msg", r.applied_now ? `Now ${r.level}: ${r.cores} of ${r.all_cores} cores for heavy work.` : `Kept: ${r.level}. ${r.note || ""}`);
+  } catch (err) { say("o-cpu-msg", err.message, true); }
+  setTimeout(() => { delete $("o-cpu-msg").dataset.kept; refreshCpu(); }, 4000);
+});
+
 async function refreshOptions() {
+  refreshCpu();
   refreshDisk();
   refreshRelay();
   refreshSysinfo();

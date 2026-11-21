@@ -204,13 +204,13 @@ fn seal_into(node: &Node, p: &ChainParams, family: u8, dir: &std::path::Path, se
         read_exact_at(&data, &mut l[..n], at)?;
         Ok(l)
     };
-    // 2. Seal every leaf, on every core; each leaf goes to its place in sealed.bin.
+    // 2. Seal every leaf, on the cores the CPU level allows (crate::cpu); each leaf goes to its place in sealed.bin.
     let me = node.identity.verifying_key().to_bytes();
     let sealed = std::fs::OpenOptions::new().read(true).write(true).create(true).truncate(true).open(dir.join("sealed.bin")).map_err(io)?;
     sealed.set_len(leaves * SEALED_LEAF as u64).map_err(io)?;
     let done = AtomicU64::new(0);
     let next = AtomicU64::new(0);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads = crate::cpu::cores();
     const CHUNK: u64 = 256;
     let failed: Mutex<Option<String>> = Mutex::new(None);
     std::thread::scope(|sc| {
@@ -561,7 +561,7 @@ fn seal_run(me: &[u8; 32], mask: &Hash, start: u64, data: &[u8], file: &std::fs:
     let leaves = (data.len() as u64).div_ceil(DATA_LEAF as u64);
     let next = AtomicU64::new(0);
     let failed: Mutex<Option<String>> = Mutex::new(None);
-    let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    let threads = crate::cpu::cores();
     const CHUNK: u64 = 256;
     std::thread::scope(|sc| {
         for _ in 0..threads {

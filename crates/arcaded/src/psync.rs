@@ -22,6 +22,7 @@ use arcade_chain::p2p::HeaderEntry;
 use arcade_chain::params::ChainParams;
 use arcade_chain::{Block, Hash256};
 use arcade_chaindb::sync::{BlockSource, Syncer};
+use arcade_chaindb::ChainDb;
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Condvar, Mutex};
@@ -82,6 +83,10 @@ struct State {
     refused: u64,
     next_id: u32,
     failed: Option<String>,
+    /// Store-only mode: sources that already failed a job (refused it, left blocks out, or
+    /// failed to send): the job goes to another source; one that failed every job left steps
+    /// aside.
+    tried: HashMap<u32, std::collections::HashSet<String>>,
 }
 
 /// Bytes one job should carry: one source must finish it well within the connector's wait,
@@ -107,10 +112,6 @@ pub struct Pool {
     /// Store-only mode: jobs in any order, each worker stores its own (run_store).
     any_order: bool,
 }
-
-/// A job fetched again more often than this (refused or failed by every source it went to)
-/// ends a store-only round with an error.
-const MAX_TRIES: u32 = 12;
 
 impl Pool {
     fn put_back(&self, job: Job) {
@@ -261,7 +262,7 @@ impl BlockSource for Prefetched<'_> {
 }
 
 /// `store`: store-only mode (the node and chain to store into).
-fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, store: Option<(&Node, &'static ChainParams)>) {
+fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, store: Option<(&ChainDb, &'static ChainParams)>) {
     let mut fails = 0;
     while !pool.stop.load(Ordering::Relaxed) {
         let job = {
@@ -293,7 +294,20 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                     break j;
                 }
                 if ahead_ok {
-                    let mut j = st.queue.pop_front().unwrap();
+                    let mut j = if pool.any_order {
+                        // Not a job this source failed already (another one fetches it); with
+                        // only those left, this source steps aside.
+                        match st.queue.iter().position(|j| !st.tried.get(&j.start).is_some_and(|t| t.contains(&name))) {
+                            Some(i) => st.queue.remove(i).unwrap(),
+                            None => {
+                                st.workers -= 1;
+                                pool.cv.notify_all();
+                                return;
+                            }
+                        }
+                    } else {
+                        st.queue.pop_front().unwrap()
+                    };
                     // A doubled job that another source already delivered: skip it.
                     if j.start < st.want || st.ready.contains_key(&j.start) || st.taken.contains(&j.start) {
                         continue;
@@ -317,14 +331,22 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
             }
         };
         let t_job = Instant::now();
-        if let Some((node, p)) = store {
+        if let Some((db, p)) = store {
             // Store-only: this worker checks and stores what it fetched (any order).
             let got = src.get_blocks(&job.hashes);
-            if pool.s.lock().unwrap().taken.contains(&job.start) {
-                continue;
+            {
+                let st = pool.s.lock().unwrap();
+                // The round is over (stopped, or the chain removed): nothing more is written.
+                if pool.stop.load(Ordering::Relaxed) {
+                    drop(st);
+                    break;
+                }
+                if st.taken.contains(&job.start) {
+                    continue;
+                }
             }
             let res = match got {
-                Ok(raws) => node.chain.init_store(p, &job.hashes, &raws).map(|r| (r, raws.iter().map(|x| x.len()).sum::<usize>())).map_err(|e| Some(e.to_string())),
+                Ok(raws) => db.init_store(p, &job.hashes, &raws).map(|r| (r, raws.iter().map(|x| x.len()).sum::<usize>())).map_err(|e| Some(e.to_string())),
                 Err(_) => Err(None),
             };
             let mut st = pool.s.lock().unwrap();
@@ -339,16 +361,17 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                         st.avg_block = if st.avg_block == 0 { per } else { (st.avg_block * 4 + per) / 5 };
                         *st.stats.entry(name.clone()).or_insert(0) += r.stored as u64;
                     }
+                    let mut tried = st.tried.remove(&job.start).unwrap_or_default();
                     if !r.again.is_empty() {
-                        if job.tries + 1 >= MAX_TRIES {
-                            st.failed = Some(format!("block {} was refused or not sent by every source tried ({}x){}", r.again[0], job.tries + 1,
-                                r.refused.first().map(|(_, why)| format!(": {why}")).unwrap_or_default()));
-                        }
+                        // Fetched again by another source (a new job id, with who failed it).
+                        tried.insert(name.clone());
                         let id = st.next_id;
                         st.next_id += r.again.len() as u32;
+                        st.tried.insert(id, tried);
                         st.queue.push_front(Job { start: id, hashes: r.again, tries: job.tries + 1 });
-                        // A source that sends damaged or other blocks steps aside after a few.
-                        fails += usize::from(!r.refused.is_empty());
+                        // A source that sends damaged or other blocks, or leaves some out, steps
+                        // aside after a few such batches in a row.
+                        fails += 1;
                     } else {
                         fails = 0;
                     }
@@ -364,6 +387,7 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                     break;
                 }
                 Err(None) => {
+                    st.tried.entry(job.start).or_default().insert(name.clone());
                     drop(st);
                     pool.put_back(job);
                     fails += 1;
@@ -497,6 +521,25 @@ fn recruit_peer(node: &Node, p: &'static ChainParams, tried: &[String]) -> Optio
     node.coin_candidates(p).iter().filter(|a| !tried.contains(a)).take(6).find_map(|a| arcade_chain::p2p::Peer::connect(p, a, Duration::from_secs(6)).ok())
 }
 
+/// Every arcade offering the chain (at `min_h` or above), dialed: (worker name, source).
+fn dial_offers<'a>(node: &'a Node, p: &'static ChainParams, offers: &[(String, String, &'static str, u64)], min_h: u32) -> Vec<(String, Box<dyn BlockSource + Send + 'a>)> {
+    let short = |id: &str| id[..id.len().min(8)].to_string();
+    let mut out = Vec::new();
+    for (id, addr, kind, their) in offers.iter() {
+        if (*their as u32) < min_h {
+            continue;
+        }
+        let src: Option<Box<dyn BlockSource + Send>> = match *kind {
+            "bk" => crate::meshsource::MeshSource::dial_chain(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
+            _ => crate::crsource::CoreShareSource::dial(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
+        };
+        if let Some(src) = src {
+            out.push((format!("arcade {}", short(id)), src));
+        }
+    }
+    out
+}
+
 /// Every arcade offering the chain (at `min_h` or above), then P2P_WANT P2P peers kept working
 /// (a peer that drops out is replaced; one that failed rests 10 minutes). `store`: the workers
 /// store what they fetch (run_store) instead of handing it to the ordered side.
@@ -509,22 +552,15 @@ fn spawn_sources<'scope, 'env>(
     min_h: u32,
     store: bool,
 ) {
-    let short = |id: &str| id[..id.len().min(8)].to_string();
-    // Every arcade offering the chain, then a few P2P peers.
-    for (id, addr, kind, their) in offers.iter() {
-        if (*their as u32) < min_h {
-            continue;
-        }
-        let src: Option<Box<dyn BlockSource + Send>> = match *kind {
-            "bk" => crate::meshsource::MeshSource::dial_chain(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
-            _ => crate::crsource::CoreShareSource::dial(node, addr, p).ok().map(|s| Box::new(s) as Box<dyn BlockSource + Send>),
-        };
-        if let Some(src) = src {
-            pool.s.lock().unwrap().workers += 1;
-            let name = format!("arcade {}", short(id));
-            sc.spawn(move || worker(pool, name, src, store.then_some((node, p))));
-        }
+    for (name, src) in dial_offers(node, p, offers, min_h) {
+        pool.s.lock().unwrap().workers += 1;
+        sc.spawn(move || worker(pool, name, src, store.then_some((&node.chain, p))));
     }
+    spawn_recruiter(sc, node, p, pool, min_h, store);
+}
+
+/// P2P_WANT of the coin's P2P peers (at `min_h` or above) kept working for `pool`.
+fn spawn_recruiter<'scope, 'env>(sc: &'scope std::thread::Scope<'scope, 'env>, node: &'env Node, p: &'static ChainParams, pool: &'env Pool, min_h: u32, store: bool) {
     // P2P peers: keep P2P_WANT of them working; when one drops out, recruit a fresh one.
     // A peer that failed rests for 10 minutes before it is tried again.
     let pool_r = pool;
@@ -555,7 +591,7 @@ fn spawn_sources<'scope, 'env>(
                             busy.insert(a.clone());
                             let name = format!("P2P {}", peer.addr.ip());
                             sc.spawn(move || {
-                                worker(pool_r, name, Box::new(peer), store.then_some((node, p)));
+                                worker(pool_r, name, Box::new(peer), store.then_some((&node.chain, p)));
                                 pool_r.s.lock().unwrap().p2p -= 1;
                             });
                         }
@@ -671,6 +707,28 @@ pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h
     if hashes.is_empty() {
         return Ok(0);
     }
+    let offers = node.offers_for(p.key);
+    let arcades = dial_offers(node, p, &offers, min_h);
+    store_round(&node.chain, p, hashes, arcades, Some((node, min_h)), Duration::from_secs(360), on_progress, stop)
+}
+
+/// A store-only round over `sources` (and, with `recruit`, the coin's P2P peers kept working):
+/// see [`run_store`]. Ends when every block was stored, at a stop, when the store fails, or
+/// when no source worked for `idle`.
+#[allow(clippy::too_many_arguments)]
+fn store_round<'a>(
+    db: &'a ChainDb,
+    p: &'static ChainParams,
+    hashes: &[Hash256],
+    sources: Vec<(String, Box<dyn BlockSource + Send + 'a>)>,
+    recruit: Option<(&'a Node, u32)>,
+    idle: Duration,
+    on_progress: &dyn Fn(String),
+    stop: &AtomicBool,
+) -> Result<u64, String> {
+    if hashes.is_empty() {
+        return Ok(0);
+    }
     let n = hashes.len() as u32;
     let mut st = State { next_id: n, ..Default::default() };
     // Jobs by position in `hashes` (a job split later keeps its range); refetches get ids past n.
@@ -678,10 +736,16 @@ pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h
         st.queue.push_back(Job { start: i as u32 * JOB, hashes: chunk.to_vec(), tries: 0 });
     }
     let pool = Pool { s: Mutex::new(st), cv: Condvar::new(), stop: AtomicBool::new(false), top: n, any_order: true };
-    let offers = node.offers_for(p.key);
     let t0 = Instant::now();
     let res = std::thread::scope(|sc| -> Result<(), String> {
-        spawn_sources(sc, node, p, &pool, &offers, min_h, true);
+        let pool = &pool;
+        for (name, src) in sources {
+            pool.s.lock().unwrap().workers += 1;
+            sc.spawn(move || worker(pool, name, src, Some((db, p))));
+        }
+        if let Some((node, min_h)) = recruit {
+            spawn_recruiter(sc, node, p, pool, min_h, true);
+        }
         let mut last_note = Instant::now() - Duration::from_secs(10);
         let mut idle_since: Option<Instant> = None;
         let r = loop {
@@ -698,7 +762,7 @@ pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h
                 }
                 // Nobody working for a while (the recruiter keeps trying meanwhile).
                 if st.workers == 0 {
-                    if idle_since.get_or_insert_with(Instant::now).elapsed() > Duration::from_secs(360) {
+                    if idle_since.get_or_insert_with(Instant::now).elapsed() > idle {
                         break Err("every source stopped".into());
                     }
                 } else {
@@ -720,4 +784,141 @@ pub fn run_store(node: &Node, p: &'static ChainParams, hashes: &[Hash256], min_h
     });
     let stored = pool.s.lock().unwrap().stored;
     res.map(|_| stored)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use arcade_chain::encode::write_varint;
+    use arcade_chain::hash::merkle_root;
+    use arcade_chain::pow::{meets_target, try_pow_hash, PowAlgo};
+    use arcade_chain::{Header, Tx};
+
+    const EASY: u32 = 0x207fffff;
+
+    fn mine(prev: Hash256, tag: u32) -> Block {
+        let mut o = 1i32.to_le_bytes().to_vec();
+        write_varint(&mut o, 1);
+        o.extend_from_slice(&[0; 32]);
+        o.extend_from_slice(&u32::MAX.to_le_bytes());
+        write_varint(&mut o, 4);
+        o.extend_from_slice(&tag.to_le_bytes());
+        o.extend_from_slice(&u32::MAX.to_le_bytes());
+        write_varint(&mut o, 1);
+        o.extend_from_slice(&50u64.to_le_bytes());
+        write_varint(&mut o, 1);
+        o.push(0x51);
+        o.extend_from_slice(&0u32.to_le_bytes());
+        let cb = Tx::parse(&o).unwrap();
+        let mut header = Header { version: 1, prev, merkle_root: merkle_root(&[cb.txid]), time: 1_600_000_000 + 60 * tag, bits: EASY, nonce: 0 };
+        while try_pow_hash(PowAlgo::Sha256d, &header.encode()).is_some_and(|h| !meets_target(&h, EASY)) {
+            header.nonce += 1;
+        }
+        let mut raw = header.encode().to_vec();
+        write_varint(&mut raw, 1);
+        raw.extend_from_slice(&cb.raw);
+        Block::parse(&raw).unwrap()
+    }
+
+    /// A source: honest, mute (sends no blocks) or one that damages every block.
+    #[derive(Clone)]
+    struct Src {
+        blocks: Vec<Block>,
+        kind: u8,
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl BlockSource for Src {
+        fn get_headers(&mut self, locator: &[Hash256]) -> Result<Vec<HeaderEntry>, String> {
+            let from = locator.iter().find_map(|l| self.blocks.iter().position(|b| b.hash() == *l)).map(|i| i + 1).unwrap_or(0);
+            Ok(self.blocks[from..].iter().map(|b| HeaderEntry { header: b.header, auxpow: None }).collect())
+        }
+        fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>, String> {
+            self.asked.fetch_add(hashes.len(), Ordering::Relaxed);
+            match self.kind {
+                1 => Ok(vec![]),
+                _ => Ok(hashes
+                    .iter()
+                    .filter_map(|h| self.blocks.iter().find(|b| b.hash() == *h))
+                    .map(|b| {
+                        let mut raw = b.encode();
+                        if self.kind == 2 {
+                            let n = raw.len();
+                            raw[n - 5] ^= 1;
+                        }
+                        raw
+                    })
+                    .collect()),
+            }
+        }
+        fn describe(&self) -> String {
+            "test".into()
+        }
+    }
+
+    fn setup(n: u32) -> (tempfile::TempDir, ChainDb, &'static ChainParams, Vec<Block>) {
+        let mut blocks = vec![mine(Hash256::ZERO, 0)];
+        for h in 1..=n {
+            let prev = blocks.last().unwrap().hash();
+            blocks.push(mine(prev, h));
+        }
+        let mut p = arcade_chain::params::BITCOIN_MAIN.clone();
+        p.value_rules = None;
+        p.block_rules = None;
+        p.genesis = Box::leak(blocks[0].hash().to_hex().into_boxed_str());
+        p.genesis_header = "";
+        p.pow_limit_bits = EASY;
+        p.checkpoints = &[];
+        let p: &'static ChainParams = Box::leak(Box::new(p));
+        let d = tempfile::tempdir().unwrap();
+        let db = ChainDb::open(d.path().join("chain.mdbx")).unwrap();
+        let mut src = Src { blocks: blocks.clone(), kind: 0, asked: Default::default() };
+        let s = Syncer::new(&db, p);
+        s.ensure_genesis(&mut src).unwrap();
+        while s.sync_headers_once(&mut src).unwrap() > 0 {}
+        (d, db, p, blocks)
+    }
+
+    fn src(blocks: &[Block], kind: u8) -> (Src, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let s = Src { blocks: blocks.to_vec(), kind, asked: Default::default() };
+        let a = s.asked.clone();
+        (s, a)
+    }
+
+    #[test]
+    fn a_store_round_gets_past_mute_and_damaging_sources() {
+        let (_d, db, p, blocks) = setup(1200);
+        let missing = db.init_missing(p.chain_no).unwrap();
+        assert_eq!(missing.len(), 1200);
+        let (good, _) = src(&blocks, 0);
+        let (mute, mute_asked) = src(&blocks, 1);
+        let (bad, bad_asked) = src(&blocks, 2);
+        let sources: Vec<(String, Box<dyn BlockSource + Send>)> = vec![("mute".into(), Box::new(mute)), ("bad".into(), Box::new(bad)), ("good".into(), Box::new(good))];
+        let n = store_round(&db, p, &missing, sources, None, Duration::from_secs(5), &|_| {}, &AtomicBool::new(false)).unwrap();
+        assert_eq!(n, 1200);
+        assert!(db.init_missing(p.chain_no).unwrap().is_empty());
+        for b in &blocks[1..] {
+            assert_eq!(db.block_raw(p.chain_no, &b.hash()).unwrap(), Some(b.encode()));
+        }
+        // Each bad source stepped aside after a few batches (it never stalls the round).
+        assert!(mute_asked.load(Ordering::Relaxed) <= 3 * JOB as usize, "{}", mute_asked.load(Ordering::Relaxed));
+        assert!(bad_asked.load(Ordering::Relaxed) <= 3 * JOB as usize, "{}", bad_asked.load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn a_store_round_of_mute_sources_ends_instead_of_spinning() {
+        let (_d, db, p, blocks) = setup(300);
+        let missing = db.init_missing(p.chain_no).unwrap();
+        let sources: Vec<(String, Box<dyn BlockSource + Send>)> = (0..3).map(|i| (format!("mute{i}"), Box::new(src(&blocks, 1).0) as Box<dyn BlockSource + Send>)).collect();
+        let t0 = Instant::now();
+        let r = store_round(&db, p, &missing, sources, None, Duration::from_secs(1), &|_| {}, &AtomicBool::new(false));
+        assert_eq!(r.unwrap_err(), "every source stopped");
+        assert!(t0.elapsed() < Duration::from_secs(60));
+        assert_eq!(db.init_missing(p.chain_no).unwrap().len(), 300);
+        // A stop ends a round at once, with nothing written after it.
+        let (good, _) = src(&blocks, 0);
+        let stop = AtomicBool::new(true);
+        let n = store_round(&db, p, &missing, vec![("good".into(), Box::new(good) as Box<dyn BlockSource + Send>)], None, Duration::from_secs(1), &|_| {}, &stop).unwrap();
+        assert_eq!(n, db.init_missing(p.chain_no).map(|m| 300 - m.len() as u64).unwrap());
+    }
 }

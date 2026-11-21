@@ -7,6 +7,7 @@ pub mod coreimport;
 pub mod copyout;
 pub mod db;
 pub mod indexer;
+pub mod ixfile;
 pub mod journal;
 pub mod rules;
 pub mod proven;

@@ -23,7 +23,7 @@
 //! Until build is done the chain's tip stays where it was (genesis): it has no coins, no
 //! balances, and is offered to no one.
 
-use crate::coreimport::{check_stored_block, DiskReplay, Note, Replay, TRUSTED, VERIFIED};
+use crate::coreimport::{check_stored_block, DiskReplay, Note, Replay, Sorted, Sorter, TRUSTED, VERIFIED};
 use crate::db::*;
 use crate::schema::*;
 use crate::sync::{BlockSource, Syncer};
@@ -48,6 +48,9 @@ pub const INIT_BUILT: &str = "init_built";
 pub const INIT_TO: &str = "init_to";
 /// STATE: the rules check has passed every block up to this height (resume point).
 pub const INIT_RULES_TO: &str = "init_rules_to";
+/// STATE: blocks the rules refused once, dropped and fetched again (comma list of hashes): one
+/// refused again is the chain's own.
+pub const INIT_REFETCHED: &str = "init_refetched";
 
 /// Independent sources that must agree on the best header.
 pub const MIN_AGREE: usize = 3;
@@ -122,11 +125,12 @@ fn short(h: &Hash256) -> String {
     x[..x.len().min(12)].to_string()
 }
 
-/// A source's answer to "headers after `best`": agreement means it has `best` as its tip
-/// (nothing after it) or extends it (the first header builds on it). A source on another
-/// chain doesn't know `best` and answers from its fork point or from genesis.
-pub fn agrees(best: &Hash256, reply: &[HeaderEntry]) -> bool {
-    reply.first().is_none_or(|e| e.header.prev == *best)
+/// A source's answer to "headers after `best`'s parent": agreement means the first header it
+/// sends is `best` itself (it has `best` on its chain, as its tip or under it). A source on
+/// another chain sends another header there, or answers from its fork point or genesis; one
+/// behind sends nothing. An empty answer never agrees: it proves nothing.
+pub fn agrees(params: &ChainParams, best: &Hash256, reply: &[HeaderEntry]) -> bool {
+    reply.first().is_some_and(|e| params.block_id(&e.header) == *best)
 }
 
 /// A source asked for headers with our own locator along the best header chain (the Syncer's
@@ -172,6 +176,8 @@ pub struct Built {
     pub coins: u64,
     pub rules_checked: u64,
     pub on_disk: bool,
+    /// Blocks the rules refused, dropped to be fetched again: the phase is back at blocks.
+    pub refetch: usize,
 }
 
 impl ChainDb {
@@ -195,7 +201,7 @@ impl ChainDb {
                 return Err(err(format!("an init install starts from nothing; this chain is at block {} already", t.height)));
             }
         }
-        for k in [INIT_ROUND, INIT_NOTE, INIT_BUILT, INIT_TO, INIT_RULES_TO] {
+        for k in [INIT_ROUND, INIT_NOTE, INIT_BUILT, INIT_TO, INIT_RULES_TO, INIT_REFETCHED] {
             self.set_state_text(c, k, None)?;
         }
         self.set_init_phase(c, Phase::Headers)
@@ -303,7 +309,7 @@ impl ChainDb {
     /// One headers round: headers from every source until each has nothing new (a source that
     /// sends a bad header or fails is left out of the count), then each is asked what follows
     /// our best header. `sources`: (independence key, source); two sources with the same key
-    /// count once (the caller keys P2P peers by network group, arcades by node id).
+    /// count once (the caller keys every source by its network, so one host, P2P or arcade, counts once).
     pub fn init_headers_round(&self, syncer: &Syncer, sources: &mut [(String, &mut dyn BlockSource)], stop: &AtomicBool) -> Result<Agreement> {
         let p = syncer.params;
         let c = p.chain_no;
@@ -331,18 +337,21 @@ impl ChainDb {
         a.best = best;
         a.height = rec.height;
         a.work_ok = rec.work >= p.min_chain_work();
+        // Asked from best's parent, an agreeing source must send best itself.
+        let ask = if rec.height > 0 { rec.header.prev } else { best };
         let mut agree: Vec<String> = Vec::new();
         for (key, src) in sources.iter_mut() {
             if let Some(why) = failed.get(key) {
                 a.differ.push(format!("{key}: {why}"));
                 continue;
             }
-            match src.get_headers(&[best]) {
-                Ok(reply) if agrees(&best, &reply) => {
+            match src.get_headers(&[ask]) {
+                Ok(reply) if rec.height > 0 && agrees(p, &best, &reply) => {
                     if !agree.contains(key) {
                         agree.push(key.clone());
                     }
                 }
+                Ok(reply) if reply.is_empty() => a.differ.push(format!("{key}: sent nothing after our best header's parent")),
                 Ok(_) => a.differ.push(format!("{key}: on another chain")),
                 Err(e) => a.differ.push(format!("{key}: {e}")),
             }
@@ -428,10 +437,18 @@ impl ChainDb {
     /// Each step is recorded once done (INIT_BUILT), so a restart carries on from the next.
     /// `threads`: for the rules check; `budget`: bytes the coin derivation may hold in memory
     /// before it goes on on disk; `tmp`: its scratch space (and the tx index sort's).
+    ///
+    /// The coin set is derived alongside the rules check but written only once the rules passed.
+    /// Blocks the rules refuse are dropped and fetched again once (`Built::refetch`, the phase back
+    /// at blocks): a stored body could be a damaged copy, not the chain's block. A chain that
+    /// breaks the rules even so, or spends coins it never made, is a [`StoreError::InvalidBlock`]
+    /// (no retry fixes it); any other error (stopped, the disk) may pass on a retry.
     #[allow(clippy::too_many_arguments)]
     pub fn init_build(&self, params: &ChainParams, tail: u32, threads: usize, budget: usize, tmp: &Path, stop: &AtomicBool, note: Note) -> Result<Built> {
         let c = params.chain_no;
         self.flush_coins(c)?;
+        // Scratch an earlier run left is of no use: its sorts and the derivation start over.
+        let _ = std::fs::remove_dir_all(tmp);
         let tip = self.tip(c)?.ok_or_else(|| err("connect genesis first"))?;
         // The target: fixed when the build starts, so a restart builds the same blocks.
         let (to, target) = match self.state_text(c, INIT_TO)?.and_then(|s| {
@@ -466,6 +483,7 @@ impl ChainDb {
             self.mark_built(c, "main")?;
             done.insert("main".into());
         }
+        stopped(stop)?;
         // 2. The tx index, one sorted pass.
         if !done.contains("txs") {
             let bs: Vec<u32> = path.iter().map(|h| self.header(c, h).map(|r| r.map(|r| r.b).unwrap_or(0))).collect::<Result<_>>()?;
@@ -474,7 +492,9 @@ impl ChainDb {
             self.mark_built(c, "txs")?;
             done.insert("txs".into());
         }
-        // 3. The coin set derived from the blocks, while the rules are checked on every core.
+        stopped(stop)?;
+        // 3. The coin set derived from the blocks (not written yet), while the rules are checked
+        //    on every core.
         let rules_on = (params.value_rules.is_some() || params.block_rules.is_some()) && !done.contains("rules");
         let rules_from = self.state_text(c, INIT_RULES_TO)?.and_then(|s| s.parse::<u32>().ok()).map(|h| h + 1).unwrap_or(1).max(tip.height + 1);
         let halt = AtomicBool::new(false);
@@ -494,7 +514,7 @@ impl ChainDb {
             let coins = if done.contains("coins") {
                 None
             } else {
-                let r = self.init_coins(params, to, budget, &tmp.join("coins"), stop, &mut |s: String| note(format!("build: {s}{}", rules_text(&seen))));
+                let r = self.init_coins_derive(params, to, budget, &tmp.join("coins"), stop, &mut |s: String| note(format!("build: {s}{}", rules_text(&seen))));
                 if r.is_err() {
                     halt.store(true, Ordering::Relaxed);
                 }
@@ -516,8 +536,7 @@ impl ChainDb {
         let mut first_err = None;
         if let Some(r) = rules {
             if r.broken_count > 0 {
-                let (h, hash, why) = r.broken.first().cloned().unwrap_or_default();
-                first_err = Some(err(format!("{} blocks break the chain's rules, the first at {h} ({hash}): {why}; the build stops here", r.broken_count)));
+                return self.init_refused(params, &r, out);
             } else if r.no_body > 0 || r.no_coin > 0 {
                 first_err = Some(err(format!("the rules check could not read {} blocks and {} spent coins", r.no_body, r.no_coin)));
             } else if r.done_to < to {
@@ -531,21 +550,29 @@ impl ChainDb {
             // Checked before a restart (or nothing to check).
             self.mark_built(c, "rules")?;
         }
-        match coins {
-            Some(Ok((n, on_disk))) => {
-                out.coins = n;
-                out.on_disk = on_disk;
-                self.mark_built(c, "coins")?;
-            }
+        let derived = match coins {
+            Some(Ok(d)) => Some(d),
+            // The derivation's own error says more than the "stopped" of the rules check it halted.
             Some(Err(e)) => {
-                first_err.get_or_insert(e);
+                if first_err.is_none() || !is_stopped(&e) {
+                    first_err = Some(e);
+                }
+                None
             }
-            None => {}
-        }
+            None => None,
+        };
         if let Some(e) = first_err {
             return Err(e);
         }
-        // 4. The tip moves: the chain is usable, the normal sync carries on from here.
+        // 4. The coin set is written, now that the rules passed.
+        if let Some(d) = derived {
+            let (n, on_disk) = self.init_coins_apply(params, d, &tmp.join("coins"), stop, note)?;
+            out.coins = n;
+            out.on_disk = on_disk;
+            self.mark_built(c, "coins")?;
+        }
+        stopped(stop)?;
+        // 5. The tip moves: the chain is usable, the normal sync carries on from here.
         let new_b = self.header(c, &target)?.map(|r| r.b).unwrap_or(0);
         self.wstore(c)?.write(|w| {
             let t = Tip { hash: target, height: to, b: new_b };
@@ -572,31 +599,135 @@ impl ChainDb {
         Ok(out)
     }
 
+    /// The rules check refused blocks. A stored body may be a damaged copy a source sent rather
+    /// than the chain's block, so the first time each is dropped (its header kept, its body
+    /// forgotten) and the phase goes back to blocks to fetch it again, from whichever source;
+    /// the build then starts over from its first step (heights and the tx index name block
+    /// numbers). A block refused again after that is the chain's own: InvalidBlock.
+    fn init_refused(&self, params: &ChainParams, r: &crate::rules::Report, mut out: Built) -> Result<Built> {
+        let c = params.chain_no;
+        let mut again: HashSet<String> = self.state_text(c, INIT_REFETCHED)?.map(|s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect()).unwrap_or_default();
+        let (h, hash, why) = r.broken.first().cloned().unwrap_or_default();
+        let hashes: Vec<Hash256> = r.broken.iter().filter_map(|(_, x, _)| Hash256::from_hex(x).ok()).collect();
+        if hashes.is_empty() || hashes.iter().any(|x| again.contains(&x.to_hex())) {
+            return Err(StoreError::InvalidBlock {
+                block: Hash256::from_hex(&hash).map(|x| x.0).unwrap_or([0; 32]),
+                why: format!("{} blocks break the chain's rules, the first at {h} ({hash}): {why}; still refused after it was fetched again, the build stops here", r.broken_count),
+            });
+        }
+        for x in &hashes {
+            self.init_drop_body(params, x)?;
+            again.insert(x.to_hex());
+        }
+        let mut v: Vec<String> = again.into_iter().collect();
+        v.sort();
+        self.set_state_text(c, INIT_REFETCHED, Some(&v.join(",")))?;
+        self.set_state_text(c, INIT_BUILT, None)?;
+        self.set_state_text(c, INIT_NOTE, Some(&format!("the rules refused {} blocks, the first at {h}: {why}; dropped, to be fetched again", hashes.len())))?;
+        self.set_init_phase(c, Phase::Blocks)?;
+        out.refetch = hashes.len();
+        Ok(out)
+    }
+
+    /// Forget a stored block's body (its rows, its tx index rows, its height row); its header stays.
+    fn init_drop_body(&self, params: &ChainParams, hash: &Hash256) -> Result<()> {
+        let c = params.chain_no;
+        self.wstore(c)?.write(|w| {
+            let Some(mut rec) = header_rec(w, c, hash)? else { return Ok(()) };
+            if rec.b == 0 {
+                return Ok(());
+            }
+            let b = rec.b;
+            for (k, raw) in w.scan_prefix(BLOCK_TX, &k_block(c, b))? {
+                let p = be_u32(&k, k.len() - 4);
+                if let Ok(txid) = row_txid(&raw, params) {
+                    let mut bp = b.to_be_bytes().to_vec();
+                    bp.extend_from_slice(&p.to_be_bytes());
+                    w.del_dup(TXS, &k_txs(c, &txid.t12()), &bp)?;
+                }
+                w.del(BLOCK_TX, &k)?;
+            }
+            w.del(BLOCK_META, &k_block(c, b))?;
+            if w.get(HEIGHT, &k_height(c, rec.height))?.is_some_and(|v| be_u32(&v, 32) == b) {
+                w.del(HEIGHT, &k_height(c, rec.height))?;
+            }
+            rec.b = 0;
+            w.put(HEADERS, &k_header(c, &hash.0), &rec.index_value())?;
+            Ok(())
+        })
+    }
+
     /// The coin set of heights 1..=to derived from the stored main chain (in memory while it
-    /// fits `budget`, else on disk) and written in place of what is stored (only differences).
-    /// Returns (coins, derived on disk). A spend of a coin the blocks never made refuses it.
-    fn init_coins(&self, params: &ChainParams, to: u32, budget: usize, tmp: &Path, stop: &AtomicBool, note: Note) -> Result<(u64, bool)> {
+    /// fits `budget`, else on disk), nothing written yet. Every input must spend a coin made
+    /// before it (an earlier block, or earlier in its own block) and not spent yet; else the
+    /// blocks are refused (InvalidBlock).
+    fn init_coins_derive(&self, params: &ChainParams, to: u32, budget: usize, tmp: &Path, stop: &AtomicBool, note: Note) -> Result<Derived> {
         let c = params.chain_no;
         let mut mem = Replay::default();
         if mem.advance(self, params, to, budget, stop, note)? {
             if mem.missing > 0 {
-                return Err(err(format!("{} inputs spend coins the blocks never made; the blocks are refused", mem.missing)));
+                return Err(never_made(mem.missing));
             }
-            let rows = mem.sorted(c);
-            drop(mem);
-            let n = rows.len() as u64;
-            let mut it = rows.into_iter();
-            self.apply_coin_diff(params, &mut || Ok(it.next()), true, tmp, stop, note)?;
-            return Ok((n, false));
+            return Ok(Derived::Mem(mem.sorted(c)));
         }
         drop(mem);
+        note("the coin set is over its memory budget (ARCADE_INIT_COINS_MB): derived on disk".into());
         let mut d = DiskReplay::new(tmp, c)?;
         d.advance(self, params, to, stop, note)?;
         let mut rows = d.finish()?;
-        let diff = self.apply_coin_diff(params, &mut || rows.next_kv(), true, tmp, stop, note)?;
-        if rows.missing > 0 {
-            return Err(err(format!("{} inputs spend coins the blocks never made; the blocks are refused", rows.missing)));
+        // Every row once through before anything is written: the count of spends of coins never
+        // made is complete only at the end.
+        let mut keep = Sorter::new(tmp, &format!("coins-{c}"))?;
+        let mut n = 0u64;
+        while let Some((k, v)) = rows.next_kv()? {
+            if n.is_multiple_of(1_000_000) && stop.load(Ordering::Relaxed) {
+                return Err(err("stopped"));
+            }
+            keep.push(&k, &v)?;
+            n += 1;
         }
-        Ok((diff.same + diff.added + diff.changed, true))
+        if rows.missing > 0 {
+            return Err(never_made(rows.missing));
+        }
+        drop(rows);
+        Ok(Derived::Disk(keep.finish()?, n))
     }
+
+    /// Write a derived coin set in place of what is stored (only differences). Returns (coins,
+    /// derived on disk).
+    fn init_coins_apply(&self, params: &ChainParams, d: Derived, tmp: &Path, stop: &AtomicBool, note: Note) -> Result<(u64, bool)> {
+        match d {
+            Derived::Mem(rows) => {
+                let n = rows.len() as u64;
+                let mut it = rows.into_iter();
+                self.apply_coin_diff(params, &mut || Ok(it.next()), true, tmp, stop, note)?;
+                Ok((n, false))
+            }
+            Derived::Disk(mut s, n) => {
+                self.apply_coin_diff(params, &mut || s.next_kv(), true, tmp, stop, note)?;
+                Ok((n, true))
+            }
+        }
+    }
+}
+
+/// A coin set derived and checked, not written yet: OUTPUTS rows in key order.
+enum Derived {
+    Mem(Vec<(Vec<u8>, Vec<u8>)>),
+    Disk(Sorted, u64),
+}
+
+fn never_made(n: u64) -> StoreError {
+    StoreError::InvalidBlock { block: [0; 32], why: format!("{n} inputs spend coins the blocks never made (or not made before them); the blocks are refused") }
+}
+
+fn stopped(stop: &AtomicBool) -> Result<()> {
+    if stop.load(Ordering::Relaxed) {
+        return Err(err("stopped"));
+    }
+    Ok(())
+}
+
+fn is_stopped(e: &StoreError) -> bool {
+    matches!(e, StoreError::Other(s) if s == "stopped")
 }

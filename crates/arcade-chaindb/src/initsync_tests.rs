@@ -8,9 +8,9 @@ use crate::sync::{BlockSource, Syncer};
 use arcade_chain::encode::write_varint;
 use arcade_chain::hash::{merkle_root, sha256d};
 use arcade_chain::p2p::HeaderEntry;
-use arcade_chain::params::{BlockRules, ChainParams, BITCOIN_BLOCK_RULES, BITCOIN_MAIN, SCRIPT_WITNESS};
+use arcade_chain::params::{BlockRules, ChainParams, ValueRules, BITCOIN_BLOCK_RULES, BITCOIN_MAIN, SCRIPT_WITNESS};
 use arcade_chain::pow::{meets_target, try_pow_hash, PowAlgo};
-use arcade_chain::{Block, Hash256, Header, Tx};
+use arcade_chain::{Block, Format, Hash256, Header, Tx};
 use std::collections::HashMap;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -120,16 +120,21 @@ struct Src {
     /// Send this instead of the block with that hash.
     swap: HashMap<Hash256, Vec<u8>>,
     asked: usize,
+    /// Answer every headers request with nothing.
+    mute: bool,
 }
 
 impl Src {
     fn new(blocks: &[Block]) -> Src {
-        Src { headers: blocks.iter().map(|b| b.header).collect(), blocks: blocks.iter().map(|b| (b.hash(), b.encode())).collect(), corrupt: false, swap: HashMap::new(), asked: 0 }
+        Src { headers: blocks.iter().map(|b| b.header).collect(), blocks: blocks.iter().map(|b| (b.hash(), b.encode())).collect(), corrupt: false, swap: HashMap::new(), asked: 0, mute: false }
     }
 }
 
 impl BlockSource for Src {
     fn get_headers(&mut self, locator: &[Hash256]) -> Result<Vec<HeaderEntry>, String> {
+        if self.mute {
+            return Ok(vec![]);
+        }
         let ids: Vec<Hash256> = self.headers.iter().map(|h| h.hash()).collect();
         let from = locator.iter().find_map(|l| ids.iter().position(|x| x == l)).map(|i| i + 1).unwrap_or(0);
         Ok(self.headers[from..].iter().take(2000).map(|h| HeaderEntry { header: *h, auxpow: None }).collect())
@@ -176,7 +181,12 @@ fn begin(db: &ChainDb, p: &'static ChainParams, src: &mut Src) {
 }
 
 fn build(db: &ChainDb, p: &'static ChainParams, tmp: &Path, tail: u32) -> Built {
-    db.init_build(p, tail, 2, usize::MAX, tmp, &AtomicBool::new(false), &mut |_| {}).unwrap()
+    build_with(db, p, tmp, tail, usize::MAX).unwrap()
+}
+
+/// The build with a coin budget (0: the coin set is derived on disk).
+fn build_with(db: &ChainDb, p: &'static ChainParams, tmp: &Path, tail: u32, budget: usize) -> arcade_store::Result<Built> {
+    db.init_build(p, tail, 2, budget, tmp, &AtomicBool::new(false), &mut |_| {})
 }
 
 /// The tail the build leaves: connected the normal way.
@@ -292,13 +302,20 @@ fn agreement_needs_three_independent_sources_on_one_tip() {
     assert!(!ag.done());
     let ag = round(&db, p, &mut [("a", &mut a), ("f", &mut f), ("b", &mut b), ("e", &mut e)]);
     assert!(ag.done(), "{}", ag.text());
-    // A source one block behind doesn't know our best header: it doesn't agree either.
+    // Asked from our best header's parent: one block behind sends nothing, which never agrees.
+    let parent = blocks[19].hash();
     let mut behind = Src::new(&blocks[..20]);
-    assert!(!agrees(&ag.best, &behind.get_headers(&[ag.best]).unwrap()));
-    // One ahead extends it: it agrees.
+    assert!(!agrees(p, &ag.best, &behind.get_headers(&[parent]).unwrap()));
+    // One ahead sends our best header first: it agrees.
     let next = mine(blocks[20].hash(), &[coinbase(77, None, false)], 21);
     let mut ahead = Src::new(&[blocks.clone(), vec![next]].concat());
-    assert!(agrees(&ag.best, &ahead.get_headers(&[ag.best]).unwrap()));
+    assert!(agrees(p, &ag.best, &ahead.get_headers(&[parent]).unwrap()));
+    // A source that answers nothing to anything isn't heard as agreeing.
+    let mut mute = Src::new(&blocks);
+    mute.mute = true;
+    let ag = round(&db, p, &mut [("a", &mut a), ("b", &mut b), ("m", &mut mute)]);
+    assert_eq!(ag.agree, vec!["a".to_string(), "b".to_string()]);
+    assert!(!ag.done(), "{}", ag.text());
     // Total work below the chain's minimum: not done however many agree.
     let p2 = params(&blocks[0], |p| p.min_chain_work = "00000000000000000000000000000000000000000000000000000000ffffffff");
     let d2 = tempfile::tempdir().unwrap();
@@ -434,4 +451,148 @@ fn an_init_install_resumes_in_each_phase() {
     assert_eq!(build(&db, p, &tmp, 3).height, 37);
     finish_normally(&db, p, &mut a);
     same_as(&db, &r, "resumed init install");
+}
+
+/// The test chain's own rules, switched on: a subsidy (`subsidy`), coinbase maturity 0, sizes,
+/// versions and lock times; scripts aren't run (the test scripts aren't signed).
+fn ruled(g: &Block, subsidy: fn(u32, &Hash256) -> u64) -> &'static ChainParams {
+    params(g, |p| {
+        p.value_rules = Some(ValueRules { max_money: 21_000_000 * 100_000_000, subsidy, maturity: |_| 0, pegout_maturity: 0, coinbase_rule: None, stake_reward: None, enforced: true });
+        p.block_rules = Some(BlockRules { script_flags: |_| 0, bip34_height: u32::MAX, min_version: |_| 1, version_rule: None, scripts: false, ..BITCOIN_BLOCK_RULES });
+    })
+}
+
+/// Headers agreed, every block stored, the phase at build.
+fn stored_all(db: &ChainDb, p: &'static ChainParams, blocks: &[Block]) {
+    let mut a = Src::new(blocks);
+    begin(db, p, &mut a);
+    round(db, p, &mut [("a", &mut a)]);
+    db.init_fetch_blocks(p, &mut [&mut a as &mut dyn BlockSource], 7, &AtomicBool::new(false)).unwrap();
+    db.set_init_phase(p.chain_no, Phase::Build).unwrap();
+}
+
+#[test]
+fn the_build_checks_the_rules_and_ends_as_a_normal_sync() {
+    let blocks = chain(40);
+    let p = ruled(&blocks[0], |_, _| 1_000_000);
+    let c = p.chain_no;
+    let d = tempfile::tempdir().unwrap();
+    let r = reference(d.path(), p, &blocks);
+    let db = open(d.path());
+    stored_all(&db, p, &blocks);
+    let built = build(&db, p, &d.path().join("tmp"), 5);
+    assert_eq!((built.height, built.refetch), (35, 0));
+    assert!(built.rules_checked >= 35, "every block's rules checked: {}", built.rules_checked);
+    assert!(db.init_built(c).contains(&"rules".to_string()));
+    finish_normally(&db, p, &mut Src::new(&blocks));
+    same_as(&db, &r, "init install with the rules on");
+}
+
+#[test]
+fn a_block_the_rules_refuse_is_fetched_again_once_then_the_build_stops() {
+    let blocks = chain(20);
+    // Block 7's coinbase pays more than its subsidy.
+    let p = ruled(&blocks[0], |h, _| if h == 7 { 1 } else { 1_000_000 });
+    let c = p.chain_no;
+    let d = tempfile::tempdir().unwrap();
+    let tmp = d.path().join("tmp");
+    let db = open(d.path());
+    stored_all(&db, p, &blocks);
+    let built = build(&db, p, &tmp, 0);
+    assert_eq!(built.refetch, 1);
+    assert_eq!(db.init_phase(c).unwrap(), Some(Phase::Blocks));
+    assert_eq!(db.stored_b(c, &blocks[7].hash()).unwrap(), Some(0), "its body was dropped");
+    assert_eq!(db.init_missing(c).unwrap(), vec![blocks[7].hash()]);
+    assert!(db.init_built(c).is_empty(), "the build starts over");
+    assert_eq!(db.tip(c).unwrap().unwrap().height, 0);
+    assert!(table(&db, OUTPUTS).is_empty(), "no coin is written before the rules pass");
+    // Fetched again (the same block: it is the chain's own), refused again: the build stops.
+    let mut a = Src::new(&blocks);
+    assert_eq!(db.init_fetch_blocks(p, &mut [&mut a as &mut dyn BlockSource], 7, &AtomicBool::new(false)).unwrap(), 1);
+    db.set_init_phase(c, Phase::Build).unwrap();
+    let e = build_with(&db, p, &tmp, 0, usize::MAX).unwrap_err();
+    assert!(matches!(e, arcade_store::StoreError::InvalidBlock { .. }), "{e}");
+    assert!(e.to_string().contains("break the chain's rules"), "{e}");
+    assert_eq!(db.tip(c).unwrap().unwrap().height, 0);
+    assert!(table(&db, OUTPUTS).is_empty());
+}
+
+#[test]
+fn the_coin_set_derived_on_disk_ends_as_a_normal_sync() {
+    let blocks = chain(40);
+    let p = params(&blocks[0], |_| {});
+    let d = tempfile::tempdir().unwrap();
+    let r = reference(d.path(), p, &blocks);
+    let db = open(d.path());
+    stored_all(&db, p, &blocks);
+    let built = build_with(&db, p, &d.path().join("tmp"), 5, 0).unwrap();
+    assert!(built.on_disk);
+    assert_eq!(built.height, 35);
+    finish_normally(&db, p, &mut Src::new(&blocks));
+    same_as(&db, &r, "coin set derived on disk");
+}
+
+#[test]
+fn a_spend_of_an_output_made_later_in_its_block_is_refused_in_memory_and_on_disk() {
+    let g = mine(Hash256::ZERO, &[coinbase(0, None, false)], 0);
+    let b1 = mine(g.hash(), &[coinbase(1, None, false)], 1);
+    let earlier = spend(b1.txs[0].txid, false);
+    let later = spend(earlier.txid, false);
+    for (in_order, budget) in [(true, usize::MAX), (true, 0), (false, usize::MAX), (false, 0)] {
+        let txs = if in_order { vec![coinbase(2, None, false), earlier.clone(), later.clone()] } else { vec![coinbase(2, None, false), later.clone(), earlier.clone()] };
+        let b2 = mine(b1.hash(), &txs, 2);
+        let blocks = vec![g.clone(), b1.clone(), b2];
+        let p = params(&g, |_| {});
+        let d = tempfile::tempdir().unwrap();
+        let db = open(d.path());
+        stored_all(&db, p, &blocks);
+        let r = build_with(&db, p, &d.path().join("tmp"), 0, budget);
+        if in_order {
+            let b = r.unwrap();
+            assert_eq!((b.height, b.on_disk), (2, budget == 0));
+        } else {
+            let e = r.unwrap_err();
+            assert!(matches!(e, arcade_store::StoreError::InvalidBlock { .. }), "budget {budget}: {e}");
+            assert!(e.to_string().contains("never made"), "{e}");
+            assert!(table(&db, OUTPUTS).is_empty(), "budget {budget}: nothing written");
+            assert_eq!(db.tip(p.chain_no).unwrap().unwrap().height, 0);
+        }
+    }
+}
+
+#[test]
+fn junk_after_the_transactions_or_a_bad_auxpow_is_refused() {
+    let blocks = chain(3);
+    let p = params(&blocks[0], |_| {});
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let mut a = Src::new(&blocks);
+    begin(&db, p, &mut a);
+    round(&db, p, &mut [("a", &mut a)]);
+    // Junk appended: same txids, same merkle root, byte-identical rebuild.
+    let b = &blocks[2];
+    let mut raw = b.encode();
+    raw.extend_from_slice(&[7u8; 100]);
+    let r = db.init_store(p, &[b.hash()], &[raw]).unwrap();
+    assert_eq!(r.stored, 0);
+    assert!(r.refused[0].1.contains("after its transactions"), "{:?}", r.refused);
+    // A merge-mined block whose own AuxPoW doesn't prove anything.
+    let pa = params(&blocks[0], |p| p.format = Format { auxpow: true, ..Format::BITCOIN });
+    let cb = coinbase(9, None, false);
+    let header = Header { version: 1 | 0x100, prev: b.hash(), merkle_root: merkle_root(&[cb.txid]), time: T0, bits: EASY, nonce: 0 };
+    let mut raw = header.encode().to_vec();
+    raw.extend_from_slice(&cb.raw);
+    raw.extend_from_slice(&[0u8; 32]);
+    for _ in 0..2 {
+        write_varint(&mut raw, 0);
+        raw.extend_from_slice(&0u32.to_le_bytes());
+    }
+    raw.extend_from_slice(&Header { version: 1, prev: Hash256::ZERO, merkle_root: Hash256::ZERO, time: T0, bits: EASY, nonce: 0 }.encode());
+    write_varint(&mut raw, 1);
+    raw.extend_from_slice(&cb.raw);
+    let blk = Block::parse_with(&raw, &pa.format).unwrap();
+    assert!(blk.auxpow.is_some());
+    let r = db.init_store(pa, &[blk.hash()], &[raw]).unwrap();
+    assert_eq!(r.stored, 0);
+    assert!(r.refused[0].1.contains("AuxPoW"), "{:?}", r.refused);
 }

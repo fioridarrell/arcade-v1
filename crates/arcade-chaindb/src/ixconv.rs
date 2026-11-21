@@ -17,7 +17,8 @@
 
 use crate::db::{decode_tip, ChainDb, UNDO_DEPTH};
 use crate::ixfile::{self, Kind, Meta, Reader, Writer};
-use crate::ixset::{list, marker, marker_name};
+use crate::addrbuild::{OFF, PENDING, TXS_PENDING};
+use crate::ixset::{addr_epoch, list, marker, marker_name};
 use crate::schema::*;
 use arcade_chain::hash::sha256;
 use arcade_chain::params::ChainParams;
@@ -162,6 +163,8 @@ struct Checkpoint {
     target_hash: [u8; 32],
     layout: Layout,
     level: i32,
+    /// The Addresses epoch when the pass began (ixset::ADDR_EPOCH).
+    epoch: u32,
     /// The last table key of the last finished group: the scan carries on after it.
     resume: Option<Vec<u8>>,
     scanned: u64,
@@ -169,7 +172,7 @@ struct Checkpoint {
     units: Vec<(u32, u32, Vec<u8>)>,
 }
 
-const CK_MAGIC: &[u8; 8] = b"ARCIXCK1";
+const CK_MAGIC: &[u8; 8] = b"ARCIXCK2";
 
 impl Checkpoint {
     fn encode(&self) -> Vec<u8> {
@@ -183,6 +186,7 @@ impl Checkpoint {
         n(&mut v, self.layout.era_ranges);
         n(&mut v, self.layout.depth);
         n(&mut v, self.level as u32);
+        n(&mut v, self.epoch);
         n(&mut v, self.resume.is_some() as u32);
         let key = self.resume.clone().unwrap_or_default();
         n(&mut v, key.len() as u32);
@@ -210,6 +214,7 @@ impl Checkpoint {
         let target_hash = t.bytes(32)?.try_into().ok()?;
         let layout = Layout { range: t.u32()?, era_ranges: t.u32()?, depth: t.u32()? };
         let level = t.u32()? as i32;
+        let epoch = t.u32()?;
         let (has_key, klen) = (t.u32()?, t.u32()? as usize);
         let key = t.bytes(klen)?.to_vec();
         let scanned = t.u64()?;
@@ -222,7 +227,7 @@ impl Checkpoint {
         if !t.0.is_empty() {
             return None;
         }
-        Some(Checkpoint { from: (has_from == 1).then_some(from), target, target_hash, layout, level, resume: (has_key == 1).then_some(key), scanned, units })
+        Some(Checkpoint { from: (has_from == 1).then_some(from), target, target_hash, layout, level, epoch, resume: (has_key == 1).then_some(key), scanned, units })
     }
 
     fn save(&self, path: &Path) -> Result<()> {
@@ -348,6 +353,33 @@ impl Out {
     }
 }
 
+/// Whether every row of `kind` at or below `upto` is in its table: no address rows or tx
+/// index rows wait in the log or in runs, and (history, spends) the Addresses index is on
+/// and has not been switched since `epoch` (when given). Checked when a pass starts and
+/// again in the transaction that switches the readers: a pass takes hours on a big chain,
+/// and rows that reach the table only after it was read would be missing from the files
+/// for good (the readers no longer consult the table at those heights).
+fn not_ready<R: crate::db::Rd>(r: &R, c: u16, kind: Kind, upto: u32, epoch: Option<u32>) -> Result<Option<String>> {
+    let addr = kind != Kind::Txs;
+    if r.get(STATE, &k_state(c, TXS_PENDING))?.is_some() || (addr && r.get(STATE, &k_state(c, PENDING))?.is_some()) {
+        return Ok(Some("address rows or tx index rows are still being built".into()));
+    }
+    if let Some((k, _)) = r.first(ADDR_LOG, &k_chain(c))? {
+        if k.len() >= 6 && be_u32(k, 2) <= upto {
+            return Ok(Some(format!("rows of height {} still wait in the address log", be_u32(k, 2))));
+        }
+    }
+    if addr && r.get(STATE, &k_state(c, OFF))?.is_some() {
+        return Ok(Some("the Addresses index is off".into()));
+    }
+    if let (true, Some(e)) = (addr, epoch) {
+        if e != addr_epoch(r, c)? {
+            return Ok(Some("the Addresses index was turned off or on during the conversion".into()));
+        }
+    }
+    Ok(None)
+}
+
 /// What a pass did.
 enum Pass {
     /// Nothing new is settled, or the files now reach this height.
@@ -365,11 +397,14 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
     let from = db.index_files_upto(c, kind)?;
     let next = from.map(|f| f + 1).unwrap_or(0);
     let ck_path = checkpoint_path(&dir, kind);
+    if crate::txruns::of(store.id(), c).is_some() {
+        return Err(other("this chain's tx index is still being built; convert it afterwards"));
+    }
 
     // Carry on an interrupted pass when it is still the same job on the same chain.
     let mut carried: Option<(Checkpoint, Vec<Writer>)> = None;
     if let Some(ck) = std::fs::read(&ck_path).ok().and_then(|v| Checkpoint::decode(&v)) {
-        let same = ck.from == from && ck.layout == o.layout && ck.level == o.level && db.hash_at(c, ck.target)?.map(|h| h.0) == Some(ck.target_hash);
+        let same = ck.from == from && ck.layout == o.layout && ck.level == o.level && ck.epoch == store.read(|r| addr_epoch(r, c))? && db.hash_at(c, ck.target)?.map(|h| h.0) == Some(ck.target_hash);
         if same {
             let writers: Result<Vec<Writer>> = ck
                 .units
@@ -385,8 +420,8 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
             }
         }
     }
-    let target = match &carried {
-        Some((ck, _)) => ck.target,
+    let (target, epoch) = match &carried {
+        Some((ck, _)) => (ck.target, ck.epoch),
         None => {
             clear_unfinished(&dir, kind);
             // Settled: deep below the tip, and below where the coins are complete (a tip
@@ -394,12 +429,16 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
             let (tip, coins_at) = store.read(|r| Ok((r.get(STATE, &k_state(c, "tip"))?.map(|v| decode_tip(&v)), r.get(STATE, &k_state(c, "coins_at"))?.map(|v| decode_tip(&v)))))?;
             let Some(tip) = tip else { return Ok(Pass::Done) };
             let base = coins_at.map(|t| t.height.min(tip.height)).unwrap_or(tip.height);
-            match o.layout.sealed(base) {
+            let t = match o.layout.sealed(base) {
                 Some(t) if next <= t => t,
                 _ => return Ok(Pass::Done),
-            }
+            };
+            (t, store.read(|r| addr_epoch(r, c))?)
         }
     };
+    if let Some(why) = store.read(|r| not_ready(r, c, kind, target, Some(epoch)))? {
+        return Err(other(format!("{tag}: {why}; convert it afterwards")));
+    }
     let hs = Heights::load(db, c, target)?;
     let (mut out, mut scanned) = match carried {
         Some((ck, writers)) => {
@@ -454,7 +493,7 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
         let stopping = stop.load(Ordering::Relaxed);
         if stopping || scanned - last_ck >= o.checkpoint_rows {
             let units = out.writers.iter_mut().map(|w| Ok((w.meta().first, w.meta().last, w.save_state()?))).collect::<Result<Vec<_>>>()?;
-            Checkpoint { from, target, target_hash: hs.hashes[target as usize], layout: o.layout, level: o.level, resume: out.done_src.clone(), scanned, units }.save(&ck_path)?;
+            Checkpoint { from, target, target_hash: hs.hashes[target as usize], layout: o.layout, level: o.level, epoch, resume: out.done_src.clone(), scanned, units }.save(&ck_path)?;
             last_ck = scanned;
             note(format!("index files {tag}: {scanned} table rows read, {} written", out.writers.iter().map(|w| w.rows()).sum::<u64>()));
             if stopping {
@@ -485,9 +524,16 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
         if !same || tip.is_none_or(|t| (t.height as u64) < target as u64 + o.layout.depth as u64) {
             return Err(other(format!("the chain changed at or below height {target} while its files were written; nothing was switched")));
         }
+        if let Some(why) = not_ready(w, c, kind, target, Some(epoch))? {
+            return Err(other(format!("{tag}: {why}; the files were written but nothing was switched")));
+        }
         let gen = marker(w, c, kind)?.filter(|m| m.len() >= 8).map(|m| be_u32(&m, 4)).unwrap_or(0).wrapping_add(1);
         w.put(STATE, &k_state(c, &marker_name(kind)), &[target.to_be_bytes(), gen.to_be_bytes()].concat())
     })?;
+    // The marker must be on disk before any file it no longer uses goes: chain.mdbx does not
+    // flush every commit (SafeNoSync), and a power cut that lost the marker would leave the
+    // old one pointing at deleted ranges.
+    db.wstore(c)?.sync()?;
     // Ranges now inside an era file are no longer read.
     db.ixsets.lock().unwrap().remove(&(c, kind.tag()));
     let files = list(&dir, kind)?;
@@ -595,13 +641,14 @@ mod tests {
             target_hash: [7; 32],
             layout: Layout { range: 100, era_ranges: 10, depth: 1000 },
             level: -3,
+            epoch: 4,
             resume: Some(vec![1, 2, 3]),
             scanned: 1 << 40,
             units: vec![(100, 199, vec![9; 50]), (200, 299, Vec::new())],
         };
         let v = ck.encode();
         let back = Checkpoint::decode(&v).unwrap();
-        assert_eq!((back.from, back.target, back.target_hash, back.layout, back.level, back.resume, back.scanned, back.units), (ck.from, ck.target, ck.target_hash, ck.layout, ck.level, ck.resume.clone(), ck.scanned, ck.units.clone()));
+        assert_eq!((back.from, back.target, back.target_hash, back.layout, back.level, back.epoch, back.resume, back.scanned, back.units), (ck.from, ck.target, ck.target_hash, ck.layout, ck.level, ck.epoch, ck.resume.clone(), ck.scanned, ck.units.clone()));
         let none = Checkpoint { from: None, resume: None, ..ck };
         let back = Checkpoint::decode(&none.encode()).unwrap();
         assert_eq!((back.from, back.resume), (None, None));

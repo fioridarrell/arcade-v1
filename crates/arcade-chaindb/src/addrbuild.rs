@@ -223,8 +223,11 @@ impl ChainDb {
             w.del(STATE, &k_state(c, PENDING))?;
             w.del(STATE, &k_state(c, BACKFILL))?;
             w.del(STATE, &k_state(c, BACKFILL_FROM))?;
-            Ok(())
-        })
+            // History and spends stop answering from index files (their tables are emptied).
+            crate::ixset::addresses_switched(w, c)
+        })?;
+        self.forget_ix(c);
+        Ok(())
     }
 
     /// Delete up to `max` address rows of a chain; 0 when none are left.
@@ -286,6 +289,7 @@ impl ChainDb {
                 return Ok(());
             }
             w.del(STATE, &k_state(c, OFF))?;
+            crate::ixset::addresses_switched(w, c)?;
             let tip = w.get(STATE, &k_state(c, "tip"))?.map(|v| be_u32(&v, 32)).unwrap_or(0);
             if tip > 0 {
                 w.put(STATE, &k_state(c, BACKFILL), &tip.to_be_bytes())?;

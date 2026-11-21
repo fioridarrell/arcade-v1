@@ -225,6 +225,8 @@ pub trait Rd {
     fn scan(&self, table: &str, prefix: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>>;
     /// The open database (for the tx index runs kept in memory beside it).
     fn store_id(&self) -> usize;
+    /// The first entry whose key starts with `prefix`.
+    fn first(&self, table: &str, prefix: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>>;
 }
 impl Rd for ReadTxn<'_> {
     fn store_id(&self) -> usize {
@@ -236,6 +238,9 @@ impl Rd for ReadTxn<'_> {
     fn scan(&self, t: &str, p: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_prefix(t, p)
     }
+    fn first(&self, t: &str, p: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self.scan_prefix_limit(t, p, 1)?.into_iter().next())
+    }
 }
 impl Rd for WriteTxn<'_> {
     fn store_id(&self) -> usize {
@@ -246,6 +251,9 @@ impl Rd for WriteTxn<'_> {
     }
     fn scan(&self, t: &str, p: &[u8]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         self.scan_prefix(t, p)
+    }
+    fn first(&self, t: &str, p: &[u8]) -> Result<Option<(Vec<u8>, Vec<u8>)>> {
+        Ok(self.scan_prefix_limit(t, p, 1)?.into_iter().next())
     }
 }
 
@@ -1589,6 +1597,16 @@ impl ChainDb {
 
     /// Raw transaction by txid (checked by full hash) and its block number.
     pub fn tx_raw(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(Vec<u8>, u32)>> {
+        self.tx_raw_with(params, txid, true)
+    }
+
+    /// [`tx_raw`](Self::tx_raw) from the tx index table alone, never the index files: for the
+    /// mempool's "is it in a block yet" checks, which ask about unconfirmed txs all the time.
+    pub fn tx_raw_tables(&self, params: &ChainParams, txid: &Hash256) -> Result<Option<(Vec<u8>, u32)>> {
+        self.tx_raw_with(params, txid, false)
+    }
+
+    fn tx_raw_with(&self, params: &ChainParams, txid: &Hash256, files: bool) -> Result<Option<(Vec<u8>, u32)>> {
         let c = params.chain_no;
         self.store(c).read(|r| {
             let mut cands: Vec<(u32, u32)> = r.scan_prefix(TXS, &k_txs(c, &txid.t12()))?.iter().map(|(_, bp)| (be_u32(bp, 0), be_u32(bp, 4))).collect();
@@ -1601,11 +1619,13 @@ impl ChainDb {
                         return Ok(if is_pruned(&raw) { Err((b, p)) } else { Ok((raw, b)) }.into());
                     }
                 }
-                if files_read {
+                if files_read || !files {
                     return Ok(None);
                 }
-                // Not in the table: the tx index files (settled heights), where this chain has them.
+                // Not in the table: the tx index files, where the table was trimmed. Latest
+                // first, so a duplicate txid (BIP30) gives the copy `locate` gives.
                 cands = self.ix_tx_cands(r, c, &txid.t12())?;
+                cands.reverse();
                 files_read = true;
             }
         })
@@ -1643,10 +1663,12 @@ impl ChainDb {
     }
 
     /// Where transactions whose id starts with `t12` are according to the tx index FILES:
-    /// (block number, position), lowest first. Empty when the chain has none. The files
-    /// keep 8 bytes of the txid: the caller confirms the id on the stored transaction.
+    /// (block number, position), lowest first. Empty unless the chain's tx index table was
+    /// trimmed (until then the table has every row the files have, and a miss in it is a
+    /// miss). The files keep 8 bytes of the txid: the caller confirms the id on the stored
+    /// transaction.
     fn ix_tx_cands<R: Rd>(&self, r: &R, c: u16, t12: &[u8; 12]) -> Result<Vec<(u32, u32)>> {
-        let Some(set) = self.ix(r, c, crate::ixfile::Kind::Txs)? else { return Ok(Vec::new()) };
+        let Some(set) = self.ix_trimmed(r, c, crate::ixfile::Kind::Txs)? else { return Ok(Vec::new()) };
         let mut out = Vec::new();
         for (h, p) in set.tx_candidates(t12)? {
             out.push((ix_block_no(r, c, h)?, p));
@@ -1988,7 +2010,7 @@ impl ChainDb {
     }
 
     /// Who spent an outpoint: (block number, position, input index). The spends table
-    /// first; then, where the chain has spends files, the files from the coin's height on
+    /// first; then, where the spends table was trimmed, the files from the coin's height on
     /// (a spend is filed under the spender's height).
     pub fn spender(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<(u32, u32, u32)>> {
         let c = params.chain_no;
@@ -1998,7 +2020,7 @@ impl ChainDb {
             if let Some(v) = r.get(SPENDS, &key)? {
                 return Ok(Some((be_u32(&v, 0), be_u32(&v, 4), be_u32(&v, 8))));
             }
-            let Some(set) = self.ix(r, c, crate::ixfile::Kind::Spends)? else { return Ok(None) };
+            let Some(set) = self.ix_trimmed(r, c, crate::ixfile::Kind::Spends)? else { return Ok(None) };
             // A coin still unspent has no spender: no file is read for it.
             if r.get(OUTPUTS, &key)?.is_some() {
                 return Ok(None);

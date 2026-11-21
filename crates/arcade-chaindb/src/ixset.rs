@@ -30,6 +30,38 @@ pub(crate) fn marker<R: Rd>(r: &R, c: u16, kind: Kind) -> Result<Option<Vec<u8>>
     r.get(STATE, &k_state(c, &marker_name(kind)))
 }
 
+/// The STATE name of a kind's "tables trimmed" flag: set once the kind's converted rows are
+/// removed from its table, so only the files hold them. Until then (all of this part: no
+/// step removes rows yet) a tx index or spends lookup that misses the table never reads a
+/// file, since the files only hold rows the table has too. History reads its files from
+/// the marker on: they split the answer at the sealed height.
+pub fn trimmed_name(kind: Kind) -> String {
+    format!("ixf:trim:{}", kind.tag() as char)
+}
+
+/// STATE: a counter changed whenever the Addresses index is turned off or on. A conversion
+/// of history or spends records it when it starts and switches no reader if it changed:
+/// the tables it read may have been emptied or rebuilt under it.
+pub const ADDR_EPOCH: &str = "ixf:addr_epoch";
+
+pub(crate) fn addr_epoch<R: Rd>(r: &R, c: u16) -> Result<u32> {
+    Ok(r.get(STATE, &k_state(c, ADDR_EPOCH))?.filter(|v| v.len() >= 4).map(|v| be_u32(&v, 0)).unwrap_or(0))
+}
+
+/// Change the Addresses epoch, and stop answering history and spends from files: with the
+/// index off their tables are emptied (files alone would give a part of the answer), and
+/// when it comes back the rows are built again before a new conversion. Callers clear the
+/// chain's cached sets after the write ([`ChainDb::forget_ix`]).
+pub(crate) fn addresses_switched(w: &arcade_store::WriteTxn, c: u16) -> Result<()> {
+    let e = addr_epoch(w, c)?.wrapping_add(1);
+    w.put(STATE, &k_state(c, ADDR_EPOCH), &e.to_be_bytes())?;
+    for k in [Kind::Hist, Kind::Spends] {
+        w.del(STATE, &k_state(c, &marker_name(k)))?;
+        w.del(STATE, &k_state(c, &trimmed_name(k)))?;
+    }
+    Ok(())
+}
+
 /// The files of one kind in `dir`: (first, last, path), in order of first then last.
 pub fn list(dir: &Path, kind: Kind) -> Result<Vec<(u32, u32, PathBuf)>> {
     let mut out = Vec::new();
@@ -168,11 +200,27 @@ impl ChainDb {
         self.wstore(c)?.write(|w| {
             for k in Kind::ALL {
                 w.del(STATE, &k_state(c, &marker_name(k)))?;
+                w.del(STATE, &k_state(c, &trimmed_name(k)))?;
             }
             Ok(())
         })?;
-        self.ixsets.lock().unwrap().retain(|(cc, _), _| *cc != c);
+        self.forget_ix(c);
         Ok(())
+    }
+
+    /// Drop chain `c`'s open file sets (they are loaded again from the marker when needed).
+    pub(crate) fn forget_ix(&self, c: u16) {
+        self.ixsets.lock().unwrap().retain(|(cc, _), _| *cc != c);
+    }
+
+    /// Chain `c`'s files of a kind when they are the only place its settled rows are (the
+    /// table was trimmed): what tx index and spends lookups use after a table miss. None
+    /// while the table still holds every row (all of this part).
+    pub(crate) fn ix_trimmed<R: Rd>(&self, r: &R, c: u16, kind: Kind) -> Result<Option<Arc<KindSet>>> {
+        if r.get(STATE, &k_state(c, &trimmed_name(kind)))?.is_none() {
+            return Ok(None);
+        }
+        self.ix(r, c, kind)
     }
 
     /// Chain `c`'s open files of a kind, as of the snapshot `r` (None: no marker). The

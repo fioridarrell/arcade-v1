@@ -87,11 +87,32 @@ build coins written: 183000000 coins in ... · ... coins/s
 build: to block 924724 in ...: ...
 ```
 
-(Illustrative numbers.) Same lines on every run, so runs on different machines compare.
+(Illustrative numbers.) Same lines on every run, so runs on different machines compare. While a
+blocks round runs, a `blocks round in progress: ...` line (blocks, MB, blocks/s, MB/s so far) is
+rewritten every 3 minutes, so a stop, a restart or an error never loses the measurement.
+
+## Block numbers
+
+Blocks arrive in any order, but each takes the block number of its height: STATE `init_b_base`
+is fixed at the first block stored (the next free number, under it) and a block at height h is
+stored as base + h; the block-number counter moves past every number handed out. So the main
+chain's block numbers run in height order, as after a block-by-block sync (the compressed index
+files need that). If the best header chain moves between rounds, a stored block on the old
+branch holds its height's number: its body is dropped (header kept) and the new branch's block
+takes the number.
+
+## Room on the drive
+
+The blocks phase holds while the chain's drive has less free than `ARCADE_INIT_FREE_GB` (default
+50) plus 12 GB for the next batches, and says so in the chain's status; it carries on by itself
+once there is room again (checked before each round and every 30 seconds during one).
 
 ## Smoke test: stop the store phase at a height (testing only)
 
-`ARCADE_INIT_UPTO=<height>` in the arcade's environment: the headers phase runs as usual, the
+`ARCADE_INIT_UPTO=<height>` in the arcade's environment: the install logs "init: storing up to
+<height>" when it starts. A value that isn't a block height (a whole number over 0, so not empty
+either) stops the install with that reason in its status; it never runs uncapped by mistake. The
+headers phase runs as usual, the
 blocks phase stores only blocks up to that height, then the install holds there ("stopped at
 block N (ARCADE_INIT_UPTO, testing only)" in its status, with the last timing line); the build
 never starts and the chain stays unusable. Meant to measure download and store speed on a real

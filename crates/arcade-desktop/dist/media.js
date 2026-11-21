@@ -19,7 +19,13 @@
    The cutout (start({video, cutout}), cutout.js): the camera's picture goes through the cutter before it is
    encoded, so every viewer sees the blurred or composited picture. In 'transparent' the blurred picture goes, and
    with it a mask (kind 5, the time of the picture it belongs to): a window that knows masks draws the person
-   alone over whatever the page put behind the tile; an older one ignores kind 5 and shows the blurred picture. */
+   alone over whatever the page put behind the tile; an older one ignores kind 5 and shows the blurred picture.
+
+   Drawn media (2026-11-21, start({drawn: {width, height, fps}, sound: 'drawn'}), for an app that goes live with a
+   picture and a voice it makes itself, a virtual streamer say): the window makes a canvas and a sound context of
+   its own, and their tracks go down the camera's and the microphone's path. The page hands it pictures (draw, an
+   ImageBitmap) and sound (play, mono samples), and viewers see and hear the host's camera and microphone. The
+   sound goes only into the call, never this window's speakers. The same switch, pill and Stop as a camera. */
 (function () {
   "use strict";
   const KIND = { cam: 1, mic: 2, scr: 3, snd: 4, mask: 5, note: 9 };
@@ -27,6 +33,9 @@
   const CAM = { most: 640, fps: 20, bitrate: 600000 }, SCR = { most: 1280, fps: 10, bitrate: 1500000 };
   const KEY_EVERY = 2000, GONE_AFTER = 3000, SPEAK_ON = 0.04, SPEAK_HOLD = 600, OUT_MOST = 80;
   const FRAME_MAX_W = 1920, FRAME_MAX_H = 1080, FRAME_MAX_FPS = 30;
+  // Drawn media: the canvas at most this big and this fast; sound played this far ahead (a little jitter buffer),
+  // at most this long a piece and this much queued.
+  const DRAWN_MOST = 1280, DRAWN_FPS = 24, DRAWN_LEAD = 0.08, DRAWN_PIECE_S = 10, DRAWN_QUEUE_S = 20;
 
   window.ArcadeMedia = function (env) {
     const { api, push, perms } = env;
@@ -75,7 +84,9 @@
       const md = on.media;
       let what = md.xstream ? "Sharing your screen" : "";
       if (md.stream) {
-        const cam = md.video && md.audio ? "Camera and microphone on" : md.video ? "Camera on" : md.audio ? "Microphone on" : "";
+        // Drawn media says so: the app's own picture or sound, not the camera's or the microphone's.
+        const V = md.drawn ? "The app's picture" : "Camera", A = md.drawnSound ? "the app's sound" : "microphone";
+        const cam = md.video && md.audio ? V + " and " + A + " on" : md.video ? V + " on" : md.audio ? A[0].toUpperCase() + A.slice(1) + " on" : "";
         what = what && cam ? what + " · " + cam.toLowerCase() : what || cam;
       }
       if (md.muted.video && md.muted.audio) what += " (muted)";
@@ -89,7 +100,7 @@
       if (!s.media) {
         s.media = { stream: null, xstream: null, video: false, audio: false, screen: false, share: {}, hear: {}, volume: {},
                     place: {}, muted: { video: false, audio: false, sound: false }, tiles: {}, enc: {}, rx: {}, out: [], busy: false,
-                    frames: {}, levels: null, spatial: null, speaking: {}, kfAsked: {}, cut: null };
+                    frames: {}, levels: null, spatial: null, speaking: {}, kfAsked: {}, cut: null, drawn: null, drawnSound: null };
         seats.add(s);
         s.media.watch = setInterval(() => watch(s), 150);
       }
@@ -562,6 +573,93 @@
       cutOff(s);
       if (md.stream) md.stream.getTracks().forEach((t) => t.stop());
       md.stream = null; md.video = md.audio = md.screen = false;
+      drawnOff(md.drawn, md.drawnSound);
+      md.drawn = null; md.drawnSound = null;
+    }
+
+    // ---------------- drawn media ----------------
+    // A canvas for the app's pictures: its track goes where a camera's would.
+    function drawnVideo(want) {
+      const n = (v, lo, hi, d) => { v = Math.round(Number(v)); return isFinite(v) && v > 0 ? Math.min(hi, Math.max(lo, v)) : d; };
+      const w = n(want.width, 16, DRAWN_MOST, 640), h = n(want.height, 16, DRAWN_MOST, 360), fps = n(want.fps, 1, DRAWN_FPS, DRAWN_FPS);
+      const canvas = document.createElement("canvas");
+      canvas.width = w; canvas.height = h;
+      const g = canvas.getContext("2d");
+      g.fillStyle = "#000"; g.fillRect(0, 0, w, h);
+      if (!canvas.captureStream) throw new Error("no drawn video in this window");
+      const track = canvas.captureStream(fps).getVideoTracks()[0];
+      if (!track) throw new Error("no drawn video in this window");
+      return { canvas, g, w, h, fps, track };
+    }
+    // A sound context of the drawn sound's own, whose only output is a stream: its track goes where a microphone's
+    // would. Nothing in it is connected to the speakers.
+    function drawnAudio() {
+      const C = window.AudioContext || window.webkitAudioContext;
+      if (!C) throw new Error("no drawn sound in this window");
+      const ctx = new C({ sampleRate: 48000 });
+      if (!ctx.createMediaStreamDestination) { ctx.close().catch(() => {}); throw new Error("no drawn sound in this window"); }
+      const dest = ctx.createMediaStreamDestination();
+      const ds = { ctx, dest, next: 0, sources: new Set(), track: dest.stream.getAudioTracks()[0] };
+      // As the window's own sound: a window not yet clicked may hold it until a click.
+      ds.wake = () => { if (ctx.state === "suspended") ctx.resume().catch(() => {}); };
+      window.addEventListener("pointerdown", ds.wake, true);
+      window.addEventListener("keydown", ds.wake, true);
+      ds.wake();
+      return ds;
+    }
+    function drawnFlush(ds) {
+      for (const src of ds.sources) { try { src.onended = null; src.stop(); src.disconnect(); } catch (err) {} }
+      ds.sources.clear();
+      ds.next = 0;
+    }
+    function drawnOff(dv, ds) {
+      if (dv) { try { dv.track.stop(); } catch (err) {} dv.canvas.width = dv.canvas.height = 0; }
+      if (ds) {
+        drawnFlush(ds);
+        window.removeEventListener("pointerdown", ds.wake, true);
+        window.removeEventListener("keydown", ds.wake, true);
+        try { ds.track.stop(); } catch (err) {}
+        ds.ctx.close().catch(() => {});
+      }
+    }
+    // One picture from the page onto the canvas, scaled to fit (black around it), then closed. Drawing here is
+    // synchronous, so the newest always wins; the shim keeps one on its way and drops (closes) the ones between.
+    function drawnDraw(md, bm) {
+      const dv = md.drawn;
+      try {
+        if (!dv) throw new Error("no drawn video: start({drawn: {width, height, fps}}) first");
+        const bw = bm && bm.width, bh = bm && bm.height;
+        if (!bw || !bh) throw new Error("draw takes an ImageBitmap");
+        const k = Math.min(dv.w / bw, dv.h / bh), w = bw * k, h = bh * k;
+        dv.g.fillStyle = "#000"; dv.g.fillRect(0, 0, dv.w, dv.h);
+        dv.g.drawImage(bm, (dv.w - w) / 2, (dv.h - h) / 2, w, h);
+      } finally { try { if (bm && bm.close) bm.close(); } catch (err) {} }
+    }
+    // Samples from the page, after what is queued, into the call alone. Nothing queued (or the queue ran dry):
+    // start again a lead ahead, so a piece that came late never plays cut.
+    function drawnPlay(md, m) {
+      const ds = md.drawnSound;
+      if (!ds) throw new Error("no drawn sound: start({sound: 'drawn'}) first");
+      const ctx = ds.ctx, queued = () => Math.max(0, Math.round((ds.next - ctx.currentTime) * 1000));
+      if (m.flush) { drawnFlush(ds); return { queued_ms: 0 }; }
+      const samples = m.samples, rate = Math.round(Number(m.rate));
+      if (!(samples instanceof Float32Array)) throw new Error("play takes a Float32Array of mono samples");
+      if (!(rate >= 8000 && rate <= 48000)) throw new Error("a rate is 8000 to 48000");
+      if (!samples.length) return { queued_ms: queued() };
+      if (samples.length > rate * DRAWN_PIECE_S) throw new Error("at most " + DRAWN_PIECE_S + " s in one play");
+      if (queued() > DRAWN_QUEUE_S * 1000) throw new Error("busy: " + DRAWN_QUEUE_S + " s are queued already");
+      ds.wake();
+      const buf = ctx.createBuffer(1, samples.length, rate);
+      if (buf.copyToChannel) buf.copyToChannel(samples, 0); else buf.getChannelData(0).set(samples);
+      const src = ctx.createBufferSource();
+      src.buffer = buf;
+      src.connect(ds.dest);                             // the call only, never ctx.destination
+      const at = Math.max(ds.next, ctx.currentTime + DRAWN_LEAD);
+      src.onended = () => { ds.sources.delete(src); try { src.disconnect(); } catch (err) {} };
+      ds.sources.add(src);
+      src.start(at);
+      ds.next = at + buf.duration;
+      return { queued_ms: queued() };
     }
     function stopScreen(s, told) {
       const md = s.media;
@@ -599,6 +697,7 @@
       const md = s.media, cam = md.stream && md.video && !md.screen ? md.stream.getVideoTracks()[0] : null;
       md.cutMode = mode;
       if (!mode) { cutOff(s); drawAll(s); return {}; }
+      if (md.drawn) { md.cutMode = ""; throw new Error("the cutout is for a camera"); }
       if (!cam) throw new Error("no camera: start({video: true}) first");
       if (!window.ArcadeCutout) throw new Error("no cutout in this window");
       if (md.cut && md.cut.track0 !== cam) cutOff(s);
@@ -630,12 +729,18 @@
       const md = mediaOf(s);
       switch (m.do) {
         case "start": {
-          const want = { video: !!m.video, audio: !!m.audio, screen: !!m.screen, sound: !!(m.sound && m.screen) };
-          // No cutout said: as before (a second start keeps it); null or "" ends it.
-          const cutout = m.cutout === undefined ? md.cutMode || "" : m.cutout ? String(m.cutout) : "";
+          const want = { video: !!m.video, audio: !!m.audio, screen: !!m.screen, sound: !!(m.sound && m.screen),
+                         drawn: m.drawn && typeof m.drawn === "object" ? m.drawn : null, drawnSound: !!m.drawnSound };
+          // No cutout said: as before (a second start keeps it, but not onto drawn pictures); null or "" ends it.
+          const cutout = m.cutout === undefined ? (want.drawn ? "" : md.cutMode || "") : m.cutout ? String(m.cutout) : "";
           if (cutout && CUTS.indexOf(cutout) < 0) throw new Error("a cutout is " + CUTS.join(", ") + " or none");
+          if (cutout && want.drawn) throw new Error("the cutout is for a camera");
+          if (want.drawn && want.screen) throw new Error("drawn pictures go where the camera's go: ask for drawn or screen, not both");
+          // Drawn pictures stand in for the camera, drawn sound for the microphone.
+          if (want.drawn) want.video = false;
+          if (want.drawnSound) want.audio = false;
           if (want.screen) want.video = false;
-          if (!want.video && !want.audio && !want.screen) throw new Error("ask for video, audio, screen or a pair");
+          if (!want.video && !want.audio && !want.screen && !want.drawn && !want.drawnSound) throw new Error("ask for video, audio, screen or a pair");
           const md0 = navigator.mediaDevices;
           if (want.screen && !(md0 && md0.getDisplayMedia)) throw new Error("no screen");
           if ((want.video || want.audio) && !(md0 && md0.getUserMedia)) throw new Error("denied");
@@ -653,8 +758,17 @@
             say(s, { type: "media-state", state: "denied" });
             throw new Error("denied");
           }
+          let dv = null, ds = null;
+          try {
+            if (want.drawn) { dv = drawnVideo(want.drawn); stream.addTrack(dv.track); }
+            if (want.drawnSound) { ds = drawnAudio(); stream.addTrack(ds.track); }
+          } catch (err) {
+            stream.getTracks().forEach((t) => t.stop());
+            drawnOff(dv, ds);
+            throw err;
+          }
           stopStream(s);
-          md.stream = stream;
+          md.stream = stream; md.drawn = dv; md.drawnSound = ds;
           md.video = stream.getVideoTracks().length > 0; md.audio = stream.getAudioTracks().length > 0; md.screen = want.screen && md.video;
           if (md.video) startVideo(s, "cam", KIND.cam, new MediaStream(stream.getVideoTracks()), want.screen ? SCR : CAM);
           const voice = stream.getAudioTracks();
@@ -667,6 +781,8 @@
           drawAll(s);
           say(s, { type: "media-state", state: "on" });
           const out = { video: md.video, audio: md.audio, screen: md.screen };
+          if (dv) out.drawn = { width: dv.w, height: dv.h, fps: dv.fps };
+          if (ds) out.drawnSound = true;
           if (cutout && md.video && !md.screen) Object.assign(out, await cutOn(s, cutout));
           else if (cutout) Object.assign(out, { cutout: "off", cutoutWhy: md.screen ? "the cutout is for a camera, not a screen" : "no camera" });
           else md.cutMode = "";
@@ -753,8 +869,10 @@
           if (mode && CUTS.indexOf(mode) < 0) throw new Error("a cutout is " + CUTS.join(", ") + " or none");
           return await cutOn(s, mode);
         }
+        case "draw": drawnDraw(md, m.bitmap); return {};
+        case "play": return drawnPlay(md, m);
         case "shown": return {};
-        default: throw new Error("media ops are start, stop, screen, share, hear, volume, place, mute, frames, spatial, levels and cutout");
+        default: throw new Error("media ops are start, stop, screen, share, hear, volume, place, mute, frames, spatial, levels, cutout, draw and play");
       }
     }
 

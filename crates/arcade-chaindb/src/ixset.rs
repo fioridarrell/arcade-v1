@@ -26,6 +26,12 @@ pub fn marker_name(kind: Kind) -> String {
     format!("ixf:{}", kind.tag() as char)
 }
 
+/// The STATE name of a kind's last generation. Unlike the marker it is never deleted
+/// (only with the chain), so a marker set again after `off` never repeats an old value.
+pub fn generation_name(kind: Kind) -> String {
+    format!("ixf:gen:{}", kind.tag() as char)
+}
+
 pub(crate) fn marker<R: Rd>(r: &R, c: u16, kind: Kind) -> Result<Option<Vec<u8>>> {
     r.get(STATE, &k_state(c, &marker_name(kind)))
 }
@@ -231,13 +237,23 @@ impl ChainDb {
         if m.len() < 4 {
             return Err(StoreError::Corrupt { table: STATE, why: "bad index files marker" });
         }
+        let cached = |m: &[u8]| self.ixsets.lock().unwrap().get(&(c, kind.tag())).filter(|(have, _)| have.as_slice() == m).map(|(_, set)| set.clone());
+        if let Some(set) = cached(&m) {
+            return Ok(Some(set));
+        }
+        // Loaded outside the lock (opening a big chain's files reads tens of MB of footers;
+        // other chains and kinds keep reading meanwhile). Two readers may both load; the
+        // first one stored wins.
+        let set = Arc::new(KindSet::load(&self.index_dir(c), kind, c, be_u32(&m, 0), |h| {
+            let v = r.get(HEIGHT, &k_height(c, h))?;
+            Ok(v.and_then(|v| v.get(..32).and_then(|x| x.try_into().ok())))
+        })?);
         let mut cache = self.ixsets.lock().unwrap();
-        if let Some((have, set)) = cache.get(&(c, kind.tag())) {
+        if let Some((have, won)) = cache.get(&(c, kind.tag())) {
             if *have == m {
-                return Ok(Some(set.clone()));
+                return Ok(Some(won.clone()));
             }
         }
-        let set = Arc::new(KindSet::load(&self.index_dir(c), kind, c, be_u32(&m, 0), |h| Ok(r.get(HEIGHT, &k_height(c, h))?.map(|v| v[..32].try_into().unwrap())))?);
         cache.insert((c, kind.tag()), (m, set.clone()));
         Ok(Some(set))
     }

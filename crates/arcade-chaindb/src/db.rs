@@ -1259,6 +1259,7 @@ impl ChainDb {
         if n > 0 {
             return Ok(n);
         }
+        self.forget_ix(chain_no);
         let own = self.files.write().unwrap().remove(&chain_no);
         if let Some(s) = own.filter(|s| !Arc::ptr_eq(s, &self.legacy)) {
             drop(s);
@@ -1611,6 +1612,9 @@ impl ChainDb {
         self.store(c).read(|r| {
             let mut cands: Vec<(u32, u32)> = r.scan_prefix(TXS, &k_txs(c, &txid.t12()))?.iter().map(|(_, bp)| (be_u32(bp, 0), be_u32(bp, 4))).collect();
             cands.extend(crate::txruns::find(r, r.store_id(), c, &txid.t12())?);
+            // Latest first: a duplicate txid (BIP30) gives the copy `locate` gives.
+            cands.sort_unstable_by(|a, b| b.cmp(a));
+            cands.dedup();
             let mut files_read = false;
             loop {
                 for (b, p) in cands {
@@ -1962,17 +1966,22 @@ impl ChainDb {
     }
 
     /// An address's history rows: (height, txid prefix, received, spent), by height then
-    /// prefix. Settled heights come from the history files where the chain has them (the
-    /// files name a transaction by its position; its id is read from the stored block, one
-    /// read per row: [`history_count_for_script`](Self::history_count_for_script) counts
-    /// without), the heights above them from the table.
+    /// prefix. From the table alone until the chain's history table is trimmed; after
+    /// that settled heights come from the history files (they name a transaction by its
+    /// position; its id is read from the stored block, one read per row:
+    /// [`history_count_for_script`](Self::history_count_for_script) counts without), the
+    /// heights above them from the table.
     pub fn history_for_script(&self, c: u16, script: &[u8]) -> Result<Vec<(u32, [u8; 12], u64, u64)>> {
         let sid = script_id(script);
         let pre = k_sid(c, &sid);
         let n = pre.len();
         let row = |(k, v): &(Vec<u8>, Vec<u8>)| (be_u32(k, n), k[n + 4..n + 16].try_into().unwrap(), be_u64(v, 0), be_u64(v, 8));
         self.store(c).read(|r| {
-            let Some(set) = self.ix(r, c, crate::ixfile::Kind::Hist)? else {
+            // The table answers while it holds every row (all of this part). The files only
+            // once it was trimmed: then each row's txid is read from its block, one read a
+            // row, which a long history can't afford (the explorer must page by position
+            // first).
+            let Some(set) = self.ix_trimmed(r, c, crate::ixfile::Kind::Hist)? else {
                 return Ok(r.scan_prefix(SCRIPT_HIST, &pre)?.iter().map(row).collect());
             };
             let params = arcade_chain::params::ALL_CHAINS.iter().find(|p| p.chain_no == c).ok_or_else(|| other("history files on a chain without known params"))?;
@@ -2003,7 +2012,7 @@ impl ChainDb {
     pub fn history_count_for_script(&self, c: u16, script: &[u8]) -> Result<usize> {
         let sid = script_id(script);
         let pre = k_sid(c, &sid);
-        self.store(c).read(|r| match self.ix(r, c, crate::ixfile::Kind::Hist)? {
+        self.store(c).read(|r| match self.ix_trimmed(r, c, crate::ixfile::Kind::Hist)? {
             Some(set) => Ok(set.history_len(&sid)? + self.hist_tail(r, &pre, set.upto)?.len()),
             None => Ok(r.scan_prefix(SCRIPT_HIST, &pre)?.len()),
         })

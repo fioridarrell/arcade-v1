@@ -889,6 +889,10 @@ pub fn preview(node: &Node, id: &str) -> Result<Value, String> {
     v["fee"] = json!(fee);
     v["outputs"] = json!(outs);
     v["caution"] = json!(caution);
+    // The coin the fee is in (2026-11-21: a swap order giving ARCADE said "Network fee: 0 PEPtest"): the chain the
+    // request is built on, a market order's the chain of what it gives.
+    let fee_chain = r["give"]["chain"].as_str().or(r["give"]["network"].as_str()).or(r["chain"].as_str()).and_then(crate::chains::find).unwrap_or(node.params);
+    v["fee_unit"] = json!(crate::explorer::unit(fee_chain));
     v["page_card"] = page_card(node, r["page"].as_str().unwrap_or(""));
     if r["kind"] == "fog" {
         // Its card as things stand now (copies, room and pay move while it waits).

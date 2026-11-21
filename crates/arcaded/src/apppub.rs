@@ -858,11 +858,11 @@ mod tests {
 
     #[test]
     fn a_withdrawal_card_files_under_the_same_app() {
-        let card = arcade_ledger::cards::parse(r#"{"app":{"name":"Kiko","family":"kiko","category":"social","version":"2"}}"#).unwrap();
+        let card = arcade_ledger::cards::parse(r#"{"app":{"name":"Test Pond","family":"test-pond","category":"social","version":"2"}}"#).unwrap();
         let w = withdrawal_card(&card, "moved", "arctest:ab", &[]);
         let back = arcade_ledger::cards::parse(&w.to_string()).unwrap();
         assert_eq!(back.key(), card.key());
-        assert_eq!(back.family, "kiko");
+        assert_eq!(back.family, "test-pond");
         let wd = back.withdraw.unwrap();
         assert_eq!((wd.reason.as_str(), wd.replaced_by.as_str(), wd.versions.len()), ("moved", "arctest:ab", 0));
         assert!(withdrawn_page("<b>", "x & y").contains("&lt;b&gt;") && withdrawn_page("a", "x & y").contains("x &amp; y"));

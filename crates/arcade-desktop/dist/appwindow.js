@@ -919,7 +919,7 @@
       // The app's card is one arcade's word (a chain whose ledger isn't here): said above Approve, not hidden.
       if (who.caution) { const c = document.createElement("span"); c.className = "caution"; c.textContent = "⚠ " + who.caution; lines.push(c); }
       if (pv.note) lines.push(`“${pv.note}”`);
-      lines.push(outs, `Network fee: ${pep(pv.fee)}`);
+      lines.push(outs, `Network fee: ${pv.fee_unit ? coinNum(pv.fee) + " " + pv.fee_unit : pep(pv.fee)}`);
       // One arcade alone (or none) vouched that its coins carry no inscription: said above Approve.
       if (pv.caution && pv.caution.note && pv.caution.level !== "green") {
         const c = document.createElement("div"); c.className = "caution " + pv.caution.level; c.setAttribute("role", "alert"); c.textContent = pv.caution.note;

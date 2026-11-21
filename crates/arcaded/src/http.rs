@@ -770,7 +770,10 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             None
         };
         let page_chain = page.as_ref().map(|p| p.0).or(program_chain).filter(|p| p.chain_no != node.params.chain_no);
-        if r.method == "POST" && path == "/r/send" && page_chain.is_some() {
+        // A page on the ARCADE chain sends there (walletsvc::file, batch 7, in that page's chain): this refused it
+        // before the request was ever filed (Storage 1.3's "Suggest a price", 2026-11-20).
+        let arc_page = page_chain.filter(|p| crate::arcsvc::defines(p.key));
+        if r.method == "POST" && path == "/r/send" && send_refused_for(page_chain, arc_page) {
             let msg = json!({"error": format!("this app is on {}: this arcade's wallet sends on {} only", page_chain.unwrap().name, node.params.name)});
             return respond(&mut s, "400 Bad Request", "application/json", &cors, msg.to_string().as_bytes());
         }
@@ -818,7 +821,11 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                 body["kind"] = json!("market");
                 body["op"] = json!(op);
             }
-            let (code, v) = crate::walletsvc::file(node, &page, &body);
+            // Filed in the page's chain when it is the ARCADE chain, so the send is built there (walletsvc::send_chain).
+            let (code, v) = match arc_page {
+                Some(p) => crate::pagechain::with(p, || crate::walletsvc::file(node, &page, &body)),
+                None => crate::walletsvc::file(node, &page, &body),
+            };
             let st = match code { 200 => "200 OK", 202 => "202 Accepted", _ => "400 Bad Request" };
             return respond(&mut s, st, "application/json", &cors, v.to_string().as_bytes());
         }
@@ -1369,6 +1376,12 @@ fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
     respond(s, "200 OK", "application/json", &[], out.to_string().as_bytes());
 }
 
+/// Whether POST /r/send is refused for a page on `page_chain` (None: the home chain): a page on another chain asks this
+/// arcade's wallet to send on a chain it doesn't send on, except the ARCADE chain (`arc_page`), whose sends it builds.
+fn send_refused_for(page_chain: Option<&'static arcade_chain::params::ChainParams>, arc_page: Option<&'static arcade_chain::params::ChainParams>) -> bool {
+    page_chain.is_some() && arc_page.is_none()
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
 
@@ -1546,6 +1559,15 @@ pub(crate) mod tests {
         for j in [&a, &b, &c] {
             let _ = crate::realtime::leave(&t.node, &tok(j));
         }
+    }
+
+    #[test]
+    fn a_page_on_the_arcade_chain_may_send_there() {
+        use arcade_chain::params::{DOGECOIN_MAIN, PEPECOIN_TEST};
+        assert!(!send_refused_for(None, None), "a home-chain page");
+        assert!(send_refused_for(Some(&DOGECOIN_MAIN), None), "another chain this wallet doesn't send on");
+        // A page on the ARCADE chain (the chain the ARCADE service defines): filed, built there by walletsvc.
+        assert!(!send_refused_for(Some(&PEPECOIN_TEST), Some(&PEPECOIN_TEST)));
     }
 
     #[test]

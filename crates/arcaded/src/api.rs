@@ -215,7 +215,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     if crate::commands::find(cmd).is_none() {
         return Err(format!("unknown command {cmd:?}: rpc.help lists them"));
     }
-    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish") || cmd == "arc.blob_upgrade") {
+    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish") || cmd == "arc.blob_upgrade" || cmd == "apps.publish" || cmd == "apps.withdraw") {
         return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
     }
     // `"chain": key` on a post, act, follow or message: written there (crate::msgsvc::write_chains; option C).
@@ -673,7 +673,9 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             let keys: Vec<String> = req["members"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             crate::grpsvc::remove(node, &s("id").ok_or("id required")?, &keys)
         }
-        "apps.store" => Ok(crate::appsvc::store(node, &s("sort").unwrap_or_else(|| "popular".into()), &s("q").unwrap_or_default(), req["flagged"] == true, &s("category").unwrap_or_default())),
+        "apps.store" => Ok(crate::appsvc::store_with(node, &s("sort").unwrap_or_else(|| "popular".into()), &s("q").unwrap_or_default(), req["flagged"] == true, &s("category").unwrap_or_default(), req["withdrawn"] == true)),
+        "apps.publish" => crate::apppub::publish_req(node, req),
+        "apps.withdraw" => crate::apppub::withdraw_req(node, req),
         "apps.categories" => Ok(crate::appsvc::categories()),
         "apps.installed" => Ok(crate::appsvc::installed(node)),
         "apps.install" => crate::appsvc::install(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),

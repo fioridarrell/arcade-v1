@@ -285,18 +285,32 @@ pub fn wallet(node: &Node) -> Value {
     let p = crate::pagechain::params(node);
     let mut spendable = 0u64;
     let mut sums: std::collections::BTreeMap<u32, u64> = Default::default();
+    let home = p.chain_no == node.params.chain_no;
     for a in &addrs {
-        if let Some(script) = arcade_ledger::address::p2pkh_script_for_address(p, a) {
-            let coins = if p.chain_no == node.params.chain_no { crate::claims::spendable(node, &script) } else { crate::ordsafe::keep_free(node, p, crate::borrow::spendable(node, p, &script)) };
-            spendable += coins.iter().map(|u| u.value).sum::<u64>();
+        if home {
+            if let Some(script) = arcade_ledger::address::p2pkh_script_for_address(p, a) {
+                spendable += crate::claims::spendable(node, &script).iter().map(|u| u.value).sum::<u64>();
+            }
         }
         for (pid, u) in holdings(node, a) {
             *sums.entry(pid).or_default() += u;
         }
     }
+    // Another chain's page (one inscribed on ARCADE, say): this wallet's key there and the coins a send from it can
+    // spend, installed, borrowed or run here alike (crate::swaps::coins). It asked borrow::spendable with the first
+    // chain's addresses, which answers only for a borrowed chain: an app on ARCADE saw 0 with thousands in the wallet
+    // (2026-11-21).
+    let mut page_addrs: Vec<String> = Vec::new();
+    if !home {
+        if let Ok((_, pk)) = crate::swaps::wallet_key(node, p) {
+            spendable = crate::swaps::coins(node, p, &pk).iter().map(|u| u.value).sum::<u64>();
+            page_addrs = crate::coinsend::key_scripts(p, &pk).into_iter().map(|(a, _)| a).collect();
+        }
+    }
     let tag = addrs.iter().find_map(|a| tag_of(node, a));
     let insc = all_inscriptions(node).iter().filter(|v| v["owner"].as_str().is_some_and(|o| addrs.iter().any(|a| a == o))).count();
-    json!({"network": p.net, "mainnet": !p.key.ends_with("test"), "addresses": addrs, "tag": tag,
+    let shown = if home { addrs.clone() } else { page_addrs };
+    json!({"network": p.net, "mainnet": !p.key.ends_with("test"), "addresses": shown, "tag": tag,
            "coin": {"spendable": spendable as f64 / 1e8, "ticker": ""},
            "tokens": balance_rows(node, &sums.into_iter().collect::<Vec<_>>()), "inscriptions": insc, "wallet": "operator"})
 }
@@ -875,6 +889,10 @@ pub fn preview(node: &Node, id: &str) -> Result<Value, String> {
     v["fee"] = json!(fee);
     v["outputs"] = json!(outs);
     v["caution"] = json!(caution);
+    // The coin the fee is in (2026-11-21: a swap order giving ARCADE said "Network fee: 0 PEPtest"): the chain the
+    // request is built on, a market order's the chain of what it gives.
+    let fee_chain = r["give"]["chain"].as_str().or(r["give"]["network"].as_str()).or(r["chain"].as_str()).and_then(crate::chains::find).unwrap_or(node.params);
+    v["fee_unit"] = json!(crate::explorer::unit(fee_chain));
     v["page_card"] = page_card(node, r["page"].as_str().unwrap_or(""));
     if r["kind"] == "fog" {
         // Its card as things stand now (copies, room and pay move while it waits).

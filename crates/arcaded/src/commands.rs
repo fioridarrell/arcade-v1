@@ -412,7 +412,7 @@ cmds! {
     "rpc.openapi" Public "" "The OpenAPI 3.1 document of the web API (also GET /api/v1/openapi.json): every command, its typed parameters and result shape." => "OpenAPI 3.1 document (object)";
     "rpc.guide" Public "" "The short guide for AI agents and scripts (also GET /api/v1/agents.md), as Markdown text." => "string (Markdown)";
     // Apps (app cards)
-    "apps.store" Public "sort?, q?, flagged?, category?" "The App Store: app cards from every chain with the arcade ledger (popular or new; starred first), in categories (counts in \"categories\"; category = one of them).";
+    "apps.store" Public "sort?, q?, flagged?, category?, withdrawn?" "The App Store: app cards from every chain with the arcade ledger (popular or new; starred first), in categories (counts in \"categories\"; category = one of them). Apps their publishers withdrew are left out; withdrawn: true lists only those.";
     "apps.categories" Public "" "The App Store's known categories (games, apps, social, node modules); a card may name any other.";
     "apps.installed" Read "" "Apps installed on this arcade, each at its newest version.";
     "apps.install" Admin "chain, txid" "Install an app (it follows its author's updates).";
@@ -469,7 +469,9 @@ cmds! {
     "apps.owner" Read "page" "arcade.owner.identity: whether this wallet created the page and still holds it.";
     "apps.owner_send" Local "page, request" "arcade.owner.send: a page this wallet created and holds sends at once (testnet).";
     "apps.node" Local "op, page, to?, body?, after?, limit?" "arcade.node for a page: identity, send (sealed node-to-node), sent, replies.";
-    "apps.launch" Read "chain, txid" "What an app window opens: the sandboxed page URL and the card.";
+    "apps.launch" Read "chain, txid" "What an app window opens: the sandboxed page URL and the card; withdrawn {reason, replaced_by} when its publisher withdrew it (it still opens).";
+    "apps.publish" Wallet "file | content_b64, type, name, card?, chain?, as?, send?, client_ref?" "Inscribe an app page, its icon or any file (at most 4 MB) signed with this arcade's own wallet key, exactly as arcade-publish writes it (arcade INSC, the card as its JSON): chain defaults to ARCADE when installed or borrowed here, else the home chain; file is a path on this computer (not over the web API); as signs with the key holding that @tag. Without send: the plan (chunks, transactions, fee, locked, balance, enough). With send: {id (first txid, served at /app/<chain>/<id>), txids, chunks, fee}; on a coin chain the pieces wait for the split's first block (state waiting; sent in the background, or ask again). Asked again (same client_ref, or the same file, type, card and chain) it finishes what is unfinished and never pays twice." => "{chain, address, tag, name, content_type, bytes, chunks, transactions, state, id, txids, fee, resumed}";
+    "apps.withdraw" Wallet "chain?, txid | family, reason?, replaced_by?, versions?, as?, send?, client_ref?" "Withdraw one of this wallet's apps from the App Store: a new version whose card says withdrawn (the whole app, or only the versions listed), published as apps.publish publishes. Only its publisher can: the app's creator must be the key signing here. replaced_by: chain:txid or a name. Without send: the plan and cost." => "apps.publish's answer + {withdrawal_card, app}";
     // API keys (managed from this computer only)
     "apikey.list" Local "" "API keys (not their secrets).";
     "apikey.create" Local "name, perms, tip_limit?" "Make an API key; the secret is shown once.";
@@ -545,7 +547,14 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("fast", "boolean", "Use the fast lane."),
     ("fee", "integer", "A fee in the smallest unit."),
     ("fee_address", "string", "Where fees go."),
-    ("file", "object", "A file: {name, type, data (base64)}."),
+    ("file", "object|string", "A file: {name, type, data (base64)}; for apps.publish, a path on this computer (the socket and cookie RPC only)."),
+    ("content_b64", "string", "A file's bytes as base64."),
+    ("card", "object|string", "An app card: the JSON beside the inscription, e.g. {\"app\": {name, family, version, ...}}; a string is used as written."),
+    ("as", "string", "An @tag to sign with: the key here (the wallet's own, or an imported one) that holds it."),
+    ("reason", "string", "Why, in a few words."),
+    ("replaced_by", "string", "What replaces it: chain:txid, or a name."),
+    ("versions", "array", "Card txids (64 hex)."),
+    ("withdrawn", "boolean", "Only the apps their publishers withdrew."),
     ("files", "array|object", "Files: [{hex | path, type, class?, gzip?}] for blobs; {name: path} for a release."),
     ("first", "integer", "The first height or leaf."),
     ("flagged", "boolean", "Only flagged ones."),

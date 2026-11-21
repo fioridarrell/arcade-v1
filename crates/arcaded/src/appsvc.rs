@@ -41,8 +41,27 @@ struct Ver {
 
 struct App {
     chain: &'static ChainParams,
-    versions: Vec<Ver>, // newest first
+    versions: Vec<Ver>, // newest first; never a withdrawal card, nor a version one withdrew
     removed: bool,
+    /// Withdrawn by its publisher (2026-11-21): the newest card of the creator's app is a withdrawal of the whole app.
+    /// {reason, replaced_by, txid (the withdrawal card)}.
+    withdrawn: Option<Value>,
+}
+
+/// One creator's cards of one app (newest first) as the store offers them (2026-11-21, Martin): withdrawal cards are
+/// never versions; the versions any of them lists are hidden; and when the newest card withdraws the whole app, the app
+/// is withdrawn (kept findable, not listed). None when no version is left to offer. Cards here are all the same
+/// creator's (gather groups by creator), so another creator's withdrawal never touches this app.
+fn resolve(vs: Vec<Ver>) -> Option<(Vec<Ver>, Option<Value>)> {
+    let whole = vs.first().and_then(|n| {
+        n.card.withdraw.as_ref().filter(|w| w.versions.is_empty()).map(|w| json!({"reason": w.reason, "replaced_by": w.replaced_by, "txid": n.txid}))
+    });
+    let hidden: BTreeSet<String> = vs.iter().filter_map(|v| v.card.withdraw.as_ref()).flat_map(|w| w.versions.iter().cloned()).collect();
+    let offered: Vec<Ver> = vs.into_iter().filter(|v| v.card.withdraw.is_none() && !hidden.contains(&v.txid)).collect();
+    if offered.is_empty() {
+        return None;
+    }
+    Some((offered, whole))
 }
 
 fn meta_get(node: &Node, k: &str) -> Value {
@@ -291,11 +310,12 @@ fn gather(node: &Node) -> Vec<App> {
         }
         for (_, mut vs) in by {
             vs.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
+            let Some((vs, withdrawn)) = resolve(vs) else { continue };
             let newest = &vs[0];
             // Removed: the creator's DELETE on the newest card (feed acts on any ledger chain, by the creator's key).
             let creator = node.home_address(&newest.creator);
             let removed = acts.iter().any(|a| a["kind"] == 6 && a["target"] == newest.txid.as_str() && a["from"] == creator.as_str());
-            apps.push(App { chain: p, versions: vs, removed });
+            apps.push(App { chain: p, versions: vs, removed, withdrawn });
         }
     }
     apps
@@ -334,15 +354,7 @@ fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
     let trusted: BTreeSet<String> = meta_get(node, "apps_trusted").as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
     // What a card can be mistaken for is an app the store still lists: not one its creator removed,
     // and not one the operator confirmed as a copy.
-    let mut all: Vec<(&Ver, &str)> = Vec::new();
-    for a in apps {
-        if a.removed || meta_get(node, &format!("cardwatch:{}:{}", a.chain.key, a.versions[0].txid)) == "confirmed" {
-            continue;
-        }
-        for v in &a.versions {
-            all.push((v, a.chain.key));
-        }
-    }
+    let all = comparable(apps, |a| meta_get(node, &format!("cardwatch:{}:{}", a.chain.key, a.versions[0].txid)) == "confirmed");
     let mut out = BTreeMap::new();
     for a in apps {
         let n = &a.versions[0];
@@ -356,12 +368,33 @@ fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
         if trusted.contains(&n.creator) && n.checked {
             continue;
         }
-        let earlier = all.iter().find(|(o, _)| o.creator != n.creator && (o.height, o.position) < (n.height, n.position) && cards::looks_like(&n.card, &o.card));
-        if let Some((o, ch)) = earlier {
-            out.insert(n.txid.clone(), format!("flagged: looks like {} by {} on {ch}", o.card.name, o.creator));
+        if let Some(f) = lookalike(n, &all) {
+            out.insert(n.txid.clone(), f);
         }
     }
     out
+}
+
+/// The cards a new card may be mistaken for: every version of each app the store still lists. Not one its creator
+/// removed, nor one its creator withdrew whole (Martin 2026-11-21: once the original owner took it away, a new app of
+/// that name is no copy of anything), nor one the operator confirmed as a copy (`confirmed`).
+fn comparable<'a>(apps: &'a [App], confirmed: impl Fn(&App) -> bool) -> Vec<(&'a Ver, &'static str)> {
+    let mut all = Vec::new();
+    for a in apps {
+        if a.removed || a.withdrawn.is_some() || confirmed(a) {
+            continue;
+        }
+        for v in &a.versions {
+            all.push((v, a.chain.key));
+        }
+    }
+    all
+}
+
+/// "flagged: looks like ..." when an earlier card by another creator in `all` looks like `n`.
+fn lookalike(n: &Ver, all: &[(&Ver, &str)]) -> Option<String> {
+    let earlier = all.iter().find(|(o, _)| o.creator != n.creator && (o.height, o.position) < (n.height, n.position) && cards::looks_like(&n.card, &o.card));
+    earlier.map(|(o, ch)| format!("flagged: looks like {} by {} on {ch}", o.card.name, o.creator))
 }
 
 /// Opinions, comments and tips on any version of an app (home chain feed acts).
@@ -526,7 +559,7 @@ pub fn add_defaults(node: &Node) {
     let mut done = done;
     let mut ids = installed_ids(node);
     for (id, feed) in todo {
-        let Some(a) = apps.iter().find(|a| !a.removed && app_id(a.chain.key, &a.versions[0].creator, &a.versions[0].card.key()) == *id) else { continue };
+        let Some(a) = apps.iter().find(|a| !a.removed && a.withdrawn.is_none() && app_id(a.chain.key, &a.versions[0].creator, &a.versions[0].card.key()) == *id) else { continue };
         if !ids.iter().any(|x| x["id"] == *id) {
             ids.push(json!({"id": id, "at": arcade_app::now(), "card": a.versions[0].card.to_json(), "default": true}));
             let _ = node.app.event("apps", &format!("installed {} (one of the apps every arcade starts with)", a.versions[0].card.name));
@@ -572,7 +605,7 @@ fn entry(node: &Node, a: &App, acts: &[Value], fx: &Fixes, me: &str, flag: Optio
         "creator": n.creator, "creator_tag": tag, "height": n.height, "time": time, "card": n.card.to_json(),
         "opens": opens, "versions": a.versions.iter().map(|v| json!({"txid": v.txid, "version": v.card.version, "height": v.height, "trust": v.trust.as_str()})).collect::<Vec<_>>(),
         "trust": trust_json(n),
-        "removed": a.removed, "flag": flag, "mine": n.creator == me, "installed": installed.contains(&id), "starred": starred.contains(&id),
+        "removed": a.removed, "withdrawn": a.withdrawn, "flag": flag, "mine": n.creator == me, "installed": installed.contains(&id), "starred": starred.contains(&id),
         "social": s,
     })
 }
@@ -610,6 +643,11 @@ pub fn categories() -> Value {
 /// The App Store: every app (not removed; flagged only when asked), starred first. `category`
 /// "" is all of them; the reply counts each category among the apps the search finds.
 pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &str) -> Value {
+    store_with(node, sort, q, show_flagged, category, false)
+}
+
+/// [`store`]; `withdrawn`: only the apps their publishers withdrew (never listed otherwise; 2026-11-21).
+pub fn store_with(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &str, withdrawn: bool) -> Value {
     let apps = gather(node);
     let fl = flags(node, &apps);
     let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
@@ -620,7 +658,7 @@ pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &st
     let q = q.trim().to_lowercase();
     let mut out: Vec<Value> = apps
         .iter()
-        .filter(|a| !a.removed)
+        .filter(|a| !a.removed && a.withdrawn.is_some() == withdrawn)
         .filter(|a| {
             let f = fl.get(&a.versions[0].txid);
             let hidden = f.is_some_and(|f| f.starts_with("flagged") || f == "confirmed");
@@ -781,6 +819,21 @@ pub fn trust(node: &Node, address: &str, on: bool) -> Result<Value, String> {
     Ok(json!({"trusted": t}))
 }
 
+/// The apps on `p` with a version `txid` or the family (or name) `family`, withdrawn ones too: (creator, newest card,
+/// every offered version's txid). For apps.withdraw (crate::apppub), which checks the creator.
+pub fn lookup(node: &Node, p: &ChainParams, txid: Option<&str>, family: Option<&str>) -> Vec<(String, Card, Vec<String>)> {
+    gather(node)
+        .into_iter()
+        .filter(|a| a.chain.chain_no == p.chain_no)
+        .filter(|a| match (txid, family) {
+            (Some(t), _) => a.versions.iter().any(|v| v.txid == t),
+            (None, Some(f)) => a.versions[0].card.family == f || a.versions[0].card.key() == f.to_lowercase(),
+            _ => false,
+        })
+        .map(|a| (a.versions[0].creator.clone(), a.versions[0].card.clone(), a.versions.iter().map(|v| v.txid.clone()).collect()))
+        .collect()
+}
+
 /// What the app window needs: the page to run (served sandboxed by this arcade, with its pass for the page API: the
 /// address carries the page's key, crate::http::page_key) and the card.
 pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
@@ -793,8 +846,10 @@ pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let key = crate::chains::find(chain).map(|cp| crate::http::page_key(node, cp.key, &opens)).unwrap_or_default();
     // One arcade's word for the version that opens: it still opens, with a caution the app window shows.
     let caution = (e["trust"]["level"] == "yellow").then(|| e["trust"]["note"].clone());
+    // Withdrawn by its publisher: it still opens (an installed copy is never taken away), and the window says so.
+    let withdrawn = e["withdrawn"].as_object().map(|w| json!({"reason": w.get("reason"), "replaced_by": w.get("replaced_by")}));
     Ok(json!({
-        "caution": caution,
+        "caution": caution, "withdrawn": withdrawn,
         "id": e["id"], "title": format!("{}{}", e["card"]["name"].as_str().unwrap_or("App"), e["card"]["version"].as_str().filter(|v| !v.is_empty()).map(|v| format!(" {v}")).unwrap_or_default()),
         "frame": format!("http://127.0.0.1:{port}/app/{chain}/{opens}?pass={key}"),
         "card": e["card"], "permissions": e["permissions"], "creator": e["creator"], "chain": chain,
@@ -1070,5 +1125,83 @@ mod trust_tests {
         assert!(t["note"].as_str().unwrap().contains("Double-check"));
         assert_eq!(trust_json(&v(2, true))["level"], "green");
         assert_eq!(trust_json(&v(0, true))["note"], "From this arcade's own ledger.");
+    }
+}
+
+#[cfg(test)]
+mod withdraw_tests {
+    use super::*;
+
+    fn ver(txid: &str, creator: &str, h: u64, card: &str) -> Ver {
+        Ver { txid: txid.into(), number: h, creator: creator.into(), height: h, position: 0, card: cards::parse(card).unwrap(),
+              trust: crate::vouch::Level::Green, holders: 0, checked: true }
+    }
+    fn chain() -> &'static ChainParams {
+        arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &arcade_chain::Hash256::ZERO)
+    }
+    /// One creator's cards (any order) as gather files them: newest first, resolved.
+    fn app(mut vs: Vec<Ver>) -> Option<App> {
+        vs.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
+        resolve(vs).map(|(versions, withdrawn)| App { chain: chain(), versions, removed: false, withdrawn })
+    }
+    const F1: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","version":"1"}}"#;
+    const F2: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","version":"2"}}"#;
+    const WHOLE: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","withdrawn":true,"reason":"retired","replaced_by":"frog-lake"}}"#;
+    fn only(txid: &str) -> String {
+        format!(r#"{{"app":{{"name":"Frog Pond","family":"frog-pond","withdrawn":true,"versions":["{txid}"]}}}}"#)
+    }
+    fn t(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    #[test]
+    fn a_withdrawal_card_hides_the_family() {
+        let a = app(vec![ver(&t('1'), "X", 10, F1), ver(&t('2'), "X", 20, F2), ver(&t('3'), "X", 30, WHOLE)]).unwrap();
+        let w = a.withdrawn.as_ref().expect("withdrawn whole");
+        assert_eq!((w["reason"].as_str(), w["replaced_by"].as_str(), w["txid"].as_str()), (Some("retired"), Some("frog-lake"), Some(t('3').as_str())));
+        assert_eq!(a.versions.iter().map(|v| v.txid.clone()).collect::<Vec<_>>(), [t('2'), t('1')], "the withdrawal card is no version");
+        // A newer real version after the withdrawal lists it again.
+        let back = app(vec![ver(&t('1'), "X", 10, F1), ver(&t('3'), "X", 30, WHOLE), ver(&t('4'), "X", 40, F2)]).unwrap();
+        assert!(back.withdrawn.is_none());
+        assert_eq!(back.versions[0].txid, t('4'));
+    }
+
+    #[test]
+    fn withdrawing_some_versions_hides_only_those() {
+        let a = app(vec![ver(&t('1'), "X", 10, F1), ver(&t('2'), "X", 20, F2), ver(&t('3'), "X", 30, &only(&t('2')))]).unwrap();
+        assert!(a.withdrawn.is_none(), "the app stays listed");
+        assert_eq!(a.versions.iter().map(|v| v.txid.clone()).collect::<Vec<_>>(), [t('1')]);
+        // Every version withdrawn one by one: nothing is left to offer.
+        assert!(app(vec![ver(&t('1'), "X", 10, F1), ver(&t('3'), "X", 30, &only(&t('1')))]).is_none());
+    }
+
+    #[test]
+    fn another_creators_withdrawal_does_not_count() {
+        // gather groups by creator: Y's withdrawal card is its own group, with no version to offer, and X's app is as
+        // it was.
+        let x = app(vec![ver(&t('1'), "X", 10, F1)]).unwrap();
+        assert!(x.withdrawn.is_none());
+        assert!(app(vec![ver(&t('9'), "Y", 50, WHOLE)]).is_none(), "a withdrawal alone offers nothing");
+        let y = app(vec![ver(&t('8'), "Y", 40, F2), ver(&t('9'), "Y", 50, &only(&t('1')))]).unwrap();
+        assert_eq!(y.versions.len(), 1, "Y's list of X's version is no withdrawal of it");
+        assert_eq!(comparable(std::slice::from_ref(&x), |_| false).len(), 1);
+    }
+
+    #[test]
+    fn a_family_its_owner_withdrew_blocks_no_new_app() {
+        let y = || app(vec![ver(&t('7'), "Y", 60, F1)]).unwrap();
+        let flagged = |x: App| {
+            let apps = [x, y()];
+            lookalike(&apps[1].versions[0], &comparable(&apps, |_| false))
+        };
+        // Without X's withdrawal, Y's later card looks like X's app: flagged.
+        assert!(flagged(app(vec![ver(&t('1'), "X", 10, F1)]).unwrap()).is_some_and(|f| f.starts_with("flagged")));
+        // X withdrew the whole family: nothing to be mistaken for any more.
+        assert_eq!(flagged(app(vec![ver(&t('1'), "X", 10, F1), ver(&t('2'), "X", 20, WHOLE)]).unwrap()), None);
+        // Withdrawing only a version leaves the family comparable.
+        assert!(flagged(app(vec![ver(&t('1'), "X", 10, F1), ver(&t('5'), "X", 15, F2), ver(&t('2'), "X", 20, &only(&t('5')))]).unwrap()).is_some());
+        // A "withdrawal" of X's family by Y is Y's own group (and offers nothing): X's app still blocks.
+        assert!(app(vec![ver(&t('6'), "Y", 30, WHOLE)]).is_none());
+        assert!(flagged(app(vec![ver(&t('1'), "X", 10, F1)]).unwrap()).is_some());
     }
 }

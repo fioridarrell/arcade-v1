@@ -171,11 +171,58 @@ pub fn on_frame(node: &Node, peer: &str, addr: &str, h: &Value) {
         }
         s.hints.insert(peer.to_string(), (lan, Instant::now(), peer_ip));
     }
+    remember(node, peer, lan, peer_ip);
     if direct(node, peer) {
         return;
     }
     let _ = node.app.event("mesh", &format!("{} is behind our router: dialing it at home ({lan})", &peer[..peer.len().min(16)]));
     crate::meshsvc::dial_lan(&node.self_arc(), lan.to_string());
+}
+
+/// Home addresses arcades behind our router told us, kept across restarts (2026-11-21: the GX10 restarted for an update
+/// and never linked to the arcade beside it again: the hint comes only over a link at our public address, a UDP path that
+/// didn't come up, and its release files were fetched through a relay that kept timing out). At most MAX_HINTS.
+const KEPT: &[u8] = b"samerouter_hints";
+
+fn kept(node: &Node) -> Vec<(String, SocketAddr, IpAddr)> {
+    let raw = node.app.store.read(|r| r.get(arcade_app::META, KEPT)).ok().flatten();
+    let v: Value = raw.and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    v.as_array().into_iter().flatten().filter_map(|e| {
+        Some((e["peer"].as_str()?.to_string(), e["lan"].as_str()?.parse().ok()?, e["via"].as_str()?.parse().ok()?))
+    }).collect()
+}
+
+fn remember(node: &Node, peer: &str, lan: SocketAddr, via: IpAddr) {
+    let mut all: Vec<(String, SocketAddr, IpAddr)> = kept(node).into_iter().filter(|(p, _, _)| p != peer).collect();
+    all.insert(0, (peer.to_string(), lan, via));
+    all.truncate(MAX_HINTS);
+    let v: Vec<Value> = all.iter().map(|(p, l, i)| json!({"peer": p, "lan": l.to_string(), "via": i.to_string()})).collect();
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, KEPT, json!(v).to_string().as_bytes()));
+}
+
+/// After a start: once STUN has told us our public address (up to KEPT_WAIT), the home address of each arcade kept
+/// above is dialed again when it is still behind our router (its public address then is still ours).
+const KEPT_WAIT: Duration = Duration::from_secs(600);
+pub fn start(node: std::sync::Arc<Node>) {
+    let saved = kept(&node);
+    if saved.is_empty() {
+        return;
+    }
+    let _ = std::thread::Builder::new().name("same router".into()).spawn(move || {
+        let t = Instant::now();
+        while our_public_ips().is_empty() && t.elapsed() < KEPT_WAIT {
+            std::thread::sleep(Duration::from_secs(5));
+        }
+        let ours = our_public_ips();
+        for (peer, lan, via) in saved {
+            if !same_router(via, &ours, public) || direct(&node, &peer) {
+                continue;
+            }
+            st().hints.insert(peer.clone(), (lan, Instant::now(), via));
+            let _ = node.app.event("mesh", &format!("{} was behind our router before this start: dialing it at home ({lan})", &peer[..peer.len().min(16)]));
+            crate::meshsvc::dial_lan(&node, lan.to_string());
+        }
+    });
 }
 
 /// The home address arcade `id` told us, while it is still behind our router (its public address then is still ours).

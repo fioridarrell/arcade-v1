@@ -50,6 +50,7 @@ mod arckeep;
 mod arcsvc;
 mod borrow;
 mod appsvc;
+mod apppub;
 mod walletsvc;
 mod coinsend;
 mod ddsvc;
@@ -855,6 +856,7 @@ fn main() {
         // STUN server (--stun-port, default 3478, 0 = none) and UDP paths beside mesh links.
         let stun_flag: Option<u16> = opt("--stun-port").map(|v| v.parse().unwrap_or_else(|_| fail_start(&format!("--stun-port {v}: give a port number"))));
         udpsvc::start(node.clone(), stun_flag);
+        samerouter::start(node.clone());
         if let Some(port) = mesh_port {
             let n = node.clone();
             std::thread::Builder::new().name("mesh listen".into()).spawn(move || meshsvc::listen(n, port)).unwrap();

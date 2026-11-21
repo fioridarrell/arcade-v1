@@ -30,6 +30,20 @@ pub struct Card {
     pub tdeck_icon: String,
     /// Seconds an app may stay minimized; None = no limit.
     pub minimized_timeout: Option<u64>,
+    /// A withdrawal by the publisher (2026-11-21, Martin): a new version whose card says `"withdrawn": true`. No new
+    /// record kind: it is published like any version, and the store reads it (arcaded appsvc).
+    pub withdraw: Option<Withdraw>,
+}
+
+/// What a withdrawal card says: why, what replaces the app, and which versions it takes back (none listed: the whole
+/// app).
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct Withdraw {
+    pub reason: String,
+    /// "chain:txid" of the replacement, or its name.
+    pub replaced_by: String,
+    /// Card txids (64 hex) withdrawn; empty = every version.
+    pub versions: Vec<String>,
 }
 
 fn text(v: &Value, limit: usize) -> String {
@@ -104,18 +118,27 @@ pub fn parse(json_text: &str) -> Option<Card> {
         tdeck: hex64(&d["tdeck"]),
         tdeck_icon: icon,
         minimized_timeout: minimized(d.get("minimized").unwrap_or(&Value::Null)),
+        withdraw: (d["withdrawn"] == true).then(|| Withdraw {
+            reason: text(&d["reason"], 280),
+            replaced_by: text(&d["replaced_by"], 140),
+            versions: d["versions"].as_array().map(|a| a.iter().map(hex64).filter(|t| !t.is_empty()).take(1000).collect()).unwrap_or_default(),
+        }),
     })
 }
 
 impl Card {
     pub fn to_json(&self) -> Value {
-        json!({
+        let mut v = json!({
             "name": self.name, "description": self.description, "version": self.version, "players": self.players,
             "genre": self.genre, "category": self.category, "multiplayer": self.multiplayer, "wallet": self.wallet, "media": self.media,
             "pictures": self.pictures, "notify": self.notify, "contacts": self.contacts, "groups": self.groups, "feed": self.feed,
             "family": self.family, "cover": self.cover, "play": self.play, "tdeck": self.tdeck, "tdeck_icon": self.tdeck_icon,
             "minimized_timeout": self.minimized_timeout,
-        })
+        });
+        if let Some(w) = &self.withdraw {
+            v["withdrawn"] = json!({"reason": w.reason, "replaced_by": w.replaced_by, "versions": w.versions});
+        }
+        v
     }
 
     /// The same app across versions: its name, casefolded.

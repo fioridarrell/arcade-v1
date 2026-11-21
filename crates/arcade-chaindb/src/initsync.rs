@@ -51,6 +51,9 @@ pub const INIT_RULES_TO: &str = "init_rules_to";
 /// STATE: blocks the rules refused once, dropped and fetched again (comma list of hashes): one
 /// refused again is the chain's own.
 pub const INIT_REFETCHED: &str = "init_refetched";
+/// STATE: timing lines of the phases so far (newline separated, the last 40), comparable
+/// between runs: blocks/s stored, tx index rows/s, coin derivation and rules blocks/s.
+pub const INIT_TIMING: &str = "init_timing";
 
 /// Independent sources that must agree on the best header.
 pub const MIN_AGREE: usize = 3;
@@ -178,6 +181,25 @@ pub struct Built {
     pub on_disk: bool,
     /// Blocks the rules refused, dropped to be fetched again: the phase is back at blocks.
     pub refetch: usize,
+    /// Timing lines of this build's steps (also kept in STATE INIT_TIMING).
+    pub timing: Vec<String>,
+}
+
+/// "12.3" per second of `n` over `d`.
+pub fn per_s(n: u64, d: std::time::Duration) -> String {
+    format!("{:.1}", n as f64 / d.as_secs_f64().max(0.001))
+}
+
+/// A duration as "1h 02m 03s" / "4m 05s" / "6.2s".
+pub fn took(d: std::time::Duration) -> String {
+    let s = d.as_secs();
+    if s >= 3600 {
+        format!("{}h {:02}m {:02}s", s / 3600, s / 60 % 60, s % 60)
+    } else if s >= 60 {
+        format!("{}m {:02}s", s / 60, s % 60)
+    } else {
+        format!("{:.1}s", d.as_secs_f64())
+    }
 }
 
 impl ChainDb {
@@ -201,7 +223,7 @@ impl ChainDb {
                 return Err(err(format!("an init install starts from nothing; this chain is at block {} already", t.height)));
             }
         }
-        for k in [INIT_ROUND, INIT_NOTE, INIT_BUILT, INIT_TO, INIT_RULES_TO, INIT_REFETCHED] {
+        for k in [INIT_ROUND, INIT_NOTE, INIT_BUILT, INIT_TO, INIT_RULES_TO, INIT_REFETCHED, INIT_TIMING] {
             self.set_state_text(c, k, None)?;
         }
         self.set_init_phase(c, Phase::Headers)
@@ -221,6 +243,19 @@ impl ChainDb {
         b.sort();
         b.dedup();
         self.set_state_text(c, INIT_BUILT, Some(&b.join(",")))
+    }
+
+    /// Add a timing line (STATE INIT_TIMING keeps the last 40).
+    pub fn init_add_timing(&self, c: u16, line: &str) -> Result<()> {
+        let mut v = self.init_timing(c);
+        v.push(line.replace('\n', " "));
+        let skip = v.len().saturating_sub(40);
+        self.set_state_text(c, INIT_TIMING, Some(&v[skip..].join("\n")))
+    }
+
+    /// The timing lines so far, oldest first.
+    pub fn init_timing(&self, c: u16) -> Vec<String> {
+        self.state_text(c, INIT_TIMING).ok().flatten().map(|s| s.lines().map(String::from).collect()).unwrap_or_default()
     }
 
     /// Build steps finished so far (for status).
@@ -303,7 +338,19 @@ impl ChainDb {
 
     /// Blocks on the best header chain we don't have yet, lowest first.
     pub fn init_missing(&self, c: u16) -> Result<Vec<Hash256>> {
-        Ok(self.init_path(c)?.into_iter().filter(|(_, b)| *b == 0).map(|(h, _)| h).collect())
+        self.init_missing_upto(c, None)
+    }
+
+    /// [`ChainDb::init_missing`] at heights up to `upto` (None: all).
+    pub fn init_missing_upto(&self, c: u16, upto: Option<u32>) -> Result<Vec<Hash256>> {
+        let tip = self.tip(c)?.map(|t| t.height).unwrap_or(0);
+        Ok(self
+            .init_path(c)?
+            .into_iter()
+            .enumerate()
+            .filter(|(i, (_, b))| *b == 0 && upto.is_none_or(|u| tip + 1 + *i as u32 <= u))
+            .map(|(_, (h, _))| h)
+            .collect())
     }
 
     /// One headers round: headers from every source until each has nothing new (a source that
@@ -479,7 +526,9 @@ impl ChainDb {
                     return Err(err(format!("block {h} is not stored yet")));
                 }
             }
+            let t = std::time::Instant::now();
             self.join_main(params, &path, tip.height)?;
+            self.init_timed(c, &mut out, format!("build main: {} heights joined in {}", path.len(), took(t.elapsed())))?;
             self.mark_built(c, "main")?;
             done.insert("main".into());
         }
@@ -488,7 +537,10 @@ impl ChainDb {
         if !done.contains("txs") {
             let bs: Vec<u32> = path.iter().map(|h| self.header(c, h).map(|r| r.map(|r| r.b).unwrap_or(0))).collect::<Result<_>>()?;
             note("build: transaction index".into());
+            let t = std::time::Instant::now();
             out.txs = self.write_txs_for(params, &bs, &tmp.join("txs"), stop, note)?;
+            let line = format!("build txs: {} tx index rows in {} · {} rows/s", out.txs, took(t.elapsed()), per_s(out.txs, t.elapsed()));
+            self.init_timed(c, &mut out, line)?;
             self.mark_built(c, "txs")?;
             done.insert("txs".into());
         }
@@ -506,19 +558,22 @@ impl ChainDb {
             let h = (rules_on && rules_from <= to).then(|| {
                 let (halt, seen) = (&halt, &seen);
                 sc.spawn(move || {
-                    crate::rules::replay(self, params, rules_from, to, threads, crate::rules::verify_all_scripts(), halt, &|r| {
+                    let t = std::time::Instant::now();
+                    let r = crate::rules::replay(self, params, rules_from, to, threads, crate::rules::verify_all_scripts(), halt, &|r| {
                         *seen.lock().unwrap() = Some(r.clone());
-                    })
+                    });
+                    (r, t.elapsed())
                 })
             });
             let coins = if done.contains("coins") {
                 None
             } else {
+                let t = std::time::Instant::now();
                 let r = self.init_coins_derive(params, to, budget, &tmp.join("coins"), stop, &mut |s: String| note(format!("build: {s}{}", rules_text(&seen))));
                 if r.is_err() {
                     halt.store(true, Ordering::Relaxed);
                 }
-                Some(r)
+                Some((r, t.elapsed()))
             };
             let mut last = std::time::Instant::now();
             while h.as_ref().is_some_and(|h| !h.is_finished()) {
@@ -534,7 +589,9 @@ impl ChainDb {
             (coins, h.map(|h| h.join().expect("rules check thread")))
         });
         let mut first_err = None;
-        if let Some(r) = rules {
+        if let Some((r, d)) = rules {
+            let n = (r.done_to + 1).saturating_sub(rules_from) as u64;
+            self.init_timed(c, &mut out, format!("build rules: {n} blocks checked (heights {rules_from}..{}) in {} · {} blocks/s", r.done_to, took(d), per_s(n, d)))?;
             if r.broken_count > 0 {
                 return self.init_refused(params, &r, out);
             } else if r.no_body > 0 || r.no_coin > 0 {
@@ -551,9 +608,13 @@ impl ChainDb {
             self.mark_built(c, "rules")?;
         }
         let derived = match coins {
-            Some(Ok(d)) => Some(d),
+            Some((Ok(d), t)) => {
+                let how = if matches!(d, Derived::Disk(..)) { "on disk" } else { "in memory" };
+                self.init_timed(c, &mut out, format!("build coins: {to} blocks derived {how} in {} · {} blocks/s", took(t), per_s(to as u64, t)))?;
+                Some(d)
+            }
             // The derivation's own error says more than the "stopped" of the rules check it halted.
-            Some(Err(e)) => {
+            Some((Err(e), _)) => {
                 if first_err.is_none() || !is_stopped(&e) {
                     first_err = Some(e);
                 }
@@ -566,7 +627,9 @@ impl ChainDb {
         }
         // 4. The coin set is written, now that the rules passed.
         if let Some(d) = derived {
+            let t = std::time::Instant::now();
             let (n, on_disk) = self.init_coins_apply(params, d, &tmp.join("coins"), stop, note)?;
+            self.init_timed(c, &mut out, format!("build coins written: {n} coins in {} · {} coins/s", took(t.elapsed()), per_s(n, t.elapsed())))?;
             out.coins = n;
             out.on_disk = on_disk;
             self.mark_built(c, "coins")?;
@@ -597,6 +660,13 @@ impl ChainDb {
         })?;
         let _ = std::fs::remove_dir_all(tmp);
         Ok(out)
+    }
+
+    /// Record a build step's timing line (STATE and `out.timing`).
+    fn init_timed(&self, c: u16, out: &mut Built, line: String) -> Result<()> {
+        self.init_add_timing(c, &line)?;
+        out.timing.push(line);
+        Ok(())
     }
 
     /// The rules check refused blocks. A stored body may be a damaged copy a source sent rather

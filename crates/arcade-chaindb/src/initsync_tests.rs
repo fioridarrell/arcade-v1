@@ -480,8 +480,15 @@ fn the_build_checks_the_rules_and_ends_as_a_normal_sync() {
     let r = reference(d.path(), p, &blocks);
     let db = open(d.path());
     stored_all(&db, p, &blocks);
+    // Until it is built, its coins and addresses aren't answered.
+    let op = arcade_chain::OutPoint { txid: blocks[1].txs[0].txid, vout: 0 };
+    assert!(db.coin(p, &op).is_err());
+    assert!(db.coins_for_script(p, &blocks[1].txs[0].outputs[0].script_pubkey).is_err());
+    assert!(db.history_for_script(c, &blocks[1].txs[0].outputs[0].script_pubkey).is_err());
     let built = build(&db, p, &d.path().join("tmp"), 5);
     assert_eq!((built.height, built.refetch), (35, 0));
+    assert!(db.coin(p, &op).is_ok());
+    assert!(built.timing.iter().any(|l| l.starts_with("build rules:") && l.contains("blocks/s")), "{:?}", built.timing);
     assert!(built.rules_checked >= 35, "every block's rules checked: {}", built.rules_checked);
     assert!(db.init_built(c).contains(&"rules".to_string()));
     finish_normally(&db, p, &mut Src::new(&blocks));

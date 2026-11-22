@@ -50,6 +50,7 @@ mod arckeep;
 mod arcsvc;
 mod borrow;
 mod appsvc;
+mod foldersvc;
 mod apppub;
 mod walletsvc;
 mod coinsend;

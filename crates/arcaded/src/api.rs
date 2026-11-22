@@ -745,6 +745,15 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
                 crate::appsvc::allowance_use(node, &id, &service, amount, &s("note").unwrap_or_default(), req["undo"] == true)
             }
         }
+        // An app's folder (crate::foldersvc, 2026-11-21): given after the person picks it on the app window's card, its
+        // changes logged; the picker's subfolders; and the folder ops for programs on this computer (CLI apps), the same
+        // code as the page API's /r/folder/*.
+        "apps.folder_set" => crate::foldersvc::grant(node, &s("id").ok_or("id required")?, &s("path").ok_or("path required")?, &crate::foldersvc::browse_roots()),
+        "apps.folder_log" => Ok(crate::foldersvc::folder_log(node, &s("id").ok_or("id required")?, req["limit"].as_u64().map(|n| n as usize))),
+        "folder.browse" => crate::foldersvc::browse(req["path"].as_str()),
+        c @ ("folder.list" | "folder.stat" | "folder.read" | "folder.write" | "folder.mkdir" | "folder.remove") => {
+            crate::foldersvc::op(node, &s("id").ok_or("id required")?, &c["folder.".len()..], req)
+        }
         "apps.review" => crate::appsvc::review(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?, &s("verdict").ok_or("verdict required (clear or confirm)")?),
         "apps.trust" => crate::appsvc::trust(node, &s("address").ok_or("address required")?, req["on"] != false),
         "inscribe" | "inscribe.estimate" => {

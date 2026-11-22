@@ -202,6 +202,33 @@ text ≤ 60; one question at a time ("busy: ..."); only claimed tags ("no name: 
 - groups.save(name, bytes) still works for apps written before files.js (behind the Group chats switch: the first file
   goes through, more ask once), with the same 128 MB limit.
 
+## B3b. /r/folder.js → arcade.folder (V1.0, 2026-11-21)
+One folder on this computer that the person gives an app, to read and write inside and nowhere else. Any app; off
+until the person picks a folder. The page never learns the folder's path, only its name.
+- granted() → {granted, name}. ask(why) → {granted, name}: the app window shows "<app> asks for a folder to work in:
+  <why>" with a folder browser (subfolders of the home folder; on Windows other drives too; no hidden folders, not the
+  home folder itself, not the arcade's own data folder), "Use this folder" and Cancel (rejects "Cancelled.").
+- list(path) → {path, entries: [{name, kind: file|dir|link, dir, size, modified}], more} (folders first, at most
+  5,000). stat(path) → {exists, path, name, kind, dir, size, modified} ({exists: false, path} when missing).
+- read(path, {as: 'text'|'base64'}) → the data (text by default; a file that isn't UTF-8 rejects "not text: read it
+  with as: base64"). At most 8 MB a read.
+- write(path, data, {as}) → {path, size}: data is text, base64 with {as: 'base64'}, or an ArrayBuffer, typed array or
+  Blob (sent as base64). At most 8 MB a write; refused ("the folder is full ...") when the folder would hold more than
+  200 MB (the whole folder is counted, up to 20,000 entries; more counts as full).
+- mkdir(path) → {path, made} (the folders above it too). remove(path) → {path, removed}: a file, or an empty folder.
+- Paths are relative to the folder ("" is the folder itself). Absolute paths, `..`, NUL, `:` and anything whose real
+  place (symlinks followed; a new file's folder) is outside the folder are refused (400). No grant: 403 "no folder:
+  ...". Nothing can be run.
+- Routes (with the page's pass): GET /r/folder/granted, /r/folder/list?path=, /r/folder/stat?path=,
+  /r/folder/read?path=&as=; POST /r/folder/write {path, data, as?}, /r/folder/mkdir {path}, /r/folder/remove {path}.
+  The page's app is the app apps.launch opened it for.
+- The operator's side: apps.perms shows folder {granted, name} and `set: {folder: false}` revokes it (the files stay);
+  apps.folder_set {id, path} grants (the window, after the pick); apps.folder_log {id, limit?} lists the app's writes,
+  mkdirs and removes (the last 500: {op, path, bytes, at}); Apps → Details shows the folder, Revoke and the last
+  changes. Programs on this computer (CLI apps) use the socket commands folder.list, folder.stat, folder.read,
+  folder.write, folder.mkdir and folder.remove with the app's `id` and the same arguments (`encoding` for as).
+- The website's arcade.folder (the browser's File System Access API) is a later step.
+
 ## B3. /r/groups.js → arcade.groups (timeout 120 s "no viewer is listening, or the wallet is still locked")
 - list() → {me, groups:[{id, name, room, members:[{tag, address}]}]}; read(id, {after, limit}) → lines oldest first
   [{txid, when, height, mine, from, text}] (after 0, limit 200); send(id, text) → {txid, fee}; leave(id) (600 s) →

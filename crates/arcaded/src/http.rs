@@ -38,6 +38,9 @@ const MAX_OPEN_BODY: usize = 64 << 10;
 const MAX_BOX_BODY: usize = 2 << 20;
 /// A program's room door message (crate::realtime keeps at most 60 KB of one, in base64 here).
 const MAX_DOOR_BODY: usize = 256 << 10;
+/// An app page's write into its folder (POST /r/folder/write, crate::foldersvc, 2026-11-21): 8 MB of file as base64 is
+/// about 10.7 MB, in a little JSON. Only a request carrying an app page's pass gets it.
+const MAX_FOLDER_BODY: usize = 12 << 20;
 /// Connections served at once; more wait for one to close.
 const MAX_CONNS: usize = 128;
 /// Connections served at once from one address, so one client can't take every place; one more is answered 503
@@ -245,6 +248,8 @@ fn body_cap(node: &Node, r: &Req, is_local: bool) -> usize {
         MAX_DOOR_BODY
     } else if p == "/api/v1/id/box_put" {
         MAX_BOX_BODY
+    } else if r.method == "POST" && p == "/r/folder/write" && page_of(node, r).is_some() {
+        MAX_FOLDER_BODY
     } else {
         MAX_OPEN_BODY
     }
@@ -702,6 +707,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             "escrow" => Some(include_str!("shims/escrow.js")),
             "swap" => Some(include_str!("shims/swap.js")),
             "market" => Some(include_str!("shims/market.js")),
+            "folder" => Some(include_str!("shims/folder.js")),
             _ => None,
         };
         return match body {
@@ -806,6 +812,13 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                 ("POST", op @ ("keep" | "forget" | "undo" | "keep_share" | "cache")) => crate::fogkeep::file(node, &page, op, &serde_json::from_slice(&r.body).unwrap_or(Value::Null)),
                 _ => (404, json!({"error": "no such storage request"})),
             };
+            return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
+        }
+        // The folder the person gave the app (foldersvc.rs, 2026-11-21): only an app page with its pass, for its own app's
+        // folder (the app the page belongs to, never one the request names).
+        if let Some(rest) = path.strip_prefix("/r/folder/") {
+            let Some((_, page)) = page.clone() else { return respond(&mut s, "400 Bad Request", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page to come from"}"#) };
+            let (code, v) = folder_route(node, &page, &r, rest);
             return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
         }
         // A market write (marketsvc.rs, docs/MARKET.md step 2) files a request like a send does.
@@ -1380,6 +1393,43 @@ fn rpc(node: &Node, s: &mut TcpStream, r: &Req) {
     respond(s, "200 OK", "application/json", &[], out.to_string().as_bytes());
 }
 
+/// The page API's folder routes (crate::foldersvc, 2026-11-21) for app page `page`: GET granted, list, stat and read
+/// (?path=&as=), POST write, mkdir and remove (a JSON body {path, data?, as?}). The page's app comes from what
+/// apps.launch told (foldersvc::app_of_page).
+fn folder_route(node: &Node, page: &str, r: &Req, op: &str) -> (u16, Value) {
+    let Some(id) = crate::foldersvc::app_of_page(node, page) else { return (404, json!({"error": "this page is no app's that this arcade knows"})) };
+    let get = matches!(r.method.as_str(), "GET" | "HEAD");
+    if get && op == "granted" {
+        return (200, crate::foldersvc::status(node, &id));
+    }
+    let args = match (get, op) {
+        (true, "list" | "stat" | "read") => {
+            // As text, as the page wrote it (query_fields would make "2026" a number).
+            let mut a = serde_json::Map::new();
+            for kv in r.query.split('&').filter(|x| !x.is_empty()) {
+                let (k, v) = kv.split_once('=').unwrap_or((kv, ""));
+                let k = pct_decode(k);
+                if k == "path" || k == "as" {
+                    a.insert(k, json!(pct_decode(v)));
+                }
+            }
+            Value::Object(a)
+        }
+        (false, "write" | "mkdir" | "remove") if r.method == "POST" => match serde_json::from_slice::<Value>(&r.body) {
+            Ok(v) if v.is_object() => v,
+            _ => return (400, json!({"error": "a JSON body: {path, data?, as?}"})),
+        },
+        _ => return (404, json!({"error": "folder routes: GET granted, list, stat, read; POST write, mkdir, remove"})),
+    };
+    if crate::foldersvc::status(node, &id)["granted"] != true {
+        return (403, json!({"error": "no folder: this app was not given one (arcade.folder.ask)"}));
+    }
+    match crate::foldersvc::op(node, &id, op, &args) {
+        Ok(v) => (200, v),
+        Err(e) => (400, json!({"error": e})),
+    }
+}
+
 /// Whether POST /r/send is refused for a page on `page_chain` (None: the home chain): a page on another chain asks this
 /// arcade's wallet to send on a chain it doesn't send on, except the ARCADE chain (`arc_page`), whose sends it builds.
 fn send_refused_for(page_chain: Option<&'static arcade_chain::params::ChainParams>, arc_page: Option<&'static arcade_chain::params::ChainParams>) -> bool {
@@ -1688,6 +1738,70 @@ pub(crate) mod tests {
         let a = ask(&t.node, &conf(), &get(&format!("/r/fog/req/{id}"), &from_page));
         assert!(a.contains(r#""status":"sent""#), "{a}");
         crate::arcblob::set_cache_limit(before);
+    }
+
+    /// arcade.folder's page routes (foldersvc.rs, 2026-11-21): behind the page's pass, for the page's own app (from what
+    /// apps.launch told), and only once the app was given a folder.
+    #[test]
+    fn folder_routes_answer_the_pages_own_app() {
+        let (_one, t) = crate::http::tests::node();
+        let page = "f".repeat(64);
+        let pass = page_pass(&t.node, t.p.key, &page);
+        let post = |path: &str, body: &str, extra: &str| {
+            format!("POST {path} HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{extra}\r\n{body}", body.len()).into_bytes()
+        };
+        let body = |a: &str| serde_json::from_str::<Value>(a.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+        let from_page = format!("Origin: null\r\nX-Arcade-Page: {pass}\r\n");
+        let id = "test-route-app";
+        crate::foldersvc::remember_page(&page, id);
+        // No pass: nothing.
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/folder/granted", ""))), "403");
+        let a = ask(&t.node, &conf(), &get("/r/folder/granted", &from_page));
+        assert_eq!(body(&a), json!({"granted": false, "name": null}), "{a}");
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/folder/list?path=", &from_page))), "403", "not given a folder");
+        let d = tempfile::tempdir().unwrap();
+        let root = std::fs::canonicalize(d.path()).unwrap().join("Shared Work");
+        std::fs::create_dir(&root).unwrap();
+        crate::foldersvc::grant(&t.node, id, &root.to_string_lossy(), &[std::fs::canonicalize(d.path()).unwrap()]).unwrap();
+        assert_eq!(body(&ask(&t.node, &conf(), &get("/r/folder/granted", &from_page))), json!({"granted": true, "name": "Shared Work"}));
+        let a = ask(&t.node, &conf(), &post("/r/folder/mkdir", r#"{"path":"2026"}"#, &from_page));
+        assert_eq!(status(&a), "200", "{a}");
+        let a = ask(&t.node, &conf(), &post("/r/folder/write", r#"{"path":"2026/n.txt","data":"hi there"}"#, &from_page));
+        assert_eq!(status(&a), "200", "{a}");
+        // "2026" stays a name, not a number.
+        let a = ask(&t.node, &conf(), &get("/r/folder/list?path=2026", &from_page));
+        assert_eq!(body(&a)["entries"][0]["name"], "n.txt", "{a}");
+        let a = ask(&t.node, &conf(), &get("/r/folder/read?path=2026%2Fn.txt&as=text", &from_page));
+        assert_eq!(body(&a)["data"], "hi there", "{a}");
+        let a = ask(&t.node, &conf(), &get("/r/folder/read?path=2026%2Fn.txt&as=base64", &from_page));
+        assert_eq!(body(&a)["data"], "aGkgdGhlcmU=", "{a}");
+        assert_eq!(body(&ask(&t.node, &conf(), &get("/r/folder/stat?path=2026", &from_page)))["dir"], true);
+        // Out of the folder: refused.
+        for bad in ["..%2Fx", "%2Fetc%2Fpasswd", "2026%2F..%2F..%2Fx"] {
+            assert_eq!(status(&ask(&t.node, &conf(), &get(&format!("/r/folder/read?path={bad}"), &from_page))), "400", "{bad}");
+        }
+        assert_eq!(status(&ask(&t.node, &conf(), &post("/r/folder/write", r#"{"path":"../x","data":"x"}"#, &from_page))), "400");
+        assert!(!d.path().join("x").exists());
+        let a = ask(&t.node, &conf(), &post("/r/folder/remove", r#"{"path":"2026/n.txt"}"#, &from_page));
+        assert_eq!(status(&a), "200", "{a}");
+        // A write bigger than the page API's usual body (64 KB), up to the folder's own cap.
+        let big = format!(r#"{{"path":"big.txt","data":"{}"}}"#, "y".repeat(200_000));
+        let a = ask(&t.node, &conf(), &post("/r/folder/write", &big, &from_page));
+        assert_eq!(status(&a), "200", "{}", &a[..a.len().min(300)]);
+        let head_only = format!("POST /r/folder/write HTTP/1.1\r\nHost: 127.0.0.1:8420\r\nContent-Length: {}\r\n\r\n", big.len());
+        assert_eq!(status(&ask(&t.node, &conf(), head_only.as_bytes())), "413", "without a pass the body stays small");
+        // The window's log of it.
+        assert_eq!(crate::foldersvc::folder_log(&t.node, id, None)["changes"].as_array().unwrap().len(), 4);
+        // A page of no app this arcade knows (not launched, not in the store): none.
+        let other = "e".repeat(64);
+        let a = ask(&t.node, &conf(), &get("/r/folder/granted", &format!("Origin: null\r\nX-Arcade-Page: {}\r\n", page_pass(&t.node, t.p.key, &other))));
+        assert_eq!(status(&a), "404", "{a}");
+        // Revoked: nothing more.
+        crate::appsvc::set_perms(&t.node, id, &json!({"folder": false})).unwrap();
+        assert_eq!(status(&ask(&t.node, &conf(), &get("/r/folder/read?path=big.txt", &from_page))), "403");
+        // The shim is served.
+        let a = ask(&t.node, &conf(), &get("/r/folder.js", ""));
+        assert!(status(&a) == "200" && a.contains("arcade.folder"), "{}", &a[..a.len().min(300)]);
     }
 
     #[test]

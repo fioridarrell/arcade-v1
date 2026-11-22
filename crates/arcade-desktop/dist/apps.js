@@ -198,12 +198,31 @@
       allowRows.push(h("div", { class: "ap-perm" }, `${what}: up to `, per, " ARCADE a day ", save,
         st ? h("div", { class: "s" }, `Spent today ${st.spent_today} ARCADE, ${st.left} left.`) : ""));
     }
+    // The folder the person gave this app (arcade.folder, 2026-11-21): its name, the last few changes the app made in
+    // it, and Revoke (the folder and its files stay).
+    let folderBox = "";
+    const fo = a.permissions && a.permissions.folder;
+    if (fo && fo.granted) {
+      let changes = [];
+      try { changes = (await api("apps.folder_log", { id: a.id, limit: 5 })).changes || []; } catch (_) { /* shown without them */ }
+      const revoke = h("button", { class: "small" }, "Revoke");
+      revoke.onclick = async () => {
+        await api("apps.perms", { id: a.id, set: { folder: false } });
+        note(`${a.card.name} can no longer use the folder “${fo.name}”.`); draw();
+      };
+      const when = (t) => new Date(t * 1000).toLocaleString();
+      folderBox = h("div", { class: "card" }, h("div", { class: "k" }, "Folder"),
+        h("div", { class: "ap-perm" }, `It can read and write in “${fo.name}”. `, revoke),
+        changes.length ? h("ul", { class: "ap-list" }, ...changes.map((c) => h("li", { class: "s" }, `${when(c.at)} · ${c.op} ${c.path}${c.op === "write" ? ` (${c.bytes} bytes)` : ""}`)))
+          : h("div", { class: "s" }, "No changes yet."));
+    }
     $("ap2-body").replaceChildren(h("div", { class: "ap-detail" }, back,
       h("div", { class: "ap-card" }, cover(a), h("div", { class: "ap-body" }, h("h2", {}, a.card.name), h("div", { class: "ap-pills" }, chainBadge(a), pills(a)), h("div", { class: "s" }, byline(a)),
         trustLine(a, true),
         h("div", { class: "ap-desc" }, a.card.description || ""), h("div", { class: "row ap-row" }, openB))),
       claimed.length ? h("div", { class: "card" }, h("div", { class: "k" }, "This app asks for"), ...sw, h("div", { class: "s" }, "Off: it asks you the first time it wants it.")) : "",
       allowRows.length ? h("div", { class: "card" }, h("div", { class: "k" }, "Allowances"), ...allowRows, h("div", { class: "s" }, "Payments within these go without asking; 0 takes it away.")) : "",
+      folderBox,
       h("h2", {}, "Ratings"),
       rateBox(a),
       h("h2", {}, "Versions"),

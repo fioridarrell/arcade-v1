@@ -458,7 +458,7 @@ Every arcade gets the same answer whichever block reached it first. An arcade do
 - A coinbase's one input carries the height (8 bytes), the id of the block before (32) and up to 60 free bytes, so no two coinbases share an id on any chain or fork. Its outputs are spendable 100 blocks on.
 - **A coinbase starts with exactly the payouts owed**, in order, then (from rules version 2) the writer's 1 ARCADE (§14.26); a zero `OP_RETURN` may follow. The block's fees join the pot (§14.18).
 - A lock time is a block height. At most 8,000 signature checks per block.
-- **Script** is a strict part of Bitcoin's, enough for what V1.0 signs: pay to a key hash, pay to a script hash, the exchange's pre-signed trades, the prize pool, bare multisig, a hash lock and a height lock. An opcode outside the list makes a script invalid even in a branch that isn't run; pushes are written the shortest way; signatures are strict DER with low S; hash types are ALL, ALL|ANYONECANPAY and SINGLE|ANYONECANPAY; a signature covers the whole locking (or redeem) script. New opcodes come by upgrade.
+- **Script** is a strict part of Bitcoin's, enough for what V1.0 signs: pay to a key hash, pay to a script hash, the exchange's pre-signed trades, the prize pool, bare multisig, a hash lock and a height lock. An opcode outside the list makes a script invalid even in a branch that isn't run; pushes are written the shortest way; signatures are strict DER with low S; hash types are ALL, ALL|ANYONECANPAY and SINGLE|ANYONECANPAY; a signature covers the whole locking (or redeem) script. New opcodes come by upgrade: from rules version 7 (`params::RULES_V7_HEIGHT` on the testnet) `OP_SIZE` (0x82) is in the list, with Bitcoin's meaning: it pushes the byte length of the top item as a number written the shortest way and leaves the item, fails on an empty stack, and counts as an opcode toward the 201. Before that height it is still an unknown opcode, so a script holding it is invalid, even in a branch that isn't run. With it a swap's maker locks ARCADE so that only a 32-byte secret claims it (`OP_SIZE 32 OP_EQUALVERIFY`, as on every other chain), and an ARCADE leg can be paired with DigiDollars; locks made before keep the form without it.
 - **Payouts** (§7, §14.19): at each epoch's end (heights that are multiples of 100) the pot is shared by weight and accrued; a block's coinbase pays every earner whose turn that block is (`H(earner) mod 1,152`), one output per payout address in address order, when its audits released it (§14.20) and it is at least 0.01 ARCADE. *(Until registration was built, the first coinbase of an epoch paid the whole pot; that is gone.)*
 
 ### 14.8 Stand-ins (local test chains only)
@@ -730,7 +730,9 @@ never touch the coin. So the rules themselves are versioned, as Bitcoin and Doge
   docs/FOGSTORE.md), 6 from `params::RULES_V6_HEIGHT` (Martin 2026-11-19: Permanent copy floor 3 with prices unchanged,
   an `OP_RETURN "aupg"` output that upgrades a Temporary blob to Permanent for the difference, and at most 4 MB of new
   blobs a block by their records' declared lengths; docs/FOGSTORE.md
-  "Rules version 6"). Mainnet's schedule is version 2 from block 0 until a release adds more.
+  "Rules version 6"), 7 from `params::RULES_V7_HEIGHT` (`OP_SIZE` in the script, §14.7; a swap's ARCADE leg is locked
+  sized from that height and can then be paired with DigiDollars). Mainnet's schedule is version 2 from block 0 until a
+  release adds more.
 
 ### 14.22 The plan from here (Martin 2026-11-12: "add everything to the plan")
 

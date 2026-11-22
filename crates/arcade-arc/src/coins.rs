@@ -179,8 +179,8 @@ pub fn unlocked(tx: &Tx, height: u64) -> bool {
 }
 
 /// A transaction that isn't a coinbase, in the block at `height`, against `coins`: its fee.
-/// `checks` counts the block's signature checks.
-pub fn check_spend(tx: &Tx, height: u64, coins: &impl Coins, checks: &mut u32) -> Result<u64, TxError> {
+/// `checks` counts the block's signature checks; `rules` are the script's at that height (script::Rules::at).
+pub fn check_spend(tx: &Tx, height: u64, coins: &impl Coins, checks: &mut u32, rules: script::Rules) -> Result<u64, TxError> {
     check_form(tx)?;
     if tx.is_coinbase() {
         return Err(TxError::Coinbase);
@@ -201,7 +201,7 @@ pub fn check_spend(tx: &Tx, height: u64, coins: &impl Coins, checks: &mut u32) -
     let total_out: u64 = tx.outputs.iter().map(|o| o.value).sum(); // check_form: no overflow
     let fee = total_in.checked_sub(total_out).ok_or(TxError::Overspend)?;
     for (index, coin) in spent.iter().enumerate() {
-        script::verify_input(tx, index, &coin.script, checks).map_err(|e| TxError::Script(index, e))?;
+        script::verify_input(tx, index, &coin.script, checks, rules).map_err(|e| TxError::Script(index, e))?;
         if *checks > MAX_SIG_CHECKS {
             return Err(TxError::TooManyChecks);
         }
@@ -242,8 +242,9 @@ impl<C: Coins> Coins for Within<'_, C> {
 /// All of a block's transactions, in order, against the coin set before the block.
 ///
 /// `payouts` are the outputs (amount, script) this block's coinbase owes, in order: it must
-/// start with exactly those. Whatever else it pays comes out of the block's fees.
-pub fn check_block(txs: &[Tx], height: u64, prev: &Hash256, coins: &impl Coins, payouts: &[(u64, Vec<u8>)]) -> Result<Changes, TxError> {
+/// start with exactly those. Whatever else it pays comes out of the block's fees. `rules`: the script's at `height`
+/// (script::Rules::at).
+pub fn check_block(txs: &[Tx], height: u64, prev: &Hash256, coins: &impl Coins, payouts: &[(u64, Vec<u8>)], rules: script::Rules) -> Result<Changes, TxError> {
     let (coinbase, rest) = txs.split_first().ok_or(TxError::Coinbase)?;
     check_coinbase(coinbase, height, prev)?;
 
@@ -262,7 +263,7 @@ pub fn check_block(txs: &[Tx], height: u64, prev: &Hash256, coins: &impl Coins, 
         }
     };
     for tx in rest {
-        let fee = check_spend(tx, height, &within, &mut checks)?;
+        let fee = check_spend(tx, height, &within, &mut checks, rules)?;
         changes.fees = changes.fees.checked_add(fee).filter(|t| *t <= MAX_MONEY).ok_or(TxError::Amount)?;
         changes.fees_by_tx.push(fee);
         for input in &tx.inputs {
@@ -345,27 +346,27 @@ mod tests {
 
         let t = pay(&[point(1), point(2)], vec![(25 * DUST, to.clone()), (4 * DUST, lock.clone())], &sk, &pk);
         let mut checks = 0;
-        assert_eq!(check_spend(&t, 10, &coins, &mut checks), Ok(DUST));
+        assert_eq!(check_spend(&t, 10, &coins, &mut checks, script::Rules::BASE), Ok(DUST));
         assert_eq!(checks, 2);
 
         // More out than in.
         let over = pay(&[point(1)], vec![(10 * DUST + 1, to.clone())], &sk, &pk);
-        assert_eq!(check_spend(&over, 10, &coins, &mut 0), Err(TxError::Overspend));
+        assert_eq!(check_spend(&over, 10, &coins, &mut 0, script::Rules::BASE), Err(TxError::Overspend));
         // A coin that isn't there.
         let ghost = pay(&[point(3)], vec![(DUST, to.clone())], &sk, &pk);
-        assert_eq!(check_spend(&ghost, 10, &coins, &mut 0), Err(TxError::MissingCoin));
+        assert_eq!(check_spend(&ghost, 10, &coins, &mut 0, script::Rules::BASE), Err(TxError::MissingCoin));
         // Somebody else's coin.
         coins.insert(point(4), held(10 * DUST, &to, 5, false));
         let theft = pay(&[point(4)], vec![(DUST, lock.clone())], &sk, &pk);
-        assert!(matches!(check_spend(&theft, 10, &coins, &mut 0), Err(TxError::Script(0, ScriptError::Verify))));
+        assert!(matches!(check_spend(&theft, 10, &coins, &mut 0, script::Rules::BASE), Err(TxError::Script(0, ScriptError::Verify))));
         // A signature changed after signing.
         let mut bent = t.clone();
         bent.outputs[0].value -= 1;
         let bent = Tx::parse_with(&bent.encode_legacy(), &TX_FORMAT).unwrap();
-        assert!(matches!(check_spend(&bent, 10, &coins, &mut 0), Err(TxError::Script(0, ScriptError::SigFailed))));
+        assert!(matches!(check_spend(&bent, 10, &coins, &mut 0, script::Rules::BASE), Err(TxError::Script(0, ScriptError::SigFailed))));
         // The block's limit on signature checks.
         let mut checks = MAX_SIG_CHECKS - 1;
-        assert_eq!(check_spend(&t, 10, &coins, &mut checks), Err(TxError::TooManyChecks));
+        assert_eq!(check_spend(&t, 10, &coins, &mut checks, script::Rules::BASE), Err(TxError::TooManyChecks));
     }
 
     #[test]
@@ -426,10 +427,10 @@ mod tests {
 
         // A block reward made at 50 is spendable from 150.
         let reward = pay(&[point(1)], to.clone(), &sk, &pk);
-        assert_eq!(check_spend(&reward, 149, &coins, &mut 0), Err(TxError::Immature));
-        assert_eq!(check_spend(&reward, 150, &coins, &mut 0), Ok(DUST));
+        assert_eq!(check_spend(&reward, 149, &coins, &mut 0, script::Rules::BASE), Err(TxError::Immature));
+        assert_eq!(check_spend(&reward, 150, &coins, &mut 0, script::Rules::BASE), Ok(DUST));
         // Any other coin right away.
-        assert_eq!(check_spend(&pay(&[point(2)], to.clone(), &sk, &pk), 51, &coins, &mut 0), Ok(DUST));
+        assert_eq!(check_spend(&pay(&[point(2)], to.clone(), &sk, &pk), 51, &coins, &mut 0, script::Rules::BASE), Ok(DUST));
 
         // Lock time 100: into block 101 at the earliest, unless every sequence is final.
         let locked = |sequence: u32| {
@@ -439,9 +440,9 @@ mod tests {
             push(&mut s, &pk);
             with_sig(&t, 0, s)
         };
-        assert_eq!(check_spend(&locked(0), 100, &coins, &mut 0), Err(TxError::Locked));
-        assert_eq!(check_spend(&locked(0), 101, &coins, &mut 0), Ok(DUST));
-        assert_eq!(check_spend(&locked(u32::MAX), 60, &coins, &mut 0), Ok(DUST));
+        assert_eq!(check_spend(&locked(0), 100, &coins, &mut 0, script::Rules::BASE), Err(TxError::Locked));
+        assert_eq!(check_spend(&locked(0), 101, &coins, &mut 0, script::Rules::BASE), Ok(DUST));
+        assert_eq!(check_spend(&locked(u32::MAX), 60, &coins, &mut 0, script::Rules::BASE), Ok(DUST));
     }
 
     #[test]
@@ -455,22 +456,22 @@ mod tests {
 
         // The fees join the pot: the coinbase takes none of them.
         let good = coinbase(10, &PREV, vec![burn()]);
-        let changes = check_block(&[good.clone(), payment.clone()], 10, &PREV, &coins, &[]).unwrap();
+        let changes = check_block(&[good.clone(), payment.clone()], 10, &PREV, &coins, &[], script::Rules::BASE).unwrap();
         assert_eq!((changes.fees, changes.claimed), (3 * DUST, 0));
         assert_eq!(changes.spent, vec![(point(1), held(100 * DUST, &lock, 5, false))]);
         assert_eq!(changes.made, vec![(OutPoint { txid: payment.txid, vout: 0 }, held(97 * DUST, &lock, 10, false))]);
         // A writer that pays itself any of them is refused.
         for take in [DUST, 3 * DUST] {
             let greedy = coinbase(10, &PREV, vec![(take, writer.clone())]);
-            assert_eq!(check_block(&[greedy, payment.clone()], 10, &PREV, &coins, &[]), Err(TxError::CoinbaseAmount));
+            assert_eq!(check_block(&[greedy, payment.clone()], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::CoinbaseAmount));
         }
         // An empty block's coinbase burns nothing.
-        assert_eq!(check_block(&[coinbase(10, &PREV, vec![burn()])], 10, &PREV, &coins, &[]).map(|c| c.made), Ok(vec![]));
-        assert_eq!(check_block(&[coinbase(10, &PREV, vec![(DUST, writer.clone())])], 10, &PREV, &coins, &[]), Err(TxError::CoinbaseAmount));
+        assert_eq!(check_block(&[coinbase(10, &PREV, vec![burn()])], 10, &PREV, &coins, &[], script::Rules::BASE).map(|c| c.made), Ok(vec![]));
+        assert_eq!(check_block(&[coinbase(10, &PREV, vec![(DUST, writer.clone())])], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::CoinbaseAmount));
 
         // The wrong height, the wrong block before, too much of its own, a lock.
-        assert_eq!(check_block(&[coinbase(11, &PREV, vec![burn()])], 10, &PREV, &coins, &[]), Err(TxError::CoinbaseInput));
-        assert_eq!(check_block(&[coinbase(10, &Hash256([1; 32]), vec![burn()])], 10, &PREV, &coins, &[]), Err(TxError::CoinbaseInput));
+        assert_eq!(check_block(&[coinbase(11, &PREV, vec![burn()])], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::CoinbaseInput));
+        assert_eq!(check_block(&[coinbase(10, &Hash256([1; 32]), vec![burn()])], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::CoinbaseInput));
         let null = OutPoint { txid: Hash256::ZERO, vout: u32::MAX };
         let wordy = tx(vec![(null, coinbase_script(10, &PREV, &[0; 61]), u32::MAX)], vec![burn()], 0);
         assert_eq!(check_coinbase(&wordy, 10, &PREV), Err(TxError::CoinbaseInput));
@@ -479,9 +480,9 @@ mod tests {
         let locked = tx(vec![(null, coinbase_script(10, &PREV, &[]), u32::MAX)], vec![burn()], 9);
         assert_eq!(check_coinbase(&locked, 10, &PREV), Err(TxError::CoinbaseInput));
         // First and only first.
-        assert_eq!(check_block(&[payment.clone()], 10, &PREV, &coins, &[]), Err(TxError::Coinbase));
-        assert_eq!(check_block(&[good.clone(), good.clone()], 10, &PREV, &coins, &[]), Err(TxError::Coinbase));
-        assert_eq!(check_block(&[], 10, &PREV, &coins, &[]), Err(TxError::Coinbase));
+        assert_eq!(check_block(&[payment.clone()], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::Coinbase));
+        assert_eq!(check_block(&[good.clone(), good.clone()], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::Coinbase));
+        assert_eq!(check_block(&[], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::Coinbase));
         // Two coinbases never share an id: the height and the block before are in them.
         assert_ne!(coinbase(10, &PREV, vec![burn()]).txid, coinbase(11, &PREV, vec![burn()]).txid);
         assert_ne!(coinbase(10, &PREV, vec![burn()]).txid, coinbase(10, &Hash256([1; 32]), vec![burn()]).txid);
@@ -493,7 +494,7 @@ mod tests {
         let (a, b) = (p2pkh(&key(1).1), p2pkh(&key(2).1));
         let owed = vec![(3_000 * DUST, a.clone()), (2_000 * DUST, b.clone())];
         let good = coinbase(100, &PREV, owed.clone());
-        let changes = check_block(&[good.clone()], 100, &PREV, &coins, &owed).unwrap();
+        let changes = check_block(&[good.clone()], 100, &PREV, &coins, &owed, script::Rules::BASE).unwrap();
         assert_eq!(changes.made.len(), 2);
         assert_eq!(changes.claimed, 0);
         assert!(changes.made.iter().all(|(_, c)| c.coinbase && c.height == 100));
@@ -504,9 +505,9 @@ mod tests {
             vec![(3_000 * DUST + 1, a.clone()), owed[1].clone()],
             vec![(3_000 * DUST, b.clone()), owed[1].clone()],
         ] {
-            assert_eq!(check_block(&[coinbase(100, &PREV, wrong)], 100, &PREV, &coins, &owed), Err(TxError::CoinbasePayouts));
+            assert_eq!(check_block(&[coinbase(100, &PREV, wrong)], 100, &PREV, &coins, &owed, script::Rules::BASE), Err(TxError::CoinbasePayouts));
         }
-        assert_eq!(check_block(&[good], 100, &PREV, &coins, &[]), Err(TxError::CoinbaseAmount));
+        assert_eq!(check_block(&[good], 100, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::CoinbaseAmount));
     }
 
     #[test]
@@ -553,7 +554,7 @@ mod tests {
         let first = pay(&[point(1)], vec![(90 * DUST, lock.clone()), (5 * DUST, lock.clone())], &sk, &pk);
         let mid = OutPoint { txid: first.txid, vout: 0 };
         let second = pay(&[mid], vec![(80 * DUST, lock.clone())], &sk, &pk);
-        let changes = check_block(&[cb.clone(), first.clone(), second.clone()], 10, &PREV, &coins, &[]).unwrap();
+        let changes = check_block(&[cb.clone(), first.clone(), second.clone()], 10, &PREV, &coins, &[], script::Rules::BASE).unwrap();
         assert_eq!(changes.fees, 15 * DUST);
         assert_eq!(changes.spent.len(), 1);
         assert_eq!(
@@ -561,19 +562,19 @@ mod tests {
             vec![(OutPoint { txid: first.txid, vout: 1 }, 5 * DUST), (OutPoint { txid: second.txid, vout: 0 }, 80 * DUST)]
         );
         // The other order: the coin isn't made yet.
-        assert_eq!(check_block(&[cb.clone(), second.clone(), first.clone()], 10, &PREV, &coins, &[]), Err(TxError::MissingCoin));
+        assert_eq!(check_block(&[cb.clone(), second.clone(), first.clone()], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::MissingCoin));
         // The same coin twice, in two transactions.
         let again = pay(&[point(1)], vec![(50 * DUST, lock.clone())], &sk, &pk);
-        assert_eq!(check_block(&[cb.clone(), first.clone(), again], 10, &PREV, &coins, &[]), Err(TxError::MissingCoin));
+        assert_eq!(check_block(&[cb.clone(), first.clone(), again], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::MissingCoin));
         let twice = pay(&[mid], vec![(70 * DUST, lock.clone())], &sk, &pk);
-        assert_eq!(check_block(&[cb.clone(), first.clone(), second.clone(), twice], 10, &PREV, &coins, &[]), Err(TxError::MissingCoin));
+        assert_eq!(check_block(&[cb.clone(), first.clone(), second.clone(), twice], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::MissingCoin));
         // This block's own reward can't be spent in it.
         let cb_paid = coinbase(10, &PREV, vec![(5 * DUST, lock.clone())]);
         let own = pay(&[OutPoint { txid: cb_paid.txid, vout: 0 }], vec![(4 * DUST, lock.clone())], &sk, &pk);
-        assert_eq!(check_block(&[cb_paid, first.clone(), own], 10, &PREV, &coins, &[]), Err(TxError::MissingCoin));
+        assert_eq!(check_block(&[cb_paid, first.clone(), own], 10, &PREV, &coins, &[], script::Rules::BASE), Err(TxError::MissingCoin));
         // An output anyone can spend is still a coin; a burned one isn't.
         let open = pay(&[point(1)], vec![(90 * DUST, vec![OP_1]), (DUST, vec![OP_RETURN, 1, 1])], &sk, &pk);
-        let changes = check_block(&[cb, open.clone()], 10, &PREV, &coins, &[]).unwrap();
+        let changes = check_block(&[cb, open.clone()], 10, &PREV, &coins, &[], script::Rules::BASE).unwrap();
         assert_eq!(changes.made, vec![(OutPoint { txid: open.txid, vout: 0 }, held(90 * DUST, &[OP_1], 10, false))]);
     }
 }

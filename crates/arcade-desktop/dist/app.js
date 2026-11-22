@@ -56,13 +56,16 @@ async function drawStart() {
   const coinsHere = st.balance > 0;
   // Redrawn only when something a step shows changes (typing must survive the 4 s refresh);
   // the "asked … ago" line is updated in place.
-  const sig = JSON.stringify([st.wallet, !!START.phrase, START.saved, coinsHere, !!st.faucet, st.faucet && st.faucet.status, c && [c.tag, c.status, c.note], failed && failed.tag, START.checked, START.busy, START.msg]);
+  const sig = JSON.stringify([st.waiting_for_chain, st.wallet, !!START.phrase, START.saved, coinsHere, !!st.faucet, st.faucet && st.faucet.status, c && [c.tag, c.status, c.note], failed && failed.tag, START.checked, START.busy, START.msg]);
   // A fresh install reads the chain first; a coin paid in a recent block shows once it's there.
   const catchUp = () => st.height != null && st.best != null && st.best > st.height + 2
     ? `Your arcade is still reading the ${chainName} chain (block ${num(st.height)} of ${num(st.best)}, ${Math.floor(st.height * 100 / st.best)}%); the coin shows once it gets there.`
     : "";
   const used = !!c && (c.status === "sent" || c.status === "confirmed");
+  // A fresh install reaching the ARCADE chain the first time (step 3 of no home chain): it waits, nothing to do.
+  const reaching = onArcade && st.waiting_for_chain === true;
   const askedText = () => !st.wallet ? `It's asked for by itself as soon as your wallet exists.`
+    : reaching ? `Finding arcades on the mesh that keep the ${chainName} chain (usually under a minute). The coin is asked for as soon as one is reached.`
     : used ? `Received, and used to publish your @handle.`
     : coinsHere ? `Here: ${coinNum(st.balance)} ${coin}. That pays for publishing your @handle.`
     : st.faucet && st.faucet.status === "paid" ? `Another arcade says it sent it${st.faucet.txid ? ` (transaction ${st.faucet.txid.slice(0, 12)}…)` : ""}. ${catchUp() || "It shows here once that payment arrives; if it doesn't, your arcade asks again by itself."}`
@@ -114,7 +117,7 @@ async function drawStart() {
       catch (e) { START.checked = null; START.msg = e.message; }
       START.busy = false; drawStart.sig = null; drawStart();
     } }, "Check");
-    const claim = h("button", { class: "primary", disabled: !START.checked || START.busy, onclick: async () => {
+    const claim = h("button", { class: "primary", disabled: !START.checked || START.busy || reaching, onclick: async () => {
       START.busy = true; drawStart.sig = null; drawStart();
       try { await api("tag.claim", { tag: START.checked }); START.msg = ""; START.checked = null; }
       catch (e) { START.msg = e.message; }

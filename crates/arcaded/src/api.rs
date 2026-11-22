@@ -194,7 +194,9 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
     // Test coins for the first handle come by themselves: asked for now, so they are
     // usually here by the time a handle is picked (a restored wallet may have some).
     // On ARCADE as the home chain (crate::claims::claim_home) the node faucet's ARCADE pays the claim instead.
-    if tag.is_none() && !crate::arcsvc::usable(crate::claims::claim_home(node)) {
+    // Only while handles are claimed on Pepecoin testnet (ARCADE stalled): a fresh install still reaching ARCADE waits for
+    // ARCADE's own faucet instead (step 3 of no home chain).
+    if tag.is_none() && crate::claims::claim_home(node).chain_no == node.params.chain_no {
         if let Ok((k, _)) = node.app.tag_key(p, 0) {
             let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
             if crate::claims::coins(node, &script).is_empty() {

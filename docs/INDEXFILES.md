@@ -129,6 +129,16 @@ Measured 2026-11-20 by `ixfiles bench` on real Bitcoin address run files from a 
 
 Notes: run files hold one history row per output or input; a file row is one per (address, transaction), as in the table. The run files carry no tx position, so the benchmark uses the rank of a row's txid among its block's as the position (same range and spread). That machine's T run files only hold transactions whose outputs were all spent before a cache flush, which does not change their randomness.
 
+### Other chains (format 3, 2026-11-22, init installs on the mini)
+
+| Chain | Sealed to | H history | P spends | T tx index | Conversion | `ixfiles check` |
+|---|---|---|---|---|---|---|
+| pep | 1,299,999 (era 0–999,999 + 3 ranges) | 67.2 M rows, 5.76 B/row | 35.3 M, 3.25 B/row | 28.3 M, 10.10 B/row | 161–187 s, 9.3 GB peak | every 400th: 20,148 addresses, 70,789 txs, 88,234 spends, 0 differ |
+| lky | 1,099,999 (era + 1 range) | 4.1 M, 6.74 B/row | 2.6 M, 3.90 B/row | 1.5 M, 9.82 B/row | 8 s | every 25th: 9,368 addresses, 60,120 txs, 105,185 spends, 0 differ |
+| flop (tx index only) | 899,999 (9 ranges: the first era isn't whole yet) | | | 1.1 M, 9.79 B/row | seconds | every 10th: 109,792 txs, 0 differ |
+
+Converted twice each (pep, lky): the same rows and bytes both times. All 27 files pass `ixfiles verify`.
+
 ## 7. Not in this part
 
 - **Catch-up buffers instead of `addr_log`** (new installs never writing the log, the runs or the big tables), and the **sealer** at the tip that writes each range as it settles.

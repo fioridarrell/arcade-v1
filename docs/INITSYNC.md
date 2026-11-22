@@ -203,6 +203,19 @@ chain (Bitcoin) with limited disk; remove the chain afterwards. Not for real ins
   as in a normal sync; the tx index points such a txid at the copy stored last, which in an init
   install is arrival order, not height.
 
+## Real-data runs (2026-11-22, the mini, throwaway arcade, `chain add <key> --init`)
+
+| Chain | Headers | Blocks | Build | Result |
+|---|---|---|---|---|
+| pep (1,303,664 built) | ~22 min, 8 P2P sources, Core's work reached, through 1,300,000 | ~25 min, 23 sources | 8 min 13 s (coins 6 m 23 s, rules 5 m 29 s on every block) | tip 1,303,963 `172dff89…`: **20,432,802 coins, 105,476,635,900.49606538 PEP, the same as Pepecoin Core's `gettxoutsetinfo` on node 2 at that block** |
+| lky (to best − 288) | ~15 min, through 1,180,000 | ~12 min, 16 sources | under 3 min | tip 1,191,761 `68328ddf…`: **339,201 coins, 19,990,625.40279840 LKY, the same as Luckycoin Core on node 2** |
+| flop (939,354 built) | ~12 min, 6 P2P sources, through 930,000 | ~10 min, then 8 short rounds chasing one-minute blocks | 43 s | tip 939,649 `66bbe496…`: **442,220 coins, 101,832,005,807 FLOP, the same as Flopcoin Core on node 3** |
+
+No source was left out for header volume on any of them (all three are merge-mined).
+Pepecoin testnet can't be tried this way: it is every arcade's home chain, installed by its own
+path (not `chains.add`), so `--init` answers that it is installed already. A new arcade's
+borrowed home chain held every install in the queue (fixed on this branch).
+
 ## Speed (Bitcoin, ~925k blocks, ~720 GB of blocks, ~1.2 billion transactions, ~3 billion inputs)
 
 What is parallel: block download and the per-block checks (every worker), the rules and script

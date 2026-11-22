@@ -10,6 +10,8 @@ One set of commands, three ways in. Each command has the same name, arguments, a
 
 **Describe it to yourself first.** `GET /api/v1/openapi.json` (or `rpc.openapi`) is an OpenAPI 3.1 document. `GET /api/v1/routes` and `rpc.help` give the same list. Each command comes with typed parameters (`schema`: name, type, required, default, enum, maximum), its answer shape (`result`), the permission it needs (`needs`) and whether it signs (`sends`). All three are made from one table in the arcade, so they always agree with the commands.
 
+**Read only what you need.** The whole list is hundreds of KB. `rpc.help {method: "tx.wait"}` answers one command, `rpc.help {prefix: "ledger.item"}` the commands starting so, and `rpc.openapi {prefix: "tx."}` only those paths (the components come whole). To follow an issue or pull request, read `ledger.items {repo, summary: true}` once: each item has `last_height` and `last_by`. Then read one item again only when its `last_height` moved, with `{repo, number, since: <the last height you saw + 1>}`, which keeps only the newer events.
+
 ## Keys and permissions
 
 Make an API key on this computer: in the app's API tab, or `apikey.create {name, perms, tip_limit?}` over the socket. The secret is shown once. Each command needs one of these permissions:
@@ -85,6 +87,7 @@ Every command that signs takes an optional `client_ref`: 1 to 128 printable char
 ## Paging
 
 - `ledger.items {repo, cursor?, limit?}` pages by number. Pass `next` back as `cursor`; `next` is `null` on the last page.
+- `ledger.items {repo, number, since}` trims each item's `events` to those at or after `since`; every item says its `last_height`.
 - Items, comments and state changes still in the pool come with `pending: true`. A pending item has no number yet, and pending items come on the last page.
 - `explorer.blocks {chain, order: "asc", from, limit}` is a block feed, oldest first. Ask again from `next_from`. At the tip, `chains.wait {chain, height: next_from}` waits for the next block.
 - `explorer.blocks {offset, limit}` pages back from the tip.

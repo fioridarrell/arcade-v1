@@ -110,6 +110,11 @@
   // Services over the mesh (arcade.svc, docs/SVC.md): asking in the player's name, and managing this computer's
   // helper, each after a yes once a window and service; each payment and new key on its own card.
   const svcAskYes = {}, svcLocalYes = {};
+  // An app the person gave an allowance for a service (apps.allowance, 2026-11-21) uses that service without the
+  // once-a-window cards: it runs unattended. New keys still ask; payments beyond the allowance still ask.
+  async function allowed(service) {
+    try { return (await api("apps.allowance", { page: here, service })).per_day > 0; } catch (_) { return false; }
+  }
   const doors = {
     async svc(m) {
       const service = String(m.service || "");
@@ -118,7 +123,7 @@
       if (m.op === "ask") {
         const to = String(m.to || "");
         if (!/^[0-9a-f]{64}$/.test(to)) throw new Error("to: an arcade's node id");
-        if (!svcAskYes[service]) {
+        if (!svcAskYes[service] && !(await allowed(service))) {
           const yes = await oneCard(() => card(`Let ${appName} use ${service} at other arcades?`, [
             `${appName} asks to send requests to ${service} services on the mesh in your name (your ARCADE address), so a seller can charge them to the credit you bought there.`,
             "It can't move your coins or buy credit without asking."], "Allow"));
@@ -131,30 +136,62 @@
       if (m.op === "local") {
         const body = m.body && typeof m.body === "object" ? m.body : {};
         const what = String(body.what || "");
-        if (!svcLocalYes[service]) {
+        // A payment within the app's allowance for this service needs neither card (counted at once; given back if it
+        // fails below).
+        let reserved = 0;
+        if (what === "buy" && Number(body.amount) > 0) {
+          try {
+            const u = await api("apps.allowance_use", { page: here, service, amount: Number(body.amount), note: `credit from ${String(body.seller || "").slice(0, 16)}` });
+            if (u.within === true) reserved = Number(body.amount);
+          } catch (_) { /* no allowance: the cards below */ }
+        }
+        if (!svcLocalYes[service] && !reserved && !(what !== "key_new" && await allowed(service))) {
           const yes = await oneCard(() => card(`Let ${appName} manage your ${service} helper?`, [
             `${appName} asks to read and change the settings of the ${service} helper running on this computer, and to use it as you.`,
             "Each payment and each new key still asks on its own card."], "Allow"));
           if (!yes) throw new Error("Cancelled.");
           svcLocalYes[service] = true;
         }
-        if (what === "buy") {
+        if (what === "buy" && !reserved) {
           const amount = Number(body.amount);
           if (!(amount > 0)) throw new Error("amount: ARCADE to pay");
-          const yes = await oneCard(() => card(`Pay ${amount} ARCADE?`, [
-            `${appName} asks to buy ${amount} ARCADE of ${service} credit from ${String(body.seller || "").slice(0, 16)}, paid from your ARCADE wallet.`,
-            "The seller credits it once the payment is in a block."], "Pay"));
-          if (!yes) throw new Error("Cancelled.");
+          {
+            const yes = await oneCard(() => card(`Pay ${amount} ARCADE?`, [
+              `${appName} asks to buy ${amount} ARCADE of ${service} credit from ${String(body.seller || "").slice(0, 16)}, paid from your ARCADE wallet.`,
+              "The seller credits it once the payment is in a block."], "Pay"));
+            if (!yes) throw new Error("Cancelled.");
+          }
         }
         if (what === "key_new") {
           const yes = await oneCard(() => card("Make a key for programs on this computer?", [
             `${appName} asks to make a key that lets programs on this computer use ${service} with your credit.`], "Make key"));
           if (!yes) throw new Error("Cancelled.");
         }
-        const r = await api("svc.ask", { to: "self", service, body, timeout: 1200 });
+        let r;
+        try { r = await api("svc.ask", { to: "self", service, body, timeout: 1200 }); }
+        catch (e) {
+          if (reserved) await api("apps.allowance_use", { page: here, service, amount: reserved, undo: true }).catch(() => {});
+          throw e;
+        }
+        if (reserved && r && r.last && r.last.error) await api("apps.allowance_use", { page: here, service, amount: reserved, undo: true }).catch(() => {});
         return { result: r.last };
       }
-      throw new Error("svc ops are offers, ask and local");
+      // The allowance this app has for a service, and asking the person for one (2026-11-21).
+      if (m.op === "allowance") return { allowance: await api("apps.allowance", { page: here, service }) };
+      if (m.op === "ask_allowance") {
+        const per = Number(m.per_day);
+        if (!(per > 0)) throw new Error("per_day: ARCADE a day, above zero");
+        const what = service === "models" ? "AI models" : `the ${service} service`;
+        const reason = String(m.reason || "").slice(0, 200);
+        const yes = await oneCard(() => card(`Give ${appName} an allowance?`, [
+          `${appName} asks to spend up to ${per} ARCADE a day on ${what}${reason ? ` (${reason})` : ""}.`,
+          "Payments within it go without asking; anything beyond it asks on a card. You can change or take it away in the app's settings."], "Allow"));
+        if (!yes) throw new Error("Cancelled.");
+        const cur = await api("apps.allowance", { page: here, service });
+        await api("apps.perms", { id: cur.id, set: { allowances: { [service]: per } } });
+        return { allowance: await api("apps.allowance", { page: here, service }) };
+      }
+      throw new Error("svc ops are offers, ask, local, allowance and ask_allowance");
     },
     // arcade.llm (the original API, APP_API.md B4) over the Models app's service (docs/SVC.md): offers straight from the
     // mesh; chats through this computer's arcade-models helper, paid from this wallet's credit at the seller.
@@ -173,7 +210,7 @@
       }
       if (m.op === "chat") {
         const req = m.req || {};
-        if (!llmYes) {
+        if (!llmYes && !(await allowed("models"))) {
           const yes = await oneCard(() => card(`Let ${appName} use your model credit?`, [
             `${appName} asks to send prompts to shared AI models, paid from your ARCADE credit at the sellers (free models cost nothing).`,
             "It sees the replies; it can't buy more credit or move your coins."], "Allow"));

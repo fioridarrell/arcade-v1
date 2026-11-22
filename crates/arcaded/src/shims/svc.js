@@ -7,7 +7,11 @@
        yes once per window and service.
      arcade.svc.local(service, body)       -> the answer of this computer's own helper for that service (its owner's
        operations: settings, buying, keys...). The player says yes once per window and service; each payment and each
-       new key also asks on its own card. */
+       new key also asks on its own card. A payment ({what: "buy", amount}) within the allowance the person gave this app
+       for the service goes without a card.
+     arcade.svc.allowance(service)         -> {per_day, spent_today, left, payments} (ARCADE, today UTC)
+     arcade.svc.askAllowance(service, perDay, reason?) -> the same, after the person says yes on a card
+       ("<app> asks to spend up to N ARCADE a day on AI models"). */
 (function () {
   'use strict';
   window.arcade = window.arcade || {};
@@ -38,6 +42,10 @@
       return ask({ op: 'ask', to: to, service: service, body: body || {}, timeout: (o && o.timeout) || 600 })
         .then(function (m) { return { last: m.last, answers: m.answers || [] }; });
     },
-    local: function (service, body) { return ask({ op: 'local', service: service, body: body || {} }).then(function (m) { return m.result; }); }
+    local: function (service, body) { return ask({ op: 'local', service: service, body: body || {} }).then(function (m) { return m.result; }); },
+    allowance: function (service) { return ask({ op: 'allowance', service: service }).then(function (m) { return m.allowance; }); },
+    askAllowance: function (service, perDay, reason) {
+      return ask({ op: 'ask_allowance', service: service, per_day: perDay, reason: reason || '' }).then(function (m) { return m.allowance; });
+    }
   };
 })();

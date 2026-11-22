@@ -50,7 +50,9 @@ on the drive the chain was put on, not the arcade's home drive. Before the build
 is room for the steps left (the tx index sort ~6% of the chain file, the coin set derived on disk
 ~55%, unless `ARCADE_INIT_COINS_MB` holds it in memory: over 1/32 of the chain file) and waits,
 saying how much it needs, until there is. Removing the chain removes the scratch; a chain in an
-init install can't be moved to another drive until it is built.
+init install can't be moved to another drive until it is built. `ARCADE_INIT_COINS_MB` is taken
+as at most three quarters of the machine's memory (MemTotal; a cgroup's MemoryMax is not read)
+and at most 1 TB.
 
 **Removing or stopping.** Store-only workers write nothing once their round is stopped, the build
 checks for a stop between its steps and before the tip moves, and `chains.remove` waits (up to

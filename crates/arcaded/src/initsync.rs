@@ -524,7 +524,29 @@ fn headers_round(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer, round: u32) 
 /// default 4096). Bitcoin's coin set needs about 20 GB to stay in memory; on disk it needs
 /// about 60 bytes per output and input of the whole history in the scratch folder instead.
 fn coins_budget() -> usize {
-    std::env::var("ARCADE_INIT_COINS_MB").ok().and_then(|v| v.parse::<usize>().ok()).unwrap_or(4096) << 20
+    coins_budget_of(std::env::var("ARCADE_INIT_COINS_MB").ok().as_deref(), mem_total())
+}
+
+/// The coin budget for ARCADE_INIT_COINS_MB=`v` on a machine with `mem` bytes of memory (None:
+/// not known): at most three quarters of the memory and never past COINS_MB_MAX, in bytes
+/// without wrapping (a huge value used to wrap around in the shift, to a tiny or random budget).
+fn coins_budget_of(v: Option<&str>, mem: Option<u64>) -> usize {
+    let mb = v.and_then(|v| v.trim().parse::<u64>().ok()).unwrap_or(4096).min(COINS_MB_MAX);
+    let mut bytes = mb.saturating_mul(1 << 20);
+    if let Some(m) = mem {
+        bytes = bytes.min(m / 4 * 3);
+    }
+    usize::try_from(bytes).unwrap_or(usize::MAX)
+}
+
+/// The most ARCADE_INIT_COINS_MB is taken as: 1 TB.
+const COINS_MB_MAX: u64 = 1 << 20;
+
+/// The machine's memory in bytes (/proc/meminfo MemTotal; None elsewhere).
+fn mem_total() -> Option<u64> {
+    let s = std::fs::read_to_string("/proc/meminfo").ok()?;
+    let kb: u64 = s.lines().find(|l| l.starts_with("MemTotal:"))?.split_whitespace().nth(1)?.parse().ok()?;
+    Some(kb.saturating_mul(1024))
 }
 
 /// The build's scratch folder: beside the chain's own folder, on the drive the chain was put on
@@ -888,6 +910,19 @@ mod tests {
         assert!(check(&KOTIA_MAIN, "full").unwrap_err().contains("proof-of-stake"));
         // No minimum chain work: refused.
         assert!(check(&DOGECOIN_MAIN, "full").unwrap_err().contains("minimum chain work"));
+    }
+
+    #[test]
+    fn the_coin_budget_is_capped_and_never_wraps() {
+        let gb = 1u64 << 30;
+        assert_eq!(coins_budget_of(None, None), 4096 << 20);
+        assert_eq!(coins_budget_of(Some("24000"), Some(128 * gb)), 24_000 << 20);
+        // Three quarters of the memory at most.
+        assert_eq!(coins_budget_of(Some("24000"), Some(16 * gb)), (12 * gb) as usize);
+        // Values that used to wrap in `<< 20`: capped at 1 TB (or the memory), never small.
+        assert_eq!(coins_budget_of(Some("18446744073709551615"), None), (1u64 << 40) as usize);
+        assert_eq!(coins_budget_of(Some("17592186044416"), Some(64 * gb)), (48 * gb) as usize);
+        assert_eq!(coins_budget_of(Some("junk"), None), 4096 << 20);
     }
 
     #[test]

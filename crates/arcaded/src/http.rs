@@ -1177,7 +1177,8 @@ fn web_api(node: &Node, s: &mut TcpStream, r: &Req, rest: &str) {
         Ok(v) => json_out(s, 200, &json!({"ok": true, "result": v})),
         Err(e) => {
             let v = crate::api::error_reply(&e);
-            json_out(s, if v["code"] == "not_found" { 404 } else { 400 }, &v)
+            // Too early (the ARCADE chain not reachable yet): 503 with retry_after_s, as while arcaded starts (2026-11-21).
+            json_out(s, if v["code"] == "not_found" { 404 } else if v["code"] == "starting" { 503 } else { 400 }, &v)
         }
     }
 }

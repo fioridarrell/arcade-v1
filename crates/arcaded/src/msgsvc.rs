@@ -960,7 +960,7 @@ pub fn publish_addresses(node: &Node, send: bool) -> Result<Value, String> {
     }
     let home = node.ledger_home();
     if crate::arcsvc::usable(home) {
-        return Err("your profile is on the ARCADE chain (the home chain): publish it from People (Publish profile), which lists your addresses".into());
+        return Err("your profile is on the ARCADE chain: publish it from People (Publish profile), which lists your addresses".into());
     }
     let (address, tag, sk) = sender_key(node)?;
     let tag = tag.ok_or("claim an @tag first: the addresses go on your @tag's profile")?;

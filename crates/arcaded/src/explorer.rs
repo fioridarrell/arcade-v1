@@ -549,7 +549,7 @@ fn pin(node: &Node, cmd: &str, req: &Value, v: &mut Value) {
         v["unit"] = json!(unit(p));
     }
     if req["chain"].is_null() {
-        v["chain_note"] = json!(format!("no chain given: answered on the home chain, {} (give chain, e.g. arctest)", p.name));
+        v["chain_note"] = json!(format!("no chain given: answered on {} (give chain, e.g. arctest)", p.name));
     }
 }
 

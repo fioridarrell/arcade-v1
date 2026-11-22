@@ -351,6 +351,142 @@ pub fn dropped(node: &Node, p: &ChainParams, mine: impl Fn(&[u8]) -> bool) -> Ve
     out
 }
 
+// ---------------- tx.resend (2026-11-21) ----------------
+//
+// A caller whose send went quiet (no peer took it, or the pools forgot it) asks for it to go out again by its txid or
+// its client_ref, rather than signing a second one. Only what a send here signed (it has a receipt, crate::receipts)
+// and this list still holds the bytes of goes; it leaves the way the first send did.
+
+/// The bytes of one of this arcade's own waiting transactions on chain `key`, while they are kept here.
+fn held(node: &Node, p: &ChainParams, txid: &str) -> Option<Tx> {
+    let m = load(node);
+    let raw = m.get(p.key)?.get(txid)?["raw"].as_str()?.to_string();
+    hex::decode(raw).ok().and_then(|raw| Tx::parse_with(&raw, &p.format).ok())
+}
+
+/// To a few of an installed chain's own P2P peers, in the background.
+fn to_coin_peers(node: &Node, p: &'static ChainParams, raw: &[u8]) {
+    let peers: Vec<String> = node.coin_candidates(p).into_iter().take(4).collect();
+    let raw = raw.to_vec();
+    std::thread::spawn(move || {
+        for a in peers {
+            if let Ok(mut peer) = arcade_chain::p2p::Peer::connect(p, &a, std::time::Duration::from_secs(10)) {
+                let _ = peer.send_tx(&raw);
+                std::thread::sleep(std::time::Duration::from_secs(2));
+            }
+        }
+    });
+}
+
+/// One held transaction out again, the way [`send_own`] sent it: the ARCADE chain's own pool (its linked arcades are
+/// offered it from there), a borrowed chain's lenders, or a kept chain's pool and peers. Ok(how), or why it was refused.
+fn rebroadcast(node: &Node, p: &'static ChainParams, tx: &Tx) -> Result<&'static str, String> {
+    if where_is(node, p, tx) == Where::Block {
+        return Ok("in_block");
+    }
+    mark_tried(tx.txid);
+    let arcade = crate::arcsvc::defined().is_some_and(|d| d.chain_no == p.chain_no);
+    if crate::borrow::is_borrowed(p.key) {
+        if node.cr_offerers(p.key).is_empty() {
+            return Err(format!("no arcade lending {} is linked now; try again in a moment", p.name));
+        }
+        return match crate::borrow::broadcast_tx(node, p, tx) {
+            Ok(_) => Ok("lenders"),
+            // A lender's node still holds it: it waits here again.
+            Err((_, answers)) if answers.to_string().to_ascii_lowercase().contains("already") => {
+                crate::borrow::keep_waiting(p, tx);
+                Ok("lenders")
+            }
+            Err((why, _)) => Err(format!("the transaction was refused: {why}")),
+        };
+    }
+    if arcade {
+        if !crate::arcsvc::runs(p) {
+            return Err(crate::arcsvc::reach_pending_error().unwrap_or_else(|| "the ARCADE chain isn't running here".into()));
+        }
+        // Into its pool (one already there is no error), which offers it to every linked arcade.
+        return match crate::arcsvc::send_lent(&tx.raw) {
+            Ok(_) => {
+                crate::receipts::outcome(&tx.txid.to_hex(), "local", true, "");
+                Ok("pool")
+            }
+            Err(e) => {
+                crate::receipts::outcome(&tx.txid.to_hex(), "local", false, &e);
+                Err(format!("the transaction was refused: {e}"))
+            }
+        };
+    }
+    if !crate::chains::kept(node, p) {
+        return Err(format!("{} is neither installed nor borrowed here", p.name));
+    }
+    if where_is(node, p, tx) == Where::Neither {
+        // Back into the pool first, checked as a new one is (its coins still there, nothing else spending them).
+        let pooled = pool_of(node, p);
+        let free = tx.inputs.iter().all(|i| {
+            coin_of(node, p, &pooled, &i.prevout).is_some() && node.chain.mempool_spender(p.chain_no, &i.prevout).ok().flatten().is_none()
+        });
+        if !free || crate::mempoolshare::sort(node, p, tx).is_err() || !crate::mempoolshare::add(node, p, tx) {
+            return Err("the transaction was refused: a coin it spends is spent already, or it no longer checks out".into());
+        }
+    }
+    if p.chain_no == node.params.chain_no {
+        crate::resend::again(node, &tx.raw);
+    } else {
+        to_coin_peers(node, p, &tx.raw);
+    }
+    Ok("peers")
+}
+
+/// `tx.resend {chain, txid | client_ref}`: send again a transaction a send here signed and this arcade still holds the
+/// bytes of (by client_ref: every transaction of that send, the first first), the way it first went out. Answers
+/// tx.status's shape for the transaction (by client_ref, the send's last), with resent [{txid, ok, how | error}].
+pub fn api_resend(node: &Node, req: &Value) -> Result<Value, String> {
+    let (key, txids): (String, Vec<String>) = match (req["txid"].as_str(), req["client_ref"].as_str()) {
+        (Some(t), _) => {
+            let key = req["chain"].as_str().ok_or("chain required (a chain key such as arctest): a txid alone could be on any chain")?;
+            let p = chain(node, key).ok_or_else(|| format!("unknown chain {key}"))?;
+            let t = t.trim().to_ascii_lowercase();
+            Hash256::from_hex(&t).map_err(|_| format!("{t} is not a txid"))?;
+            let rec = crate::receipts::receipt(node, p.key, &t)
+                .ok_or_else(|| format!("not_found: no transaction {t} on {} was signed here, so there is nothing of this arcade's to send again", p.name))?;
+            // Those the same send signed before it (a parent the pools may have forgotten too), then it.
+            let all: Vec<String> = rec["txids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+            let upto = all.iter().position(|x| *x == t).map(|i| all[..=i].to_vec()).unwrap_or_else(|| vec![t.clone()]);
+            (p.key.to_string(), upto)
+        }
+        (None, Some(r)) => {
+            let rec = crate::receipts::by_ref(node, r).ok_or_else(|| format!("not_found: no send with client_ref {r} was signed here, so there is nothing of this arcade's to send again"))?;
+            let txids = rec["txids"].as_array().into_iter().flatten().filter_map(|x| x.as_str().map(String::from)).collect();
+            (rec["chain"].as_str().unwrap_or("").to_string(), txids)
+        }
+        _ => return Err("txid and chain required (or client_ref)".into()),
+    };
+    let p = chain(node, &key).ok_or_else(|| format!("unknown chain {key}"))?;
+    let last = txids.last().cloned().ok_or("not_found: that send signed no transaction here")?;
+    let mut resent = Vec::new();
+    let mut held_any = false;
+    for t in &txids {
+        let Some(tx) = held(node, p, t) else { continue };
+        held_any = true;
+        resent.push(match rebroadcast(node, p, &tx) {
+            Ok(how) => json!({"txid": t, "ok": true, "how": how}),
+            Err(e) => json!({"txid": t, "ok": false, "error": e, "code": crate::receipts::refusal_code(&e)}),
+        });
+    }
+    let mut st = crate::receipts::status(node, &json!({"chain": p.key, "txid": last}))?;
+    if !held_any {
+        // In a block already: nothing to send, and tx.status says so.
+        if st["state"] == "confirmed" {
+            st["resent"] = json!([]);
+            st["note"] = json!("already in a block: nothing to send again");
+            return Ok(st);
+        }
+        return Err(format!("{last} was signed here, but this arcade no longer holds its bytes (they are kept until a block has it, a dropped one {} days), so it can't be sent again", KEEP / 86_400));
+    }
+    st["resent"] = json!(resent);
+    Ok(st)
+}
+
 /// How many are remembered per chain (for tests and status).
 #[cfg(test)]
 fn remembered(node: &Node) -> std::collections::HashMap<String, usize> {
@@ -427,6 +563,55 @@ mod tests {
         let e = send_own(&t.node, t.p, &b).unwrap_err();
         assert!(e.contains("spent by another"), "{e}");
         assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 1, "the refused one isn't sent");
+    }
+
+    /// tx.resend (2026-11-21): a transaction a send here signed goes out again by its txid or its client_ref, back into
+    /// the pool it fell out of and to the coin's peers; nothing is signed again.
+    #[test]
+    fn a_transaction_signed_here_is_sent_again() {
+        let (t, coins) = crate::mempoolshare::tests::funded();
+        let k = crate::mempoolshare::tests::key();
+        let a = arcade_wallet::tx::sign_keyhash(t.p, 1, &coins[1..], &[arcade_wallet::tx::TxOutSpec { value: 1300, script: p2pkh(1) }], &k, 0).unwrap();
+        // Signed and sent by a send command, so it has a receipt.
+        let req = json!({"cmd": "wallet.send", "send": true, "client_ref": "resend-test-1"});
+        crate::receipts::run(&t.node, "wallet.send", &req, || {
+            send_own(&t.node, t.p, &a)?;
+            Ok(json!({"txid": a.txid.to_hex()}))
+        }).unwrap();
+        // The pool lost it, and its first send is long gone from the outbox.
+        assert!(t.node.chain.mempool_remove(t.p, &a.txid).unwrap());
+        t.node.tx_outbox.lock().unwrap().clear();
+        let v = api_resend(&t.node, &json!({"chain": t.p.key, "txid": a.txid.to_hex()})).unwrap();
+        assert_eq!(v["resent"][0]["ok"], true, "{v}");
+        assert_eq!(v["resent"][0]["how"], "peers", "{v}");
+        assert_eq!(v["ever_signed_here"], true, "tx.status's shape: {v}");
+        assert!(t.node.chain.mempool_tx(t.p.chain_no, &a.txid).unwrap().is_some(), "back in the pool");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().as_slice(), &[a.raw.clone()], "and out to the peers");
+        // By client_ref: the same transaction, still waiting, goes out once more.
+        t.node.tx_outbox.lock().unwrap().clear();
+        let v = api_resend(&t.node, &json!({"client_ref": "resend-test-1"})).unwrap();
+        assert_eq!(v["txid"], a.txid.to_hex());
+        assert_eq!(v["resent"][0]["ok"], true, "{v}");
+        assert_eq!(t.node.tx_outbox.lock().unwrap().len(), 1);
+    }
+
+    /// tx.resend refuses what this arcade never signed: an unknown txid, an unknown client_ref, and a transaction it
+    /// holds in its list but that no send here signed (no receipt).
+    #[test]
+    fn a_transaction_not_signed_here_is_refused() {
+        let t = setup();
+        let e = api_resend(&t.node, &json!({"chain": t.p.key, "txid": "ab".repeat(32)})).unwrap_err();
+        assert_eq!(crate::api::error_code(&e), "not_found", "{e}");
+        assert!(e.contains("signed here"), "{e}");
+        let e = api_resend(&t.node, &json!({"client_ref": "never-sent-here"})).unwrap_err();
+        assert_eq!(crate::api::error_code(&e), "not_found", "{e}");
+        let other = tx(&[(t.spend.txid, 1)], &[(1800, p2pkh(1))], 51);
+        note(&t.node, t.p, &other);
+        t.node.tx_outbox.lock().unwrap().clear();
+        let e = api_resend(&t.node, &json!({"chain": t.p.key, "txid": other.txid.to_hex()})).unwrap_err();
+        assert_eq!(crate::api::error_code(&e), "not_found", "{e}");
+        assert!(t.node.tx_outbox.lock().unwrap().is_empty(), "nothing sent");
+        assert_eq!(crate::api::error_code(&api_resend(&t.node, &json!({"txid": other.txid.to_hex()})).unwrap_err()), "bad_args");
     }
 
     /// One the network would refuse (no signature) isn't put back, though its coin is there.

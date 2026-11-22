@@ -316,7 +316,7 @@ pub fn start(node: &Arc<Node>, key: &str, id: &str) -> Result<Value, String> {
     let key = p.key;
     let c = p.chain_no;
     if c == node.params.chain_no {
-        return Err(format!("{} is this arcade's home chain; it stays on the arcade's drive for now", p.name));
+        return Err(format!("{} stays on the arcade's drive for now: it can't be moved", p.name));
     }
     let run = node.extra.lock().unwrap().get(key).cloned().ok_or_else(|| format!("{} is not installed", p.name))?;
     if moving(key) {

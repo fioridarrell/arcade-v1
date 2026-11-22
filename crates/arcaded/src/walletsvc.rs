@@ -705,7 +705,7 @@ fn build_with_caution(node: &Node, r: &Value, send: bool) -> Result<(String, u64
     }
     // A request a page on the ARCADE chain made (batch 7): built and sent on that chain, not the home chain.
     if let Some(k) = r["chain"].as_str().filter(|k| *k != p.key) {
-        let ap = crate::chains::find(k).filter(|ap| crate::arcsvc::defines(ap.key)).ok_or_else(|| format!("a page's send is on the home chain or the ARCADE chain, not {k}"))?;
+        let ap = crate::chains::find(k).filter(|ap| crate::arcsvc::defines(ap.key)).ok_or_else(|| format!("a page's send is on {} or the ARCADE chain, not {k}", p.name))?;
         return arc_send(node, ap, r, send).map(|(t, f, o)| (t, f, o, None));
     }
     let to = r["to"].as_str().unwrap_or("");

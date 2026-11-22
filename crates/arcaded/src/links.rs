@@ -52,14 +52,14 @@ pub fn verify(node: &Node, r: &Value) -> Result<(), String> {
     // The @tag's holder on ARCADE or the old home (by key hash), and a record made for either home: arcades on the
     // release before ARCADE became home still make them for Pepecoin testnet (HOMECHAIN.md phase 3).
     let (_, owner) = crate::hometag::owner_or_err(node, s(r, "tag"))?;
-    let home = [node.ledger_home(), node.params].into_iter().find(|h| h.net == s(r, "home")).ok_or("a link for another home chain")?;
+    let home = [node.ledger_home(), node.params].into_iter().find(|h| h.net == s(r, "home")).ok_or("a link made for a chain this arcade doesn't keep @tags on")?;
     check(r, home, &crate::hometag::address_on(home, &owner).ok_or("bad owner address")?)
 }
 
 /// The checks that need no database: `owner` is the address the @tag row names.
 fn check(r: &Value, home: &ChainParams, owner: &str) -> Result<(), String> {
     if s(r, "home") != home.net {
-        return Err("a link for another home chain".into());
+        return Err("a link made for a chain this arcade doesn't keep @tags on".into());
     }
     let p = by_net(s(r, "net")).ok_or("unknown chain")?;
     if r["at"].as_u64().unwrap_or(0) > arcade_app::now() + 600 {

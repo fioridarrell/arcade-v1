@@ -49,7 +49,7 @@ pub fn ledger_send(node: &Node, pid: u32, units: u64, to: &str, send: bool, chai
     } else if p.chain_no == node.params.chain_no {
         crate::walletsvc::token_send(node, pid, units, to, send)?
     } else {
-        return Err(format!("arcade tokens are sent on the home chain or the ARCADE chain, not {}", p.name));
+        return Err(format!("arcade tokens are sent on {} or the ARCADE chain, not {}", node.params.name, p.name));
     };
     Ok(json!({"chain": p.key, "propertyid": pid, "units": units, "to": to, "fee": fee, "outputs": outputs, "txid": if send { json!(txid) } else { Value::Null }, "sent": send}))
 }

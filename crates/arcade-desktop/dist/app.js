@@ -232,7 +232,7 @@ function drawMesh(ov) {
       ? h("div", { class: "lines" }, ...me.chains.map((c) => h("div", { class: "line" },
           coinLogo(c.key, c.name, "span", "logo"), h("span", { class: "cn" }, c.name),
           h("span", { class: "chips" },
-            c.home ? chip("home chain") : null,
+            c.home ? chip("built in") : null,
             c.borrowed ? chip("syncing; borrowed meanwhile", "off") : chip(`block ${num(c.tip)}`),
             c.mode === "shared" ? chip("shared storage") : null,
             ...ixChips(c.indexes),

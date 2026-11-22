@@ -32,7 +32,7 @@ const HELP: &str = "arcade — Arcade V1.0
                        names, maps, collections        need ord (added with them)
                        tokens                          need ord; pep, peptest, doge, dgb, ltc, ltctest, shic, wjk
                        dogefeed                        Dogecoin (doge)
-                       messages                        the home chain only (always on there)
+                       messages                        Pepecoin testnet only (always on there)
                        dunes (Dogecoin), runes (Bitcoin)  coming
                      while another chain is still being installed, the add waits in the queue (checked first)
   arcade chain queue                        chains waiting to be installed, next first

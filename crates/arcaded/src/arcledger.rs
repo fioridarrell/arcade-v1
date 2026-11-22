@@ -22,7 +22,8 @@ pub fn chain() -> Result<&'static ChainParams, String> {
 /// that needs to be sent"). Coins, waiting change and the broadcast follow whichever copy stands in (claims::arc_coins,
 /// arcsvc::waiting_outputs, ownwait::send_arc).
 pub fn write_chain() -> Result<&'static ChainParams, String> {
-    crate::arcsvc::usable_chain().ok_or_else(|| "the ARCADE chain isn't installed or borrowed here".to_string())
+    // Not reachable yet (arcaded starting, its borrowed copy still being set up): "starting" with a retry (2026-11-21).
+    crate::arcsvc::usable_chain().ok_or_else(|| crate::arcsvc::reach_pending_error().unwrap_or_else(|| "the ARCADE chain isn't installed or borrowed here".to_string()))
 }
 
 // ---------------- reads while ARCADE is only borrowed (borrowed = installed, batch 4) ----------------

@@ -84,7 +84,7 @@
       const cb = document.createElement("input"); cb.type = "checkbox"; cb.checked = !!bc.on; cb.disabled = !globalOn;
       cb.onchange = () => {
         // The home chain not installed here: borrowing is all this arcade has of it (balances, the test coin, @handles).
-        if (!cb.checked && c.home && !confirm(`${c.name} is this arcade's home chain and it isn't installed here: borrowing it is how this arcade reads your balances, gets its test coin and claims @handles. Stop borrowing it anyway?`)) { cb.checked = true; return; }
+        if (!cb.checked && c.home && !confirm(`${c.name} isn't installed here, and borrowing it is how this arcade reads your balances, gets its test coin and claims @handles. Stop borrowing it anyway?`)) { cb.checked = true; return; }
         setBorrow({ chain: c.key, on: cb.checked }, cb.checked ? `Borrowing ${c.name}.` : `Stopped borrowing ${c.name}; its borrowed data is removed.`);
       };
       sw.append(cb, document.createTextNode(" Borrow"));
@@ -137,7 +137,7 @@
     if (c.queued > 1) out.push(smallBtn("Sync next", `Move ${c.name} to the front of the queue: it starts when the chain syncing now has caught up.`, async () => {
       await api("chains.queue_first", { key: c.key }); bmsg(`${c.name} is next in the queue.`, false);
     }));
-    out.push(smallBtn("Sync now", `Start ${c.name} now. The chain syncing now is paused and continues right after it. Not while the home chain or the ARCADE chain is catching up.`, async () => {
+    out.push(smallBtn("Sync now", `Start ${c.name} now. The chain syncing now is paused and continues right after it. Not while ${HOME.name} or the ARCADE chain is catching up.`, async () => {
       const r = await api("chains.start_now", { key: c.key });
       const p = (r.paused || []).map((k) => (chains.find((x) => x.key === k) || {}).name || k);
       bmsg(`${c.name} starts now${p.length ? `; ${p.join(", ")} paused and continues after it` : ""}.`, false);

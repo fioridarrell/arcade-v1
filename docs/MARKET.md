@@ -541,5 +541,6 @@ way to enforce a maker fee on orders placed through it (beside the taker-side tr
 Security fixes (re-audit at ba0e09a, 2026-11-11): a swap maker's lock takes only a 32-byte secret
 (`OP_SIZE 32 OP_EQUALVERIFY`; its quote says `"sized": true`, and an older taker never finds the lock,
 so both sides refund); an ARCADE coin leg can't be swapped for DigiDollars until the ARCADE chain has
-OP_SIZE; a take goes ahead only on the terms its card showed; swap funding and borrowed-chain sends keep
+OP_SIZE (rules version 7, from `params::RULES_V7_HEIGHT`: from the chain's next block at that height a maker locks
+ARCADE sized too, and a taker refuses a sized ARCADE quote before it sees version 7 start); a take goes ahead only on the terms its card showed; swap funding and borrowed-chain sends keep
 inscribed coins out.

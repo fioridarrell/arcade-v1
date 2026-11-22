@@ -934,20 +934,55 @@ fn spent_secret(node: &Node, leg: &Value, spec: &Spec, st: &Value) -> Result<Opt
 
 // ---------------- orders, the maker's answers ----------------
 
-/// Whether the maker's lock of `give` takes only a 32-byte secret: everywhere but the ARCADE chain, whose script
-/// has no OP_SIZE.
+/// Whether the maker's lock of `give` takes only a 32-byte secret: everywhere but the ARCADE chain before its rules
+/// version 7 (no OP_SIZE in its script until then), judged for the chain's next block here.
 fn sized_on(node: &Node, give: &Value) -> bool {
-    leg_ok(node, give).is_ok_and(|p| !by_height(p))
+    leg_ok(node, give).is_ok_and(|p| sizes(p, tip_height(node, p) as u64 + 1))
+}
+
+/// Whether a lock on `p` in the block at `height` may take a 32-byte secret only (OP_SIZE 32 OP_EQUALVERIFY): any
+/// chain but the ARCADE chain, and the ARCADE chain from rules version 7 by the schedule this arcade follows.
+fn sizes(p: &ChainParams, height: u64) -> bool {
+    if !by_height(p) {
+        return true;
+    }
+    let net = crate::arcsvc::svc_net().filter(|n| n.key == p.key).or(match p.key {
+        "arc" => Some(arcade_arc::params::MAINNET),
+        "arctest" => Some(arcade_arc::params::TESTNET),
+        _ => None,
+    });
+    net.is_some_and(|n| arcade_arc::params::rules_v7(&n, height))
 }
 
 /// A pair the maker can't be stranded in: the taker makes the secret, and a lock of the maker's that takes any
-/// length (the ARCADE chain's) can't be paired with one of the taker's that takes 32 bytes only (DigiDollars).
+/// length (the ARCADE chain's before rules version 7) can't be paired with one of the taker's that takes 32 bytes only
+/// (DigiDollars).
 fn pair_ok(node: &Node, give: &Value, get_leg: &Value) -> Result<(), String> {
-    if !sized_on(node, give) && get_leg["kind"] == "dd" {
-        return Err("an ARCADE coin leg can't be swapped for DigiDollars yet".into());
-    }
+    unsized_pair(sized_on(node, give), get_leg)?;
     confirmable(node, give)?;
     confirmable(node, get_leg)
+}
+
+/// [`pair_ok`]'s refusal: the maker's lock takes any length (`sized` false) and the taker's is a DigiDollar lock.
+fn unsized_pair(sized: bool, get_leg: &Value) -> Result<(), String> {
+    if !sized && get_leg["kind"] == "dd" {
+        return Err("an ARCADE coin leg can't be swapped for DigiDollars yet".into());
+    }
+    Ok(())
+}
+
+/// The form of the maker's lock in a swap whose taker says what its quote gave (`said`, None from a taker that doesn't
+/// say): what this arcade would quote now, unless the ARCADE chain's rules version 7 began between the quote and now
+/// (the unsized form the quote gave still holds there, when the taker's leg isn't DigiDollars). A sized ARCADE lock
+/// before version 7 is never made: the chain would refuse its claim.
+fn maker_form(node: &Node, give: &Value, get_leg: &Value, said: Option<bool>) -> Result<bool, String> {
+    let now = sized_on(node, give);
+    match said {
+        None => Ok(now),
+        Some(s) if s == now => Ok(s),
+        Some(false) if leg_ok(node, give).is_ok_and(by_height) => unsized_pair(false, get_leg).map(|_| false),
+        Some(_) => Err("the lock form quoted (a 32-byte secret only, or any length) isn't the one this arcade makes now: take the order again".into()),
+    }
 }
 
 /// Place an order: give `give`, get `get` (whole, one fill). `opts` (all optional): `key` {chain: 32-byte secret hex}
@@ -1282,6 +1317,7 @@ fn maker_begin(node: &Node, q: &Value) -> Result<Value, String> {
         return Err("that order is held for somebody else".into());
     }
     pair_ok(node, &o["give"], &o["get"])?;
+    let sized = maker_form(node, &o["give"], &o["get"], q["sized"].as_bool())?;
     let taker_time = q["taker_time"].as_u64().ok_or("give the lock time")? as u32;
     if taker_time < now() + maker_secs() * 3 / 2 {
         return Err("that lock ends too soon".into());
@@ -1291,7 +1327,7 @@ fn maker_begin(node: &Node, q: &Value) -> Result<Value, String> {
     let mut s = json!({"id": id, "role": "maker", "order": public_order(&o), "peer": q["taker"], "maker_keys": keys_for(node, &[&o["give"], &o["get"]], Some(&o), &account)?, "account": account,
                        "taker_keys": q["taker_keys"], "taker_time": taker_time, "maker_time": now() + maker_secs(),
                        "taker_lock": q["taker_lock"], "maker_lock": {"step": "start"}, "step": "locking", "at": arcade_app::now(),
-                       "sized": sized_on(node, &o["give"])});
+                       "sized": sized});
     // On the ARCADE chain: the taker's height must last 3 times the order's time even with blocks twice as fast as
     // lately; this side's own lock ends at the height of 1 time (see by_height).
     let gp = leg_ok(node, &o["get"])?;
@@ -1343,6 +1379,12 @@ pub fn take(node: &Node, maker: &str, order: &str, shown: Option<&Value>) -> Res
     leg_ok(node, &o["get"])?;
     confirmable(node, &o["give"])?;
     confirmable(node, &o["get"])?;
+    // A maker's ARCADE lock that takes a 32-byte secret only is claimed from rules version 7 (OP_SIZE): before it, as
+    // this arcade follows the chain, the claim would be refused, so nothing is locked.
+    let gv = leg_ok(node, &o["give"])?;
+    if quote["sized"] == true && !sizes(gv, tip_height(node, gv) as u64 + 1) {
+        return Err("the maker's ARCADE lock needs ARCADE rules version 7 (OP_SIZE), which this arcade doesn't see started yet: nothing was locked".into());
+    }
     let secret: [u8; 32] = arcade_mesh::random::bytes();
     let id = hex::encode(Sha256::digest(secret));
     let secs = quote["maker_secs"].as_u64().unwrap_or(4 * 3600) as u32;
@@ -1379,6 +1421,10 @@ pub fn outside(node: &Node, op: &str, req: &Value) -> Result<Value, String> {
                                "taker_keys": req["taker_keys"], "taker_time": req["taker_time"], "taker_lock": req["taker_lock"]});
             if !req["taker_height"].is_null() {
                 q["taker_height"] = req["taker_height"].clone();
+            }
+            // The maker's lock form from the quote the visitor took (when the website says it).
+            if let Some(sized) = req["sized"].as_bool() {
+                q["sized"] = json!(sized);
             }
             ask(node, maker, q)
         }
@@ -1440,7 +1486,8 @@ fn step(node: &Node, s: &mut Value) -> Result<(), String> {
                     return Ok(());
                 }
                 let q = json!({"op": "slocked", "chain": "dgbtest", "order": s["order"]["id"], "hash": s["id"], "taker": node.id_hex(),
-                               "taker_keys": s["taker_keys"], "taker_time": s["taker_time"], "taker_height": s["taker_height"], "taker_lock": s["taker_lock"]});
+                               "taker_keys": s["taker_keys"], "taker_time": s["taker_time"], "taker_height": s["taker_height"], "taker_lock": s["taker_lock"],
+                               "sized": s["sized"] == true});
                 match ask(node, s["peer"].as_str().unwrap_or(""), q) {
                     Ok(_) => s["step"] = json!("waiting"),
                     Err(e) => s["last"] = json!(e),
@@ -1562,7 +1609,7 @@ mod arcade_lock_tests {
         let check = |raw: &[u8]| {
             let tx = Tx::parse_with(raw, &p.format).unwrap();
             let mut n = 0;
-            (arcade_arc::script::verify_input(&tx, 0, &lock.script(), &mut n), tx)
+            (arcade_arc::script::verify_input(&tx, 0, &lock.script(), &mut n, arcade_arc::script::Rules::BASE), tx)
         };
         let (ok, _) = check(&htlc::claim(p, &lock, &coin, outs.clone(), &secret, &a).unwrap());
         assert!(ok.is_ok(), "claim: {ok:?}");
@@ -1572,6 +1619,64 @@ mod arcade_lock_tests {
         let early = Htlc { time: 999, ..lock.clone() };
         let (ok, _) = check(&htlc::refund(p, &early, &coin, outs, &b).unwrap());
         assert!(ok.is_err(), "a refund signed for an earlier height must not spend this lock");
+    }
+
+    /// A maker's sized ARCADE lock (rules version 7, OP_SIZE): the taker's claim opens it with a 32-byte secret only,
+    /// and only under version 7's rules; its refund still goes after its height.
+    #[test]
+    fn rules_v7_a_sized_arcade_lock_takes_32_bytes_only() {
+        use arcade_arc::params::{TESTNET, RULES_V7_HEIGHT};
+        use arcade_arc::script::{verify_input, Rules, ScriptError};
+        let p = arcade_arc::store::chain_params(&TESTNET, &Hash256::ZERO);
+        let (a, b) = (SecretKey::from_slice(&[3u8; 32]).unwrap(), SecretKey::from_slice(&[4u8; 32]).unwrap());
+        let pk = |k: &SecretKey| PublicKey::from_secret_key(SECP256K1, k).serialize().to_vec();
+        let coin = [(OutPoint { txid: Hash256([7; 32]), vout: 0 }, 50_000_000u64)];
+        let to = arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk(&a)));
+        let outs = htlc::pay_out(&coin, &to, htlc::SPEND_FEE).unwrap();
+        let (before, after) = (Rules::at(&TESTNET, RULES_V7_HEIGHT - 1), Rules::at(&TESTNET, RULES_V7_HEIGHT));
+        assert_eq!((before, after), (Rules::BASE, Rules::ALL));
+        for len in [31usize, 32, 33] {
+            let secret = vec![9u8; len];
+            let lock = Htlc { hash: Sha256::digest(&secret).into(), claimer: pk(&a), refunder: pk(&b), time: RULES_V7_HEIGHT as u32 + 100, sized: true };
+            assert_eq!(Htlc::parse(&lock.redeem()), Some(lock.clone()), "read back sized");
+            let claim = Tx::parse_with(&htlc::claim(p, &lock, &coin, outs.clone(), &secret, &a).unwrap(), &p.format).unwrap();
+            let got = verify_input(&claim, 0, &lock.script(), &mut 0, after);
+            assert_eq!(got, if len == 32 { Ok(()) } else { Err(ScriptError::Verify) }, "{len}-byte secret");
+            assert_eq!(verify_input(&claim, 0, &lock.script(), &mut 0, before), Err(ScriptError::UnknownOp(0x82)), "before version 7");
+            // The same secret opens the unsized lock (made before version 7) under either rules.
+            let plain = Htlc { sized: false, ..lock.clone() };
+            let claim = Tx::parse_with(&htlc::claim(p, &plain, &coin, outs.clone(), &secret, &a).unwrap(), &p.format).unwrap();
+            assert_eq!(verify_input(&claim, 0, &plain.script(), &mut 0, before), Ok(()));
+            assert_eq!(verify_input(&claim, 0, &plain.script(), &mut 0, after), Ok(()));
+            let refund = Tx::parse_with(&htlc::refund(p, &lock, &coin, outs.clone(), &b).unwrap(), &p.format).unwrap();
+            assert_eq!(verify_input(&refund, 0, &lock.script(), &mut 0, after), Ok(()), "refund");
+        }
+    }
+}
+
+#[cfg(test)]
+mod arcade_op_size_tests {
+    use super::*;
+    use arcade_arc::params::RULES_V7_HEIGHT;
+
+    /// An ARCADE leg is locked sized (and paired with DigiDollars) from rules version 7's height on; before it, the
+    /// pair is refused with the plain reason it always had. Other chains are sized at every height.
+    #[test]
+    fn rules_v7_an_arcade_leg_pairs_with_digidollars_from_its_height() {
+        let arc = arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &Hash256::ZERO);
+        let dgb = crate::chains::find("dgbtest").unwrap();
+        let dd = json!({"chain": "dgbtest", "kind": "dd", "asset": "DD", "amount": "100"});
+        let coin = json!({"chain": "peptest", "kind": "coin", "amount": "1"});
+        assert!(!sizes(arc, RULES_V7_HEIGHT - 1) && sizes(arc, RULES_V7_HEIGHT) && sizes(arc, RULES_V7_HEIGHT + 10_000));
+        assert!(sizes(dgb, 0) && sizes(dgb, RULES_V7_HEIGHT - 1));
+        let main = arcade_arc::store::chain_params(&arcade_arc::params::MAINNET, &Hash256::ZERO);
+        assert!(!sizes(main, u64::MAX), "mainnet has no version 7 scheduled");
+        // Before: refused, saying why; any other leg goes.
+        let e = unsized_pair(sizes(arc, RULES_V7_HEIGHT - 1), &dd).unwrap_err();
+        assert_eq!(e, "an ARCADE coin leg can't be swapped for DigiDollars yet");
+        assert!(unsized_pair(sizes(arc, RULES_V7_HEIGHT - 1), &coin).is_ok());
+        // From the height: the pair goes.
+        assert!(unsized_pair(sizes(arc, RULES_V7_HEIGHT), &dd).is_ok());
     }
 }
 

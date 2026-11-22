@@ -8,7 +8,7 @@
 //! so a transaction has one way to be written and nobody but its signers can change its id:
 //!
 //! - an opcode outside the list below makes the script invalid, even in a branch that
-//!   isn't run (new opcodes come by upgrade);
+//!   isn't run (new opcodes come by upgrade: `OP_SIZE` from rules version 7, [`Rules`]);
 //! - every push is written the shortest way, and an unlocking script only pushes;
 //! - `OP_IF` takes exactly nothing or the number 1;
 //! - a signature is strict DER with a low S, a public key is compressed or uncompressed;
@@ -61,6 +61,27 @@ pub const OP_CHECKSIGVERIFY: u8 = 0xad;
 pub const OP_CHECKMULTISIG: u8 = 0xae;
 pub const OP_CHECKMULTISIGVERIFY: u8 = 0xaf;
 pub const OP_CHECKLOCKTIMEVERIFY: u8 = 0xb1;
+/// From rules version 7 ([`Rules::op_size`]): the byte length of the top item, pushed as a number; the item stays.
+pub const OP_SIZE: u8 = 0x82;
+
+/// What a script may use beyond the opcodes it had from block 1, by the rules version of the block it is judged for.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Rules {
+    /// `OP_SIZE` is known (rules version 7, crate::params::rules_v7); before it, it is an unknown opcode.
+    pub op_size: bool,
+}
+
+impl Rules {
+    /// The script as it was from block 1 (rules versions 1 to 6).
+    pub const BASE: Rules = Rules { op_size: false };
+    /// Every opcode this arcade knows.
+    pub const ALL: Rules = Rules { op_size: true };
+
+    /// The script rules for a transaction in the block at `height` of `net`.
+    pub fn at(net: &crate::params::Net, height: u64) -> Rules {
+        Rules { op_size: crate::params::rules_v7(net, height) }
+    }
+}
 
 /// Every opcode that isn't a push.
 const OPCODES: [u8; 18] = [
@@ -251,8 +272,8 @@ enum Op {
     Code(u8),
 }
 
-/// The next opcode of `script` at `pos`, refused if it is a push written a longer way.
-fn next_op(script: &[u8], pos: &mut usize) -> Result<Op, ScriptError> {
+/// The next opcode of `script` at `pos`, refused if it is a push written a longer way, or an opcode `rules` don't know.
+fn next_op(script: &[u8], pos: &mut usize, rules: Rules) -> Result<Op, ScriptError> {
     let op = script[*pos];
     *pos += 1;
     let len = match op {
@@ -277,7 +298,7 @@ fn next_op(script: &[u8], pos: &mut usize) -> Result<Op, ScriptError> {
         }
         OP_1NEGATE => return Ok(Op::Push(vec![0x81])),
         OP_1..=OP_16 => return Ok(Op::Push(vec![op - OP_1 + 1])),
-        _ if OPCODES.contains(&op) || op == OP_CHECKLOCKTIMEVERIFY => return Ok(Op::Code(op)),
+        _ if OPCODES.contains(&op) || op == OP_CHECKLOCKTIMEVERIFY || (op == OP_SIZE && rules.op_size) => return Ok(Op::Code(op)),
         _ => return Err(ScriptError::UnknownOp(op)),
     };
     if len > MAX_PUSH_BYTES {
@@ -298,6 +319,24 @@ fn truthy(v: &[u8]) -> bool {
         None => false,
         Some((&last, rest)) => rest.iter().any(|&b| b != 0) || (last != 0 && last != 0x80),
     }
+}
+
+/// `n` as a script number, the shortest way (0 is the empty item).
+fn script_number(n: i64) -> Vec<u8> {
+    let mut out = Vec::new();
+    let mut abs = n.unsigned_abs();
+    while abs > 0 {
+        out.push((abs & 0xff) as u8);
+        abs >>= 8;
+    }
+    if let Some(last) = out.last_mut() {
+        if *last & 0x80 != 0 {
+            out.push(if n < 0 { 0x80 } else { 0 });
+        } else if n < 0 {
+            *last |= 0x80;
+        }
+    }
+    out
 }
 
 fn boolean(b: bool) -> Vec<u8> {
@@ -353,6 +392,7 @@ struct Machine<'a> {
     index: usize,
     /// Signature checks done so far (a block has a limit).
     checks: &'a mut u32,
+    rules: Rules,
 }
 
 impl Machine<'_> {
@@ -448,7 +488,7 @@ impl Machine<'_> {
         // One entry for each open IF: (is this branch run, has its ELSE come).
         let mut open: Vec<(bool, bool)> = Vec::new();
         while pos < script.len() {
-            let op = next_op(script, &mut pos)?;
+            let op = next_op(script, &mut pos, self.rules)?;
             let live = open.iter().all(|c| c.0);
             let code = match op {
                 Op::Push(data) => {
@@ -517,6 +557,10 @@ impl Machine<'_> {
                         return Err(ScriptError::Verify);
                     }
                 }
+                OP_SIZE => {
+                    let len = stack.last().ok_or(ScriptError::StackEmpty)?.len();
+                    stack.push(script_number(len as i64));
+                }
                 OP_SHA256 => {
                     let top = pop(stack)?;
                     stack.push(sha256(&top).to_vec());
@@ -569,14 +613,14 @@ impl Machine<'_> {
 }
 
 /// The items an unlocking script pushes; it may do nothing else.
-fn pushes(script_sig: &[u8]) -> Result<Vec<Vec<u8>>, ScriptError> {
+fn pushes(script_sig: &[u8], rules: Rules) -> Result<Vec<Vec<u8>>, ScriptError> {
     if script_sig.len() > MAX_SCRIPT_BYTES {
         return Err(ScriptError::TooLong);
     }
     let mut stack = Vec::new();
     let mut pos = 0;
     while pos < script_sig.len() {
-        match next_op(script_sig, &mut pos)? {
+        match next_op(script_sig, &mut pos, rules)? {
             Op::Push(data) => stack.push(data),
             Op::Code(_) => return Err(ScriptError::NotPushOnly),
         }
@@ -587,12 +631,12 @@ fn pushes(script_sig: &[u8]) -> Result<Vec<Vec<u8>>, ScriptError> {
     Ok(stack)
 }
 
-/// Whether input `index` of `tx` may spend a coin locked by `coin_script`. `checks` counts
-/// the signature checks done, for the block's limit.
-pub fn verify_input(tx: &Tx, index: usize, coin_script: &[u8], checks: &mut u32) -> Result<(), ScriptError> {
+/// Whether input `index` of `tx` may spend a coin locked by `coin_script`, under the script `rules` of the block it is
+/// for ([`Rules::at`]). `checks` counts the signature checks done, for the block's limit.
+pub fn verify_input(tx: &Tx, index: usize, coin_script: &[u8], checks: &mut u32, rules: Rules) -> Result<(), ScriptError> {
     let input = tx.inputs.get(index).ok_or(ScriptError::NoInput)?;
-    let mut stack = pushes(&input.script_sig)?;
-    let mut machine = Machine { tx, index, checks };
+    let mut stack = pushes(&input.script_sig, rules)?;
+    let mut machine = Machine { tx, index, checks, rules };
     if let Some(hash) = p2sh_hash(coin_script) {
         let redeem = pop(&mut stack)?;
         if hash160(&redeem) != hash {
@@ -674,7 +718,7 @@ pub(crate) mod tests {
     }
 
     fn run(t: &Tx, index: usize, coin_script: &[u8]) -> Result<(), ScriptError> {
-        verify_input(t, index, coin_script, &mut 0)
+        verify_input(t, index, coin_script, &mut 0, Rules::BASE)
     }
 
     /// Two inputs, two outputs, nothing signed.
@@ -720,7 +764,7 @@ pub(crate) mod tests {
         let t = plain();
         let good = with_sig(&t, 0, sig_and_key(&sign(&t, 0, &lock, &sk, SIGHASH_ALL), &pk));
         let mut checks = 0;
-        assert_eq!(verify_input(&good, 0, &lock, &mut checks), Ok(()));
+        assert_eq!(verify_input(&good, 0, &lock, &mut checks, Rules::BASE), Ok(()));
         assert_eq!(checks, 1);
         // Exactly as the wallet writes it.
         assert_eq!(good.inputs[0].script_sig, arcade_wallet::legs::script_sig(&sign(&t, 0, &lock, &sk, SIGHASH_ALL), &pk));
@@ -820,7 +864,7 @@ pub(crate) mod tests {
         // The claim: referee's signature, pool's signature, 1.
         let claim = with_sig(&t, 0, unlock(&[&referee_sig, &pool_sig, &[1]]));
         let mut checks = 0;
-        assert_eq!(verify_input(&claim, 0, &lock, &mut checks), Ok(()));
+        assert_eq!(verify_input(&claim, 0, &lock, &mut checks, Rules::BASE), Ok(()));
         assert_eq!(checks, 2);
         // The refund: creator's signature, nothing.
         let refund = with_sig(&t, 0, unlock(&[&creator_sig, &[]]));
@@ -937,7 +981,7 @@ pub(crate) mod tests {
             let mut s = Vec::new();
             push(&mut s, &[n]);
             assert_eq!(s.len(), 1);
-            assert_eq!(pushes(&s).unwrap(), vec![vec![n]]);
+            assert_eq!(pushes(&s, Rules::BASE).unwrap(), vec![vec![n]]);
         }
         let mut big = Vec::new();
         push(&mut big, &[0x42; 521]);
@@ -1034,7 +1078,7 @@ pub(crate) mod tests {
         let lock = multisig(1, &[&a_pk, &b_pk, &c_pk]);
         let sig = |sk: &SecretKey, lock: &[u8]| sign(&t, 0, lock, sk, SIGHASH_ALL);
         let mut checks = 0;
-        assert_eq!(verify_input(&with_sig(&t, 0, unlock(&[&[], &sig(&a, &lock)])), 0, &lock, &mut checks), Ok(()));
+        assert_eq!(verify_input(&with_sig(&t, 0, unlock(&[&[], &sig(&a, &lock)])), 0, &lock, &mut checks, Rules::BASE), Ok(()));
         assert_eq!(checks, 3); // tried against the third key, the second, then the first
         assert_eq!(run(&with_sig(&t, 0, unlock(&[&[], &sig(&c, &lock)])), 0, &lock), Ok(()));
         assert_eq!(run(&with_sig(&t, 0, unlock(&[&[], &sig(&key(4).0, &lock)])), 0, &lock), Err(ScriptError::SigFailed));
@@ -1110,5 +1154,94 @@ pub(crate) mod tests {
         assert_eq!(number(&[0xff], 1), Ok(-127));
         assert_eq!(number(&[0x80, 0x00], 2), Ok(128));
         assert_eq!(number(&[0x00], 1), Err(ScriptError::Number));
+    }
+
+    /// `script` run with `rules` against `items` pushed by the unlocking script (a bare coin script).
+    fn run_with(rules: Rules, items: &[&[u8]], script: &[u8]) -> Result<(), ScriptError> {
+        let mut sig = Vec::new();
+        for item in items {
+            push(&mut sig, item);
+        }
+        verify_input(&with_sig(&plain(), 0, sig), 0, script, &mut 0, rules)
+    }
+
+    #[test]
+    fn rules_v7_op_size_pushes_the_length_and_leaves_the_item() {
+        use crate::params::{rules_v7, Net, TESTNET};
+        // <item> SIZE <n> EQUALVERIFY <item> EQUAL: the length is pushed the shortest way and the item stays.
+        for (len, n) in [(0usize, vec![]), (1, vec![1]), (32, vec![32]), (33, vec![33]), (127, vec![0x7f]), (128, vec![0x80, 0]), (255, vec![0xff, 0]), (520, vec![0x08, 0x02])] {
+            let item = vec![0x42; len];
+            let mut lock = vec![OP_SIZE];
+            push(&mut lock, &n);
+            lock.push(OP_EQUALVERIFY);
+            push(&mut lock, &item);
+            lock.push(OP_EQUAL);
+            assert_eq!(run_with(Rules::ALL, &[&item], &lock), Ok(()), "{len} bytes");
+            // One off is another number.
+            let mut wrong = vec![OP_SIZE];
+            push(&mut wrong, &script_number(len as i64 + 1));
+            wrong.extend_from_slice(&[OP_EQUALVERIFY, OP_DROP, OP_1]);
+            assert_eq!(run_with(Rules::ALL, &[&item], &wrong), Err(ScriptError::Verify), "{len} bytes");
+            // Before version 7 the same script is invalid.
+            assert_eq!(run_with(Rules::BASE, &[&item], &lock), Err(ScriptError::UnknownOp(OP_SIZE)));
+        }
+        assert_eq!(script_number(0), Vec::<u8>::new());
+        assert_eq!((script_number(-1), script_number(-128), script_number(520)), (vec![0x81], vec![0x80, 0x80], vec![0x08, 0x02]));
+        // Nothing to size.
+        assert_eq!(run_with(Rules::ALL, &[], &[OP_SIZE]), Err(ScriptError::StackEmpty));
+        // An empty item's size is 0, which is false: SIZE alone leaves two items.
+        assert_eq!(run_with(Rules::ALL, &[&[]], &[OP_SIZE, OP_NOTIF, OP_1, OP_ENDIF, OP_DROP]), Err(ScriptError::NotClean));
+        assert_eq!(run_with(Rules::ALL, &[&[]], &[OP_SIZE, OP_NOTIF, OP_DROP, OP_1, OP_ENDIF]), Ok(()));
+        // In a branch that isn't run: unknown before version 7 (the script is invalid), skipped from it.
+        let unrun = [OP_0, OP_IF, OP_SIZE, OP_ENDIF, OP_1];
+        assert_eq!(run_with(Rules::BASE, &[], &unrun), Err(ScriptError::UnknownOp(OP_SIZE)));
+        assert_eq!(run_with(Rules::ALL, &[], &unrun), Ok(()));
+        // An unlocking script still only pushes.
+        assert_eq!(verify_input(&with_sig(&plain(), 0, vec![OP_1, OP_SIZE]), 0, &[OP_DROP], &mut 0, Rules::ALL), Err(ScriptError::NotPushOnly));
+        // It counts toward the opcode limit.
+        let mut many = vec![OP_1];
+        many.extend(std::iter::repeat([OP_SIZE, OP_DROP]).take(100).flatten());
+        assert_eq!(run_with(Rules::ALL, &[], &many), Ok(()));
+        many.push(OP_SIZE);
+        many.push(OP_DROP);
+        assert_eq!(run_with(Rules::ALL, &[], &many), Err(ScriptError::TooManyOps));
+        // The rules follow the block's height.
+        let net = Net { rules: &[(3, 0), (6, 10), (7, 700)], ..TESTNET };
+        assert_eq!((Rules::at(&net, 699), Rules::at(&net, 700)), (Rules::BASE, Rules::ALL));
+        assert!(!rules_v7(&net, 699) && rules_v7(&net, 700));
+    }
+
+    #[test]
+    fn rules_v7_a_sized_arcade_lock_takes_a_32_byte_secret_only() {
+        use arcade_wallet::htlc::Htlc;
+        let ((claimer, claimer_pk), (_, refunder_pk)) = (key(1), key(2));
+        // A claim with the secret: the swap form on the ARCADE chain (the time lock a height).
+        let claim = |lock: &Htlc, secret: &[u8], rules: Rules| {
+            let redeem = lock.redeem();
+            let t = tx(vec![(coin(1), vec![], u32::MAX)], vec![(1, vec![OP_1])], 0);
+            let mut s = Vec::new();
+            push(&mut s, &sign(&t, 0, &redeem, &claimer, SIGHASH_ALL));
+            push(&mut s, secret);
+            s.push(OP_1);
+            push(&mut s, &redeem);
+            run_with_tx(&with_sig(&t, 0, s), &p2sh(&redeem), rules)
+        };
+        for len in [1usize, 31, 32, 33, 64, 520] {
+            let secret = vec![0x5a; len];
+            let plain = Htlc { hash: sha256(&secret), claimer: claimer_pk.clone(), refunder: refunder_pk.clone(), time: 5_200, sized: false };
+            let sized = Htlc { sized: true, ..plain.clone() };
+            assert_eq!(Htlc::parse(&sized.redeem()), Some(sized.clone()));
+            assert_eq!(Htlc::parse(&plain.redeem()), Some(plain.clone()));
+            // The unsized lock opens for any length, under either rules.
+            assert_eq!(claim(&plain, &secret, Rules::BASE), Ok(()), "{len}");
+            assert_eq!(claim(&plain, &secret, Rules::ALL), Ok(()), "{len}");
+            // The sized one only for 32 bytes, and only from version 7.
+            assert_eq!(claim(&sized, &secret, Rules::ALL), if len == 32 { Ok(()) } else { Err(ScriptError::Verify) }, "{len}");
+            assert_eq!(claim(&sized, &secret, Rules::BASE), Err(ScriptError::UnknownOp(OP_SIZE)), "{len}");
+        }
+    }
+
+    fn run_with_tx(t: &Tx, coin_script: &[u8], rules: Rules) -> Result<(), ScriptError> {
+        verify_input(t, 0, coin_script, &mut 0, rules)
     }
 }

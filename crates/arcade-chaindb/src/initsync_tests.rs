@@ -106,6 +106,8 @@ fn params(genesis: &Block, tweak: impl FnOnce(&mut ChainParams)) -> &'static Cha
     p.pow_limit_bits = EASY;
     p.checkpoints = &[];
     p.min_chain_work = "";
+    // The init checkpoint: the made-up genesis (tests of the floor move it).
+    p.init_checkpoint = Some((0, p.genesis));
     tweak(&mut p);
     Box::leak(Box::new(p))
 }
@@ -708,6 +710,60 @@ fn a_source_feeding_a_low_work_branch_is_left_out_of_the_headers_round() {
     let ag = round(&db, p, &mut [("l", &mut l), ("a", &mut a)]);
     assert_eq!(ag.best, good[40].hash());
     assert!(!ag.differ.iter().any(|x| x.contains("less work")), "{:?}", ag.differ);
+}
+
+#[test]
+fn headers_are_done_only_through_the_init_checkpoint() {
+    let blocks = chain(30);
+    let leak = |b: &Block| -> &'static str { Box::leak(b.hash().to_hex().into_boxed_str()) };
+    // Checkpoint at 12 on this chain: done.
+    let at12 = leak(&blocks[12]);
+    let p = params(&blocks[0], |p| p.init_checkpoint = Some((12, at12)));
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let (mut a, mut b, mut e) = (Src::new(&blocks), Src::new(&blocks), Src::new(&blocks));
+    begin(&db, p, &mut a);
+    let ag = round(&db, p, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert!(ag.floor_ok && ag.done(), "{}", ag.text());
+    // Checkpoint above every source's tip: not done, however many agree.
+    let p2 = params(&blocks[0], |p| p.init_checkpoint = Some((40, at12)));
+    let d2 = tempfile::tempdir().unwrap();
+    let db2 = open(d2.path());
+    begin(&db2, p2, &mut a);
+    let ag = round(&db2, p2, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert_eq!(ag.agree.len(), 3);
+    assert!(!ag.floor_ok && !ag.done(), "{}", ag.text());
+    assert!(ag.text().contains("release checkpoint"));
+    // Another block named at 12: the sources' chain is refused at 12 and never gets through.
+    let other = leak(&blocks[13]);
+    let p3 = params(&blocks[0], |p| p.init_checkpoint = Some((12, other)));
+    let d3 = tempfile::tempdir().unwrap();
+    let db3 = open(d3.path());
+    begin(&db3, p3, &mut a);
+    let ag = round(&db3, p3, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert!(ag.height < 12 && !ag.floor_ok && !ag.done(), "{}", ag.text());
+    // No init checkpoint at all: never done.
+    let p4 = params(&blocks[0], |p| p.init_checkpoint = None);
+    let d4 = tempfile::tempdir().unwrap();
+    let db4 = open(d4.path());
+    begin(&db4, p4, &mut a);
+    let ag = round(&db4, p4, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert!(!ag.done());
+}
+
+#[test]
+fn init_checkpoints_fence_headers_but_leave_scripts_checked() {
+    use arcade_chain::params::ALL_CHAINS;
+    for p in ALL_CHAINS.iter() {
+        let Some((h, hash)) = p.init_floor() else { continue };
+        assert_eq!(p.checkpoint_at(h), Some(hash), "{}", p.key);
+        assert!(p.last_checkpoint(u32::MAX) >= Some(h), "{}", p.key);
+        // assume_valid is only ever an older release checkpoint, never the init one.
+        assert!(p.assume_valid().is_none_or(|a| p.checkpoints.iter().any(|(x, _)| *x == a)), "{}", p.key);
+        if p.block_rules.is_some_and(|b| b.scripts) && p.assume_valid().is_none_or(|a| a < h) {
+            assert!(crate::rules::script_flags(p, h, false).is_some(), "{}: scripts at the init checkpoint are checked", p.key);
+        }
+    }
 }
 
 #[test]

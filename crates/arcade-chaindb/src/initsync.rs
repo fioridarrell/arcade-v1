@@ -179,20 +179,24 @@ pub struct Agreement {
     pub differ: Vec<String>,
     /// The best header's total work reaches the chain's `min_chain_work`.
     pub work_ok: bool,
+    /// The best header chain runs through the release's init checkpoint (ChainParams::
+    /// init_checkpoint). False on a chain without one (init installs are refused there).
+    pub floor_ok: bool,
 }
 
 impl Agreement {
     /// Enough sources agree and the work is there: the headers phase is done.
     pub fn done(&self) -> bool {
-        self.agree.len() >= MIN_AGREE && self.work_ok
+        self.agree.len() >= MIN_AGREE && self.work_ok && self.floor_ok
     }
 
     pub fn text(&self) -> String {
         format!(
-            "best header {} at {} · {} of {} sources agree{} · work {}{}",
+            "best header {} at {} · {} of {} sources agree{} · work {}{}{}",
             short(&self.best), self.height, self.agree.len(), MIN_AGREE,
             if self.differ.is_empty() { String::new() } else { format!(" ({} don't: {})", self.differ.len(), self.differ.iter().take(4).cloned().collect::<Vec<_>>().join("; ")) },
             if self.work_ok { "enough" } else { "below the chain's minimum" },
+            if self.floor_ok { "" } else { " · not through the release checkpoint yet" },
             if self.new_headers > 0 { format!(" · {} new headers", self.new_headers) } else { String::new() }
         )
     }
@@ -488,6 +492,7 @@ impl ChainDb {
         a.best = best;
         a.height = rec.height;
         a.work_ok = rec.work >= p.min_chain_work();
+        a.floor_ok = self.through_floor(p, rec.height)?;
         // Asked from best's parent, an agreeing source must send best itself.
         let ask = if rec.height > 0 { rec.header.prev } else { best };
         let mut agree: Vec<String> = Vec::new();
@@ -510,6 +515,15 @@ impl ChainDb {
         a.agree = agree;
         self.set_state_text(c, INIT_NOTE, Some(&a.text()))?;
         Ok(a)
+    }
+
+    /// Whether a best header at `height` lies on the chain through the release's init checkpoint.
+    /// The checkpoint's block must be stored and the best header at or above its height: every
+    /// header at that height was checked against the checkpoint (check_header), and a header is
+    /// only stored after its parent, so every stored header above it descends from that block.
+    fn through_floor(&self, p: &ChainParams, height: u32) -> Result<bool> {
+        let Some((h, hash)) = p.init_floor() else { return Ok(false) };
+        Ok(height >= h && self.header(p.chain_no, &hash)?.is_some_and(|r| r.height == h))
     }
 
     /// Whether `last` (a stored header) is on a branch with less work than the best header chain

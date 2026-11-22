@@ -94,8 +94,13 @@ pub fn check(p: &arcade_chain::params::ChainParams, mode: &str) -> Result<(), St
     if matches!(p.pow, arcade_chain::pow::PowRule::PowThenStake { .. }) || p.value_rules.is_some_and(|v| v.stake_reward.is_some()) {
         return Err(format!("{} has proof-of-stake blocks: an init install can't check stake (install it without --init)", p.name));
     }
-    if p.min_chain_work().is_zero() {
-        return Err(format!("{} has no minimum chain work set for init installs yet (only Bitcoin has one): install it without --init", p.name));
+    // The trust floor: a release checkpoint taken from two independent sources. Where none could
+    // be checked (no chain data of our own, or no second source), the chain stays refused.
+    if p.init_floor().is_none() {
+        return Err(format!(
+            "{} has no init checkpoint in this release (a block hash checked against two independent sources): install it without --init",
+            p.name
+        ));
     }
     Ok(())
 }
@@ -901,15 +906,21 @@ mod tests {
 
     #[test]
     fn init_only_where_it_can_be_checked() {
-        use arcade_chain::params::{BITCOIN_MAIN, DOGECOIN_MAIN, KOTIA_MAIN};
+        use arcade_chain::params::{ALL_CHAINS, BITCOIN_MAIN, DIGIBYTE_MAIN, DIGIBYTE_TEST, KOTIA_MAIN};
         assert!(check(&BITCOIN_MAIN, "full").is_ok() && check(&BITCOIN_MAIN, "chain").is_ok());
         assert!(check(&BITCOIN_MAIN, "light").is_err() && check(&BITCOIN_MAIN, "shared").is_err());
         // Bitcoin's floor is set and parses (a typo would turn it off).
         assert!(!BITCOIN_MAIN.min_chain_work().is_zero());
         // Proof of stake: refused, whatever else.
         assert!(check(&KOTIA_MAIN, "full").unwrap_err().contains("proof-of-stake"));
-        // No minimum chain work: refused.
-        assert!(check(&DOGECOIN_MAIN, "full").unwrap_err().contains("minimum chain work"));
+        // No checkpoint checked against two sources: refused.
+        assert!(check(&DIGIBYTE_MAIN, "full").unwrap_err().contains("no init checkpoint"));
+        assert!(check(&DIGIBYTE_TEST, "full").unwrap_err().contains("no init checkpoint"));
+        // Every chain init allows has a checkpoint, and a minimum chain work that parses where set.
+        for p in ALL_CHAINS.iter().filter(|p| check(p, "full").is_ok()) {
+            assert!(p.init_floor().is_some(), "{}", p.key);
+            assert!(p.min_chain_work.is_empty() || !p.min_chain_work().is_zero(), "{}", p.key);
+        }
     }
 
     #[test]

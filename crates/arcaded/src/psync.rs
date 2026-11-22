@@ -1020,6 +1020,9 @@ pub(crate) mod tests {
         p.pow_limit_bits = EASY;
         p.checkpoints = &[];
         p.min_chain_work = "";
+        // The init checkpoint: the made-up genesis (an init install's headers phase is done
+        // only through it).
+        p.init_checkpoint = Some((0, p.genesis));
         (Box::leak(Box::new(p)), blocks)
     }
 

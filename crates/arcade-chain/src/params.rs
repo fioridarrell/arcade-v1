@@ -474,6 +474,32 @@ pub fn check_header(
     }
 }
 
+/// The parent proof of work an AuxPoW header at `height` must carry: the chain's own work
+/// algorithm there (merge mining shares the parent's work, so the parent is hashed the same
+/// way: Scrypt for the Litecoin-mined chains). None where the chain has no work algorithm to
+/// check at that height (proof of stake) or several (DigiByte, which has no AuxPoW).
+pub fn auxpow_parent_algo(params: &ChainParams, h: &Header, height: u32) -> Option<PowAlgo> {
+    match params.pow {
+        PowRule::Single(a) => Some(a),
+        PowRule::PowThenStake { .. } => params.pow.algo(h.version, height).flatten(),
+        PowRule::DigiByte => None,
+    }
+}
+
+/// An AuxPoW header's proof: the merged-mining proof commits to the header (`id`, its block id)
+/// under the chain's id, and its parent's work (hashed with [`auxpow_parent_algo`]) meets the
+/// header's own target. Every place that takes an AuxPoW header checks it here.
+pub fn check_auxpow_proof(params: &ChainParams, h: &Header, id: Hash256, a: &crate::auxpow::AuxPow, height: u32) -> Result<(), String> {
+    let chain_id = params.auxpow_chain_id.unwrap_or(h.chain_id());
+    a.check(id, chain_id, params.auxpow_strict_chain_id).map_err(|x| x.to_string())?;
+    let algo = auxpow_parent_algo(params, h, height).ok_or("AuxPoW on a chain without a single work algorithm here")?;
+    let ph = try_pow_hash(algo, &a.parent.encode()).ok_or("AuxPoW parent: its work algorithm isn't implemented")?;
+    if !meets_target(&ph, h.bits) {
+        return Err("AuxPoW parent misses target".into());
+    }
+    Ok(())
+}
+
 /// Settle a [`PowCheck::NeedsBlock`] header with its block: a proof-of-stake block (second
 /// transaction is a coinstake) passes as not checkable; anything else must meet its PoW.
 pub fn check_block_work(params: &ChainParams, b: &crate::block::Block, height: u32)
@@ -1815,6 +1841,24 @@ mod tests {
 
     /// Dogecoin 1.14's AuxPoW header rules, on Pepecoin mainnet (merge mining from 42,000,
     /// strict chain id 63) and testnet (not strict).
+    #[test]
+    fn auxpow_parents_are_hashed_with_the_chains_own_algorithm() {
+        let h = Header::parse(&[0u8; 80]);
+        for p in ALL_CHAINS.iter().filter(|p| p.format.auxpow) {
+            // Every AuxPoW chain here is merge-mined under Litecoin: Scrypt, taken from its params.
+            assert_eq!(auxpow_parent_algo(p, &h, 1_000_000), Some(PowAlgo::Scrypt), "{}", p.key);
+        }
+        assert_eq!(auxpow_parent_algo(&DIGIBYTE_MAIN, &h, 1), None);
+        // A sha256d chain with AuxPoW would hash its parents with sha256d.
+        let mut q = PEPECOIN_MAIN.clone();
+        q.pow = PowRule::Single(PowAlgo::Sha256d);
+        assert_eq!(auxpow_parent_algo(&q, &h, 1), Some(PowAlgo::Sha256d));
+        // Past Kotia-style proof of work there is no parent work to check.
+        q.pow = PowRule::PowThenStake { algo: PowAlgo::Scrypt, last_pow_height: 10 };
+        assert_eq!(auxpow_parent_algo(&q, &h, 10), Some(PowAlgo::Scrypt));
+        assert_eq!(auxpow_parent_algo(&q, &h, 11), None);
+    }
+
     #[test]
     fn auxpow_header_rules() {
         let h = |version: i32| Header { version, prev: Hash256::ZERO, merkle_root: Hash256::ZERO, time: 0, bits: 0, nonce: 0 };

@@ -133,6 +133,22 @@ pub const MIN_AGREE: usize = 3;
 /// much work at each height, and overtakes).
 pub const SIDE_BUDGET: u32 = if cfg!(test) { 50 } else { 20_000 };
 
+/// Header bytes a source may send in one headers round, on average, for each new header of
+/// ours it brings (header, AuxPoW proof and count byte as they arrive), on top of
+/// [`HEADER_BYTES_SLACK`]. A plain header is 81 bytes. An AuxPoW one carries its parent's
+/// coinbase and two merkle branches: a few hundred bytes on the Litecoin-mined chains, rarely
+/// more than 2 KiB. A source that sends far more than that (huge proofs, or the same headers
+/// over and over) is left out of the round instead of being read on.
+pub const HEADER_BYTES_EACH: u64 = if cfg!(test) { 1_000 } else { 16 * 1024 };
+/// Header bytes a source may send in a round beyond [`HEADER_BYTES_EACH`] per new header: one
+/// full headers message (2,000 headers) of large proofs.
+pub const HEADER_BYTES_SLACK: u64 = if cfg!(test) { 4_000 } else { 2_000 * 16 * 1024 };
+
+/// The bytes a headers entry took on the wire (header, its AuxPoW, the count byte).
+fn entry_bytes(e: &HeaderEntry) -> u64 {
+    81 + e.auxpow.as_ref().map_or(0, |a| a.raw.len() as u64)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Headers,
@@ -226,6 +242,8 @@ struct Located<'a, 'b> {
     p: &'a ChainParams,
     /// The last header of the source's last answer (whose branch it feeds).
     last: Option<Hash256>,
+    /// Header bytes this source sent this round.
+    bytes: u64,
 }
 
 impl BlockSource for Located<'_, '_> {
@@ -234,6 +252,7 @@ impl BlockSource for Located<'_, '_> {
         let mut loc: Vec<Hash256> = best.into_iter().collect();
         loc.extend(self.back.iter().filter(|h| best.as_ref() != Some(h)));
         let reply = self.inner.get_headers(&loc)?;
+        self.bytes += reply.iter().map(entry_bytes).sum::<u64>();
         self.last = reply.last().map(|e| self.p.block_id(&e.header));
         Ok(reply)
     }
@@ -459,8 +478,9 @@ impl ChainDb {
         // The best header chain's work by height, for the best header it was taken at.
         let mut works: Option<(Hash256, Vec<arcade_chain::pow::U256>)> = None;
         for (key, src) in sources.iter_mut() {
-            let mut loc = Located { inner: &mut **src, db: self, c, back: &back, p, last: None };
+            let mut loc = Located { inner: &mut **src, db: self, c, back: &back, p, last: None, bytes: 0 };
             let mut side = 0u32;
+            let mut brought = 0u64;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return Err(err("stopped"));
@@ -469,6 +489,11 @@ impl ChainDb {
                     Ok(0) => break,
                     Ok(n) => {
                         a.new_headers += n;
+                        brought += u64::from(n);
+                        if loc.bytes > HEADER_BYTES_SLACK + brought * HEADER_BYTES_EACH {
+                            failed.insert(key.clone(), format!("sent {} KiB of headers for {brought} new ones; left out", loc.bytes / 1024));
+                            break;
+                        }
                         // Headers that went to a low-work branch count against the source.
                         if let Some(last) = loc.last.take() {
                             if self.low_work_branch(c, &last, &mut works)? {

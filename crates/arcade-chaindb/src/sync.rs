@@ -10,7 +10,7 @@
 use crate::db::{ChainDb, HeaderRec, Tip, STATUS_HEADER, STATUS_INVALID};
 use arcade_chain::params::{check_block_work, check_context, check_header, ChainParams, PowCheck, MEDIAN_TIME_SPAN};
 use arcade_chain::p2p::{HeaderEntry, Peer};
-use arcade_chain::pow::{meets_target, pow_hash, work_from_bits, PowAlgo, U256};
+use arcade_chain::pow::{work_from_bits, U256};
 use arcade_chain::{Block, Hash256, Header};
 use std::collections::HashMap;
 
@@ -233,12 +233,7 @@ impl<'a> Syncer<'a> {
             match check {
                 PowCheck::AuxPow => {
                     let a = e.auxpow.as_ref().ok_or_else(|| bad("AuxPoW flag without data".into()))?;
-                    let chain_id = self.params.auxpow_chain_id.unwrap_or(e.header.chain_id());
-                    a.check(hash, chain_id, self.params.auxpow_strict_chain_id)
-                        .map_err(|x| bad(x.to_string()))?;
-                    if !meets_target(&pow_hash(PowAlgo::Scrypt, &a.parent.encode()), e.header.bits) {
-                        return Err(bad("AuxPoW parent misses target".into()));
-                    }
+                    arcade_chain::params::check_auxpow_proof(self.params, &e.header, hash, a, height).map_err(bad)?;
                 }
                 // PoS candidates are settled when the block arrives (check_block_work).
                 PowCheck::Verified | PowCheck::NotCheckable | PowCheck::NeedsBlock => {}
@@ -544,7 +539,7 @@ mod tests {
     use arcade_chain::encode::write_varint;
     use arcade_chain::hash::merkle_root;
     use arcade_chain::params::{DIGIBYTE_MAIN, KOTIA_MAIN, LITECOIN_MAIN, PEPECOIN_TEST, WOJAKCOIN_MAIN};
-    use arcade_chain::pow::{try_pow_hash, PowRule};
+    use arcade_chain::pow::{meets_target, try_pow_hash, PowAlgo, PowRule};
     use arcade_chain::{Format, Header, Tx};
 
     const T0: u32 = 1_600_000_000;

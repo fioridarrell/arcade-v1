@@ -124,11 +124,13 @@ struct Src {
     asked: usize,
     /// Answer every headers request with nothing.
     mute: bool,
+    /// Send each header this many times over (1: once), as a source wasting bandwidth would.
+    repeat: usize,
 }
 
 impl Src {
     fn new(blocks: &[Block]) -> Src {
-        Src { headers: blocks.iter().map(|b| b.header).collect(), blocks: blocks.iter().map(|b| (b.hash(), b.encode())).collect(), corrupt: false, swap: HashMap::new(), asked: 0, mute: false }
+        Src { headers: blocks.iter().map(|b| b.header).collect(), blocks: blocks.iter().map(|b| (b.hash(), b.encode())).collect(), corrupt: false, swap: HashMap::new(), asked: 0, mute: false, repeat: 1 }
     }
 }
 
@@ -139,7 +141,8 @@ impl BlockSource for Src {
         }
         let ids: Vec<Hash256> = self.headers.iter().map(|h| h.hash()).collect();
         let from = locator.iter().find_map(|l| ids.iter().position(|x| x == l)).map(|i| i + 1).unwrap_or(0);
-        Ok(self.headers[from..].iter().take(2000).map(|h| HeaderEntry { header: *h, auxpow: None }).collect())
+        let r = self.repeat.max(1);
+        Ok(self.headers[from..].iter().take(2000 / r).flat_map(|h| std::iter::repeat_n(HeaderEntry { header: *h, auxpow: None }, r)).collect())
     }
     fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>, String> {
         self.asked += hashes.len();
@@ -749,6 +752,30 @@ fn headers_are_done_only_through_the_init_checkpoint() {
     begin(&db4, p4, &mut a);
     let ag = round(&db4, p4, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
     assert!(!ag.done());
+}
+
+#[test]
+fn a_source_sending_far_more_header_bytes_than_it_brings_is_left_out() {
+    let blocks = chain(30);
+    let p = params(&blocks[0], |_| {});
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let (mut a, mut b) = (Src::new(&blocks), Src::new(&blocks));
+    // 81 bytes a header, each sent 40 times: 3,240 bytes per new header, over the test's 1,000.
+    let mut waste = Src::new(&blocks);
+    waste.repeat = 40;
+    begin(&db, p, &mut a);
+    let ag = round(&db, p, &mut [("w", &mut waste), ("a", &mut a), ("b", &mut b)]);
+    assert!(ag.differ.iter().any(|x| x.starts_with("w:") && x.contains("KiB of headers")), "{:?}", ag.differ);
+    assert_eq!(ag.agree, vec!["a".to_string(), "b".to_string()]);
+    // Sent a few times over, within the allowance: heard as usual.
+    let d2 = tempfile::tempdir().unwrap();
+    let db2 = open(d2.path());
+    let mut twice = Src::new(&blocks);
+    twice.repeat = 2;
+    begin(&db2, p, &mut a);
+    let ag = round(&db2, p, &mut [("t", &mut twice), ("a", &mut a)]);
+    assert!(ag.agree.contains(&"t".to_string()), "{}", ag.text());
 }
 
 #[test]

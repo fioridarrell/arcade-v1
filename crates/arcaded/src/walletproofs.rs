@@ -36,6 +36,51 @@ static SENT: Mutex<Option<(BTreeSet<(String, String)>, Instant)>> = Mutex::new(N
 /// Every address to prove: (coin, address, key, compressed). This wallet's own on each coin (the key holding a tag
 /// there, else its first), then each imported wallet's; the ARCADE chain itself is the owner, not proven.
 fn signers(node: &Node) -> Vec<(String, String, arcade_wallet::SecretKey, bool)> {
+    let hidden = hidden(node);
+    let mut all = every_signer(node);
+    all.retain(|(c, a, ..)| !hidden.contains(&(c.clone(), a.clone())));
+    all
+}
+
+/// Addresses the owner took off their card (Martin 2026-11-21: "you can remove the addresses shown on your card"):
+/// (coin, address) pairs kept here; the proof set leaves them out, so the newest set drops them from every card.
+const HIDDEN: &[u8] = b"walletproofs_hidden";
+
+fn hidden(node: &Node) -> BTreeSet<(String, String)> {
+    let v: Value = node.app.store.read(|r| r.get(arcade_app::META, HIDDEN)).ok().flatten().and_then(|b| serde_json::from_slice(&b).ok()).unwrap_or(Value::Null);
+    v.as_array().into_iter().flatten().filter_map(|x| Some((x[0].as_str()?.to_string(), x[1].as_str()?.to_string()))).collect()
+}
+
+/// `a.card_addresses`: every address of this wallet (each coin here, each imported wallet) with what the card shows:
+/// verified (its proof is on the chain), waiting (its proof is on its way), or removed (taken off the card here).
+pub fn card_addresses(node: &Node) -> Result<Value, String> {
+    let hidden = hidden(node);
+    let owner = crate::arcledger::write_chain().ok().and_then(|p| crate::arcledger::sender(node, p).ok().map(|s| (p, s.0)));
+    let on_chain: BTreeSet<(String, String)> = owner.as_ref().map(|(p, o)| proven(node, p.chain_no, o).into_iter().map(|(c, a, _)| (c, a)).collect()).unwrap_or_default();
+    let rows: Vec<Value> = every_signer(node).into_iter().map(|(c, a, ..)| {
+        let key = (c.clone(), a.clone());
+        let state = if hidden.contains(&key) { "removed" } else if on_chain.contains(&key) { "verified" } else { "waiting" };
+        json!({"coin": c, "address": a, "state": state})
+    }).collect();
+    Ok(json!({"addresses": rows}))
+}
+
+/// `a.card_address {coin, address, show}`: take an address off this wallet's card (show false) or put it back, then
+/// publish the new set at once (only the ARCADE key signs a set; removing needs nothing more).
+pub fn set_card_address(node: &Node, coin: &str, address: &str, show: bool) -> Result<Value, String> {
+    if !every_signer(node).iter().any(|(c, a, ..)| c == coin && a == address) {
+        return Err(format!("{address} is not one of this wallet's {coin} addresses"));
+    }
+    let mut h = hidden(node);
+    if show { h.remove(&(coin.to_string(), address.to_string())); } else { h.insert((coin.to_string(), address.to_string())); }
+    let v: Vec<Value> = h.iter().map(|(c, a)| json!([c, a])).collect();
+    node.app.store.write(|w| w.put(arcade_app::META, HIDDEN, json!(v).to_string().as_bytes())).map_err(|e| e.to_string())?;
+    let sent = publish(node, true).unwrap_or_else(|e| json!({"sent": false, "why": e}));
+    Ok(json!({"coin": coin, "address": address, "shown": show, "published": sent}))
+}
+
+/// Every address this wallet could prove, before the owner's removals.
+fn every_signer(node: &Node) -> Vec<(String, String, arcade_wallet::SecretKey, bool)> {
     let mut out: Vec<(String, String, arcade_wallet::SecretKey, bool)> = Vec::new();
     if !node.app.has_wallet().unwrap_or(false) {
         return out;

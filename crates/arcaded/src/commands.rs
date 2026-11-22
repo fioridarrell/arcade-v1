@@ -222,7 +222,9 @@ cmds! {
     "arc.blob_publish_status" Read "id?" "Publishing of large blobs from here: parts in blocks and waiting, the manifest, what was paid, resends.";
     "arc.blob_upgrade" Wallet "id, send?, client_ref?" "Make a Temporary blob Permanent (ARCADE rules version 6): pay the Permanent fee minus the Temporary fee for its bytes (0.003525 ARCADE per started kB), from this wallet; anyone may upgrade any Temporary blob, and it stays its publisher's. A large blob's manifest id upgrades all its parts, paid for their bytes too. Refused for an unknown, Permanent, Release or expired Temporary blob, and before version 6. Without send, only the quote." => "{blob, blobs, parts, bytes, already_paid, permanent_fee, difference, fee, at_height, floor, txid, hex, size, sent}";
     "a.profile" Read "tag? | address?" "A profile card on the ARCADE chain (yours when neither), with follower counts.";
-    "a.profile_set" Wallet "name?, bio?, url?, picture?, addresses?, client_ref?" "Publish your profile on the ARCADE chain (A://).";
+    "a.profile_set" Wallet "name?, bio?, url?, picture?, client_ref?" "Publish your profile on the ARCADE chain (A://). Its addresses are only its wallet proofs, published by themselves: see a.card_addresses.";
+    "a.card_addresses" Read "" "Every address of this wallet (each coin here, each imported wallet) and what your card shows for it: verified (proven on the chain), waiting (proof on its way) or removed.";
+    "a.card_address" Wallet "coin, address, show" "Take one of your addresses off your card (show: false) or put it back (true); the new proof set is published at once.";
     "a.follow" Wallet "tag, client_ref?" "Follow an @tag on the ARCADE chain.";
     "a.unfollow" Wallet "tag, client_ref?" "Stop following an @tag.";
     "a.follows" Read "tag? | address?" "Who it follows and who follows it (yours when neither).";
@@ -630,6 +632,8 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("node", "string", "An arcade's node id (hex)."),
     ("nonce", "string", "A sign-in nonce."),
     ("note", "string", "A note."),
+    ("coin", "string", "A coin's chain key."),
+    ("show", "boolean", "Show it (true) or not (false)."),
     ("undo", "boolean", "Give back what was counted."),
     ("origin", "string", "An arcade's node id, or its first hex digits."),
     ("notes", "string", "Notes."),

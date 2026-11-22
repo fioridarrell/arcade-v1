@@ -867,9 +867,8 @@ pub fn a_profile_set(node: &Node, req: &Value) -> Result<Value, String> {
             v.insert(to.into(), json!(s));
         }
     }
-    if let Some(a) = req["addresses"].as_object().filter(|a| !a.is_empty()) {
-        v.insert("a".into(), json!(a.iter().filter(|(_, x)| x.as_str().is_some_and(|s| !s.is_empty())).map(|(k, x)| (k.clone(), x.clone())).collect::<serde_json::Map<_, _>>()));
-    }
+    // No stated addresses (Martin 2026-11-21: "You should not be able to change your addresses shown, they should just
+    // be automatic"): a card's addresses are only its wallet proofs (crate::walletproofs), each signed by its own key.
     let v = Value::Object(v);
     if let Some(p) = arcade_ledger::aproto::profile_problem(&v) {
         return Err(p.into());

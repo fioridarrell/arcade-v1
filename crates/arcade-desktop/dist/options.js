@@ -191,10 +191,31 @@ $("o-cpu-level").addEventListener("change", async (e) => {
   setTimeout(() => { delete $("o-cpu-msg").dataset.kept; refreshCpu(); }, 4000);
 });
 
+// Welcoming new arcades (faucet.newcomers / faucet.welcome_set): automatic welcomes and their amount.
+async function refreshWelcomeOpts() {
+  try {
+    const w = await api("faucet.newcomers");
+    if (document.activeElement !== $("o-wel-auto")) $("o-wel-auto").checked = !!w.auto;
+    if (document.activeElement !== $("o-wel-amount")) $("o-wel-amount").value = w.amount / 1e8;
+  } catch (e) { /* not on this arcade */ }
+}
+$("o-wel-auto").addEventListener("change", async (e) => {
+  try { await api("faucet.welcome_set", { auto: e.target.checked }); say("o-wel-msg", e.target.checked ? "New arcades are welcomed automatically after people's head start." : "Automatic welcomes off: Home still shows new arcades with the button."); }
+  catch (err) { say("o-wel-msg", err.message, true); }
+  refreshWelcomeOpts();
+});
+$("o-wel-set").addEventListener("click", async () => {
+  const amount = Math.round(Number($("o-wel-amount").value) * 1e8);
+  try { const r = await api("faucet.welcome_set", { amount }); say("o-wel-msg", `Each new arcade gets ${r.amount / 1e8} ARCADE from this arcade.`); }
+  catch (e) { say("o-wel-msg", e.message, true); }
+  refreshWelcomeOpts();
+});
+
 async function refreshOptions() {
   refreshCpu();
   refreshDisk();
   refreshRelay();
+  refreshWelcomeOpts();
   refreshSysinfo();
   const u = await api("update.status");
   $("o-ver").textContent = u.version || "local build";

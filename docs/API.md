@@ -210,6 +210,9 @@ marks the change. Hand `psbt` to the app as `{type: "psbt", chain, psbt, finaliz
 | `faucet.ask` | `/api/v1/faucet/ask` | wallet | index?, tag? | Ask the mesh for test coins. |
 | `faucet.arc` | `/api/v1/faucet/arc` | wallet | address | The user faucet: ask the mesh to top a website user's ARCADE address up to 0.05 ARCADE, in two coins (once per address a day; a website calls it when a user signs in). This arcade's own wallet gets 1 ARCADE once from the node faucet instead. |
 | `faucet.arc_status` | `/api/v1/faucet/arc_status` | read | — | The ARCADE top-up asks this arcade knows and how many it paid today; `node_faucet`: node-gift asks, gifts paid today, nodes known paid, and this arcade's own gift. |
+| `faucet.newcomers` | `/api/v1/faucet/newcomers` | read | — | New arcades waiting for their welcome (1 ARCADE, so they can claim a @handle at once), this arcade's welcome settings, whether it can send one now, and the welcomers' high scores (who welcomed each new arcade first, read from the chain). |
+| `faucet.welcome` | `/api/v1/faucet/welcome` | wallet | node, amount? | Welcome a new arcade now from this wallet ("Welcome to the arcade"): this arcade's welcome amount, or amount (1 to 100 ARCADE, in satoshis). Refused once any arcade has welcomed it; the first payment on the chain gets the high-score point. |
+| `faucet.welcome_set` | `/api/v1/faucet/welcome_set` | admin | auto?, amount? | Welcome new arcades automatically (on unless turned off; after a 3-minute head start for people pressing the button) and the amount each gets (in satoshis: 1 to 100 ARCADE, 1 ARCADE unless set). |
 
 ### Messages
 

@@ -31,7 +31,57 @@ async function refreshHome() {
   $("w-loading").hidden = true;
   if (!$("home").classList.contains("on")) return;
   // Side by side: the mesh doesn't wait for the getting-started card.
-  await Promise.all([drawStart(), api("mesh.overview").then(drawMesh)]);
+  await Promise.all([drawStart(), api("mesh.overview").then(drawMesh), drawWelcome()]);
+}
+
+// Home: new arcades waiting for their welcome (faucet.newcomers), each with a "Welcome to the arcade" button, and the
+// welcomers high scores. The first arcade whose payment lands welcomes it; the notice goes away on every arcade once
+// one has (a payment notice heard over the mesh, or the coins seen on the chain).
+const WEL = { busy: null, sig: null };
+async function drawWelcome() {
+  const w = await api("faucet.newcomers").catch(() => null);
+  const box = $("h-welcome");
+  if (!w) { box.hidden = true; $("h-welcomers").hidden = true; return; }
+  box.hidden = !w.open.length;
+  const amt = w.amount / 1e8;
+  const sig = JSON.stringify([w.open.map((n) => n.node), w.can_send, w.amount, w.auto, WEL.busy]);
+  if (sig !== WEL.sig) {
+    WEL.sig = sig;
+    $("h-welcome-text").textContent = w.open.length === 1
+      ? `One new arcade joined. Welcome it with ${amt} ARCADE so it can claim its @handle now: the first arcade to do it gets a point.`
+      : `${w.open.length} new arcades joined. Welcome them with ${amt} ARCADE each so they can claim their @handles now: the first arcade to welcome each gets a point.`;
+    $("h-welcome-list").replaceChildren(...w.open.map((n) => {
+      const who = n.name ? `${n.name} (${n.node.slice(0, 12)}…)` : `Arcade ${n.node.slice(0, 12)}…`;
+      const b = h("button", { class: "primary" }, WEL.busy === n.node ? "Sending…" : "Welcome to the arcade");
+      b.disabled = !w.can_send || !!WEL.busy;
+      if (!w.can_send) b.title = "This arcade needs a wallet and its own caught-up copy of the ARCADE chain to send a welcome.";
+      b.addEventListener("click", () => welcomeArcade(n.node));
+      return h("li", {}, h("span", { class: "who" }, who), " ", h("span", { class: "when", "data-auto": n.auto_after }, ""), " ", b);
+    }));
+  }
+  // The automatic welcomes' countdown, updated in place.
+  document.querySelectorAll("#h-welcome-list .when").forEach((el) => {
+    const left = Number(el.dataset.auto) - Date.now() / 1000;
+    el.textContent = left > 0 ? `people first: ${Math.ceil(left / 60)} min before automatic welcomes` : "automatic welcomes may go any moment";
+  });
+  const sc = w.scores || { top: [] };
+  $("h-welcomers").hidden = !sc.top.length;
+  $("h-welcomers-list").replaceChildren(...sc.top.map((t) =>
+    h("li", {}, h("b", {}, t.tag ? `@${t.tag}` : `${t.address.slice(0, 10)}…`), ` ${t.welcomes === 1 ? "1 welcome" : `${t.welcomes} welcomes`}`)));
+}
+
+async function welcomeArcade(id) {
+  WEL.busy = id;
+  drawWelcome();
+  try {
+    const r = await api("faucet.welcome", { node: id });
+    say("h-welcome-msg", `Sent ${r.amount / 1e8} ARCADE (transaction ${String(r.txid).slice(0, 12)}…). If it is the first payment in a block, the point is yours.`);
+  } catch (e) {
+    say("h-welcome-msg", e.message, true);
+  }
+  WEL.busy = null;
+  WEL.sig = null;
+  drawWelcome();
 }
 
 // Home: a getting-started guide until this arcade's owner has a handle.

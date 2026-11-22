@@ -243,7 +243,7 @@ impl Pool {
             return Err(PoolError::Row);
         }
         let mut checks = 0u32;
-        let fee = coins::check_spend(&tx, height, &View { base: coins, pool: self, height }, &mut checks)?;
+        let fee = coins::check_spend(&tx, height, &View { base: coins, pool: self, height }, &mut checks, crate::script::Rules::at(net, height))?;
         let bytes = tx.raw.len();
         let (blobs, paid) = named(&tx, net, held);
         // More new blobs by their records' lengths than one block brings (a block's cap from rules version 6, and a block
@@ -568,7 +568,7 @@ mod tests {
         let (txs, fees) = pool.pick(max_bytes);
         let mut all = vec![coins::coinbase(HEIGHT, &PREV, b"", &[])];
         all.extend(txs.iter().cloned());
-        let changes = check_block(&all, HEIGHT, &PREV, coins, &[]).expect("a block of picked transactions");
+        let changes = check_block(&all, HEIGHT, &PREV, coins, &[], crate::script::Rules::BASE).expect("a block of picked transactions");
         assert_eq!(changes.fees, fees);
         (txs, fees)
     }
@@ -697,7 +697,7 @@ mod tests {
         // A block with `a`, and with another spend of `b`'s coin.
         let other = send(point(1), 10 * COIN, COIN / 5);
         let block = vec![coins::coinbase(HEIGHT, &PREV, b"", &[]), a.clone(), other.clone()];
-        let changes = check_block(&block, HEIGHT, &PREV, &coins, &[]).unwrap();
+        let changes = check_block(&block, HEIGHT, &PREV, &coins, &[], crate::script::Rules::BASE).unwrap();
         for (at, _) in &changes.spent {
             coins.remove(at);
         }
@@ -731,7 +731,7 @@ mod tests {
     fn block_holds_at(pool: &Pool, coins: &HashMap<OutPoint, Coin>, height: u64) {
         let mut all = vec![coins::coinbase(height, &PREV, b"", &[])];
         all.extend(pool.pick(1_000_000).0);
-        check_block(&all, height, &PREV, coins, &[]).expect("a block of picked transactions");
+        check_block(&all, height, &PREV, coins, &[], crate::script::Rules::BASE).expect("a block of picked transactions");
     }
 
     #[test]

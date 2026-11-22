@@ -2416,6 +2416,8 @@ fn connect_one(
     // Per input: the height, coinbase flag and peg-out flag of the coin it spends (for
     // rules::check, with `prevouts`).
     let mut spent_meta: Vec<Vec<(u32, bool, bool)>> = Vec::with_capacity(blk.txs.len());
+    // The coin a coinstake (tx 1) stakes with its first input: block number, position, value, height (crate::stake).
+    let mut staked: Option<(u32, u32, u64, u32)> = None;
     for (p, tx) in blk.txs.iter().enumerate() {
         let mut pv = Vec::new();
         let mut meta = Vec::new();
@@ -2462,6 +2464,9 @@ fn connect_one(
                     }
                 };
                 meta.push((coin.height, coin.coinbase, pegout));
+                if p == 1 && vin == 0 {
+                    staked = Some((pb, pp, coin.value, coin.height));
+                }
                 let sid = script_id(&coin.script);
                 pv.push(Prevout { value: coin.value, script: coin.script.clone() });
                 match cache.as_deref_mut() {
@@ -2560,6 +2565,13 @@ fn connect_one(
             .unwrap_or_else(|| crate::rules::Watch::new(params));
         wt.add(height, &hash, &r);
         l.put(STATE, &k, &wt.encode())?;
+    }
+
+    // A staked chain's stake row (crate::stake): checked as it connects; broken, and the checks are on, the block is invalid.
+    if params.staked_from().is_some() {
+        if let Some(row) = crate::stake::on_connect(w, params, blk, height, tip, staked)? {
+            crate::stake::put_row(&l, c, b, &row)?;
+        }
     }
 
     // Protocol indexes, in the same commit; only those exactly caught up to the parent.

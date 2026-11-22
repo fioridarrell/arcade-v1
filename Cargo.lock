@@ -169,6 +169,7 @@ dependencies = [
  "bitcoinconsensus",
  "hex",
  "libmdbx",
+ "secp256k1",
  "tempfile",
  "thiserror 1.0.69",
 ]

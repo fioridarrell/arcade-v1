@@ -84,8 +84,9 @@ pub struct Syncer<'a> {
 /// the same minimum work, so between them the longest branch wins and anyone can make one up;
 /// this keeps a made-up branch from taking back more than this many blocks. A real branch
 /// that deep almost always carries a checked block on DigiByte (three of its five algorithms
-/// are checked); on a chain of staked blocks a real reorg deeper than this stops the sync
-/// (UnverifiedReorg) until someone looks, as ReorgTooDeep does past the undo window.
+/// are checked). On a staked chain it applies only until its stake checks are on
+/// (crate::stake): then each block of a branch is checked as it connects, and only the undo
+/// window (and checkpoints) bound a reorg.
 pub const UNVERIFIED_REORG_DEPTH: u32 = 100;
 
 /// Blocks behind the best header from which address rows are logged and built later.
@@ -339,7 +340,9 @@ impl<'a> Syncer<'a> {
             if let Some(cp) = self.params.last_checkpoint(tip.height).filter(|cp| fork < *cp) {
                 return Err(SyncError::BelowCheckpoint(cp));
             }
-            if depth > UNVERIFIED_REORG_DEPTH && !self.has_checked_work(fork, &path)? {
+            // A staked chain with its stake checks on: every block of the branch is checked as it connects (an invalid
+            // one sends the sync back to the chain it had), so its depth is bounded by the undo window alone.
+            if depth > UNVERIFIED_REORG_DEPTH && !self.db.stake_on(self.params)? && !self.has_checked_work(fork, &path)? {
                 return Err(SyncError::UnverifiedReorg(depth));
             }
             self.pre_reorg_tip.set(Some(tip.hash));

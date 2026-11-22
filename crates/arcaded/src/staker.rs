@@ -2,10 +2,13 @@
 //! is selected"). Rules in arcade_chain::kotia_pos; this side keeps the stake modifier, checks
 //! itself against real blocks, and stakes this wallet's KOT when turned on.
 //!
-//! - Modifier: worked out from genesis over the stored chain (needs Kotia installed in full),
-//!   carried forward block by block; checkpoints every 10,000 blocks in
-//!   HOME/cache/kot-modifiers.json (a reorg goes back to the newest checkpoint still on the
-//!   best chain). The last WINDOW modifiers stay in memory.
+//! - Modifier: kept in the chain database with every block (arcade_chaindb::stake), worked out
+//!   as blocks connect, and once over a chain synced before that by the stake pass ([`pass_run`],
+//!   in the background at a low share of the computer). The pass starts from the newest
+//!   checkpoint this staker kept before (HOME/cache/kot-modifiers.json, every 10,000 blocks)
+//!   under the staked stretch, else from block 0. The same pass checks every staked block's
+//!   stake; once the newest ones all hold, the chain's checks are enforced and its checked blocks
+//!   count as confirmations (swaps).
 //! - Self-check: before staking (and on request) the newest PoS blocks are checked with our
 //!   rules: kernel, retarget, block signature. Staking waits until every one passes, so a
 //!   wrong rule never builds a block (a wrong block is only refused by the network anyway;
@@ -21,29 +24,17 @@ use arcade_chain::params::{by_key, ChainParams};
 use arcade_chain::{Hash256, OutPoint, Tx};
 use arcade_wallet::secp256k1::{ecdsa::Signature, Message, PublicKey, SECP256K1};
 use serde_json::{json, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Duration;
 
 const KEY: &str = "kot";
-const CHECKPOINT_EVERY: u32 = 10_000;
-const WINDOW: usize = 2_000;
 /// Newest PoS blocks the self-check reads.
 const SELF_CHECK: u32 = 200;
 const META_ON: &[u8] = b"stake:kot:on";
 
 #[derive(Default)]
-struct Mods {
-    /// Height, block hash and modifier after it, of the newest block worked out.
-    at: Option<(u32, Hash256, Hash256)>,
-    recent: VecDeque<(u32, Hash256)>,
-    cps: Vec<(u32, Hash256, Hash256)>,
-    loaded: bool,
-}
-
-#[derive(Default)]
 struct St {
-    mods: Mods,
     state: String,
     checked: Option<Value>,
     last_slot: u32,
@@ -74,110 +65,22 @@ fn file(node: &Node) -> std::path::PathBuf {
     node.home.join("cache").join("kot-modifiers.json")
 }
 
-fn h(s: &str) -> Hash256 {
-    Hash256::from_hex(s).unwrap_or(Hash256::ZERO)
+/// The checkpoints this staker kept before the modifier moved into the chain database:
+/// (height, block id, modifier after it).
+fn old_checkpoints(node: &Node) -> Vec<(u32, Hash256, Hash256)> {
+    let h = |s: &str| Hash256::from_hex(s).ok();
+    let Ok(v) = std::fs::read(file(node)).map_err(|_| ()).and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|_| ())) else { return Vec::new() };
+    v["cps"].as_array().into_iter().flatten().filter_map(|c| Some((c[0].as_u64()? as u32, h(c[1].as_str()?)?, h(c[2].as_str()?)?))).collect()
 }
 
-fn load(node: &Node, m: &mut Mods) {
-    if m.loaded {
-        return;
-    }
-    m.loaded = true;
-    if let Ok(v) = std::fs::read(file(node)).map_err(|_| ()).and_then(|b| serde_json::from_slice::<Value>(&b).map_err(|_| ())) {
-        m.cps = v["cps"].as_array().into_iter().flatten().filter_map(|c| Some((c[0].as_u64()? as u32, h(c[1].as_str()?), h(c[2].as_str()?)))).collect();
-    }
+/// The checkpoint to start the stake pass from: the newest under the staked stretch (every
+/// staked block is then checked by the pass).
+fn seed_point(cps: &[(u32, Hash256, Hash256)], staked_from: u32) -> Option<(u32, Hash256, Hash256)> {
+    cps.iter().filter(|c| c.0 < staked_from).max_by_key(|c| c.0).cloned()
 }
 
-fn save(node: &Node, m: &Mods) {
-    let v = json!({"cps": m.cps.iter().map(|(a, b, c)| json!([a, b.to_hex(), c.to_hex()])).collect::<Vec<_>>()});
-    let f = file(node);
-    let _ = std::fs::create_dir_all(f.parent().unwrap());
-    let tmp = f.with_extension("tmp");
-    if std::fs::write(&tmp, v.to_string()).is_ok() {
-        let _ = std::fs::rename(&tmp, &f);
-    }
-}
-
-/// The kernel a block adds to the modifier: its coinstake's first input txid (PoS), else its id.
-fn kernel_at(node: &Node, p: &ChainParams, height: u32) -> Result<(Hash256, Hash256), String> {
-    let c = p.chain_no;
-    let hash = node.chain.hash_at(c, height).map_err(|e| e.to_string())?.ok_or_else(|| format!("no block at {height}"))?;
-    let rec = node.chain.header(c, &hash).map_err(|e| e.to_string())?.ok_or("header missing")?;
-    if rec.b == 0 {
-        return Err(format!("block {height} not stored"));
-    }
-    let k = match node.chain.tx_at(p, rec.b, 1).map_err(|e| e.to_string())? {
-        Some(t) if t.is_coinstake() => t.inputs[0].prevout.txid,
-        _ => hash,
-    };
-    Ok((hash, k))
-}
-
-/// Carry the modifier forward to the tip (at most `max` blocks per call).
-fn advance(node: &Node, max: u32) -> Result<Option<u32>, String> {
-    let p = params();
-    let c = p.chain_no;
-    let Some(tip) = node.chain.tip(c).map_err(|e| e.to_string())? else { return Ok(None) };
-    let mut m = with(|s| std::mem::take(&mut s.mods));
-    load(node, &mut m);
-    // Still on the best chain? Else back to the newest checkpoint that is.
-    let on_best = |node: &Node, at: u32, hash: &Hash256| node.chain.hash_at(c, at).ok().flatten().as_ref() == Some(hash);
-    if let Some((at, hash, _)) = m.at {
-        if at > tip.height || !on_best(node, at, &hash) {
-            m.at = None;
-            m.recent.clear();
-        }
-    }
-    if m.at.is_none() {
-        m.cps.retain(|(a, hh, _)| *a <= tip.height && on_best(node, *a, hh));
-        m.at = start_point(&m.cps, tip.height);
-    }
-    let mut done = 0;
-    let mut err = None;
-    while done < max {
-        let next = m.at.map(|a| a.0 + 1).unwrap_or(0);
-        if next > tip.height {
-            break;
-        }
-        let (hash, k) = match kernel_at(node, p, next) {
-            Ok(x) => x,
-            Err(e) => {
-                err = Some(e);
-                break;
-            }
-        };
-        // Genesis's modifier is 0; every later one hashes in its block's kernel.
-        let modi = match m.at { None => Hash256::ZERO, Some((_, _, prev)) => pos::next_modifier(&prev, &k) };
-        m.at = Some((next, hash, modi));
-        m.recent.push_back((next, modi));
-        while m.recent.len() > WINDOW {
-            m.recent.pop_front();
-        }
-        if next % CHECKPOINT_EVERY == 0 && m.cps.last().map(|x| x.0) < Some(next) {
-            m.cps.push((next, hash, modi));
-            save(node, &m);
-        }
-        done += 1;
-    }
-    let at = m.at.map(|a| a.0);
-    with(|s| s.mods = m);
-    match err {
-        Some(e) if done == 0 => Err(e),
-        _ => Ok(at),
-    }
-}
-
-/// The checkpoint to work the modifier out from: the newest one that leaves the self-check's
-/// whole window (the newest SELF_CHECK blocks, and the block before them) after it. Starting at
-/// a checkpoint inside that window left the blocks before it with no modifier in memory, so the
-/// self-check failed them and staking stopped until they aged out (JB20B, 2026-11-11: a reorg
-/// at the tip went back to the checkpoint at 1,540,000 and 55 good blocks failed).
-fn start_point(cps: &[(u32, Hash256, Hash256)], tip: u32) -> Option<(u32, Hash256, Hash256)> {
-    cps.iter().rev().find(|(a, _, _)| a.saturating_add(SELF_CHECK + 1) < tip).cloned()
-}
-
-fn modifier_at(height: u32) -> Option<Hash256> {
-    with(|s| s.mods.recent.iter().rev().find(|x| x.0 == height).map(|x| x.1))
+fn modifier_at(node: &Node, height: u32) -> Option<Hash256> {
+    node.chain.stake_modifier_at(params().chain_no, height).ok().flatten()
 }
 
 /// A transaction's own time field (Kotia txs carry one).
@@ -206,10 +109,10 @@ fn verify_block_sig(id: &Hash256, sig: &[u8], key: &[u8]) -> bool {
 pub fn self_check(node: &Node, n: u32) -> Value {
     let p = params();
     let c = p.chain_no;
-    let Some(at) = with(|s| s.mods.at.map(|a| a.0)) else { return json!({"ok": false, "why": "stake modifier not worked out yet"}) };
+    let Some(at) = node.chain.tip(c).ok().flatten().map(|t| t.height).filter(|h| modifier_at(node, *h).is_some()) else { return json!({"ok": false, "why": "stake modifier not worked out yet"}) };
     let (mut checked, mut passed) = (0u32, 0u32);
     let mut fails: Vec<Value> = Vec::new();
-    let lo = at.saturating_sub(n.min(WINDOW as u32 - 3)).max(2);
+    let lo = at.saturating_sub(n).max(2);
     for height in lo..=at {
         let Some(hash) = node.chain.hash_at(c, height).ok().flatten() else { continue };
         let Some(raw) = node.chain.block_raw(c, &hash).ok().flatten() else { continue };
@@ -220,7 +123,7 @@ pub fn self_check(node: &Node, n: u32) -> Value {
         checked += 1;
         let cs = &b.txs[1];
         let i0 = &cs.inputs[0];
-        let prev_mod = modifier_at(height - 1);
+        let prev_mod = modifier_at(node, height - 1);
         let value = node.chain.tx_raw(p, &i0.prevout.txid).ok().flatten()
             .and_then(|(r, _)| Tx::parse_with(&r, &p.format).ok())
             .and_then(|t| t.outputs.get(i0.prevout.vout as usize).map(|o| o.value));
@@ -381,9 +284,10 @@ pub fn status(node: &Node) -> Value {
         (_, Ok((_, _, a))) => (json!(a), Value::Null),
         _ => (Value::Null, Value::Null),
     };
+    let pass = node.chain.stake_status(p).unwrap_or_default();
     with(|s| json!({
         "on": is_on(node), "installed": installed, "address": addr, "coins": coins, "state": s.state,
-        "modifier_at": s.mods.at.map(|a| a.0), "tip": tip, "self_check": s.checked, "tried": s.tried, "staked": s.staked,
+        "modifier_at": pass.at, "checks_on": pass.on, "tip": tip, "self_check": s.checked, "tried": s.tried, "staked": s.staked,
     }))
 }
 
@@ -397,7 +301,7 @@ pub fn run(node: std::sync::Arc<Node>) {
     let mut last_check = 0u64;
     loop {
         std::thread::sleep(Duration::from_secs(1));
-        if !is_on(&node) && !CHECK.load(std::sync::atomic::Ordering::Relaxed) && with(|s| s.checked.is_none() && s.mods.at.is_none()) {
+        if !is_on(&node) && !CHECK.load(std::sync::atomic::Ordering::Relaxed) && with(|s| s.checked.is_none()) {
             set_state("off");
             continue;
         }
@@ -415,21 +319,11 @@ pub fn run(node: std::sync::Arc<Node>) {
             set_state("off");
             continue;
         }
-        // The modifier: in steps, so a fresh install catches up without holding things up.
-        match advance(&node, 20_000) {
-            Ok(Some(at)) => {
-                let tip = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
-                if at < tip {
-                    set_state(&format!("working out the stake modifier: block {at} of {tip}"));
-                    continue;
-                }
-            }
-            Ok(None) => continue,
-            Err(e) => {
-                set_state(&format!("stake modifier: {e}"));
-                std::thread::sleep(Duration::from_secs(20));
-                continue;
-            }
+        // The modifier: worked out by the stake pass (pass_run).
+        let st = node.chain.stake_status(p).unwrap_or_default();
+        if st.at != Some(st.tip) {
+            set_state(&format!("working out the stake modifier: {}", st.why.unwrap_or_default()));
+            continue;
         }
         let now = arcade_app::now();
         if with(|s| s.checked.is_none()) || now > last_check + 3600 {
@@ -465,7 +359,7 @@ fn try_slot(node: &Node, p: &'static ChainParams) -> Result<(), String> {
         return Ok(());
     }
     with(|s| s.last_slot = slot);
-    let modi = modifier_at(tip.height).ok_or("modifier of the tip not worked out")?;
+    let modi = modifier_at(node, tip.height).ok_or("modifier of the tip not worked out")?;
     let bits = pos::next_bits(trec.header.bits, trec.header.time, prev.header.time);
     let (sk, script, addr) = stake_key(node, p)?;
     let coins: Vec<_> = stake_coins(node, p, &script, tip.height).into_iter().filter(|c| c.1 >= pos::COINBASE_MATURITY).collect();
@@ -496,6 +390,69 @@ fn try_slot(node: &Node, p: &'static ChainParams) -> Result<(), String> {
     Ok(())
 }
 
+/// The stake pass (arcade_chaindb::stake) on every staked chain installed here in full: the
+/// stake modifier and the check of every stored staked block, once, then each new block as it
+/// connects. Low priority: short steps (each a few reads and one short write of the chain's own
+/// file; no other lock is taken), resting by the computer share chosen in Options (crate::cpu).
+pub fn pass_run(node: std::sync::Arc<Node>) {
+    let mut seeded: std::collections::HashSet<u16> = Default::default();
+    let mut said: HashMap<u16, String> = HashMap::new();
+    loop {
+        let mut busy = false;
+        for p in arcade_chain::params::ALL_CHAINS.iter().filter(|p| p.staked_from().is_some()) {
+            if !full_here(&node, p) {
+                continue;
+            }
+            let c = p.chain_no;
+            if seeded.insert(c) && p.key == KEY && node.chain.stake_status(p).is_ok_and(|s| s.at.is_none()) {
+                if let Some((h, id, m)) = seed_point(&old_checkpoints(&node), p.staked_from().unwrap_or(0)) {
+                    if node.chain.stake_seed(p, h, &id, &m).unwrap_or(false) {
+                        let _ = node.app.event("stake", &format!("{}: checking staked blocks, from the stake modifier kept at block {h}", p.name));
+                    }
+                }
+            }
+            let began = std::time::Instant::now();
+            match node.chain.stake_step(p, 5_000, Duration::from_millis(300)) {
+                Ok(s) => {
+                    if s.at != Some(s.tip) {
+                        busy = true;
+                    }
+                    let note = if s.on { "on".to_string() } else { s.why.clone().unwrap_or_default() };
+                    if said.get(&c) != Some(&note) && (s.on || s.at == Some(s.tip)) {
+                        let msg = if s.on {
+                            format!("{}: stake checks on ({} stored staked blocks broke a rule as checked here)", p.name, s.bad)
+                        } else {
+                            format!("{}: {note}", p.name)
+                        };
+                        let _ = node.app.event("stake", &msg);
+                        said.insert(c, note);
+                    }
+                }
+                Err(e) => {
+                    let note = format!("{}: stake pass: {e}", p.name);
+                    if said.get(&c) != Some(&note) {
+                        let _ = node.app.event("stake", &note);
+                        said.insert(c, note);
+                    }
+                    std::thread::sleep(Duration::from_secs(30));
+                }
+            }
+            let least = Duration::from_millis(if crate::cpu::level() == crate::cpu::Level::Low { 300 } else { 50 });
+            std::thread::sleep(crate::cpu::rest_for(began.elapsed()).max(least));
+        }
+        if !busy {
+            std::thread::sleep(Duration::from_secs(10));
+        }
+    }
+}
+
+/// A chain installed in full here (not borrowed): the only kind whose stake can be checked here
+/// (a borrower holds no coin set and no modifier).
+pub fn full_here(node: &Node, p: &ChainParams) -> bool {
+    let installed = if p.chain_no == node.params.chain_no { node.home_mode == "full" } else { node.extra.lock().unwrap().get(p.key).is_some_and(|r| r.mode == "full") };
+    installed && !crate::borrow::is_borrowed(p.key)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -505,15 +462,11 @@ mod tests {
     }
 
     #[test]
-    fn start_point_leaves_room_for_the_self_check() {
-        let cps = vec![cp(1_520_000), cp(1_530_000), cp(1_540_000)];
-        // The tip just past the newest checkpoint: start one checkpoint back.
-        assert_eq!(start_point(&cps, 1_540_148).map(|c| c.0), Some(1_530_000));
-        assert_eq!(start_point(&cps, 1_540_000 + SELF_CHECK + 1).map(|c| c.0), Some(1_530_000));
-        // Far enough past it: the newest checkpoint will do.
-        assert_eq!(start_point(&cps, 1_540_000 + SELF_CHECK + 2).map(|c| c.0), Some(1_540_000));
-        // No checkpoint far enough back: from genesis.
-        assert_eq!(start_point(&[cp(10_000)], 10_100), None);
-        assert_eq!(start_point(&[], 5), None);
+    fn the_pass_starts_from_the_newest_checkpoint_under_the_staked_stretch() {
+        let cps = vec![cp(990_000), cp(1_000_000), cp(1_010_000), cp(1_540_000)];
+        assert_eq!(seed_point(&cps, 1_000_001).map(|c| c.0), Some(1_000_000));
+        assert_eq!(seed_point(&cps, 1_000_000).map(|c| c.0), Some(990_000));
+        assert_eq!(seed_point(&[cp(1_540_000)], 1_000_001), None);
+        assert_eq!(seed_point(&[], 5), None);
     }
 }

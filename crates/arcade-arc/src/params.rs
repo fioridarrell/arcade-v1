@@ -129,12 +129,17 @@ pub const BLOB_TEMPORARY: u64 = 90 * 24 * 3600;
 /// The newest rules version this arcade knows. Version 2 (time keepers, §6.2): a block's proof of time may come in
 /// up to [`MAX_POT_RUNS`] runs one after another. Version 3 (blobs, §15 step 1): blob records and a block's blob section.
 /// Version 4 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20): see [`rules_v4`]. Version 5 (fog storage): see
-/// [`rules_v5`]. Version 6 (Martin 2026-11-19): see [`rules_v6`].
-pub const RULES_KNOWN: u32 = 6;
+/// [`rules_v5`]. Version 6 (Martin 2026-11-19): see [`rules_v6`]. Version 7 (OP_SIZE): see [`rules_v7`].
+pub const RULES_KNOWN: u32 = 7;
 
 /// The testnet height rules version 6 starts at (CONSENSUS: set in the release that ships it, ahead of the tip; this is
 /// a placeholder until then). [`TESTNET`]'s schedule reads it.
 pub const RULES_V6_HEIGHT: u64 = 2_725;
+
+/// The testnet height rules version 7 starts at (CONSENSUS): about 25 blocks past the tip when v0.1.164 was published
+/// (Martin, 2026-11-22: "20 to 30 blocks ahead"; most arcades update within 10 minutes). Never at a height ending 80
+/// to 99, next to an epoch's end. [`TESTNET`]'s schedule reads it; nothing else names the number.
+pub const RULES_V7_HEIGHT: u64 = 4_247;
 
 /// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
 /// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the
@@ -159,6 +164,14 @@ pub fn rules_v5(net: &Net, height: u64) -> bool {
 /// output is only an OP_RETURN's data, as it always was.
 pub fn rules_v6(net: &Net, height: u64) -> bool {
     net.rules_at(height) >= 6
+}
+
+/// Whether rules version 7 applies to the block at `height` (2026-11-22): the script takes `OP_SIZE` (Bitcoin's: the
+/// byte length of the top item pushed as a number, the item left; crate::script). It lets a swap's maker lock ARCADE
+/// so that only a 32-byte secret claims it, as on every other chain, so an ARCADE leg can be paired with DigiDollars.
+/// Before it `OP_SIZE` is an unknown opcode: a script holding it is invalid, even in a branch that isn't run.
+pub fn rules_v7(net: &Net, height: u64) -> bool {
+    net.rules_at(height) >= 7
 }
 
 /// The first height where [`rules_v4`] holds, if any (a network's rules versions rise with height).
@@ -276,8 +289,8 @@ pub const TESTNET: Net = Net {
     // top of version 2's time keepers and writer's share) from block 0. The chain before ran 1 from 0 and 2 from 1,065.
     // Version 4 from block 1,000 (Martin 2026-11-16, ARCADE issues #6, #10, #11, #14, #20; released in v0.1.106).
     // Version 5 (fog storage) from 2,150 (v0.1.133). Version 6 (Permanent floor 3, Temporary-to-Permanent upgrades)
-    // from [`RULES_V6_HEIGHT`].
-    rules: &[(3, 0), (4, 1_000), (5, 2_150), (6, RULES_V6_HEIGHT)],
+    // from [`RULES_V6_HEIGHT`] (2,725). Version 7 (OP_SIZE) from [`RULES_V7_HEIGHT`].
+    rules: &[(3, 0), (4, 1_000), (5, 2_150), (6, RULES_V6_HEIGHT), (7, RULES_V7_HEIGHT)],
     audit_period: AUDIT_PERIOD_BLOCKS,
     blob_window: BLOB_WINDOW,
     blob_temporary: BLOB_TEMPORARY,
@@ -321,6 +334,11 @@ mod tests {
         assert_eq!(TESTNET.rules_at(RULES_V6_HEIGHT - 1), 5);
         assert!(!rules_v6(&TESTNET, RULES_V6_HEIGHT - 1) && rules_v6(&TESTNET, RULES_V6_HEIGHT));
         assert!(!rules_v6(&MAINNET, u64::MAX));
+        // Version 7 after version 6, at a height not next to an epoch's end.
+        assert!(RULES_V6_HEIGHT < RULES_V7_HEIGHT && !(80..100).contains(&(RULES_V7_HEIGHT % 100)));
+        assert_eq!(TESTNET.rules_at(RULES_V7_HEIGHT - 1), 6);
+        assert!(!rules_v7(&TESTNET, RULES_V7_HEIGHT - 1) && rules_v7(&TESTNET, RULES_V7_HEIGHT));
+        assert!(!rules_v7(&MAINNET, u64::MAX));
         // Every version scheduled on the real networks is one this arcade knows.
         for n in [MAINNET, TESTNET] {
             assert!(n.rules.iter().all(|(v, _)| *v <= RULES_KNOWN));

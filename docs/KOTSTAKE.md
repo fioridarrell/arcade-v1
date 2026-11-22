@@ -1,6 +1,16 @@
-# Kotia proof of stake in V1.0: checking and staking — PLAN (not built)
+# Kotia proof of stake in V1.0: checking and staking
 
-Status: **plan for Martin's approval.** Nothing here is built yet. Written 2026-11-09 on the GX10.
+Status: written 2026-11-09 on the GX10 as a plan. Since then the staker (phase 2, `crates/arcaded/src/staker.rs`) was built, and on 2026-11-22 the stake checks of phase 1, for Kotia as a swap leg (see "Built: stake checks" below).
+
+## Built: stake checks (2026-11-22)
+
+- **Checked as blocks connect** (`crates/arcade-chaindb/src/stake.rs`): above block 1,000,000 every block must be staked; the block time equals the coinstake's, is a multiple of 16 and after the previous block's; nBits is the retarget of the last two staked blocks; the block signature is by the key in coinstake output 1; the staked coin is 19 or more blocks deep (the network asks 20: one looser, never stricter); the kernel meets target × value with the previous block's modifier. Not checked: the clock (15 s ahead), the coinbase's shape and the reward.
+- **The modifier** is kept per block in the chain database (`core.v1.stake`: block number → modifier and a mark: checked, broke a rule, or nothing to check), written in the block's commit and undone with it. The staker reads it from there; its old file `cache/kot-modifiers.json` is only read once, to start the pass.
+- **The one-time pass** (`staker::pass_run`, thread "stake pass") works out and checks every stored block of an install synced before, in short steps at the computer share chosen in Options, from the newest old checkpoint under block 1,000,001, else from block 0. It is resumable (STATE `stake:pass`).
+- **Enforced only when safe:** a block that breaks a stake rule is invalid only once the pass has reached the tip and none of the newest 10,000 staked blocks broke one (STATE `stake:on`). Until then nothing is refused, and Kotia swaps are refused, saying why.
+- **Confirmations:** checked staked blocks count one each (`proven.rs`); a Kotia lock in a swap needs 6 (`ChainParams::lock_confirms`). `chains.list` rows carry `confirms: {by: "stake" | "work", needs}`.
+- **Borrowed Kotia** can't check a stake: swaps on it are refused ("Kotia swaps need Kotia installed in full here").
+- **Deep reorgs:** with the checks on, the 100-block limit on reorgs onto unchecked branches no longer applies to Kotia (each block of the branch is checked as it connects); the undo window still bounds it.
 
 ## Martin's decisions
 

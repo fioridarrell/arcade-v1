@@ -746,7 +746,7 @@ impl<T: TimeProofs, S: Storage> Chain<T, S> {
             }
         }
         let (payouts, writer_paid) = self.payouts_at(entry.height, &block.header.writer);
-        let changes = coins::check_block(&block.txs, entry.height, &entry.prev, &self.coins, &payouts)?;
+        let changes = coins::check_block(&block.txs, entry.height, &entry.prev, &self.coins, &payouts, crate::script::Rules::at(&self.net, entry.height))?;
         let blob_changes = self.blob_changes(block, entry.height, &changes)?;
         let undo = self.storage.apply(block, &Applied { height: entry.height, id: *id, seed: entry.seed, fees: changes.fees, writer_paid })?;
         for (at, _) in &changes.spent {

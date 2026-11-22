@@ -34,6 +34,9 @@ pub const TXS_RUNS: &str = "core.v1.txs_runs";
 /// block changed in the family's tables ([`crate::journal`]). A family's segment is its
 /// journals for a range of heights, sealed like blocks.
 pub const JOURNAL: &str = "core.v1.journal";
+/// Staked chains (crate::stake): C|B -> stake modifier after the block (32) | mark u8. Added
+/// without a version bump: an older file gets the table when opened, an older build ignores it.
+pub const STAKE: &str = "core.v1.stake";
 
 static TABLES: &[TableDef] = &[
     TableDef::plain(HEADERS),
@@ -53,6 +56,7 @@ static TABLES: &[TableDef] = &[
     TableDef::plain(ADDR_LOG),
     TableDef::plain(TXS_RUNS),
     TableDef::plain(JOURNAL),
+    TableDef::plain(STAKE),
 ];
 
 fn add_addr_log(_w: &arcade_store::WriteTxn) -> arcade_store::Result<()> {

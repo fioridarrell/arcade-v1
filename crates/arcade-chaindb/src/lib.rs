@@ -12,6 +12,7 @@ pub mod rules;
 pub mod proven;
 pub mod schema;
 pub mod split;
+pub mod stake;
 pub mod sync;
 pub mod txruns;
 pub mod undo;
@@ -24,3 +25,5 @@ pub use indexer::{BlockCtx, Indexer, Prevout};
 mod tests;
 #[cfg(test)]
 mod coreimport_tests;
+#[cfg(test)]
+mod stake_tests;

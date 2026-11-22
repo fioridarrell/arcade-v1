@@ -112,9 +112,11 @@ fn free_mb(node: &Node) -> u64 {
     cfg(node)["free_mb"].as_u64().unwrap_or(100)
 }
 
-/// Does this arcade pay relays that charge (its operator's choice), and up to how much a month (base units)?
+/// Does this arcade pay relays that charge, and up to how much a month (base units)? On unless its operator turned it
+/// off (Martin 2026-11-21, "pay automatically by default"): off by default, an arcade past a relay's free allowance lost
+/// its relayed links without a word, and arcades that can't dial each other (a firewall, a router) stayed apart.
 fn pay_on(node: &Node) -> bool {
-    cfg(node)["pay_on"] == true
+    cfg(node)["pay_on"] != false
 }
 
 fn pay_cap(node: &Node) -> u64 {
@@ -1113,7 +1115,10 @@ fn pay_due(node: &Node, st: &mut G) -> Vec<(String, String, u64)> {
     let mut due = Vec::new();
     for (relay, b) in &st.bills {
         let price = b["price"].as_u64().unwrap_or(0);
-        if price == 0 || !st.ends.values().any(|e| e.relay == *relay) || st.paying.get(relay).is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
+        // Paid while we have links through it, and also while we owe it (2026-11-21): a relay ends an unpaid arcade's
+        // relayed links, so waiting for a link to pay deadlocked, and that arcade was cut off for the month.
+        let owing = b["charged"].as_u64().unwrap_or(0) > b["credit"].as_u64().unwrap_or(0);
+        if price == 0 || (!owing && !st.ends.values().any(|e| e.relay == *relay)) || st.paying.get(relay).is_some_and(|t| t.elapsed() < Duration::from_secs(600)) {
             continue;
         }
         let (charged, credit, month_charged) = (b["charged"].as_u64().unwrap_or(0), b["credit"].as_u64().unwrap_or(0), b["month_charged"].as_u64().unwrap_or(0));

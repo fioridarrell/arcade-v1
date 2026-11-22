@@ -79,7 +79,7 @@ fn fixture() -> Fixture {
 }
 
 fn opts() -> Options {
-    Options { layout: Layout { range: 100, era_ranges: 2, depth: UNDO_DEPTH }, level: 3, threads: 2, chunk_rows: 500, checkpoint_rows: 2000 }
+    Options { layout: Layout { range: 100, era_ranges: 2, depth: UNDO_DEPTH }, level: 3, threads: 2, chunk_rows: 500, checkpoint_rows: 2000, free_bytes: None, floor_bytes: 0 }
 }
 
 fn convert(f: &Fixture, o: &Options) -> Vec<String> {
@@ -545,4 +545,44 @@ fn a_pass_stopped_before_the_marker_is_carried_through_by_the_next() {
     assert_eq!(files(&f), files(&other));
     flag_trimmed(&f, &Kind::ALL);
     same(&answers(&f, &blocks), &want, "converted again from scratch");
+}
+
+/// The free space the hold test's drive reports.
+static FREE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn test_free(_: &std::path::Path) -> Option<u64> {
+    Some(FREE.load(std::sync::atomic::Ordering::SeqCst))
+}
+
+#[test]
+fn a_conversion_holds_while_the_drive_is_short_then_goes_on() {
+    use std::sync::atomic::Ordering::SeqCst;
+    let (f, whole) = (fixture(), fixture());
+    let blocks = ix_chain(&f.g, 1360);
+    for x in [&f, &whole] {
+        x.db.connect_blocks(x.p, &blocks).unwrap();
+    }
+    convert(&whole, &opts());
+    let o = Options { free_bytes: Some(test_free), floor_bytes: 1 << 20, ..opts() };
+    // Under the floor: held (and said so) before anything is written; space freed: on it goes,
+    // to the same files.
+    FREE.store(1000, SeqCst);
+    let mut notes = Vec::new();
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            FREE.store(1 << 40, SeqCst);
+        });
+        assert!(f.db.convert_to_index_files(f.p, &o, &AtomicBool::new(false), &mut |x| notes.push(x)).unwrap());
+    });
+    assert!(notes.iter().any(|n| n.contains("held:") && n.contains("ARCADE_IX_FREE_GB")), "{notes:?}");
+    assert!(notes.iter().any(|n| n.contains("room again")), "{notes:?}");
+    assert_eq!(files(&f), files(&whole));
+    // Stopped while held: nothing written, nothing switched.
+    let g = fixture();
+    g.db.connect_blocks(g.p, &blocks).unwrap();
+    FREE.store(1000, SeqCst);
+    assert!(!g.db.convert_to_index_files(g.p, &o, &AtomicBool::new(true), &mut |_| {}).unwrap());
+    assert!(!g.db.has_index_files(g.p.chain_no).unwrap());
+    assert!(!names(&g).iter().any(|n| n.ends_with(".ixf")), "{:?}", names(&g));
 }

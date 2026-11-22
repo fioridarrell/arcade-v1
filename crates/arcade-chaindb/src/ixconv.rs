@@ -83,7 +83,16 @@ pub struct Options {
     pub chunk_rows: usize,
     /// Table rows between checkpoints.
     pub checkpoint_rows: u64,
+    /// Free bytes on the drive of a path (None: not known). Unset: the drive isn't watched.
+    /// The library has no system calls of its own; the arcade and the ixfiles tool pass one.
+    pub free_bytes: Option<fn(&Path) -> Option<u64>>,
+    /// Free space kept on the index files' drive: a pass (or an era merge) waits, saying so,
+    /// until there is this much plus its estimated size (ARCADE_IX_FREE_GB in the tool).
+    pub floor_bytes: u64,
 }
+
+/// The free space kept by default while index files are written (as ARCADE_INIT_FREE_GB).
+pub const FLOOR_BYTES: u64 = 50 << 30;
 
 impl Default for Options {
     fn default() -> Self {
@@ -93,6 +102,8 @@ impl Default for Options {
             threads: std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(16),
             chunk_rows: 200_000,
             checkpoint_rows: 50_000_000,
+            free_bytes: None,
+            floor_bytes: FLOOR_BYTES,
         }
     }
 }
@@ -261,6 +272,46 @@ fn clear_unfinished(dir: &Path, kind: Kind) {
         if name.strip_suffix(".tmp").and_then(ixfile::parse_name).is_some_and(|(k, ..)| k == kind) {
             let _ = std::fs::remove_file(e.path());
         }
+    }
+}
+
+/// File bytes per table row, a little over what Bitcoin measured (docs/INDEXFILES.md §6: history
+/// ~13.5, spends ~3.7, tx index ~8.5), for the room a pass needs before it starts.
+fn bytes_per_row(kind: Kind) -> u64 {
+    match kind {
+        Kind::Hist => 18,
+        Kind::Spends => 6,
+        Kind::Txs => 12,
+    }
+}
+
+/// How often a held pass looks at the drive again.
+const HOLD_POLL: std::time::Duration = if cfg!(test) { std::time::Duration::from_millis(20) } else { std::time::Duration::from_secs(10) };
+
+/// Wait until `dir`'s drive has the floor plus `need` bytes free (`what` is for the message,
+/// repeated every few minutes while held). Ok(false): stopped while waiting.
+fn hold_for_room(dir: &Path, need: u64, o: &Options, tag: char, what: &str, stop: &AtomicBool, note: &mut dyn FnMut(String)) -> Result<bool> {
+    let Some(free_of) = o.free_bytes else { return Ok(true) };
+    let mut said: Option<std::time::Instant> = None;
+    loop {
+        let Some(free) = free_of(dir) else { return Ok(true) };
+        if free >= o.floor_bytes.saturating_add(need) {
+            if said.is_some() {
+                note(format!("index files {tag}: room again ({} GB free); going on", free >> 30));
+            }
+            return Ok(true);
+        }
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if said.is_none_or(|t| t.elapsed() > std::time::Duration::from_secs(300)) {
+            note(format!(
+                "index files {tag}: held: {} GB free on the drive of {}, under the floor of {} GB plus about {} GB for {what} (ARCADE_IX_FREE_GB); free some space, it carries on by itself",
+                free >> 30, dir.display(), o.floor_bytes >> 30, need.div_ceil(1 << 30)
+            ));
+            said = Some(std::time::Instant::now());
+        }
+        std::thread::sleep(HOLD_POLL);
     }
 }
 
@@ -457,6 +508,16 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
     if let Some(why) = store.read(|r| not_ready(r, c, kind, target, Some(epoch)))? {
         return Err(other(format!("{tag}: {why}; convert it afterwards")));
     }
+    // Room for the files first: the table's rows at the kind's bytes per row, less what the
+    // files of the heights below already hold (a carried-on pass counts its own parts too).
+    if o.free_bytes.is_some() {
+        let rows = store.table_sizes()?.into_iter().find(|t| t.0 == table).map(|t| t.1).unwrap_or(0);
+        let have: u64 = list(&dir, kind)?.iter().filter_map(|f| std::fs::metadata(&f.2).ok()).map(|m| m.len()).sum();
+        let need = (rows.saturating_mul(bytes_per_row(kind))).saturating_sub(have);
+        if !hold_for_room(&dir, need, o, tag, &format!("heights {next}..={target}"), stop, note)? {
+            return Ok(Pass::Stopped);
+        }
+    }
     let hs = Heights::load(db, c, target)?;
     let (mut out, mut scanned) = match carried {
         Some((ck, writers)) => {
@@ -519,7 +580,9 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
             Checkpoint { from, target, target_hash: hs.hashes[target as usize], layout: o.layout, level: o.level, epoch, resume: out.done_src.clone(), scanned, units }.save(&ck_path)?;
             last_ck = scanned;
             note(format!("index files {tag}: {scanned} table rows read, {} written", out.writers.iter().map(|w| w.rows()).sum::<u64>()));
-            if stopping {
+            // Below the floor part way (the estimate was short, or something else filled the
+            // drive): held here, the checkpoint already saved.
+            if stopping || !hold_for_room(&dir, 0, o, tag, "the rest of this pass", stop, note)? {
                 return Ok(Pass::Stopped);
             }
         }
@@ -537,7 +600,9 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
     }
     let _ = std::fs::remove_file(&ck_path);
     note(format!("index files {tag}: {rows} rows in {bytes} bytes, read back and checked"));
-    merge_eras(&dir, kind, &o.layout, target, from, o.level, o.threads, note)?;
+    if !merge_eras(&dir, kind, o, target, from, stop, note)? {
+        return Ok(Pass::Stopped);
+    }
 
     // Switch the readers, unless the chain changed under the files meanwhile (it cannot,
     // that deep; checked all the same, in the transaction that sets the marker).
@@ -580,8 +645,9 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
 /// The ranges stay until the readers have switched (the caller removes them).
 /// Eras ending at or below `switched` (the marker before this pass) are in use already and
 /// were checked when first adopted.
-#[allow(clippy::too_many_arguments)]
-fn merge_eras(dir: &Path, kind: Kind, layout: &Layout, upto: u32, switched: Option<u32>, level: i32, threads: usize, note: &mut dyn FnMut(String)) -> Result<()> {
+/// Room is held for as each era is merged (its ranges' bytes). Ok(false): stopped while held.
+fn merge_eras(dir: &Path, kind: Kind, o: &Options, upto: u32, switched: Option<u32>, stop: &AtomicBool, note: &mut dyn FnMut(String)) -> Result<bool> {
+    let (layout, level, threads) = (&o.layout, o.level, o.threads);
     let files = list(dir, kind)?;
     let mut first = 0u64;
     while first + layout.era() - 1 <= upto as u64 {
@@ -607,6 +673,10 @@ fn merge_eras(dir: &Path, kind: Kind, layout: &Layout, upto: u32, switched: Opti
                 })
                 .collect();
             if parts.len() == layout.era_ranges as usize {
+                let need: u64 = parts.iter().filter_map(|p| std::fs::metadata(p).ok()).map(|m| m.len()).sum();
+                if !hold_for_room(dir, need, o, kind.tag() as char, &format!("era {first}..={last}"), stop, note)? {
+                    return Ok(false);
+                }
                 let readers = parts.iter().map(|p| Reader::open(p)).collect::<Result<Vec<_>>>()?;
                 let info = ixfile::merge(dir, &readers, level, threads)?;
                 Reader::open(&info.path)?.verify()?;
@@ -617,7 +687,7 @@ fn merge_eras(dir: &Path, kind: Kind, layout: &Layout, upto: u32, switched: Opti
         }
         first += layout.era();
     }
-    Ok(())
+    Ok(true)
 }
 
 impl ChainDb {

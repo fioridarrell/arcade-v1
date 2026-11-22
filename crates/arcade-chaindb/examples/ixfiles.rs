@@ -2,7 +2,10 @@
 //!
 //!   ixfiles convert <shared chain.mdbx> <chain key>   settled rows -> files, readers switched
 //!                                                     (Ctrl-C: stop at the next checkpoint
-//!                                                     and carry on next run; twice: quit)
+//!                                                     and carry on next run; twice: quit;
+//!                                                     held while the drive has less than
+//!                                                     ARCADE_IX_FREE_GB, default 50, plus
+//!                                                     the pass's estimated size)
 //!   ixfiles info    <shared chain.mdbx> <chain key>   what the readers use now
 //!   ixfiles off     <shared chain.mdbx> <chain key>   back to the tables alone
 //!   ixfiles verify  <file.ixf>...                     read files whole and check them
@@ -29,6 +32,22 @@ fn catch_interrupt() {
     unsafe {
         libc::signal(libc::SIGINT, on_interrupt as *const () as libc::sighandler_t);
     }
+}
+
+/// Free bytes on the drive of `p` (statvfs).
+#[cfg(unix)]
+fn free_bytes(p: &std::path::Path) -> Option<u64> {
+    let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
+    let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
+        return None;
+    }
+    Some(s.f_bavail as u64 * s.f_frsize as u64)
+}
+
+#[cfg(not(unix))]
+fn free_bytes(_: &std::path::Path) -> Option<u64> {
+    None
 }
 
 fn be32(b: &[u8], at: usize) -> u32 {
@@ -165,7 +184,11 @@ fn main() {
             match cmd {
                 "convert" => {
                     catch_interrupt();
-                    let done = db.convert_to_index_files(p, &Options::default(), &STOP, &mut |s| println!("{s}")).unwrap();
+                    // The drive is watched: held under ARCADE_IX_FREE_GB (default 50) plus a
+                    // pass's estimated size.
+                    let floor = std::env::var("ARCADE_IX_FREE_GB").ok().map(|v| v.trim().parse::<u64>().expect("ARCADE_IX_FREE_GB: a number of GB")).map(|g| g.saturating_mul(1 << 30));
+                    let o = Options { free_bytes: Some(free_bytes), floor_bytes: floor.unwrap_or(arcade_chaindb::ixconv::FLOOR_BYTES), ..Options::default() };
+                    let done = db.convert_to_index_files(p, &o, &STOP, &mut |s| println!("{s}")).unwrap();
                     println!("{}", if done { "done" } else { "stopped" });
                 }
                 "off" => db.set_index_files_off(c).unwrap(),

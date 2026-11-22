@@ -822,7 +822,11 @@ pub fn card(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
 /// Per-app permission switches (only the ones its card claims matter).
 pub fn perms(node: &Node, id: &str) -> Value {
     let v = meta_get(node, &format!("appperm:{id}"));
-    if v.is_object() { v } else { json!({"wallet": false, "contacts": false, "groups": false, "feed": false, "media": false, "pictures": false, "notify": false}) }
+    let mut v = if v.is_object() { v } else { json!({"wallet": false, "contacts": false, "groups": false, "feed": false, "media": false, "pictures": false, "notify": false}) };
+    // The folder the person gave the app (crate::foldersvc, 2026-11-21): {granted, name}; its path is never shown, and
+    // it is kept on its own (appfolder:<id>), not with the switches.
+    v["folder"] = crate::foldersvc::status(node, id);
+    v
 }
 
 pub fn set_perms(node: &Node, id: &str, set: &Value) -> Result<Value, String> {
@@ -851,8 +855,16 @@ pub fn set_perms(node: &Node, id: &str, set: &Value) -> Result<Value, String> {
         }
         v["allowances"] = json!(al);
     }
+    // The folder (2026-11-21): only taken away here (folder: false); it is given by apps.folder_set, after the person
+    // picks one on the app window's card.
+    if set["folder"] == false {
+        crate::foldersvc::revoke(node, id)?;
+    }
+    if let Some(o) = v.as_object_mut() {
+        o.remove("folder");
+    }
     meta_put(node, &format!("appperm:{id}"), &v)?;
-    Ok(v)
+    Ok(perms(node, id))
 }
 
 // ---------------- spending allowances (2026-11-21) ----------------
@@ -995,6 +1007,9 @@ pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let opens = e["opens"].as_str().unwrap_or("").to_ascii_lowercase();
     let key = crate::chains::find(chain).map(|cp| crate::http::page_key(node, cp.key, &opens)).unwrap_or_default();
     // One arcade's word for the version that opens: it still opens, with a caution the app window shows.
+    // The page and its app, for the page API's folder routes (crate::foldersvc, 2026-11-21): a page's pass names only the
+    // page, and looking its app up through the whole App Store takes minutes on a busy arcade.
+    crate::foldersvc::remember_page(&opens, e["id"].as_str().unwrap_or(""));
     let caution = (e["trust"]["level"] == "yellow").then(|| e["trust"]["note"].clone());
     // Withdrawn by its publisher: it still opens (an installed copy is never taken away), and the window says so.
     let withdrawn = e["withdrawn"].as_object().map(|w| json!({"reason": w.get("reason"), "replaced_by": w.get("replaced_by")}));

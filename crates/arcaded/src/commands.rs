@@ -419,12 +419,21 @@ cmds! {
     "apps.uninstall" Admin "id" "Uninstall an app.";
     "apps.star" Admin "chain, txid, on?" "Star or unstar an app (starred show first).";
     "apps.card" Public "chain, txid" "One app: card, versions, comments, permission switches.";
-    "apps.perms" Admin "id, set?" "An app's permission switches (wallet, contacts, groups, media, pictures, notify), and its spending allowances: set {allowances: {<service>: ARCADE a day, or 0 to take it away}}.";
+    "apps.perms" Admin "id, set?" "An app's permission switches (wallet, contacts, groups, media, pictures, notify), its spending allowances: set {allowances: {<service>: ARCADE a day, or 0 to take it away}}, and its folder {granted, name} (never the path): set {folder: false} takes it away.";
     "apps.allowance" Read "id | page, service" "An app's spending allowance for a service: {per_day, spent_today, left, payments} in ARCADE, today (UTC).";
     "apps.allowance_use" Admin "id | page, service, amount, note?, undo?" "Count a payment (amount in ARCADE, not satoshis) an app asks for against today's allowance: {within: true} when it fits (counted at once; the app window then pays without a card), {within: false} when not (nothing counted). undo: true gives it back.";
     "apps.review" Admin "chain, txid, verdict" "Clear or confirm an app flagged as a lookalike.";
     "apps.trust" Admin "address, on?" "Trust a publisher (never flagged as a lookalike).";
     "apps.storage" Local "page, op, key?, value?" "An app page's saves (load, set, remove, clear, history), as arcade.storage.";
+    "apps.folder_set" Admin "id, path" "Give an app one folder on this computer to read and write inside (arcade.folder): path is an existing folder inside the home folder (not the home folder itself, not hidden, not the arcade's own). The app window calls it after the person picks one. apps.perms shows {granted, name}; set {folder: false} takes it away." => "{granted, name}";
+    "apps.folder_log" Admin "id, limit?" "What an app changed in its folder, newest first (at most 500): [{op (write, mkdir, remove), path, bytes, at}], with {granted, name}." => "{granted, name, changes}";
+    "folder.browse" Local "path?" "The folder picker: the subfolders (names only, no files, no hidden ones) of path, or of the home folder; only inside the home folder (and other drives on Windows)." => "{path, name, parent, is_root, crumbs, dirs, more, roots}";
+    "folder.list" Local "id, path?" "arcade.folder.list for a program: what is in a folder inside the app's granted folder (path relative to it)." => "{path, entries: [{name, kind, dir, size, modified}], more}";
+    "folder.stat" Local "id, path" "arcade.folder.stat for a program: one entry in the app's folder, or {exists: false}.";
+    "folder.read" Local "id, path, encoding?" "arcade.folder.read for a program: a file in the app's folder (at most 8 MB), as text or base64." => "{path, size, as, data}";
+    "folder.write" Local "id, path, data, encoding?" "arcade.folder.write for a program: write a file in the app's folder (at most 8 MB; the folder at most 200 MB), logged." => "{path, size}";
+    "folder.mkdir" Local "id, path" "arcade.folder.mkdir for a program: make a folder (and the ones above it) in the app's folder, logged." => "{path, made}";
+    "folder.remove" Local "id, path" "arcade.folder.remove for a program: remove a file, or an empty folder, in the app's folder, logged." => "{path, removed}";
     "realtime.join" Local "page, room, game?, member?, cred?, fast?" "Join a room over the mesh as this arcade's player (game defaults to the page): a token, me and the members; fast: true also takes the fast lane (realtime.fast). A website joins for its user with member (their address, or a guest id) and cred {a, x, s} signed over realtime.cert's words.";
     "realtime.ice" Local "tag?, lan?" "ICE servers for one player (tag: their address or account, kept apart only for the relay's per-login limit): logins on this arcade's media relay where other arcades proved its STUN port open (lan: true adds its LAN address, for a player on its own network), else on relays borrowed from linked arcades; and this arcade's proved STUN. What a website hands its pages for WebRTC.";
     "realtime.cert" Public "address" "The words an address signs (Core signmessage) to play through this arcade, and their expiry: a website's user signs them in the browser and the site passes {a: address, x: expires, s: signature} to realtime.join.";
@@ -781,6 +790,9 @@ pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
     ("explorer.dogefeed_address", "direction", "in,out,both", "", 0),
     ("apps.node", "op", "identity,send,sent,replies", "", 0),
     ("inscribe", "encoding", "text,base64", "\"text\"", 0),
+    ("folder.read", "encoding", "text,base64", "\"text\"", 0),
+    ("folder.write", "encoding", "text,base64", "\"text\"", 0),
+    ("apps.folder_log", "limit", "", "500", 500),
     ("inscribe.estimate", "encoding", "text,base64", "\"text\"", 0),
     ("explorer.arc_segments", "limit", "", "", 500),
     ("explorer.arc_holders", "limit", "", "", 500),

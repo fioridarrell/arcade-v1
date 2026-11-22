@@ -487,6 +487,35 @@ fn a_deep_reorg_just_above_the_files() {
     same(&answers(&f, &all), &want, "settled rows only in files");
 }
 
+/// Files name blocks by height and position, never by this arcade's block numbers: an arcade
+/// whose main-chain blocks got other numbers (it held another branch first) writes the very
+/// same files, ids and bytes (design-v3 §4: files equal whichever builder made them).
+#[test]
+fn files_do_not_depend_on_local_block_numbers() {
+    let c = fixture().p.chain_no;
+    let (a, b) = (fixture(), fixture());
+    let blocks = ix_chain(&a.g, 1360);
+    a.db.connect_blocks(a.p, &blocks).unwrap();
+    // b first follows a short branch from genesis: its blocks take numbers 1..=7.
+    let mut prev = b.g.hash();
+    let mut side = Vec::new();
+    for h in 1..=7u32 {
+        let b = block(prev, vec![tx(&[], &[(5, script(900 + h))], h + 7_000_000)], 30_000 + h);
+        prev = b.hash();
+        side.push(b);
+    }
+    b.db.connect_blocks(b.p, &side).unwrap();
+    for _ in 0..7 {
+        b.db.disconnect_tip(c).unwrap();
+    }
+    b.db.connect_blocks(b.p, &blocks).unwrap();
+    assert_eq!(b.db.tip(c).unwrap().unwrap().hash, a.db.tip(c).unwrap().unwrap().hash);
+    convert(&a, &opts());
+    convert(&b, &opts());
+    assert!(!files(&a).is_empty());
+    assert_eq!(files(&a), files(&b));
+}
+
 /// A pass that wrote its files and merged an era, then stopped before switching the
 /// readers (as a crash there would leave it): the readers keep the old files, and the next
 /// pass checks the merged era before adopting it (merging it again when it is damaged).

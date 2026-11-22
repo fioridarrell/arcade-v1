@@ -17,7 +17,7 @@ pub fn is_send(cmd: &str) -> bool {
 }
 
 /// Sends that resume themselves under one client_ref (crate::apppub's journal) rather than replay their first answer.
-const RESUMES: &[&str] = &["apps.publish", "apps.withdraw"];
+const RESUMES: &[&str] = &["apps.publish", "apps.withdraw", "apps.transfer"];
 
 /// Receipts kept; past this the oldest go.
 const KEEP: usize = 5000;

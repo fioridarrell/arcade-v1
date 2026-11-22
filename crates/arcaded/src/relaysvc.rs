@@ -327,8 +327,13 @@ fn over_limit(node: &Node, m: &Meter) -> bool {
     m.month_bytes as f64 >= limit_gb(node) * 1e9
 }
 
+/// Linked so that no relayed link is needed: a direct mesh link (TCP) to it. A UDP-only path doesn't count (2026-11-21:
+/// a new arcade far away had only a lossy UDP path to the GX10, 700 ms and a fifth of its packets resent, dropping every
+/// couple of minutes, and no relayed link was ever asked for because the UDP path counted as linked; both had a good
+/// link to the same relay).
 fn linked(node: &Node, id: &str) -> bool {
-    node.links.lock().unwrap().values().any(|l| l.node_id == id)
+    let _ = node;
+    crate::meshsvc::direct_up(id)
 }
 
 /// The address a linked arcade is known at here (the IP part: what the other side shows for it).

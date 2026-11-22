@@ -112,12 +112,18 @@
   const svcAskYes = {}, svcLocalYes = {};
   // An app the person gave an allowance for a service (apps.allowance, 2026-11-21) uses that service without the
   // once-a-window cards: it runs unattended. New keys still ask; payments beyond the allowance still ask.
+  // By the app's id when the window has it: by page the arcade looks the app up through the whole App Store, which took
+  // minutes on a busy arcade, and the page's first svc call waited for it (2026-11-21).
+  const who = () => (id ? { id } : { page: here });
   async function allowed(service) {
-    try { return (await api("apps.allowance", { page: here, service })).per_day > 0; } catch (_) { return false; }
+    // At most 5 s: no allowance known in time is no allowance (the usual cards ask).
+    const ask = api("apps.allowance", { ...who(), service }).then((a) => a.per_day > 0).catch(() => false);
+    return Promise.race([ask, new Promise((res) => setTimeout(() => res(false), 5000))]);
   }
   const doors = {
     async svc(m) {
-      const service = String(m.service || "");
+      // An allowance asked about with no service names the AI models' (the one the arcade knows apps to buy from).
+      const service = String(m.service || (m.op === "allowance" || m.op === "ask_allowance" ? "models" : ""));
       if (!/^[a-z0-9-]{1,32}$/.test(service)) throw new Error("service: 1-32 of a-z, 0-9 and -");
       if (m.op === "offers") return { offers: await api("svc.offers", { service }) };
       if (m.op === "ask") {
@@ -141,7 +147,7 @@
         let reserved = 0;
         if (what === "buy" && Number(body.amount) > 0) {
           try {
-            const u = await api("apps.allowance_use", { page: here, service, amount: Number(body.amount), note: `credit from ${String(body.seller || "").slice(0, 16)}` });
+            const u = await api("apps.allowance_use", { ...who(), service, amount: Number(body.amount), note: `credit from ${String(body.seller || "").slice(0, 16)}` });
             if (u.within === true) reserved = Number(body.amount);
           } catch (_) { /* no allowance: the cards below */ }
         }
@@ -170,14 +176,14 @@
         let r;
         try { r = await api("svc.ask", { to: "self", service, body, timeout: 1200 }); }
         catch (e) {
-          if (reserved) await api("apps.allowance_use", { page: here, service, amount: reserved, undo: true }).catch(() => {});
+          if (reserved) await api("apps.allowance_use", { ...who(), service, amount: reserved, undo: true }).catch(() => {});
           throw e;
         }
-        if (reserved && r && r.last && r.last.error) await api("apps.allowance_use", { page: here, service, amount: reserved, undo: true }).catch(() => {});
+        if (reserved && r && r.last && r.last.error) await api("apps.allowance_use", { ...who(), service, amount: reserved, undo: true }).catch(() => {});
         return { result: r.last };
       }
       // The allowance this app has for a service, and asking the person for one (2026-11-21).
-      if (m.op === "allowance") return { allowance: await api("apps.allowance", { page: here, service }) };
+      if (m.op === "allowance") return { allowance: await api("apps.allowance", { ...who(), service }) };
       if (m.op === "ask_allowance") {
         const per = Number(m.per_day);
         if (!(per > 0)) throw new Error("per_day: ARCADE a day, above zero");
@@ -187,9 +193,9 @@
           `${appName} asks to spend up to ${per} ARCADE a day on ${what}${reason ? ` (${reason})` : ""}.`,
           "Payments within it go without asking; anything beyond it asks on a card. You can change or take it away in the app's settings."], "Allow"));
         if (!yes) throw new Error("Cancelled.");
-        const cur = await api("apps.allowance", { page: here, service });
+        const cur = await api("apps.allowance", { ...who(), service });
         await api("apps.perms", { id: cur.id, set: { allowances: { [service]: per } } });
-        return { allowance: await api("apps.allowance", { page: here, service }) };
+        return { allowance: await api("apps.allowance", { ...who(), service }) };
       }
       throw new Error("svc ops are offers, ask, local, allowance and ask_allowance");
     },

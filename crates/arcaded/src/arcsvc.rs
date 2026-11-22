@@ -889,9 +889,16 @@ pub const STALL_SECS: u64 = 20 * 60;
 /// while one stands in) is older than [`STALL_SECS`], or it is neither installed nor borrowed. Writes go to Pepecoin testnet meanwhile; reads span both.
 pub fn stalled() -> bool {
     let Some(p) = defined() else { return true };
-    if borrowed(p) {
-        // The borrowed copy's newest block, as its lenders gave it.
-        let t = crate::borrow::tip_time(p.key).unwrap_or(0);
+    // Not reached yet is no stall (2026-11-21, step 3 of no home chain): a fresh install that hasn't linked to an arcade
+    // keeping ARCADE yet waits for it, rather than failing over to Pepecoin testnet for its @handle and first coin.
+    if first_reach_pending(p) {
+        return false;
+    }
+    // Not run here (borrowed, or its borrowed copy still being set up): the borrowed copy's newest block, as its lenders
+    // gave it, says whether the chain moves (2026-11-21: in the moment between the first block heard and the copy
+    // counting as borrowed, it read as stalled, and a fresh install asked for Pepecoin testnet coins).
+    if borrowed(p) || svc().is_none() {
+        let Some(t) = crate::borrow::tip_time(p.key) else { return false };
         let limit = std::env::var("ARCADE_STALL_SECS").ok().and_then(|v| v.parse().ok()).unwrap_or(STALL_SECS);
         return arcade_app::now().saturating_sub(t) > limit;
     }
@@ -904,6 +911,16 @@ pub fn stalled() -> bool {
         }
         None => true,
     }
+}
+
+/// A fresh arcade that hasn't reached the ARCADE chain yet: not installed here, and no block of it heard from a lender.
+pub fn first_reach_pending(p: &ChainParams) -> bool {
+    svc().is_none() && crate::borrow::tip_time(p.key).is_none()
+}
+
+/// The ARCADE chain when this arcade is still waiting to reach it the first time (see `first_reach_pending`).
+pub fn waiting_first() -> Option<&'static ChainParams> {
+    defined().filter(|p| first_reach_pending(p))
 }
 
 pub fn tip_id() -> Option<Hash256> {

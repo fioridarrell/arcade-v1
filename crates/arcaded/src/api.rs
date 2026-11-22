@@ -194,7 +194,9 @@ pub fn create_wallet(node: &Node, phrase: Option<&str>) -> Result<Value, String>
     // Test coins for the first handle come by themselves: asked for now, so they are
     // usually here by the time a handle is picked (a restored wallet may have some).
     // On ARCADE as the home chain (crate::claims::claim_home) the node faucet's ARCADE pays the claim instead.
-    if tag.is_none() && !crate::arcsvc::usable(crate::claims::claim_home(node)) {
+    // Only while handles are claimed on Pepecoin testnet (ARCADE stalled): a fresh install still reaching ARCADE waits for
+    // ARCADE's own faucet instead (step 3 of no home chain).
+    if tag.is_none() && crate::claims::claim_home(node).chain_no == node.params.chain_no {
         if let Ok((k, _)) = node.app.tag_key(p, 0) {
             let script = arcade_wallet::keys::p2pkh_script_for(&arcade_wallet::secp256k1::PublicKey::from_slice(&hex::decode(&k.pubkey).unwrap()).unwrap());
             if crate::claims::coins(node, &script).is_empty() {
@@ -216,7 +218,7 @@ pub fn dispatch(node: &Node, req: &Value) -> Result<Value, String> {
     if crate::commands::find(cmd).is_none() {
         return Err(format!("unknown command {cmd:?}: rpc.help lists them"));
     }
-    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish") || cmd == "arc.blob_upgrade" || cmd == "apps.publish" || cmd == "apps.withdraw") {
+    if let Some(tag) = req["as"].as_str().filter(|_| cmd.starts_with("ledger.") || cmd.starts_with("a.") || cmd.starts_with("arc.blob_publish") || cmd == "arc.blob_upgrade" || cmd == "apps.publish" || cmd == "apps.transfer" || cmd == "apps.withdraw") {
         return crate::arcledger::with_sign_as(Some(tag.to_string()), || dispatch_inner(node, req));
     }
     // `"chain": key` on a post, act, follow or message: written there (crate::msgsvc::write_chains; option C).
@@ -718,6 +720,7 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "apps.store" => Ok(crate::appsvc::store_with(node, &s("sort").unwrap_or_else(|| "popular".into()), &s("q").unwrap_or_default(), req["flagged"] == true, &s("category").unwrap_or_default(), req["withdrawn"] == true)),
         "apps.publish" => crate::apppub::publish_req(node, req),
         "apps.withdraw" => crate::apppub::withdraw_req(node, req),
+        "apps.transfer" => crate::apppub::transfer_req(node, req),
         "apps.categories" => Ok(crate::appsvc::categories()),
         "apps.installed" => Ok(crate::appsvc::installed(node)),
         "apps.install" => crate::appsvc::install(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),

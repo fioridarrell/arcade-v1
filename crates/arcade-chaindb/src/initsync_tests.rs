@@ -345,7 +345,7 @@ fn bad_blocks_are_refused_and_fetched_again() {
     let mut bad = Src::new(&blocks);
     bad.corrupt = true;
     let want = [blocks[3].hash()];
-    let r = db.init_store(p, &want, &bad.get_blocks(&want).unwrap()).unwrap();
+    let r = db.init_store(p, &want, bad.get_blocks(&want).unwrap()).unwrap();
     assert_eq!((r.stored, r.again.len(), r.refused.len()), (0, 1, 1));
     assert!(r.refused[0].1.contains("merkle"), "{:?}", r.refused);
     let r = db.init_store(p, &want, &[blocks[4].encode()]).unwrap();
@@ -397,7 +397,7 @@ fn a_block_with_its_witnesses_stripped_is_refused() {
     // Same txids, same merkle root: only the witness commitment tells.
     assert!(Block::parse(&b2_stripped).unwrap().check().is_ok());
     let want = [b2.hash()];
-    let r = db.init_store(p, &want, &[b2_stripped.clone()]).unwrap();
+    let r = db.init_store(p, &want, [&b2_stripped]).unwrap();
     assert_eq!(r.stored, 0, "a stripped block must not be stored");
     assert!(r.refused[0].1.contains("witness"), "{:?}", r.refused);
     let mut stripper = Src::new(&blocks);

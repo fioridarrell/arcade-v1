@@ -102,7 +102,7 @@ Ten range files of an era are merged (a k-way merge of sorted rows) into one era
 
 ## 6. Sizes
 
-Measured 2026-11-20 by `ixfiles bench` on the pioneer's real Bitcoin address run files (heights 609,000–615,000; one run file, and two merged), zstd 19, including footers:
+Measured 2026-11-20 by `ixfiles bench` on real Bitcoin address run files from a 32-core NVMe test machine (heights 609,000–615,000; one run file, and two merged), zstd 19, including footers:
 
 | Kind | Run rows | Raw in the run file | Index file, 1 run | Index file, 2 runs merged | Earlier whole-file estimate |
 |---|---|---|---|---|---|
@@ -112,7 +112,7 @@ Measured 2026-11-20 by `ixfiles bench` on the pioneer's real Bitcoin address run
 
 **History is about twice the design's estimate, spends about 1.4 times; the tx index is as hoped.** The earlier figures compressed each column over a whole run file at once, where zstd finds repeats far apart (an amount received in one row and spent in another, for one). Cut into blocks of 8,192 rows sorted by address, most of that is out of reach, and script ids (hashes, about 21 bytes per new address) do not compress at all. Whole-chain estimates at these rates: history ~90–110 GB, spends ~10–13 GB, tx index ~10–12 GB: roughly 110–135 GB where the design said 75–100, against 0.7–0.95 TB of tables. History should gain from era files (longer runs per address), and has clear room left (bigger blocks, coding amounts against the address's earlier rows, a per-file dictionary); any of that is a new format version and must be settled before files are shared.
 
-Notes: run files hold one history row per output or input; a file row is one per (address, transaction), as in the table. The run files carry no tx position, so the benchmark uses the rank of a row's txid among its block's as the position (same range and spread). The pioneer's T run files only hold transactions whose outputs were all spent before a cache flush, which does not change their randomness.
+Notes: run files hold one history row per output or input; a file row is one per (address, transaction), as in the table. The run files carry no tx position, so the benchmark uses the rank of a row's txid among its block's as the position (same range and spread). That machine's T run files only hold transactions whose outputs were all spent before a cache flush, which does not change their randomness.
 
 ## 7. Not in this part
 

@@ -714,3 +714,18 @@ fn bitcoin_has_a_checkpoint_at_its_minimum_chain_work_block() {
     assert_eq!(BITCOIN_MAIN.assume_valid(), None);
     assert!(crate::rules::script_flags(&BITCOIN_MAIN, 500_000, false).is_some());
 }
+
+#[test]
+fn a_stored_block_whose_header_we_lack_is_refused_not_checked_at_height_0() {
+    let blocks = chain(3);
+    let p = params(&blocks[0], |p| p.block_rules = Some(BlockRules { script_flags: |_| SCRIPT_WITNESS, ..BITCOIN_BLOCK_RULES }));
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let mut a = Src::new(&blocks[..2]);
+    begin(&db, p, &mut a);
+    round(&db, p, &mut [("a", &mut a)]);
+    // Block 2's header never came: refused (it used to be checked as if at height 0).
+    let e = crate::coreimport::check_stored_block(&db, p, &blocks[2].encode()).unwrap_err().to_string();
+    assert!(e.contains("not in our header chain"), "{e}");
+    assert!(crate::coreimport::check_stored_block(&db, p, &blocks[1].encode()).is_ok());
+}

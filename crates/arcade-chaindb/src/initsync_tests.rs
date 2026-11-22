@@ -654,3 +654,63 @@ fn block_numbers_follow_heights_even_when_the_best_chain_moves() {
         }
     }
 }
+
+/// A block on `prev` mined at `bits`.
+fn mine_bits(prev: Hash256, txs: &[Tx], height: u32, bits: u32) -> Block {
+    let ids: Vec<Hash256> = txs.iter().map(|t| t.txid).collect();
+    let mut header = Header { version: 1, prev, merkle_root: merkle_root(&ids), time: T0 + 60 * height, bits, nonce: 0 };
+    while try_pow_hash(PowAlgo::Sha256d, &header.encode()).is_some_and(|h| !meets_target(&h, bits)) {
+        header.nonce += 1;
+    }
+    let mut raw = header.encode().to_vec();
+    write_varint(&mut raw, txs.len() as u64);
+    for t in txs {
+        raw.extend_from_slice(&t.raw);
+    }
+    Block::parse(&raw).unwrap()
+}
+
+#[test]
+fn a_source_feeding_a_low_work_branch_is_left_out_of_the_headers_round() {
+    // Our chain at 16x the easiest work per block; a made-up branch from genesis at the easiest
+    // (allowed: a block may be up to 4x easier than its parent), longer but with far less work.
+    const HARD: u32 = 0x2007ffff;
+    let g = mine(Hash256::ZERO, &[coinbase(0, None, false)], 0);
+    let p = params(&g, |_| {});
+    let mut good = vec![g.clone()];
+    for h in 1..=40 {
+        let prev = good.last().unwrap().hash();
+        good.push(mine_bits(prev, &[coinbase(h, None, false)], h, HARD));
+    }
+    let mut low = vec![g.clone()];
+    for h in 1..=(SIDE_BUDGET + 40) {
+        let prev = low.last().unwrap().hash();
+        low.push(mine_bits(prev, &[coinbase(5000 + h, None, false)], h, EASY));
+    }
+    // Ours first: the low branch is spam and its source is left out.
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let (mut a, mut l) = (Src::new(&good), Src::new(&low));
+    begin(&db, p, &mut a);
+    let ag = round(&db, p, &mut [("a", &mut a), ("l", &mut l)]);
+    assert_eq!(ag.best, good[40].hash());
+    assert!(ag.differ.iter().any(|x| x.starts_with("l: sent") && x.contains("less work")), "{:?}", ag.differ);
+    assert!(!ag.differ.iter().any(|x| x.starts_with("a:")), "{:?}", ag.differ);
+    // The low branch sent first: our chain still wins and its source is never counted against.
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let (mut a, mut l) = (Src::new(&good), Src::new(&low));
+    begin(&db, p, &mut l);
+    let ag = round(&db, p, &mut [("l", &mut l), ("a", &mut a)]);
+    assert_eq!(ag.best, good[40].hash());
+    assert!(!ag.differ.iter().any(|x| x.contains("less work")), "{:?}", ag.differ);
+}
+
+#[test]
+fn bitcoin_has_a_checkpoint_at_its_minimum_chain_work_block() {
+    assert_eq!(BITCOIN_MAIN.last_checkpoint(u32::MAX), Some(691_719));
+    assert_eq!(BITCOIN_MAIN.checkpoint_at(691_719).unwrap().to_hex(), "00000000000000000008a89e854d57e5667df88f1cdef6fde2fbca1de5b639ad");
+    // A header fence only: every script is still checked.
+    assert_eq!(BITCOIN_MAIN.assume_valid(), None);
+    assert!(crate::rules::script_flags(&BITCOIN_MAIN, 500_000, false).is_some());
+}

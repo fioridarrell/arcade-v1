@@ -291,6 +291,17 @@ impl ChainParams {
         }
     }
 
+    /// Scripts at or under this height are taken as valid unless ARCADE_VERIFY_ALL_SCRIPTS=1
+    /// (Core's "assume valid"): the newest checkpoint, since no fork may start under it.
+    /// Bitcoin's checkpoint is a fence against header spam only (init installs): its scripts are
+    /// all checked, as before it had one.
+    pub fn assume_valid(&self) -> Option<u32> {
+        if self.key == "btc" {
+            return None;
+        }
+        self.last_checkpoint(u32::MAX)
+    }
+
     /// The highest checkpoint height at or below `height`: no fork may start under it.
     pub fn last_checkpoint(&self, height: u32) -> Option<u32> {
         self.checkpoints.iter().map(|(h, _)| *h).filter(|h| *h <= height).max()
@@ -1325,7 +1336,11 @@ pub static BITCOIN_MAIN: ChainParams = ChainParams {
         "seed.bitcoin.sprovoost.nl", "dnsseed.emzy.de", "seed.bitcoin.wiz.biz",
     ],
     fixed_peers: &[],
-    checkpoints: &[],
+    // Block 691,719: the block min_chain_work below ends at (Core 22.0's nMinimumChainWork and
+    // defaultAssumeValid; hash checked against two block explorers). No header fork may start
+    // under it, so a made-up branch can't spread over the low-difficulty years. Scripts are still
+    // checked everywhere (assume_valid).
+    checkpoints: &[(691_719, "00000000000000000008a89e854d57e5667df88f1cdef6fde2fbca1de5b639ad")],
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 970_000,

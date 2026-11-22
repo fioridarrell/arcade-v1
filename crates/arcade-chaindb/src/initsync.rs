@@ -126,6 +126,13 @@ pub const STORE_FLUSH_BYTES: usize = 16 << 20;
 /// Independent sources that must agree on the best header.
 pub const MIN_AGREE: usize = 3;
 
+/// Headers one source may send in a headers round on a branch with less work than our best
+/// header chain has at the same height (a branch that can't win: made-up headers at low
+/// difficulty) before it is left out of the round. Honest forks are a few blocks long; an
+/// honest source behind a low-work branch sent first never counts (its chain has at least as
+/// much work at each height, and overtakes).
+pub const SIDE_BUDGET: u32 = if cfg!(test) { 50 } else { 20_000 };
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Headers,
@@ -212,6 +219,9 @@ struct Located<'a, 'b> {
     db: &'a ChainDb,
     c: u16,
     back: &'a [Hash256],
+    p: &'a ChainParams,
+    /// The last header of the source's last answer (whose branch it feeds).
+    last: Option<Hash256>,
 }
 
 impl BlockSource for Located<'_, '_> {
@@ -219,7 +229,9 @@ impl BlockSource for Located<'_, '_> {
         let best = self.db.best_header(self.c).map_err(|e| e.to_string())?;
         let mut loc: Vec<Hash256> = best.into_iter().collect();
         loc.extend(self.back.iter().filter(|h| best.as_ref() != Some(h)));
-        self.inner.get_headers(&loc)
+        let reply = self.inner.get_headers(&loc)?;
+        self.last = reply.last().map(|e| self.p.block_id(&e.header));
+        Ok(reply)
     }
     fn get_blocks(&mut self, hashes: &[Hash256]) -> std::result::Result<Vec<Vec<u8>>, String> {
         self.inner.get_blocks(hashes)
@@ -440,15 +452,30 @@ impl ChainDb {
         let mut a = Agreement::default();
         let back = self.init_locator(c)?;
         let mut failed: HashMap<String, String> = HashMap::new();
+        // The best header chain's work by height, for the best header it was taken at.
+        let mut works: Option<(Hash256, Vec<arcade_chain::pow::U256>)> = None;
         for (key, src) in sources.iter_mut() {
-            let mut loc = Located { inner: &mut **src, db: self, c, back: &back };
+            let mut loc = Located { inner: &mut **src, db: self, c, back: &back, p, last: None };
+            let mut side = 0u32;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return Err(err("stopped"));
                 }
                 match syncer.sync_headers_once(&mut loc) {
                     Ok(0) => break,
-                    Ok(n) => a.new_headers += n,
+                    Ok(n) => {
+                        a.new_headers += n;
+                        // Headers that went to a low-work branch count against the source.
+                        if let Some(last) = loc.last.take() {
+                            if self.low_work_branch(c, &last, &mut works)? {
+                                side += n;
+                                if side > SIDE_BUDGET {
+                                    failed.insert(key.clone(), format!("sent {side} headers of a branch with less work than ours; left out"));
+                                    break;
+                                }
+                            }
+                        }
+                    }
                     Err(e) => {
                         failed.insert(key.clone(), e.to_string());
                         break;
@@ -483,6 +510,36 @@ impl ChainDb {
         a.agree = agree;
         self.set_state_text(c, INIT_NOTE, Some(&a.text()))?;
         Ok(a)
+    }
+
+    /// Whether `last` (a stored header) is on a branch with less work than the best header chain
+    /// at its height (or, past the best header, less work than it). `works` caches the best
+    /// chain's work by height for the best header it was taken at.
+    fn low_work_branch(&self, c: u16, last: &Hash256, works: &mut Option<(Hash256, Vec<arcade_chain::pow::U256>)>) -> Result<bool> {
+        let Some(best) = self.best_header(c)? else { return Ok(false) };
+        if best == *last {
+            return Ok(false);
+        }
+        let (Some(rec), Some(brec)) = (self.header(c, last)?, self.header(c, &best)?) else { return Ok(false) };
+        if rec.height > brec.height {
+            return Ok(rec.work < brec.work);
+        }
+        if works.as_ref().is_none_or(|(b, _)| *b != best) {
+            let mut v = vec![arcade_chain::pow::U256::ZERO; brec.height as usize + 1];
+            self.store(c).read(|r| {
+                let mut x = brec.clone();
+                loop {
+                    v[x.height as usize] = x.work;
+                    if x.height == 0 {
+                        break;
+                    }
+                    x = header_rec(r, c, &x.header.prev)?.ok_or_else(|| err("a header's parent is missing"))?;
+                }
+                Ok(())
+            })?;
+            *works = Some((best, v));
+        }
+        Ok(works.as_ref().is_some_and(|(_, v)| rec.work < v[rec.height as usize]))
     }
 
     /// Store a batch a source sent for `wanted` (store-only, any order): each block must be one

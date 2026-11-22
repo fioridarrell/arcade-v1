@@ -35,11 +35,11 @@ pub fn verify_all_scripts() -> bool {
 }
 
 /// The script flags to check a block at `height` with, or None when its scripts aren't checked:
-/// the chain has no block rules, or the block is under the newest checkpoint ("assume valid":
-/// V1 lets no fork start under it) and ARCADE_VERIFY_ALL_SCRIPTS is off.
+/// the chain has no block rules, or the block is under the chain's assume-valid height (its
+/// newest checkpoint, ChainParams::assume_valid) and ARCADE_VERIFY_ALL_SCRIPTS is off.
 pub fn script_flags(params: &ChainParams, height: u32, all: bool) -> Option<u32> {
     let br = params.block_rules.filter(|b| height > 0 && b.scripts)?;
-    (all || params.last_checkpoint(u32::MAX).is_none_or(|cp| height > cp)).then(|| (br.script_flags)(height))
+    (all || params.assume_valid().is_none_or(|cp| height > cp)).then(|| (br.script_flags)(height))
 }
 
 /// Size without witness data (Core's SERIALIZE_TRANSACTION_NO_WITNESS): the wire bytes,
@@ -416,7 +416,7 @@ const WATCH_FIRST: usize = 5;
 impl Watch {
     pub fn new(params: &ChainParams) -> Watch {
         let scripts_from = if params.block_rules.is_some_and(|b| b.scripts) {
-            if verify_all_scripts() { 1 } else { params.last_checkpoint(u32::MAX).map_or(1, |c| c + 1) }
+            if verify_all_scripts() { 1 } else { params.assume_valid().map_or(1, |c| c + 1) }
         } else {
             u32::MAX
         };

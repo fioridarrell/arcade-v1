@@ -708,6 +708,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             "swap" => Some(include_str!("shims/swap.js")),
             "market" => Some(include_str!("shims/market.js")),
             "folder" => Some(include_str!("shims/folder.js")),
+            "apps" => Some(include_str!("shims/apps.js")),
             _ => None,
         };
         return match body {
@@ -761,6 +762,14 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
             if let Some((code, v)) = crate::explorer::page_read(node, &path, &query_fields(&r.query)) {
                 return respond(&mut s, status_line(code), "application/json", &cors, v.to_string().as_bytes());
             }
+        }
+        // The arcade's apps (/r/apps, appsvc::page_list; arcade.apps.list): public card data, with or without a pass.
+        if matches!(r.method.as_str(), "GET" | "HEAD") && path == "/r/apps" {
+            let q = query_fields(&r.query);
+            let v = crate::appsvc::page_list(node, q.get("q").and_then(|v| v.as_str()).unwrap_or(""), q.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize,
+                                             q.get("limit").and_then(|v| v.as_u64()).map(|n| n as usize).unwrap_or(crate::appsvc::PAGE_ROWS_DEFAULT));
+            let body = v.to_string();
+            return respond(&mut s, "200 OK", "application/json", &cors, if r.method == "HEAD" { &[] } else { body.as_bytes() });
         }
         if page.is_none() && !program && !matches!(path.as_str(), "/r/blockheight" | "/r/blocktime") {
             return respond(&mut s, "403 Forbidden", "application/json", &cors, br#"{"error":"open this page in the arcade: the request has no page pass"}"#);
@@ -1739,6 +1748,20 @@ pub(crate) mod tests {
         let a = ask(&t.node, &conf(), &get(&format!("/r/fog/req/{id}"), &from_page));
         assert!(a.contains(r#""status":"sent""#), "{a}");
         crate::arcblob::set_cache_limit(before);
+    }
+
+    /// arcade.apps (2026-11-22): GET /r/apps answers the apps with or without a pass, and the shim is served.
+    #[test]
+    fn the_apps_read_needs_no_pass() {
+        let (_one, t) = crate::http::tests::node();
+        for extra in ["", "Origin: null\r\n"] {
+            let a = ask(&t.node, &conf(), &get("/r/apps?limit=5", extra));
+            assert_eq!(status(&a), "200", "{a}");
+            let v: Value = serde_json::from_str(a.split("\r\n\r\n").nth(1).unwrap()).unwrap();
+            assert!(v["apps"].is_array() && v["total"].is_u64() && v["more"].is_boolean(), "{v}");
+        }
+        let a = ask(&t.node, &conf(), &get("/r/apps.js", ""));
+        assert!(status(&a) == "200" && a.contains("arcade.apps"), "{}", &a[..a.len().min(300)]);
     }
 
     /// arcade.folder's page routes (foldersvc.rs, 2026-11-21): behind the page's pass, for the page's own app (from what

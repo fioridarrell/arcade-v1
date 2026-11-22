@@ -94,6 +94,17 @@ pub fn check(p: &arcade_chain::params::ChainParams, mode: &str) -> Result<(), St
     if matches!(p.pow, arcade_chain::pow::PowRule::PowThenStake { .. }) || p.value_rules.is_some_and(|v| v.stake_reward.is_some()) {
         return Err(format!("{} has proof-of-stake blocks: an init install can't check stake (install it without --init)", p.name));
     }
+    // Litecoin's MWEB: the extension block after a block's transactions is stored and served
+    // as part of the block, but nothing here checks it. Its header could be checked against
+    // the HogEx commitment, but not its body: the body's roots are MMR roots over every MWEB
+    // output and kernel ever made, which takes the whole MWEB state. So no init install, which
+    // takes blocks from sources it hasn't checked over, until it is checked.
+    if p.format.mweb {
+        return Err(format!(
+            "{} carries MWEB extension blocks, which this release can't check yet (their roots need the whole MWEB state): install it without --init",
+            p.name
+        ));
+    }
     // The trust floor: a release checkpoint taken from two independent sources. Where none could
     // be checked (no chain data of our own, or no second source), the chain stays refused.
     if p.init_floor().is_none() {
@@ -913,6 +924,11 @@ mod tests {
         assert!(!BITCOIN_MAIN.min_chain_work().is_zero());
         // Proof of stake: refused, whatever else.
         assert!(check(&KOTIA_MAIN, "full").unwrap_err().contains("proof-of-stake"));
+        // MWEB: refused, whatever else.
+        use arcade_chain::params::{JUNKCOIN_MAIN, LITECOIN_MAIN, LITECOIN_TEST};
+        for m in [&LITECOIN_MAIN, &LITECOIN_TEST, &JUNKCOIN_MAIN] {
+            assert!(check(m, "full").unwrap_err().contains("MWEB"), "{}", m.key);
+        }
         // No checkpoint checked against two sources: refused.
         assert!(check(&DIGIBYTE_MAIN, "full").unwrap_err().contains("no init checkpoint"));
         assert!(check(&DIGIBYTE_TEST, "full").unwrap_err().contains("no init checkpoint"));

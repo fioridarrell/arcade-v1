@@ -102,6 +102,31 @@ pub fn tiling(files: &[(u32, u32, PathBuf)], upto: u32) -> Result<Vec<PathBuf>> 
     Ok(out)
 }
 
+/// The mark beside a file that was read back whole here (`Reader::verify`): `<file>.ok`, holding
+/// the file's id in hex. A file without a matching mark (copied in from elsewhere, or written by
+/// a build before marks) is verified whole before a reader adopts it ([`KindSet::load`]).
+pub fn checked_mark(path: &Path) -> PathBuf {
+    let mut p = path.as_os_str().to_owned();
+    p.push(".ok");
+    PathBuf::from(p)
+}
+
+/// Mark `path` as read back whole here (best effort: without the mark it is only verified again).
+pub fn mark_checked(path: &Path, id: &[u8; 32]) {
+    let _ = std::fs::write(checked_mark(path), hex::encode(id));
+}
+
+/// Whether `path` carries the mark of a whole read of this very file (its id).
+pub fn is_checked(path: &Path, id: &[u8; 32]) -> bool {
+    std::fs::read(checked_mark(path)).is_ok_and(|v| v == hex::encode(id).as_bytes())
+}
+
+/// Remove a file and its mark.
+pub fn remove_with_mark(path: &Path) -> std::io::Result<()> {
+    let _ = std::fs::remove_file(checked_mark(path));
+    std::fs::remove_file(path)
+}
+
 /// One kind's open files for a chain, lowest heights first.
 pub struct KindSet {
     pub kind: Kind,
@@ -113,6 +138,8 @@ pub struct KindSet {
 impl KindSet {
     /// Open the files covering `0..=upto`; `hash_at` is the main chain's block hash at a
     /// height, and every file must end on it (files of another chain or fork are refused).
+    /// A file not read back whole here (no matching [`checked_mark`]: copied in from another
+    /// arcade, or written before marks) is verified whole first, and marked.
     pub fn load(dir: &Path, kind: Kind, chain: u16, upto: u32, mut hash_at: impl FnMut(u32) -> Result<Option<[u8; 32]>>) -> Result<KindSet> {
         let mut files = Vec::new();
         for path in tiling(&list(dir, kind)?, upto)? {
@@ -123,6 +150,10 @@ impl KindSet {
             }
             if hash_at(r.meta.last)? != Some(r.meta.last_hash) {
                 return Err(StoreError::Other(format!("index file {}: not of this chain (the block at {} differs)", path.display(), r.meta.last)));
+            }
+            if !is_checked(&path, &r.id) {
+                r.verify()?;
+                mark_checked(&path, &r.id);
             }
             files.push(r);
         }

@@ -125,8 +125,9 @@ fn files(f: &Fixture) -> BTreeMap<String, Vec<u8>> {
         .unwrap_or_default()
 }
 
+/// The files in the index dir (not the marks of a whole read, `<file>.ok`).
 fn names(f: &Fixture) -> Vec<String> {
-    files(f).into_keys().collect()
+    files(f).into_keys().filter(|n| !n.ends_with(".ok")).collect()
 }
 
 /// What removing converted rows from the tables will do (a later step): every settled row
@@ -585,4 +586,39 @@ fn a_conversion_holds_while_the_drive_is_short_then_goes_on() {
     assert!(!g.db.convert_to_index_files(g.p, &o, &AtomicBool::new(true), &mut |_| {}).unwrap());
     assert!(!g.db.has_index_files(g.p.chain_no).unwrap());
     assert!(!names(&g).iter().any(|n| n.ends_with(".ixf")), "{:?}", names(&g));
+}
+
+#[test]
+fn a_file_not_checked_here_is_read_whole_before_it_is_used() {
+    use crate::ixset::{checked_mark, is_checked, KindSet};
+    let f = fixture();
+    let c = f.p.chain_no;
+    let blocks = ix_chain(&f.g, 1360);
+    f.db.connect_blocks(f.p, &blocks).unwrap();
+    convert(&f, &opts());
+    let dir = f.db.index_dir(c);
+    let upto = f.db.index_files_upto(c, Kind::Hist).unwrap().unwrap();
+    let load = || KindSet::load(&dir, Kind::Hist, c, upto, |h| Ok(f.db.hash_at(c, h)?.map(|x| x.0)));
+    // Every file written here is marked as read back whole.
+    let set = load().unwrap();
+    for r in &set.files {
+        let path = crate::ixset::list(&dir, Kind::Hist).unwrap().into_iter().find(|x| (x.0, x.1) == (r.meta.first, r.meta.last)).unwrap().2;
+        assert!(is_checked(&path, &r.id), "{}", path.display());
+    }
+    // A file whose block bytes are damaged (its footer intact, so it opens), as one copied in
+    // from elsewhere (no mark): refused when loaded, not adopted.
+    let (_, _, path) = crate::ixset::list(&dir, Kind::Hist).unwrap().into_iter().last().unwrap();
+    let mut bytes = std::fs::read(&path).unwrap();
+    bytes[crate::ixfile::HEADER_LEN + 40] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::remove_file(checked_mark(&path)).unwrap();
+    assert!(load().is_err());
+    // A good file without its mark is read whole once and marked.
+    let (_, _, other) = crate::ixset::list(&dir, Kind::Hist).unwrap().into_iter().next().unwrap();
+    std::fs::remove_file(checked_mark(&other)).unwrap();
+    bytes[crate::ixfile::HEADER_LEN + 40] ^= 0xff;
+    std::fs::write(&path, &bytes).unwrap();
+    std::fs::remove_file(checked_mark(&path)).ok();
+    load().unwrap();
+    assert!(checked_mark(&other).exists() && checked_mark(&path).exists());
 }

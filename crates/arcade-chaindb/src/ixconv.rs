@@ -18,7 +18,7 @@
 use crate::db::{decode_tip, ChainDb, UNDO_DEPTH};
 use crate::ixfile::{self, Kind, Meta, Reader, Writer};
 use crate::addrbuild::{OFF, PENDING, TXS_PENDING};
-use crate::ixset::{addr_epoch, generation_name, list, marker, marker_name};
+use crate::ixset::{addr_epoch, generation_name, list, mark_checked, marker, marker_name, remove_with_mark};
 use crate::schema::*;
 use arcade_chain::hash::sha256;
 use arcade_chain::params::ChainParams;
@@ -490,7 +490,7 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
                 // is written again. Whatever is there (left by an earlier install, another
                 // layout, a pass that never switched) goes, so nothing stale is adopted.
                 for (_, _, path) in list(&dir, kind)? {
-                    std::fs::remove_file(&path).map_err(other)?;
+                    remove_with_mark(&path).map_err(other)?;
                 }
             }
             // Settled: deep below the tip, and below where the coins are complete (a tip
@@ -594,7 +594,9 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
     let mut bytes = 0u64;
     for w in out.writers {
         let info = w.finish()?;
-        Reader::open(&info.path)?.verify()?;
+        let r = Reader::open(&info.path)?;
+        r.verify()?;
+        mark_checked(&info.path, &r.id);
         rows += info.rows;
         bytes += info.bytes;
     }
@@ -634,7 +636,7 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
     let files = list(&dir, kind)?;
     for (a, b, path) in &files {
         if files.iter().any(|(a2, b2, _)| a2 <= a && b <= b2 && (a2, b2) != (a, b) && *b2 <= target) {
-            let _ = std::fs::remove_file(path);
+            let _ = remove_with_mark(path);
         }
     }
     note(format!("index files {tag}: on up to height {target}"));
@@ -657,11 +659,11 @@ fn merge_eras(dir: &Path, kind: Kind, o: &Options, upto: u32, switched: Option<u
         let mut have = false;
         if let Some(f) = files.iter().find(|f| (f.0 as u64, f.1 as u64) == (first, last)) {
             let in_use = switched.is_some_and(|s| last <= s as u64);
-            match if in_use { Ok(()) } else { Reader::open(&f.2).and_then(|r| r.verify()) } {
+            match if in_use { Ok(()) } else { Reader::open(&f.2).and_then(|r| r.verify().map(|()| mark_checked(&f.2, &r.id))) } {
                 Ok(()) => have = true,
                 Err(e) => {
                     note(format!("index files {}: era {first}..={last} is not usable ({e}); merging it again", kind.tag() as char));
-                    std::fs::remove_file(&f.2).map_err(other)?;
+                    remove_with_mark(&f.2).map_err(other)?;
                 }
             }
         }
@@ -679,7 +681,9 @@ fn merge_eras(dir: &Path, kind: Kind, o: &Options, upto: u32, switched: Option<u
                 }
                 let readers = parts.iter().map(|p| Reader::open(p)).collect::<Result<Vec<_>>>()?;
                 let info = ixfile::merge(dir, &readers, level, threads)?;
-                Reader::open(&info.path)?.verify()?;
+                let r = Reader::open(&info.path)?;
+                r.verify()?;
+                mark_checked(&info.path, &r.id);
                 note(format!("index files {}: era {first}..={last} merged from its ranges ({} rows)", kind.tag() as char, info.rows));
             } else if files.iter().any(|f| (f.0 as u64, f.1 as u64) == (first, last)) {
                 return Err(other(format!("era {first}..={last} was not usable and its ranges are gone; switch the files off and convert again")));

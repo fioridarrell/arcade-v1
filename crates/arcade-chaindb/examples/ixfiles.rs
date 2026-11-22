@@ -8,7 +8,8 @@
 //!                                                     the pass's estimated size)
 //!   ixfiles info    <shared chain.mdbx> <chain key>   what the readers use now
 //!   ixfiles off     <shared chain.mdbx> <chain key>   back to the tables alone
-//!   ixfiles verify  <file.ixf>...                     read files whole and check them
+//!   ixfiles verify  <file.ixf>...                     read files whole and check them (and
+//!                                                     mark them checked: <file>.ok)
 //!   ixfiles bench   <H|S|T> <out dir> <run file>...   address run files -> one index file (sizes)
 use arcade_chaindb::ixconv::Options;
 use arcade_chaindb::ixfile::{hist_row, spend_row, tx_row, Kind, Meta, Reader, Writer, LEVEL};
@@ -174,6 +175,8 @@ fn main() {
             for path in &a[1..] {
                 let r = Reader::open(std::path::Path::new(path)).unwrap();
                 r.verify().unwrap();
+                // Read whole here: a reader adopts it without reading it again.
+                arcade_chaindb::ixset::mark_checked(std::path::Path::new(path), &r.id);
                 println!("{path}: {:?} heights {}..={} rows {} bytes {} id {} ok", r.meta.kind, r.meta.first, r.meta.last, r.rows, r.bytes, hex::encode(r.id));
             }
         }

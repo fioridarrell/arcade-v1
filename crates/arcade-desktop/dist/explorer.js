@@ -63,7 +63,8 @@
     // ?chain=<key> picks the starting chain (links, shortcuts).
     const want = first ? new URLSearchParams(location.search).get("chain") : null;
     if (want && inst.find((c) => c.key === want.toLowerCase())) chain = inst.find((c) => c.key === want.toLowerCase());
-    else if (!chain || !inst.find((c) => c.key === chain.key)) chain = inst.find((c) => c.home) || inst[0];
+    // ARCADE first (step 3 of no home chain, 2026-11-21), else the first chain, else any.
+    else if (!chain || !inst.find((c) => c.key === chain.key)) chain = inst.find((c) => c.key === "arctest") || inst.find((c) => c.home) || inst[0];
     else chain = inst.find((c) => c.key === chain.key);
     paintSelector();
     if (first) announce();

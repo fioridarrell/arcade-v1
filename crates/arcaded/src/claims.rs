@@ -57,7 +57,8 @@ fn coin_chain_coins(node: &Node, p: &'static ChainParams, script: &[u8]) -> Vec<
 pub fn claim_home(node: &Node) -> &'static ChainParams {
     // ARCADE stalled (or its copy still syncing with no borrowed copy standing in): claimed on Pepecoin testnet, a
     // handle as good on either chain.
-    crate::arcsvc::usable_chain().filter(|_| !crate::arcsvc::stalled()).unwrap_or(node.params)
+    // Not reached yet (a fresh install): ARCADE all the same; the claim waits for it (step 3 of no home chain).
+    crate::arcsvc::usable_chain().filter(|_| !crate::arcsvc::stalled()).or_else(crate::arcsvc::waiting_first).unwrap_or(node.params)
 }
 
 pub fn chain_for(node: &Node, key: Option<&str>) -> Result<&'static ChainParams, String> {
@@ -566,6 +567,11 @@ fn ask_for_first_handle(node: &Node) {
     if !node.app.has_wallet().unwrap_or(false) {
         return;
     }
+    // Only while handles are claimed on Pepecoin testnet (ARCADE stalled): a new wallet's handle goes on ARCADE, paid by
+    // ARCADE's own faucet (step 3 of no home chain, 2026-11-21: a fresh install still asked for PEPtest here).
+    if claim_home(node).chain_no != p.chain_no {
+        return;
+    }
     if node.app.tag_keys(p.chain_no).unwrap_or_default().iter().any(|k| k.tag.is_some())
         || node.app.claims().unwrap_or_default().iter().any(|c| c.chain == p.chain_no && c.status != ClaimStatus::Failed)
     {
@@ -825,12 +831,13 @@ pub fn start_status(node: &Node) -> serde_json::Value {
         // (Borrowed: the borrowed copy's height, which its lenders keep up to date.)
         let borrowed = crate::arcsvc::borrowed(p);
         let tip = if borrowed { crate::borrow::tip(node, p.key) } else { node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height) };
+        let waiting = crate::arcsvc::first_reach_pending(p);
         return json!({
-            "wallet": true, "tag": tag, "address": key.address, "balance": balance,
+            "wallet": true, "tag": tag, "address": key.address, "balance": balance, "waiting_for_chain": waiting,
             "chain": {"key": p.key, "name": p.name, "unit": crate::explorer::unit(p)},
             "claim": claim.map(|c| json!({"tag": c.tag, "status": format!("{:?}", c.status).to_lowercase(), "note": c.note})),
             "faucet": crate::arcfaucet::of_address(&key.address),
-            "synced": borrowed || crate::arcsvc::lends().is_some(), "borrowed": borrowed, "height": tip, "best": tip,
+            "synced": !waiting && (borrowed || crate::arcsvc::lends().is_some()), "borrowed": borrowed, "height": tip, "best": tip,
         });
     }
     let ask = crate::faucet::last_ask(node, &key.address);

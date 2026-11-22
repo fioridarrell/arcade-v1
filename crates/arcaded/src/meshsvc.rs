@@ -1594,6 +1594,12 @@ fn operator_me(node: &Node) -> Value {
         })
         .collect();
     let mut me = json!({"t": "op", "op": "me", "version": "V1.0", "lora": false, "links": links});
+    // Its release and whether it updates by itself (2026-11-22, Martin: so we know which arcades take a release
+    // without their operator; a new rule can then start soon after a release). Older arcades ignore both.
+    if let Some(r) = crate::updater::version() {
+        me["release"] = json!(r);
+    }
+    me["auto_update"] = json!(crate::updater::on(node));
     if !tag.is_empty() {
         me["tag"] = json!(tag);
         me["name"] = json!(format!("@{tag}"));

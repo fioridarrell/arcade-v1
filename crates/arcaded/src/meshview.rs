@@ -20,7 +20,8 @@ fn ops() -> std::sync::MutexGuard<'static, BTreeMap<String, (u64, Value)>> {
 
 /// An `op me` frame from a linked arcade: its operator's @tag, name and version.
 pub fn on_op_me(peer: &str, head: &Value) {
-    let keep = json!({"tag": head["tag"], "name": head["name"], "version": head["version"]});
+    let keep = json!({"tag": head["tag"], "name": head["name"], "version": head["version"],
+        "release": head["release"].as_str().filter(|r| r.len() <= 32), "auto_update": head["auto_update"].as_bool()});
     ops().insert(peer.to_string(), (arcade_app::now(), keep));
 }
 
@@ -186,6 +187,8 @@ pub fn overview(node: &Node) -> Value {
         arcades.push(json!({
             "node": id,
             "tag": op["tag"], "name": op["name"], "version": op["version"],
+            // Its release and whether it updates by itself, as its "op me" said (null from arcades before 0.1.164).
+            "release": op["release"], "auto_update": op["auto_update"],
             // Its handle proven by the handle's key (handlegate.rs): what gets it index data.
             "handle_proven": crate::handlegate::proven(&id),
             "linked": link.is_some(),
@@ -235,7 +238,7 @@ pub fn overview(node: &Node) -> Value {
     let tag = node.app.tag_keys(node.params.chain_no).unwrap_or_default().into_iter().find_map(|k| k.tag)
         .or_else(|| crate::handlegate::own_proof(node).map(|(t, _)| t));
     json!({
-        "me": {"node": node.id_hex(), "tag": tag, "version": option_env!("ARCADE_VERSION"), "links": links.len(), "chains": mine,
+        "me": {"node": node.id_hex(), "tag": tag, "version": option_env!("ARCADE_VERSION"), "auto_update": crate::updater::on(node), "links": links.len(), "chains": mine,
                "handle_proven": crate::handlegate::have_handle(node)},
         "mesh": {"linked": arcades.iter().filter(|a| a["linked"] == true).count(), "heard": arcades.iter().filter(|a| a["linked"] != true).count(), "chains": avail},
         "arcades": arcades,

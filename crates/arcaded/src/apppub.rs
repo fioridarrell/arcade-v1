@@ -683,6 +683,74 @@ pub fn withdrawal_card(card: &arcade_ledger::cards::Card, reason: &str, replaced
 /// `apps.withdraw`: a new version of one of this wallet's apps whose card says it is withdrawn (the whole app, or the
 /// versions listed), published as `apps.publish` publishes. Only the app's publisher may: its creator must be the key
 /// that signs here.
+/// The card of a transfer: the app's name and family (so it files under the same app) and `transfer_to`.
+pub fn transfer_card(card: &arcade_ledger::cards::Card, to: &str) -> Value {
+    let mut a = json!({"name": card.name, "transfer_to": to});
+    if !card.family.is_empty() {
+        a["family"] = json!(card.family);
+    }
+    if !card.category.is_empty() {
+        a["category"] = json!(card.category);
+    }
+    json!({"app": a})
+}
+
+/// `apps.transfer {chain?, txid | family, to, send?, client_ref?}` (2026-11-21, Martin: "add a way to transfer the
+/// rights for an app, so that we don't have to rely on the publisher publishing before someone else snipes it"): hands
+/// one of this wallet's apps to another address (or @tag, on the ARCADE chain). From the block it is in, the new owner's
+/// cards of the same name are the app's next versions, and theirs alone; the name is never free in between.
+pub fn transfer_req(node: &Node, req: &Value) -> Result<Value, String> {
+    let p = chain_for(node, req["chain"].as_str())?;
+    let (address, _, _) = signer(node, p)?;
+    let to_raw = req["to"].as_str().map(str::trim).filter(|t| !t.is_empty()).ok_or("to: the new owner's address or @tag")?;
+    let to = if let Some(tag) = to_raw.strip_prefix('@') {
+        if !is_arcade(p) {
+            return Err(format!("an @tag names an owner on the ARCADE chain; on {} give the new owner's address", p.name));
+        }
+        crate::arcledger::tag_owner(node, tag).map(|(a, _)| a).ok_or_else(|| format!("@{tag} has no owner on the ARCADE chain"))?
+    } else {
+        if arcade_ledger::address::script_for_address(p, to_raw).is_none() {
+            return Err(format!("{to_raw} is not an address on {}", p.name));
+        }
+        to_raw.to_string()
+    };
+    if to == address {
+        return Err("that is this wallet's own address".into());
+    }
+    let txid = req["txid"].as_str().map(|t| t.trim().to_lowercase()).filter(|t| !t.is_empty());
+    let family = req["family"].as_str().map(|t| t.trim().to_string()).filter(|t| !t.is_empty());
+    if txid.is_none() && family.is_none() {
+        return Err("txid (any version of the app) or family required".into());
+    }
+    let found = crate::appsvc::lookup(node, p, txid.as_deref(), family.as_deref());
+    if found.is_empty() {
+        return Err(format!("no such app on {} here", p.name));
+    }
+    let Some(card) = found.into_iter().find(|(c, _, _)| *c == address).map(|(_, card, _)| card) else {
+        return Err(format!("only its owner can transfer it: this wallet's key on {} ({address}) doesn't hold it", p.name));
+    };
+    let t = transfer_card(&card, &to);
+    let page = format!("<!doctype html><meta charset=\"utf-8\"><title>{0}</title><p>{0} now belongs to {1}.</p>", html_text(&card.name), html_text(&to));
+    let ask = Ask {
+        content: page.into_bytes(),
+        name: "transfer.html".into(),
+        ctype: "text/html;charset=utf-8".into(),
+        json: t.to_string(),
+        chain: Some(p.key.to_string()),
+        client_ref: crate::receipts::client_ref(req)?,
+        send: req["send"] == true,
+    };
+    let mut v = publish(node, &ask)?;
+    v["transfer_card"] = t;
+    v["app"] = json!(card.name);
+    v["to"] = json!(to);
+    Ok(v)
+}
+
+fn html_text(s: &str) -> String {
+    s.replace('&', "&amp;").replace('<', "&lt;").replace('>', "&gt;")
+}
+
 pub fn withdraw_req(node: &Node, req: &Value) -> Result<Value, String> {
     let p = chain_for(node, req["chain"].as_str())?;
     let (address, _, _) = signer(node, p)?;
@@ -696,7 +764,7 @@ pub fn withdraw_req(node: &Node, req: &Value) -> Result<Value, String> {
         return Err(format!("no such app on {} here", p.name));
     }
     let Some((card, txids)) = found.into_iter().find(|(c, _, _)| *c == address).map(|(_, card, t)| (card, t)) else {
-        return Err(format!("only its publisher can withdraw it: this wallet's key on {} ({address}) did not publish it", p.name));
+        return Err(format!("only its owner can withdraw it: this wallet's key on {} ({address}) doesn't hold it", p.name));
     };
     let versions: Vec<String> = req["versions"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(|s| s.trim().to_lowercase())).collect()).unwrap_or_default();
     if let Some(bad) = versions.iter().find(|v| !txids.contains(*v)) {

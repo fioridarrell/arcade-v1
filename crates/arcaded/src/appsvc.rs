@@ -41,6 +41,10 @@ struct Ver {
 
 struct App {
     chain: &'static ChainParams,
+    /// Who first published it (its id goes by this, so a transfer keeps installs, permissions and allowances) and who
+    /// holds it now (the last transfer's address, else the root): only the owner withdraws or transfers it.
+    root: String,
+    owner: String,
     versions: Vec<Ver>, // newest first; never a withdrawal card, nor a version one withdrew
     removed: bool,
     /// Withdrawn by its publisher (2026-11-21): the newest card of the creator's app is a withdrawal of the whole app.
@@ -57,11 +61,61 @@ fn resolve(vs: Vec<Ver>) -> Option<(Vec<Ver>, Option<Value>)> {
         n.card.withdraw.as_ref().filter(|w| w.versions.is_empty()).map(|w| json!({"reason": w.reason, "replaced_by": w.replaced_by, "txid": n.txid}))
     });
     let hidden: BTreeSet<String> = vs.iter().filter_map(|v| v.card.withdraw.as_ref()).flat_map(|w| w.versions.iter().cloned()).collect();
-    let offered: Vec<Ver> = vs.into_iter().filter(|v| v.card.withdraw.is_none() && !hidden.contains(&v.txid)).collect();
+    let offered: Vec<Ver> = vs.into_iter().filter(|v| v.card.withdraw.is_none() && v.card.transfer_to.is_empty() && !hidden.contains(&v.txid)).collect();
     if offered.is_empty() {
         return None;
     }
     Some((offered, whole))
+}
+
+/// One app per first publisher and name, following its transfers (2026-11-21): a transfer card in the owner's cards
+/// hands the app to its `transfer_to` address, whose cards of the same name AFTER it are the app's next versions; the old
+/// owner's cards after it are no longer the app's, and the new owner's from before it were never this app's. Chains of
+/// transfers are followed. (root, owner, versions in any order, transfer cards included for `resolve` to leave out).
+fn follow_transfers(mut by: BTreeMap<(String, String), Vec<Ver>>) -> Vec<(String, String, Vec<Ver>)> {
+    let at = |v: &Ver| (v.height, v.position);
+    let targets: BTreeSet<(String, String)> = by.iter()
+        .flat_map(|((_, k), vs)| vs.iter().filter(|v| !v.card.transfer_to.is_empty()).map(move |v| (v.card.transfer_to.clone(), k.clone())))
+        .collect();
+    let mut starts: Vec<(String, String)> = by.keys().filter(|k| !targets.contains(*k)).cloned().collect();
+    // A group only ever handed over is followed from its giver; one left over (its giver's chain went elsewhere) stands alone.
+    let mut out = Vec::new();
+    let mut walk = |by: &mut BTreeMap<(String, String), Vec<Ver>>, start: (String, String)| -> Option<(String, String, Vec<Ver>)> {
+        let mut vs_all = Vec::new();
+        let (mut cur, mut after) = (start.clone(), (0u64, 0u64));
+        let mut owner = start.0.clone();
+        let mut first = true;
+        while let Some(mut vs) = by.remove(&cur) {
+            vs.sort_by_key(|v| at(v));
+            let t = vs.iter().find(|v| !v.card.transfer_to.is_empty() && (first || at(v) > after)).map(|v| (at(v), v.card.transfer_to.clone()));
+            let until = t.as_ref().map(|x| x.0).unwrap_or((u64::MAX, u64::MAX));
+            vs_all.extend(vs.into_iter().filter(|v| (first || at(v) > after) && at(v) <= until));
+            owner = cur.0.clone();
+            first = false;
+            match t {
+                Some((tat, to)) if to != cur.0 => {
+                    after = tat;
+                    owner = to.clone();
+                    cur = (to, cur.1.clone());
+                }
+                _ => break,
+            }
+        }
+        (!vs_all.is_empty()).then(|| (start.0, owner, vs_all))
+    };
+    starts.sort();
+    for k in starts {
+        if let Some(x) = walk(&mut by, k) {
+            out.push(x);
+        }
+    }
+    let rest: Vec<(String, String)> = by.keys().cloned().collect();
+    for k in rest {
+        if let Some(x) = walk(&mut by, k) {
+            out.push(x);
+        }
+    }
+    out
 }
 
 fn meta_get(node: &Node, k: &str) -> Value {
@@ -308,14 +362,14 @@ fn gather(node: &Node) -> Vec<App> {
                 checked,
             });
         }
-        for (_, mut vs) in by {
+        for (root, owner, mut vs) in follow_transfers(by) {
             vs.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
             let Some((vs, withdrawn)) = resolve(vs) else { continue };
             let newest = &vs[0];
             // Removed: the creator's DELETE on the newest card (feed acts on any ledger chain, by the creator's key).
             let creator = node.home_address(&newest.creator);
             let removed = acts.iter().any(|a| a["kind"] == 6 && a["target"] == newest.txid.as_str() && a["from"] == creator.as_str());
-            apps.push(App { chain: p, versions: vs, removed, withdrawn });
+            apps.push(App { chain: p, root, owner, versions: vs, removed, withdrawn });
         }
     }
     apps
@@ -368,7 +422,7 @@ fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
         if trusted.contains(&n.creator) && n.checked {
             continue;
         }
-        if let Some(f) = lookalike(n, &all) {
+        if let Some(f) = lookalike(n, &a.root, &all) {
             out.insert(n.txid.clone(), f);
         }
     }
@@ -378,23 +432,24 @@ fn flags(node: &Node, apps: &[App]) -> BTreeMap<String, String> {
 /// The cards a new card may be mistaken for: every version of each app the store still lists. Not one its creator
 /// removed, nor one its creator withdrew whole (Martin 2026-11-21: once the original owner took it away, a new app of
 /// that name is no copy of anything), nor one the operator confirmed as a copy (`confirmed`).
-fn comparable<'a>(apps: &'a [App], confirmed: impl Fn(&App) -> bool) -> Vec<(&'a Ver, &'static str)> {
+fn comparable<'a>(apps: &'a [App], confirmed: impl Fn(&App) -> bool) -> Vec<(&'a Ver, &'static str, &'a str)> {
     let mut all = Vec::new();
     for a in apps {
         if a.removed || a.withdrawn.is_some() || confirmed(a) {
             continue;
         }
         for v in &a.versions {
-            all.push((v, a.chain.key));
+            all.push((v, a.chain.key, a.root.as_str()));
         }
     }
     all
 }
 
 /// "flagged: looks like ..." when an earlier card by another creator in `all` looks like `n`.
-fn lookalike(n: &Ver, all: &[(&Ver, &str)]) -> Option<String> {
-    let earlier = all.iter().find(|(o, _)| o.creator != n.creator && (o.height, o.position) < (n.height, n.position) && cards::looks_like(&n.card, &o.card));
-    earlier.map(|(o, ch)| format!("flagged: looks like {} by {} on {ch}", o.card.name, o.creator))
+/// `root`: the app `n` is a version of; its own earlier versions (by an owner it was transferred from) are no copy.
+fn lookalike(n: &Ver, root: &str, all: &[(&Ver, &str, &str)]) -> Option<String> {
+    let earlier = all.iter().find(|(o, _, r)| *r != root && o.creator != n.creator && (o.height, o.position) < (n.height, n.position) && cards::looks_like(&n.card, &o.card));
+    earlier.map(|(o, ch, _)| format!("flagged: looks like {} by {} on {ch}", o.card.name, o.creator))
 }
 
 /// Opinions, comments and tips on any version of an app (home chain feed acts).
@@ -559,7 +614,7 @@ pub fn add_defaults(node: &Node) {
     let mut done = done;
     let mut ids = installed_ids(node);
     for (id, feed) in todo {
-        let Some(a) = apps.iter().find(|a| !a.removed && a.withdrawn.is_none() && app_id(a.chain.key, &a.versions[0].creator, &a.versions[0].card.key()) == *id) else { continue };
+        let Some(a) = apps.iter().find(|a| !a.removed && a.withdrawn.is_none() && app_id(a.chain.key, &a.root, &a.versions[0].card.key()) == *id) else { continue };
         if !ids.iter().any(|x| x["id"] == *id) {
             ids.push(json!({"id": id, "at": arcade_app::now(), "card": a.versions[0].card.to_json(), "default": true}));
             let _ = node.app.event("apps", &format!("installed {} (one of the apps every arcade starts with)", a.versions[0].card.name));
@@ -584,7 +639,7 @@ fn starred_ids(node: &Node) -> BTreeSet<String> {
 fn entry(node: &Node, a: &App, acts: &[Value], fx: &Fixes, me: &str, flag: Option<&String>, installed: &BTreeSet<String>, starred: &BTreeSet<String>) -> Value {
     let n = &a.versions[0];
     let c = a.chain.chain_no;
-    let id = app_id(a.chain.key, &n.creator, &n.card.key());
+    let id = app_id(a.chain.key, &a.root, &n.card.key());
     // Open `play` only when that page has the same creator.
     let opens = if !n.card.play.is_empty()
         && arcade_ledger::content::inscription(&node.chain, c, &n.card.play).is_some_and(|p| p["creator"] == n.creator.as_str())
@@ -602,7 +657,7 @@ fn entry(node: &Node, a: &App, acts: &[Value], fx: &Fixes, me: &str, flag: Optio
     let tag = creator_tag(node, a.chain, &n.creator);
     json!({
         "id": id, "chain": a.chain.key, "chain_name": a.chain.name, "txid": n.txid, "number": n.number,
-        "creator": n.creator, "creator_tag": tag, "height": n.height, "time": time, "card": n.card.to_json(),
+        "creator": n.creator, "creator_tag": tag, "owner": a.owner, "first_publisher": a.root, "height": n.height, "time": time, "card": n.card.to_json(),
         "opens": opens, "versions": a.versions.iter().map(|v| json!({"txid": v.txid, "version": v.card.version, "height": v.height, "trust": v.trust.as_str()})).collect::<Vec<_>>(),
         "trust": trust_json(n),
         "removed": a.removed, "withdrawn": a.withdrawn, "flag": flag, "mine": n.creator == me, "installed": installed.contains(&id), "starred": starred.contains(&id),
@@ -701,7 +756,7 @@ pub fn installed(node: &Node) -> Value {
     let mut out = Vec::new();
     for i in &ids {
         let id = i["id"].as_str().unwrap_or("");
-        match apps.iter().find(|a| app_id(a.chain.key, &a.versions[0].creator, &a.versions[0].card.key()) == id) {
+        match apps.iter().find(|a| app_id(a.chain.key, &a.root, &a.versions[0].card.key()) == id) {
             Some(a) => {
                 let mut e = entry(node, a, &acts, &fx, &me, fl.get(&a.versions[0].txid), &set, &starred);
                 e["installed_at"] = i["at"].clone();
@@ -719,7 +774,7 @@ fn find(node: &Node, chain: &str, txid: &str) -> Result<(App, String), String> {
         .into_iter()
         .find(|a| a.chain.chain_no == p.chain_no && a.versions.iter().any(|v| v.txid == txid))
         .ok_or("no app card with that txid here")?;
-    let id = app_id(a.chain.key, &a.versions[0].creator, &a.versions[0].card.key());
+    let id = app_id(a.chain.key, &a.root, &a.versions[0].card.key());
     Ok((a, id))
 }
 
@@ -797,7 +852,7 @@ pub fn of_page(node: &Node, txid: &str) -> Option<Value> {
     let first = &a.versions[0];
     // The page's own version: one arcade's word for it is said where the app asks for money (walletsvc::page_card).
     let this = a.versions.iter().find(|v| v.txid == txid).unwrap_or(first);
-    Some(json!({"id": app_id(a.chain.key, &first.creator, &first.card.key()), "name": first.card.name, "chain": a.chain.key, "txid": first.txid,
+    Some(json!({"id": app_id(a.chain.key, &a.root, &first.card.key()), "name": first.card.name, "chain": a.chain.key, "txid": first.txid,
                 "creator": this.creator, "trust": trust_json(this)}))
 }
 
@@ -830,7 +885,7 @@ pub fn lookup(node: &Node, p: &ChainParams, txid: Option<&str>, family: Option<&
             (None, Some(f)) => a.versions[0].card.family == f || a.versions[0].card.key() == f.to_lowercase(),
             _ => false,
         })
-        .map(|a| (a.versions[0].creator.clone(), a.versions[0].card.clone(), a.versions.iter().map(|v| v.txid.clone()).collect()))
+        .map(|a| (a.owner.clone(), a.versions[0].card.clone(), a.versions.iter().map(|v| v.txid.clone()).collect()))
         .collect()
 }
 
@@ -1142,7 +1197,8 @@ mod withdraw_tests {
     /// One creator's cards (any order) as gather files them: newest first, resolved.
     fn app(mut vs: Vec<Ver>) -> Option<App> {
         vs.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
-        resolve(vs).map(|(versions, withdrawn)| App { chain: chain(), versions, removed: false, withdrawn })
+        let root = vs.last().map(|v| v.creator.clone()).unwrap_or_default();
+        resolve(vs).map(|(versions, withdrawn)| App { chain: chain(), root: root.clone(), owner: root, versions, removed: false, withdrawn })
     }
     const F1: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","version":"1"}}"#;
     const F2: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","version":"2"}}"#;
@@ -1192,7 +1248,7 @@ mod withdraw_tests {
         let y = || app(vec![ver(&t('7'), "Y", 60, F1)]).unwrap();
         let flagged = |x: App| {
             let apps = [x, y()];
-            lookalike(&apps[1].versions[0], &comparable(&apps, |_| false))
+            lookalike(&apps[1].versions[0], &apps[1].root, &comparable(&apps, |_| false))
         };
         // Without X's withdrawal, Y's later card looks like X's app: flagged.
         assert!(flagged(app(vec![ver(&t('1'), "X", 10, F1)]).unwrap()).is_some_and(|f| f.starts_with("flagged")));
@@ -1203,5 +1259,79 @@ mod withdraw_tests {
         // A "withdrawal" of X's family by Y is Y's own group (and offers nothing): X's app still blocks.
         assert!(app(vec![ver(&t('6'), "Y", 30, WHOLE)]).is_none());
         assert!(flagged(app(vec![ver(&t('1'), "X", 10, F1)]).unwrap()).is_some());
+    }
+}
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+
+    fn ver(txid: &str, creator: &str, h: u64, card: &str) -> Ver {
+        Ver { txid: txid.into(), number: h, creator: creator.into(), height: h, position: 0, card: cards::parse(card).unwrap(),
+              trust: crate::vouch::Level::Green, holders: 0, checked: true }
+    }
+    fn t(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+    const A: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","version":"1"}}"#;
+    const A2: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","version":"2"}}"#;
+    const TO_Y: &str = r#"{"app":{"name":"Frog Pond","family":"frog-pond","transfer_to":"Y"}}"#;
+
+    fn group(vs: Vec<Ver>) -> BTreeMap<(String, String), Vec<Ver>> {
+        let mut by: BTreeMap<(String, String), Vec<Ver>> = BTreeMap::new();
+        for v in vs {
+            by.entry((v.creator.clone(), v.card.key())).or_default().push(v);
+        }
+        by
+    }
+
+    #[test]
+    fn a_transfer_hands_the_app_on_and_keeps_its_root() {
+        // X publishes v1, transfers to Y; Y publishes v2 after. Y's card from before the transfer is no version of it;
+        // X's card after the transfer neither.
+        let by = group(vec![ver(&t('1'), "X", 10, A), ver(&t('2'), "X", 20, TO_Y), ver(&t('0'), "Y", 5, A2),
+                            ver(&t('3'), "Y", 30, A2), ver(&t('4'), "X", 40, A2)]);
+        let out = follow_transfers(by);
+        let main = out.into_iter().find(|(r, _, _)| r == "X").expect("the app, rooted at X");
+        assert_eq!(main.1, "Y", "owned by Y now");
+        let mut txids: Vec<String> = main.2.iter().map(|v| v.txid.clone()).collect();
+        txids.sort();
+        assert_eq!(txids, vec![t('1'), t('2'), t('3')]);
+        // Resolved: the transfer card is no version; Y's v2 is the newest.
+        let mut vs = main.2;
+        vs.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
+        let (offered, _) = resolve(vs).unwrap();
+        assert_eq!(offered[0].txid, t('3'));
+        assert!(offered.iter().all(|v| v.card.transfer_to.is_empty()));
+    }
+
+    #[test]
+    fn the_new_owners_version_is_no_copy_of_its_own_app() {
+        let by = group(vec![ver(&t('1'), "X", 10, A), ver(&t('2'), "X", 20, TO_Y), ver(&t('3'), "Y", 30, A2)]);
+        let apps: Vec<App> = follow_transfers(by).into_iter().filter_map(|(root, owner, mut vs)| {
+            vs.sort_by(|a, b| (b.height, b.position).cmp(&(a.height, a.position)));
+            resolve(vs).map(|(versions, withdrawn)| App { chain: chain(), root, owner, versions, removed: false, withdrawn })
+        }).collect();
+        assert_eq!(apps.len(), 1);
+        let all = comparable(&apps, |_| false);
+        assert!(lookalike(&apps[0].versions[0], &apps[0].root, &all).is_none(), "not flagged against its own earlier versions");
+        // Somebody else's same-name card later is still a copy.
+        let z = ver(&t('5'), "Z", 50, A2);
+        assert!(lookalike(&z, "Z", &all).is_some());
+    }
+
+    #[test]
+    fn transfers_chain_and_a_card_without_one_stays_alone() {
+        let to_z = r#"{"app":{"name":"Frog Pond","family":"frog-pond","transfer_to":"Z"}}"#;
+        let by = group(vec![ver(&t('1'), "X", 10, A), ver(&t('2'), "X", 20, TO_Y), ver(&t('3'), "Y", 30, to_z), ver(&t('4'), "Z", 40, A2)]);
+        let out = follow_transfers(by);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].0, "X");
+        assert_eq!(out[0].1, "Z");
+        assert_eq!(out[0].2.len(), 4);
+    }
+
+    fn chain() -> &'static ChainParams {
+        arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &arcade_chain::Hash256::ZERO)
     }
 }

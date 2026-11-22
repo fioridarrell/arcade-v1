@@ -33,6 +33,10 @@ pub struct Card {
     /// A withdrawal by the publisher (2026-11-21, Martin): a new version whose card says `"withdrawn": true`. No new
     /// record kind: it is published like any version, and the store reads it (arcaded appsvc).
     pub withdraw: Option<Withdraw>,
+    /// A transfer by the publisher (2026-11-21, Martin): a new version whose card says `"transfer_to": "<address>"` hands
+    /// the app to that address: its cards of the same name after this one are the app's next versions. No new record
+    /// kind, and the name is never free in between, so nobody can take it first.
+    pub transfer_to: String,
 }
 
 /// What a withdrawal card says: why, what replaces the app, and which versions it takes back (none listed: the whole
@@ -118,6 +122,7 @@ pub fn parse(json_text: &str) -> Option<Card> {
         tdeck: hex64(&d["tdeck"]),
         tdeck_icon: icon,
         minimized_timeout: minimized(d.get("minimized").unwrap_or(&Value::Null)),
+        transfer_to: text(&d["transfer_to"], 80),
         withdraw: (d["withdrawn"] == true).then(|| Withdraw {
             reason: text(&d["reason"], 280),
             replaced_by: text(&d["replaced_by"], 140),
@@ -137,6 +142,9 @@ impl Card {
         });
         if let Some(w) = &self.withdraw {
             v["withdrawn"] = json!({"reason": w.reason, "replaced_by": w.replaced_by, "versions": w.versions});
+        }
+        if !self.transfer_to.is_empty() {
+            v["transfer_to"] = json!(self.transfer_to);
         }
         v
     }

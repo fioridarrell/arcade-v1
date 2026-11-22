@@ -18,6 +18,8 @@ const APP_WINDOW_COMMANDS: &[&str] = &[
     "apps.node", "apps.owner", "apps.owner_send", "apps.perms", "apps.storage",
     // Spending allowances and the folder card (2026-11-21), sent by the window's own scripts, never by a page.
     "apps.allowance", "apps.allowance_use", "apps.folder_set", "folder.browse",
+    // arcade.apps.open (2026-11-22): the window checks the other app and opens it in its own window after a yes on its card.
+    "apps.open",
     "chains.list", "explorer.inscription", "explorer.ledger_inscription",
     "contacts.delete", "contacts.list", "contacts.save", "msg.who",
     // arcade.feed (the Feed app): reads, and posts, acts, follows and mutes behind the app's Feed switch (appwindow.js).
@@ -352,7 +354,7 @@ mod tests {
             }
         }
         assert!(asked > 40, "{asked}");
-        for cmd in ["wallet.approve", "wallet.deny", "realtime.poll"] {
+        for cmd in ["wallet.approve", "wallet.deny", "realtime.poll", "apps.open"] {
             assert!(window_may("app-00ff", cmd), "{cmd}");
         }
         // The rest is the main window's.

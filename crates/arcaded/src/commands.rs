@@ -420,6 +420,8 @@ cmds! {
     "apps.install" Admin "chain, txid" "Install an app (it follows its author's updates).";
     "apps.uninstall" Admin "id" "Uninstall an app.";
     "apps.star" Admin "chain, txid, on?" "Star or unstar an app (starred show first).";
+    "apps.rows" Public "q?, offset?, limit?" "The apps for app pages (GET /r/apps, arcade.apps.list): every app the App Store lists, by name, public card data only, from the kept copy of the apps (made at most every 15 s). Each row {id, chain, chain_name, txid (its newest card), name, version, category, about, by (the publisher's @tag or null), creator, owner, icon (the cover's address on this arcade, /app/<chain>/<txid>, or null), trust, installed}. Cards carry no screenshots. q matches name, about, category and @tag; at most 500 rows a call." => "{apps, total, more}";
+    "apps.open" Read "id, from? | page?" "What an app window needs to open another app (arcade.apps.open) in its own window, after the person says yes on the window's card: apps.launch's answer for the app with that id (one apps.rows lists). from: the asking app's id (or page: its page's txid); an app can't open itself." => "apps.launch's answer";
     "apps.card" Public "chain, txid" "One app: card, versions, comments, permission switches.";
     "apps.perms" Admin "id, set?" "An app's permission switches (wallet, contacts, groups, media, pictures, notify), its spending allowances: set {allowances: {<service>: ARCADE a day, or 0 to take it away}}, and its folder {granted, name} (never the path): set {folder: false} takes it away.";
     "apps.allowance" Read "id | page, service" "An app's spending allowance for a service: {per_day, spent_today, left, payments} in ARCADE, today (UTC).";
@@ -798,6 +800,8 @@ pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
     ("folder.read", "encoding", "text,base64", "\"text\"", 0),
     ("folder.write", "encoding", "text,base64", "\"text\"", 0),
     ("apps.folder_log", "limit", "", "500", 500),
+    ("apps.rows", "limit", "", "100", 500),
+    ("apps.rows", "offset", "", "0", 0),
     ("inscribe.estimate", "encoding", "text,base64", "\"text\"", 0),
     ("explorer.arc_segments", "limit", "", "", 500),
     ("explorer.arc_holders", "limit", "", "", 500),

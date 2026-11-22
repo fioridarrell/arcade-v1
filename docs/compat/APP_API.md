@@ -229,6 +229,20 @@ until the person picks a folder. The page never learns the folder's path, only i
   folder.write, folder.mkdir and folder.remove with the app's `id` and the same arguments (`encoding` for as).
 - The website's arcade.folder (the browser's File System Access API) is a later step.
 
+## B3c. /r/apps.js → arcade.apps (V1.0, 2026-11-22)
+The apps on this arcade, for any app that lists or opens other apps (an assistant, a launcher). No app is named.
+- list(o?) → [{id, chain, chain_name, txid (its newest card), name, version, category, about, by (publisher's @tag or
+  null), creator, owner, icon (/app/<chain>/<txid> of its cover, or null), trust (green|yellow), installed}]: every app
+  the App Store lists (not removed, withdrawn or held back as a lookalike), by name. o = {q, offset, limit}: q matches
+  name, about, category and @tag; 100 rows by default, at most 500. page(o?) → {apps, total, more}.
+- Route: GET /r/apps?q=&offset=&limit= (public card data, with or without a pass; socket: apps.rows). Made once per
+  kept copy of the apps (at most every 15 s), never a walk of the store per request.
+- open(id) → {opened, title}: the window shows "<this app> wants to open <that app>" (Allow / No; one arcade's word and a
+  withdrawal are said on it), then opens it in its own window as Apps does. Refused: its own app ("an app can't open
+  itself"), an id the store doesn't list ("no app with that id on this arcade"), No ("declined"), another open question
+  ("busy: ..."). The window asks the arcade with apps.open {id, from, page}.
+- Cards carry no screenshots, so rows have none; the icon is the only picture.
+
 ## B3. /r/groups.js → arcade.groups (timeout 120 s "no viewer is listening, or the wallet is still locked")
 - list() → {me, groups:[{id, name, room, members:[{tag, address}]}]}; read(id, {after, limit}) → lines oldest first
   [{txid, when, height, mine, from, text}] (after 0, limit 200); send(id, text) → {txid, fee}; leave(id) (600 s) →

@@ -390,6 +390,8 @@ pub struct Cache {
     /// (copy id, flags epoch, flags): one made at a time.
     flags: Mutex<Option<(u64, u64, Arc<BTreeMap<String, String>>)>>,
     flags_epoch: std::sync::atomic::AtomicU64,
+    /// The page rows (/r/apps, [`page_rows`]) of one copy and its flags: made once per copy.
+    rows: Mutex<Option<(u64, Arc<BTreeMap<String, String>>, Arc<Vec<Value>>)>>,
 }
 
 /// Marks the copy being made as no longer being made if making it panicked, so the callers waiting for it don't wait forever.
@@ -1204,6 +1206,108 @@ pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     }))
 }
 
+// ---------------- arcade.apps: the apps for app pages (2026-11-22) ----------------
+//
+// An app page lists the arcade's apps (GET /r/apps, arcade.apps.list) and asks its window to open one (arcade.apps.open:
+// the window asks the person, then apps.open). Public card data only, made once per kept copy of the apps (never a walk
+// of the store per request), and bounded. Cards carry an icon (`cover`) and no screenshots.
+
+/// Rows a page gets at most in one answer, and by default.
+pub const PAGE_ROWS_MAX: usize = 500;
+pub const PAGE_ROWS_DEFAULT: usize = 100;
+
+/// The rows of every app the store lists (not removed, not withdrawn, not held back as a lookalike), by name: {id, chain,
+/// chain_name, txid (its newest card), name, version, category, about, by (the publisher's @tag or null), creator, owner,
+/// icon (the cover's address on this arcade, or null), trust}. `tag`: an app's publisher's @tag.
+fn page_rows_of(apps: &[App], fl: &BTreeMap<String, String>, tag: impl Fn(&App) -> Option<String>) -> Vec<Value> {
+    let mut out: Vec<Value> = apps
+        .iter()
+        .filter(|a| !a.removed && a.withdrawn.is_none())
+        .filter(|a| !fl.get(&a.versions[0].txid).is_some_and(|f| f.starts_with("flagged") || f == "confirmed"))
+        .map(|a| {
+            let n = &a.versions[0];
+            let c = &n.card;
+            json!({
+                "id": app_id(a.chain.key, &a.root, &c.key()), "chain": a.chain.key, "chain_name": a.chain.name, "txid": n.txid,
+                "name": c.name, "version": c.version, "category": c.category, "about": c.description,
+                "by": tag(a), "creator": n.creator, "owner": a.owner,
+                "icon": (!c.cover.is_empty()).then(|| format!("/app/{}/{}", a.chain.key, c.cover)),
+                "trust": n.trust.as_str(),
+            })
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        let k = |v: &Value| (v["name"].as_str().unwrap_or("").to_lowercase(), v["id"].as_str().unwrap_or("").to_string());
+        k(a).cmp(&k(b))
+    });
+    out
+}
+
+/// [`page_rows_of`] for this arcade's kept copy of the apps, made once per copy and flags.
+fn page_rows(node: &Node) -> Arc<Vec<Value>> {
+    let snap = gather(node);
+    let fl = flags_of(node, &snap);
+    let mut kept = node.apps_cache.rows.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((id, f, rows)) = &*kept {
+        if *id == snap.id && Arc::ptr_eq(f, &fl) {
+            return rows.clone();
+        }
+    }
+    let rows = Arc::new(page_rows_of(&snap.apps, &fl, |a| creator_tag(node, a.chain, &a.versions[0].creator)));
+    *kept = Some((snap.id, fl, rows.clone()));
+    rows
+}
+
+/// The rows a page asked for: those matching `q` (name, about, category, publisher's tag; "" all), from `offset`, at most
+/// `limit` (capped at [`PAGE_ROWS_MAX`]), each with `installed` (installed here). {apps, total (matching), more}.
+fn page_list_of(rows: &[Value], installed: &BTreeSet<String>, q: &str, offset: usize, limit: usize) -> Value {
+    let q = q.trim().to_lowercase();
+    let hit = |r: &&Value| {
+        q.is_empty() || ["name", "about", "category", "by"].iter().any(|k| r[*k].as_str().is_some_and(|s| s.to_lowercase().contains(&q)))
+    };
+    let found: Vec<&Value> = rows.iter().filter(hit).collect();
+    let limit = limit.clamp(1, PAGE_ROWS_MAX);
+    let page: Vec<Value> = found.iter().skip(offset).take(limit).map(|r| {
+        let mut r = (*r).clone();
+        r["installed"] = json!(r["id"].as_str().is_some_and(|i| installed.contains(i)));
+        r
+    }).collect();
+    json!({"apps": page, "total": found.len(), "more": found.len() > offset.saturating_add(page.len())})
+}
+
+/// The apps for app pages (GET /r/apps, apps.rows): see [`page_list_of`].
+pub fn page_list(node: &Node, q: &str, offset: usize, limit: usize) -> Value {
+    let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
+    page_list_of(&page_rows(node), &installed, q, offset, limit)
+}
+
+/// Which app an app page may open (arcade.apps.open): one the store lists, never itself (`from`: the asking app's id).
+/// (chain, txid) of its newest card, or why not.
+fn open_target(rows: &[Value], id: &str, from: &str) -> Result<(String, String), String> {
+    let id = id.trim();
+    if id.is_empty() {
+        return Err("which app? give its id (from arcade.apps.list)".into());
+    }
+    if !from.is_empty() && id == from {
+        return Err("an app can't open itself: it is already open".into());
+    }
+    let r = rows.iter().find(|r| r["id"] == id).ok_or("no app with that id on this arcade")?;
+    Ok((r["chain"].as_str().unwrap_or("").to_string(), r["txid"].as_str().unwrap_or("").to_string()))
+}
+
+/// apps.open: what the window of app `from` (its id; or `page`, its page's txid) needs to open app `id` in its own window
+/// (apps.launch's answer), after the person said yes there. Refused for the asking app itself and for an id the store
+/// doesn't list.
+pub fn open(node: &Node, id: &str, from: &str, page: &str) -> Result<Value, String> {
+    let from = if from.is_empty() && !page.is_empty() {
+        of_page(node, page).and_then(|a| a["id"].as_str().map(String::from)).unwrap_or_default()
+    } else {
+        from.to_string()
+    };
+    let (chain, txid) = open_target(&page_rows(node), id, &from)?;
+    launch(node, &chain, &txid)
+}
+
 // ---------------- arcade.storage: saves per app page (the original's pagestore limits) ----------------
 
 const MAX_KEY: usize = 256;
@@ -1586,6 +1690,75 @@ mod allowance_tests {
         assert!(set_perms(n, id, &json!({"allowances": {"models": 1e9}})).is_err());
         // The other switches are untouched.
         assert_eq!(perms(n, id)["wallet"], false);
+    }
+}
+
+#[cfg(test)]
+mod page_rows_tests {
+    use super::*;
+
+    fn chain() -> &'static ChainParams {
+        arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &arcade_chain::Hash256::ZERO)
+    }
+    fn app(name: &str, creator: &str, txid: char, extra: &str) -> App {
+        let card = cards::parse(&format!(r#"{{"app":{{"name":"{name}","description":"About {name}","version":"1"{extra}}}}}"#)).unwrap();
+        let v = Ver { txid: txid.to_string().repeat(64), number: 1, creator: creator.into(), height: 1, position: 0, card,
+                      trust: crate::vouch::Level::Green, holders: 0, checked: true };
+        App { chain: chain(), root: creator.into(), owner: creator.into(), versions: vec![v], removed: false, withdrawn: None }
+    }
+
+    #[test]
+    fn rows_list_what_the_store_lists_by_name() {
+        let cover = "c".repeat(64);
+        let mut gone = app("Gone", "x", '3', "");
+        gone.removed = true;
+        let mut away = app("Away", "x", '4', "");
+        away.withdrawn = Some(json!({"reason": "old"}));
+        let apps = vec![app("zebra", "x", '1', ""), app("Atlas", "y", '2', &format!(r#","cover":"{cover}""#)), gone, away, app("Copy", "z", '5', "")];
+        let fl = BTreeMap::from([("5".repeat(64), "flagged: looks like Atlas".to_string())]);
+        let rows = page_rows_of(&apps, &fl, |a| (a.root == "y").then(|| "maker".to_string()));
+        let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+        assert_eq!(names, ["Atlas", "zebra"], "removed, withdrawn and held-back apps are not listed");
+        let a = &rows[0];
+        assert_eq!(a["id"], app_id(chain().key, "y", "atlas"));
+        assert_eq!(a["txid"], "2".repeat(64));
+        assert_eq!(a["by"], "maker");
+        assert_eq!(a["about"], "About Atlas");
+        assert_eq!(a["icon"], format!("/app/{}/{cover}", chain().key));
+        assert_eq!(rows[1]["icon"], Value::Null);
+        assert_eq!(rows[1]["by"], Value::Null);
+        assert!(a.get("screenshots").is_none(), "cards carry no screenshots");
+        // Search, installed, paging and the cap.
+        let installed = BTreeSet::from([a["id"].as_str().unwrap().to_string()]);
+        let l = page_list_of(&rows, &installed, "MAKER", 0, 10);
+        assert_eq!((l["total"].clone(), l["apps"][0]["installed"].clone(), l["more"].clone()), (json!(1), json!(true), json!(false)));
+        let l = page_list_of(&rows, &installed, "", 0, 1);
+        assert_eq!((l["apps"].as_array().unwrap().len(), l["more"].clone(), l["total"].clone()), (1, json!(true), json!(2)));
+        assert_eq!(page_list_of(&rows, &installed, "", 1, 1)["apps"][0]["installed"], false);
+        let many: Vec<Value> = (0..PAGE_ROWS_MAX + 20).map(|i| json!({"id": i.to_string(), "name": "n"})).collect();
+        assert_eq!(page_list_of(&many, &BTreeSet::new(), "", 0, usize::MAX)["apps"].as_array().unwrap().len(), PAGE_ROWS_MAX);
+    }
+
+    #[test]
+    fn opening_refuses_itself_and_unknown_apps() {
+        let rows = page_rows_of(&[app("Atlas", "y", '2', ""), app("Notes", "x", '1', "")], &BTreeMap::new(), |_| None);
+        let atlas = rows[0]["id"].as_str().unwrap();
+        let notes = rows[1]["id"].as_str().unwrap();
+        assert_eq!(open_target(&rows, atlas, notes).unwrap(), (chain().key.to_string(), "2".repeat(64)));
+        assert!(open_target(&rows, atlas, atlas).unwrap_err().contains("can't open itself"));
+        assert!(open_target(&rows, "pep:nobody:nothing", notes).unwrap_err().contains("no app with that id"));
+        assert!(open_target(&rows, " ", notes).unwrap_err().contains("which app"));
+    }
+
+    /// The node's own rows: made once per copy of the apps.
+    #[test]
+    fn the_nodes_rows_are_kept() {
+        let t = crate::sitesvc::tests::setup();
+        let n = &t.node;
+        assert!(Arc::ptr_eq(&page_rows(n), &page_rows(n)));
+        let l = page_list(n, "", 0, PAGE_ROWS_DEFAULT);
+        assert!(l["apps"].is_array() && l["total"].is_u64(), "{l}");
+        assert!(open(n, "pep:nobody:nothing", "", "").unwrap_err().contains("no app with that id"));
     }
 }
 

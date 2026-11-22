@@ -26,25 +26,40 @@ use arcade_arc::params::{Net, RANGE};
 use arcade_arc::segment::{self, Rooter, Span};
 use arcade_chain::Reader;
 use arcade_chain::params::ChainParams;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 /// Most items kept waiting here.
 const MAX_ITEMS: usize = 500;
 /// Each peer is sent the waiting items this often (and when there are new ones).
-const SEND_EVERY: Duration = Duration::from_secs(30);
+/// Every waiting item goes to each peer again this often (new ones go at once): a peer that lost some (a link that
+/// ended mid-send) gets them back.
+const SEND_ALL_EVERY: Duration = Duration::from_secs(600);
 /// A range is measured only this many blocks below its chain's tip.
 const SETTLED: u32 = 100;
 
 struct Pool {
     items: Vec<(Vec<u8>, Item)>,
-    /// Bumped on every new item: a peer told an older number is sent them again.
+    /// The items' hashes, for telling a new one from one kept (was a byte compare with every item, under this lock).
+    keys: BTreeSet<Hash>,
+    /// Bumped on every new item: a peer told an older number is sent what it hasn't had.
     version: u64,
-    told: BTreeMap<String, (u64, Instant)>,
+    /// Per peer: the version it was last told, when it was last sent everything, and the items sent since.
+    told: BTreeMap<String, Told>,
 }
 
-static POOL: Mutex<Pool> = Mutex::new(Pool { items: Vec::new(), version: 0, told: BTreeMap::new() });
+struct Told {
+    version: u64,
+    all_at: Instant,
+    sent: HashSet<Hash>,
+}
+
+static POOL: Mutex<Pool> = Mutex::new(Pool { items: Vec::new(), keys: BTreeSet::new(), version: 0, told: BTreeMap::new() });
+
+fn key(e: &[u8]) -> Hash {
+    arcade_arc::merkle::leaf_hash(e)
+}
 
 fn encoded(item: &Item) -> Vec<u8> {
     let mut v = Vec::new();
@@ -55,10 +70,12 @@ fn encoded(item: &Item) -> Vec<u8> {
 /// Keep `item` until a block holds it. Whether it was new.
 pub fn add(item: Item) -> bool {
     let e = encoded(&item);
+    let k = key(&e);
     let mut p = POOL.lock().unwrap();
-    if p.items.iter().any(|(x, _)| *x == e) || p.items.len() >= MAX_ITEMS {
+    if p.keys.contains(&k) || p.items.len() >= MAX_ITEMS {
         return false;
     }
+    p.keys.insert(k);
     p.items.push((e, item));
     p.version += 1;
     true
@@ -71,8 +88,10 @@ pub fn waiting() -> Vec<Item> {
 
 /// A block holds these, or the chain will never take them: they stop waiting.
 pub fn forget(gone: &[Item]) {
-    let gone: Vec<Vec<u8>> = gone.iter().map(encoded).collect();
-    POOL.lock().unwrap().items.retain(|(e, _)| !gone.contains(e));
+    let gone: HashSet<Hash> = gone.iter().map(|i| key(&encoded(i))).collect();
+    let mut p = POOL.lock().unwrap();
+    p.items.retain(|(e, _)| !gone.contains(&key(e)));
+    p.keys.retain(|k| !gone.contains(k));
 }
 
 /// The most item bytes in one "it" frame: under the mesh's 64 KB frame limit with room for the frame's head. One
@@ -88,16 +107,32 @@ pub fn due_for(peer: &str) -> Vec<Vec<u8>> {
         return Vec::new();
     }
     let v = p.version;
-    let due = p.told.get(peer).is_none_or(|(seen, at)| *seen != v || at.elapsed() >= SEND_EVERY);
-    if !due {
-        return Vec::new();
+    let now = Instant::now();
+    // What this peer hasn't had: new items since it was last told, and everything again every SEND_ALL_EVERY (2026-11-22:
+    // the whole pool went to every peer every 30 s, megabytes on a slow link, and its thread sat in the writes until
+    // the peer gave up on it; the GX10's links ended one after another).
+    let all = match p.told.get(peer) {
+        None => true,
+        Some(t) if now.duration_since(t.all_at) >= SEND_ALL_EVERY => true,
+        Some(t) if t.version == v => return Vec::new(),
+        Some(_) => false,
+    };
+    let picked: Vec<(Hash, Vec<u8>)> = {
+        let sent = p.told.get(peer).map(|t| &t.sent);
+        p.items.iter().map(|(e, _)| (key(e), e)).filter(|(k, _)| all || !sent.is_some_and(|s| s.contains(k))).map(|(k, e)| (k, e.clone())).collect()
+    };
+    let t = p.told.entry(peer.to_string()).or_insert_with(|| Told { version: v, all_at: now, sent: HashSet::new() });
+    t.version = v;
+    if all {
+        t.all_at = now;
+        t.sent.clear();
     }
-    p.told.insert(peer.to_string(), (v, Instant::now()));
+    t.sent.extend(picked.iter().map(|(k, _)| *k));
     let mut out: Vec<Vec<u8>> = Vec::new();
-    for (e, _) in &p.items {
+    for (_, e) in picked {
         match out.last_mut() {
-            Some(last) if last.len() + e.len() <= ITEMS_FRAME => last.extend_from_slice(e),
-            _ => out.push(e.clone()),
+            Some(last) if last.len() + e.len() <= ITEMS_FRAME => last.extend_from_slice(&e),
+            _ => out.push(e),
         }
     }
     out
@@ -828,11 +863,17 @@ mod tests {
         let a = entry(0, 1);
         assert!(add(a.clone()));
         assert!(!add(a.clone()), "the same item once");
-        assert!(!due_for("peer-x").is_empty());
-        assert!(due_for("peer-x").is_empty(), "not again until something changes or 30 s pass");
+        let has = |blobs: &[Vec<u8>], i: &Item| {
+            let e = encoded(i);
+            blobs.iter().any(|b| b.windows(e.len()).any(|w| w == e.as_slice()))
+        };
+        assert!(has(&due_for("peer-x"), &a));
+        // (Other tests share the pool and may add items meanwhile: what matters is that `a` isn't sent again.)
+        assert!(!has(&due_for("peer-x"), &a), "an item a peer has had isn't sent again (until SEND_ALL_EVERY)");
         let b = entry(RANGE, 2);
         add(b.clone());
-        assert!(!due_for("peer-x").is_empty(), "a new item: sent again");
+        let next = due_for("peer-x");
+        assert!(has(&next, &b) && !has(&next, &a), "a new item goes, alone: the ones it had stay unsent");
         forget(&[a.clone(), b.clone()]);
         assert!(!waiting().contains(&a) && !waiting().contains(&b));
         // Unsigned items from a peer are not kept.

@@ -641,11 +641,22 @@ impl ChainDb {
         // Scratch an earlier run left is of no use: its sorts and the derivation start over.
         let _ = std::fs::remove_dir_all(tmp);
         let tip = self.tip(c)?.ok_or_else(|| err("connect genesis first"))?;
-        // The target: fixed when the build starts, so a restart builds the same blocks.
-        let (to, target) = match self.state_text(c, INIT_TO)?.and_then(|s| {
+        // The target: fixed when the build starts, so a restart builds the same blocks; unless
+        // the best header chain has left it since (a reorg between rounds): then the build
+        // starts over for the new chain's target.
+        let fixed = self.state_text(c, INIT_TO)?.and_then(|s| {
             let (h, x) = s.split_once(':')?;
             Some((h.parse::<u32>().ok()?, Hash256::from_hex(x).ok()?))
-        }) {
+        });
+        let fixed = match fixed {
+            Some((to, target)) if !self.init_on_best(c, to, &target)? => {
+                self.init_retarget(params, tip.height, to, &target)?;
+                self.set_state_text(c, INIT_NOTE, Some(&format!("the best header chain left the build's target at {to}; the build starts over")))?;
+                None
+            }
+            t => t,
+        };
+        let (to, target) = match fixed {
             Some(t) => t,
             None => {
                 let path = self.init_path(c)?;
@@ -737,7 +748,7 @@ impl ChainDb {
             let n = (r.done_to + 1).saturating_sub(rules_from) as u64;
             self.init_timed(c, &mut out, format!("build rules: {n} blocks checked (heights {rules_from}..{}) in {} · {} blocks/s", r.done_to, took(d), per_s(n, d)))?;
             if r.broken_count > 0 {
-                return self.init_refused(params, &r, out);
+                return self.init_refused(params, &r, out, (tip.height, to, &target));
             } else if r.no_body > 0 || r.no_coin > 0 {
                 first_err = Some(err(format!("the rules check could not read {} blocks and {} spent coins", r.no_body, r.no_coin)));
             } else if r.done_to < to {
@@ -818,7 +829,8 @@ impl ChainDb {
     /// forgotten) and the phase goes back to blocks to fetch it again, from whichever source;
     /// the build then starts over from its first step (heights and the tx index name block
     /// numbers). A block refused again after that is the chain's own: InvalidBlock.
-    fn init_refused(&self, params: &ChainParams, r: &crate::rules::Report, mut out: Built) -> Result<Built> {
+    /// `at`: the build's tip, height and target (what step 1 joined, undone here).
+    fn init_refused(&self, params: &ChainParams, r: &crate::rules::Report, mut out: Built, at: (u32, u32, &Hash256)) -> Result<Built> {
         let c = params.chain_no;
         let mut again: HashSet<String> = self.state_text(c, INIT_REFETCHED)?.map(|s| s.split(',').filter(|x| !x.is_empty()).map(String::from).collect()).unwrap_or_default();
         let (h, hash, why) = r.broken.first().cloned().unwrap_or_default();
@@ -836,11 +848,59 @@ impl ChainDb {
         let mut v: Vec<String> = again.into_iter().collect();
         v.sort();
         self.set_state_text(c, INIT_REFETCHED, Some(&v.join(",")))?;
-        self.set_state_text(c, INIT_BUILT, None)?;
+        // The next build fixes its target and checks the rules afresh (the best header chain
+        // may move while the blocks are fetched again): what step 1 joined is undone, and the
+        // target, the rules' resume point and the steps built are forgotten.
+        self.init_retarget(params, at.0, at.1, at.2)?;
         self.set_state_text(c, INIT_NOTE, Some(&format!("the rules refused {} blocks, the first at {h}: {why}; dropped, to be fetched again", hashes.len())))?;
         self.set_init_phase(c, Phase::Blocks)?;
         out.refetch = hashes.len();
         Ok(out)
+    }
+
+    /// Whether `target` (at height `to`) is on the best header chain.
+    fn init_on_best(&self, c: u16, to: u32, target: &Hash256) -> Result<bool> {
+        let Some(best) = self.best_header(c)? else { return Ok(false) };
+        self.store(c).read(|r| {
+            let mut h = best;
+            loop {
+                let Some(rec) = header_rec(r, c, &h)? else { return Ok(false) };
+                if rec.height <= to {
+                    return Ok(rec.height == to && h == *target);
+                }
+                h = rec.header.prev;
+            }
+        })
+    }
+
+    /// The build's target is given up (the best header chain left it, or blocks were refused):
+    /// forget the target, the rules' resume point and the steps built, and undo what step 1
+    /// joined along the old path (its heights and main-chain marks), so the next build starts
+    /// from nothing for whatever target it fixes.
+    fn init_retarget(&self, params: &ChainParams, tip: u32, old_to: u32, old_target: &Hash256) -> Result<()> {
+        let c = params.chain_no;
+        if self.built(c)?.contains("main") {
+            let old = self.path_down(c, tip + 1, old_to, old_target)?;
+            for chunk in old.chunks(50_000) {
+                self.wstore(c)?.write(|w| {
+                    for h in chunk {
+                        let Some(mut rec) = header_rec(w, c, h)? else { continue };
+                        if w.get(HEIGHT, &k_height(c, rec.height))?.is_some_and(|v| v[..32] == h.0) {
+                            w.del(HEIGHT, &k_height(c, rec.height))?;
+                        }
+                        if rec.status == STATUS_MAIN {
+                            rec.status = STATUS_HEADER;
+                            w.put(HEADERS, &k_header(c, &h.0), &rec.index_value())?;
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+        }
+        for k in [INIT_TO, INIT_RULES_TO, INIT_BUILT] {
+            self.set_state_text(c, k, None)?;
+        }
+        Ok(())
     }
 
     /// Forget a stored block's body (its rows, its tx index rows, its height row); its header stays.

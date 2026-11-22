@@ -516,6 +516,10 @@ fn a_block_the_rules_refuse_is_fetched_again_once_then_the_build_stops() {
     assert_eq!(db.stored_b(c, &blocks[7].hash()).unwrap(), Some(0), "its body was dropped");
     assert_eq!(db.init_missing(c).unwrap(), vec![blocks[7].hash()]);
     assert!(db.init_built(c).is_empty(), "the build starts over");
+    // ...with a target fixed afresh and the rules checked afresh, the old join undone.
+    assert_eq!(db.state_text(c, INIT_TO).unwrap(), None);
+    assert_eq!(db.state_text(c, INIT_RULES_TO).unwrap(), None);
+    assert!(table(&db, HEIGHT).len() <= 1, "only genesis keeps a height row");
     assert_eq!(db.tip(c).unwrap().unwrap().height, 0);
     assert!(table(&db, OUTPUTS).is_empty(), "no coin is written before the rules pass");
     // Fetched again (the same block: it is the chain's own), refused again: the build stops.
@@ -728,4 +732,42 @@ fn a_stored_block_whose_header_we_lack_is_refused_not_checked_at_height_0() {
     let e = crate::coreimport::check_stored_block(&db, p, &blocks[2].encode()).unwrap_err().to_string();
     assert!(e.contains("not in our header chain"), "{e}");
     assert!(crate::coreimport::check_stored_block(&db, p, &blocks[1].encode()).is_ok());
+}
+
+#[test]
+fn a_build_target_the_best_chain_left_is_given_up_and_its_join_undone() {
+    let blocks = chain(12);
+    let p = params(&blocks[0], |_| {});
+    let c = p.chain_no;
+    let mut fork = blocks[..=8].to_vec();
+    for h in 9..=13 {
+        let prev = fork.last().unwrap().hash();
+        fork.push(mine(prev, &[coinbase(900 + h, None, false)], h));
+    }
+    let d = tempfile::tempdir().unwrap();
+    let r = reference(d.path(), p, &fork);
+    let db = open(d.path());
+    stored_all(&db, p, &blocks);
+    // A build that fixed its target on the old chain and joined it (step 1), then stopped.
+    let old: Vec<Hash256> = blocks[1..].iter().map(|b| b.hash()).collect();
+    db.join_main(p, &old, 0).unwrap();
+    db.set_state_text(c, INIT_TO, Some(&format!("12:{}", blocks[12].hash().to_hex()))).unwrap();
+    db.set_state_text(c, INIT_BUILT, Some("main")).unwrap();
+    db.set_state_text(c, INIT_RULES_TO, Some("5")).unwrap();
+    // The best header chain moves to the branch, whose blocks are stored.
+    let mut f = Src::new(&fork);
+    assert_eq!(round(&db, p, &mut [("f", &mut f)]).height, 13);
+    db.init_fetch_blocks(p, &mut [&mut f as &mut dyn BlockSource], 3, &AtomicBool::new(false)).unwrap();
+    db.set_init_phase(c, Phase::Build).unwrap();
+    let built = build(&db, p, &d.path().join("tmp"), 0);
+    assert_eq!(built.height, 13);
+    assert_eq!(db.tip(c).unwrap().unwrap().hash, fork[13].hash());
+    assert_eq!(db.coin_totals(c).unwrap(), r.coin_totals(c).unwrap());
+    // The old branch's blocks are no longer marked main or named by a height.
+    for b in &blocks[9..=12] {
+        assert_ne!(db.header(c, &b.hash()).unwrap().unwrap().status, STATUS_MAIN, "{}", b.hash());
+    }
+    for h in 1..=13 {
+        assert_eq!(db.hash_at(c, h).unwrap(), Some(fork[h as usize].hash()));
+    }
 }

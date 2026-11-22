@@ -133,6 +133,9 @@ pub const MIN_AGREE: usize = 3;
 /// much work at each height, and overtakes).
 pub const SIDE_BUDGET: u32 = if cfg!(test) { 50 } else { 20_000 };
 
+/// low_work_branch keeps the best header chain's header at every WORK_STEP-th height.
+const WORK_STEP: u32 = if cfg!(test) { 4 } else { 1_000 };
+
 /// Header bytes a source may send in one headers round, on average, for each new header of
 /// ours it brings (header, AuxPoW proof and count byte as they arrive), on top of
 /// [`HEADER_BYTES_SLACK`]. A plain header is 81 bytes. An AuxPoW one carries its parent's
@@ -475,8 +478,8 @@ impl ChainDb {
         let mut a = Agreement::default();
         let back = self.init_locator(c)?;
         let mut failed: HashMap<String, String> = HashMap::new();
-        // The best header chain's work by height, for the best header it was taken at.
-        let mut works: Option<(Hash256, Vec<arcade_chain::pow::U256>)> = None;
+        // The best header chain's headers at sampled heights, for the best header they were taken at.
+        let mut works: Option<(Hash256, Vec<Hash256>)> = None;
         for (key, src) in sources.iter_mut() {
             let mut loc = Located { inner: &mut **src, db: self, c, back: &back, p, last: None, bytes: 0 };
             let mut side = 0u32;
@@ -552,9 +555,11 @@ impl ChainDb {
     }
 
     /// Whether `last` (a stored header) is on a branch with less work than the best header chain
-    /// at its height (or, past the best header, less work than it). `works` caches the best
-    /// chain's work by height for the best header it was taken at.
-    fn low_work_branch(&self, c: u16, last: &Hash256, works: &mut Option<(Hash256, Vec<arcade_chain::pow::U256>)>) -> Result<bool> {
+    /// at its height (or, past the best header, less work than it). `works` caches, for the
+    /// best header it was taken at, the best chain's header at every [`WORK_STEP`]th height: a
+    /// height's work is read by walking down at most that many headers from the next sample.
+    /// (Holding every height's work took 32 bytes a height: ~0.8 GB on DigiByte's 24.5 M.)
+    fn low_work_branch(&self, c: u16, last: &Hash256, works: &mut Option<(Hash256, Vec<Hash256>)>) -> Result<bool> {
         let Some(best) = self.best_header(c)? else { return Ok(false) };
         if best == *last {
             return Ok(false);
@@ -564,21 +569,37 @@ impl ChainDb {
             return Ok(rec.work < brec.work);
         }
         if works.as_ref().is_none_or(|(b, _)| *b != best) {
-            let mut v = vec![arcade_chain::pow::U256::ZERO; brec.height as usize + 1];
+            let mut v = vec![Hash256::ZERO; (brec.height / WORK_STEP) as usize + 1];
             self.store(c).read(|r| {
-                let mut x = brec.clone();
+                let (mut h, mut x) = (best, brec.clone());
                 loop {
-                    v[x.height as usize] = x.work;
+                    if x.height % WORK_STEP == 0 {
+                        v[(x.height / WORK_STEP) as usize] = h;
+                    }
                     if x.height == 0 {
                         break;
                     }
-                    x = header_rec(r, c, &x.header.prev)?.ok_or_else(|| err("a header's parent is missing"))?;
+                    h = x.header.prev;
+                    x = header_rec(r, c, &h)?.ok_or_else(|| err("a header's parent is missing"))?;
                 }
                 Ok(())
             })?;
             *works = Some((best, v));
         }
-        Ok(works.as_ref().is_some_and(|(_, v)| rec.work < v[rec.height as usize]))
+        let samples = &works.as_ref().expect("set above").1;
+        // The sample at or above rec's height (the best header itself above the last sample).
+        let i = rec.height.div_ceil(WORK_STEP) as usize;
+        let mut x = match samples.get(i) {
+            Some(s) if i as u32 * WORK_STEP <= brec.height => self.header(c, s)?.ok_or_else(|| err("a sampled header is missing"))?,
+            _ => brec,
+        };
+        self.store(c).read(|r| {
+            while x.height > rec.height {
+                x = header_rec(r, c, &x.header.prev)?.ok_or_else(|| err("a header's parent is missing"))?;
+            }
+            Ok(())
+        })?;
+        Ok(rec.work < x.work)
     }
 
     /// Store a batch a source sent for `wanted` (store-only, any order): each block must be one

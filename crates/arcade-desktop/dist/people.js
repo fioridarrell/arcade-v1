@@ -42,7 +42,7 @@
     const pr = p.profile || {};
     return [
       h("div", { class: "pp-prof" }, avatar(p), h("div", {}, h("div", { class: "name" }, pr.n || (p.tag ? "@" + p.tag : "No name yet")), h("div", { class: "pp-tag" }, p.tag ? "@" + p.tag : p.address))),
-      h("div", { class: "row", style: "margin:8px 0 0" }, h("span", { class: "s" }, "Home chain"), homePill(p.from_home ? { chain: p.from_home.chain, key: "", via: "profile" } : { chain: "ARCADE", key: "arctest", via: "A://" })),
+      h("div", { class: "row", style: "margin:8px 0 0" }, h("span", { class: "s" }, "Published on"), homePill(p.from_home ? { chain: p.from_home.chain, key: "", via: "profile" } : { chain: "ARCADE", key: "arctest", via: "A://" })),
       pr.b ? h("p", { class: "s" }, pr.b) : "",
       pr.u ? h("p", { class: "s" }, pr.u) : "",
       h("div", { class: "pp-stats" },

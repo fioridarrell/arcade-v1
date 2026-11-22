@@ -530,7 +530,7 @@ pub fn start_now(node: &Arc<Node>, key: &str) -> Result<Value, String> {
         return Err(format!("{key} isn't waiting in the queue"));
     }
     if home_syncing(node) {
-        return Err(format!("{} is this arcade's home chain and is still catching up; it can't be paused, and other chains start once it has caught up", node.params.name));
+        return Err(format!("{} is still catching up; it can't be paused, and other chains start once it has caught up", node.params.name));
     }
     if let Some(p) = arcade_syncing() {
         return Err(format!("the {} chain is still catching up; it can't be paused, and other chains start once it has caught up", p.name));
@@ -990,14 +990,14 @@ pub fn remove_index(node: &Arc<Node>, key: &str, index: &str) -> Result<Value, S
         return Err(format!("the ord index on {} is being rebuilt; remove {index} when it's done", p.name));
     }
     if home && index == "messages" {
-        return Err("messaging lives on the home chain, so its Messages index stays".into());
+        return Err(format!("messaging lives on {}, so its Messages index stays", node.params.name));
     }
     if home && index == "ledger" {
-        return Err("the home chain's ledger holds your @handle and claims, so it stays".into());
+        return Err(format!("the ledger of {} holds your @handle and claims, so it stays", node.params.name));
     }
     if index == "addresses" {
         if home {
-            return Err("the home chain keeps its addresses: the wallet and faucet need its coins".into());
+            return Err(format!("{} keeps its addresses: the wallet and faucet need its coins", node.params.name));
         }
         if !cur.iter().any(|i| i == "addresses") {
             return Err(format!("addresses is not on {key}"));

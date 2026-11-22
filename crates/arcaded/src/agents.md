@@ -28,7 +28,7 @@ A command a key may not call answers `403` with code `forbidden`. It is still li
 ## Chains, units, decimals
 
 - `chain` is a chain key: `arctest` (ARCADE testnet), `arc`, `peptest`, `pep`, `doge`, `dgb`, and so on. `chains.list` names them all.
-- Leave `chain` out and the home chain is used. The answer's `chain` (and `chain_note`) says which one.
+- Leave `chain` out and the command's default is used (Pepecoin testnet for most). The answer's `chain` (and `chain_note`) says which one.
 - Amounts are integers in the chain's smallest unit (satoshis). Answers say `decimals` (8) and `unit`. 1 ARCADE = 100000000.
 - Explorer and status reads say where they were answered from in `source`:
   - `local`: this arcade's own copy;
@@ -48,7 +48,7 @@ The web API answers `{"ok": true, "result": ...}` or `{"ok": false, "error": "..
 - `unknown_chain`, `not_installed`
 - `insufficient_funds`, `not_enough_arcade`
 - `client_ref_used`
-- `starting`, `stopping` (503 with `Retry-After`: retry, the arcade is opening or closing its chains)
+- `starting`, `stopping` (503 with `Retry-After`: retry, the arcade is opening or closing its chains; `starting` also answers a send on the ARCADE chain before that chain can be reached here, with `retry_after_s`)
 - `error`: anything else
 
 ## Sends: client_ref, receipts and retries
@@ -78,6 +78,7 @@ Every command that signs takes an optional `client_ref`: 1 to 128 printable char
   - `dropped`
   - `unknown`
 - `tx.wait` also stops on `dropped` and `broadcast_failed`.
+- `tx.resend {chain, txid | client_ref}` (wallet) sends a transaction this arcade signed again, the same way it first went out, when `tx.status` shows it stuck (`signed`, `dropped`, or `accepted_local` with no peer holding it). Nothing is signed again. It answers `tx.status` with `resent [{txid, ok, how | error}]`, and code `not_found` when nothing signed here matches. Prefer it to a new send: a new client_ref would sign a second transaction.
 - `chains.wait {chain, height, timeout?}` answers once that chain's tip reaches `height`.
 - `events.since {cursor?, kinds?, limit?, wait?}` follows the arcade's event log, oldest first:
   - with no cursor it starts from now; with `"0"`, from the oldest event kept;

@@ -923,6 +923,71 @@ pub fn waiting_first() -> Option<&'static ChainParams> {
     defined().filter(|p| first_reach_pending(p))
 }
 
+/// Why a write on the ARCADE chain has to wait a moment here (2026-11-21: sends made during startup were told ARCADE
+/// "is only borrowed: install it", which sent people to Chains & Coins for nothing).
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+enum Pending {
+    /// No block of it heard from a lender yet (a fresh install, or arcaded just started).
+    NotReached,
+    /// A block heard, the borrowed copy still being set up.
+    SettingUp,
+    /// Installed here, its own copy still opening or catching up (a borrowed copy stands in meanwhile).
+    OwnOpening,
+    /// arcaded itself still starting.
+    Starting,
+}
+
+/// [`Pending`] from what is known: whether the chain can be used (installed or borrowed), whether it was ever reached,
+/// whether its own copy answers, whether it is installed here, whether arcaded is still starting, and whether the write
+/// needs the own copy (blobs travel from its pool; lenders take transactions only).
+fn pending(usable: bool, reached: bool, own: bool, installed: bool, starting: bool, needs_own: bool) -> Option<Pending> {
+    if !usable {
+        return Some(if !reached { Pending::NotReached } else { Pending::SettingUp });
+    }
+    if !needs_own || own {
+        return None;
+    }
+    if installed {
+        Some(Pending::OwnOpening)
+    } else if starting {
+        Some(Pending::Starting)
+    } else {
+        None // only borrowed: the caller says to install it
+    }
+}
+
+/// The words for a [`Pending`]. They begin "starting:", which crate::api::error_code turns into the code `starting`,
+/// answered with retry_after_s.
+fn pending_text(w: Pending, name: &str) -> String {
+    match w {
+        Pending::NotReached => format!("starting: {name} isn't reachable here yet (no arcade that keeps it has answered so far); try again in a few seconds"),
+        Pending::SettingUp => format!("starting: {name} is being set up here (its borrowed copy isn't ready yet); try again in a few seconds"),
+        Pending::OwnOpening => format!("starting: {name} is installed here and its own copy is still opening or catching up; try again in a moment"),
+        Pending::Starting => format!("starting: the arcade service is still opening {name}; try again in a few seconds"),
+    }
+}
+
+/// The answer a write on the ARCADE chain gets while that chain can't be reached here YET: no block of it was heard
+/// from a lender, or the borrowed copy is still being set up. None when the chain can be written to (or this arcade
+/// knows no ARCADE chain at all).
+pub fn reach_pending_error() -> Option<String> {
+    let p = defined()?;
+    pending(usable(p), !first_reach_pending(p), own(p), false, false, false).map(|w| pending_text(w, p.name))
+}
+
+/// Whether the operator installed the ARCADE chain here (its own copy starts with the arcade), running yet or not.
+pub fn installed_here(node: &Node) -> bool {
+    DEF.get().is_some_and(|d| node.app.store.read(|r| r.get(arcade_app::META, &installed_key(&d.net))).ok().flatten().is_some())
+}
+
+/// [`reach_pending_error`] for a write only the own copy can make (blobs): also while this arcade's own copy, installed
+/// here, is still opening or catching up, or arcaded itself is starting, rather than telling the operator to install
+/// what is installed (2026-11-21).
+pub fn own_pending_error(node: &Node) -> Option<String> {
+    let p = defined()?;
+    pending(usable(p), !first_reach_pending(p), own(p), installed_here(node), crate::api::phase() == "starting", true).map(|w| pending_text(w, p.name))
+}
+
 pub fn tip_id() -> Option<Hash256> {
     svc().map(|s| s.st.lock().unwrap().chain.tip().id)
 }
@@ -3474,6 +3539,37 @@ mod tests {
     use arcade_arc::vrf;
     use arcade_chain::hash::hash160;
     use arcade_chain::{OutPoint, TxIn, TxOut};
+
+    /// A write made before the ARCADE chain can be reached answers "starting" with a retry, not "install it"
+    /// (2026-11-21). Args: usable, reached, own, installed, starting, needs_own.
+    #[test]
+    fn a_write_before_arcade_is_reachable_waits_rather_than_asks_to_install() {
+        // Never reached (a fresh install, or just started): wait, whatever the write.
+        assert_eq!(pending(false, false, false, false, true, false), Some(Pending::NotReached));
+        assert_eq!(pending(false, false, false, true, false, true), Some(Pending::NotReached));
+        // A block heard, the borrowed copy not set up yet.
+        assert_eq!(pending(false, true, false, false, false, false), Some(Pending::SettingUp));
+        // Usable: a plain transaction goes, borrowed or own.
+        assert_eq!(pending(true, true, false, false, false, false), None);
+        // A blob needs the own copy: installed and still opening waits, so does anything while arcaded starts.
+        assert_eq!(pending(true, true, false, true, false, true), Some(Pending::OwnOpening));
+        assert_eq!(pending(true, true, false, false, true, true), Some(Pending::Starting));
+        // Only borrowed, after start: the caller's "install ARCADE" answer stands.
+        assert_eq!(pending(true, true, false, false, false, true), None);
+        assert_eq!(pending(true, true, true, true, false, true), None);
+        // Every one of them is the code `starting`, with retry_after_s.
+        for w in [Pending::NotReached, Pending::SettingUp, Pending::OwnOpening, Pending::Starting] {
+            let e = pending_text(w, "ARCADE testnet");
+            assert_eq!(crate::api::error_code(&e), "starting", "{e}");
+            let v = crate::api::error_reply(&e);
+            assert_eq!(v["retry_after_s"], 5, "{v}");
+            assert!(!e.contains("only borrowed") && !e.contains("install it"), "{e}");
+        }
+        // The real "only borrowed" refusal keeps its code.
+        let e = "long texts and files go on the ARCADE chain as blobs, and those need ARCADE installed here (it is only borrowed): install it in Chains & Coins";
+        assert_eq!(crate::api::error_code(e), "not_installed");
+        assert!(crate::api::error_reply(e)["retry_after_s"].is_null());
+    }
 
     #[test]
     fn a_borrowed_copy_answers_until_the_chain_is_installed_and_caught_up() {

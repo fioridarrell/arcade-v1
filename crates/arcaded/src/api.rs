@@ -98,7 +98,7 @@ pub fn error_code(e: &str) -> &'static str {
         "unknown_chain"
     } else if l.starts_with("not_found") || l.starts_with("no transaction") || l.starts_with("no block") || l.starts_with("no such") || l.contains(" not found") {
         "not_found"
-    } else if l.contains("service is starting") {
+    } else if l.contains("service is starting") || l.starts_with("starting:") {
         "starting"
     } else if l.contains("service is stopping") {
         "stopping"
@@ -116,7 +116,16 @@ pub fn error_code(e: &str) -> &'static str {
 
 /// An error answer: the text and its code.
 pub fn error_reply(e: &str) -> Value {
-    json!({"ok": false, "error": e, "code": error_code(e)})
+    let code = error_code(e);
+    let mut v = json!({"ok": false, "error": e, "code": code});
+    // A call that came too early (the ARCADE chain not reachable yet, crate::arcsvc::reach_pending_error) says when to
+    // ask again, as the answer during startup does (2026-11-21).
+    if code == "starting" {
+        v["starting"] = json!(true);
+        v["state"] = json!("starting");
+        v["retry_after_s"] = json!(5);
+    }
+    v
 }
 
 fn handle(node: Arc<Node>, s: UnixStream) {
@@ -1276,6 +1285,7 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.status" => crate::arcsvc::status(node),
         "tx.status" => crate::receipts::status(node, req),
         "tx.wait" => crate::receipts::wait(node, req),
+        "tx.resend" => crate::ownwait::api_resend(node, req),
         "arc.earning" => crate::arcsvc::earning(node),
         "arc.block" => crate::arcsvc::block(req),
         "arc.submit" => crate::arcsvc::submit(req),

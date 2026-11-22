@@ -449,6 +449,10 @@ fn quote(parts: &[(Hash, u64)], manifest_len: u64, class: Class) -> Result<Value
 /// blob. Without `send`, the quote: its id, parts, fee and the blocks it takes. With it, the job starts (or the one for
 /// the same bytes resumes) and `arc.blob_publish_status` follows it.
 pub fn api_publish(node: &Node, req: &Value) -> Result<Value, String> {
+    // Still starting, or the own copy still opening: "starting" with a retry (2026-11-21).
+    if let Some(e) = crate::arcsvc::own_pending_error(node) {
+        return Err(e);
+    }
     if crate::arcsvc::usable_chain().is_some_and(|p| !crate::arcsvc::own(p)) {
         return Err("large blobs need the ARCADE chain installed here (it is only borrowed): install it in Chains & Coins".into());
     }

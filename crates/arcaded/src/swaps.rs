@@ -220,16 +220,18 @@ pub(crate) fn depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
 /// use the plain depth.
 pub(crate) fn money_depth(node: &Node, p: &ChainParams, txid: &Hash256) -> u32 {
     // Borrowed: in a block a lender names, fetched and checked (its work, its parent) against the headers followed
-    // here, every one of them checked by the chain's rules as it came (crate::borrow).
+    // here, every one of them checked by the chain's rules as it came (crate::borrow). Not a staked chain: a staked
+    // block's stake can't be checked without the chain in full (confirmable_on).
     if lent(p) {
-        return crate::borrow::depth(node, p, txid);
+        return if p.staked_from().is_some() { 0 } else { crate::borrow::depth(node, p, txid) };
     }
     let Ok(Some((b, _))) = node.chain.tx_location(p, txid) else { return 0 };
     let Some((_, h, _)) = node.chain.block_at(p, b).ok().flatten() else { return 0 };
     node.chain.money_depth(p).map(|m| m.at(h)).unwrap_or(0)
 }
-/// A leg on a chain where nothing can confirm a lock (no checked work at its tip: Kotia's staked blocks) is
-/// refused before anything is locked: the other side's lock there could never be seen as mined.
+/// A leg on a chain where nothing can confirm a lock (no checked work at its tip; a staked chain not installed in full
+/// here, or whose stake checks are not on yet) is refused before anything is locked: the other side's lock there could
+/// never be seen as confirmed.
 fn confirmable(node: &Node, leg: &Value) -> Result<(), String> {
     match crate::chains::find(leg["chain"].as_str().unwrap_or("")) {
         Some(p) => confirmable_on(node, p),
@@ -237,9 +239,21 @@ fn confirmable(node: &Node, leg: &Value) -> Result<(), String> {
     }
 }
 fn confirmable_on(node: &Node, p: &ChainParams) -> Result<(), String> {
+    // A staked chain: each block's stake is checked here as it connects (arcade_chaindb::stake), which needs the chain
+    // in full (its coins and stake modifiers); a borrower can't check one.
+    if let Some(from) = p.staked_from() {
+        if !crate::staker::full_here(node, p) {
+            return Err(format!("{} swaps need {} installed in full here", p.name, p.name));
+        }
+        let st = node.chain.stake_status(p).map_err(|e| e.to_string())?;
+        if st.tip >= from && !st.on {
+            let why = st.why.unwrap_or_default();
+            return Err(format!("{} can't be a swap leg here yet: this arcade is still checking its staked blocks ({why})", p.name));
+        }
+    }
     let Ok(m) = node.chain.money_depth(p) else { return Ok(()) };
     if p.confirms_by_proven_work() && m.tip() > 0 && !m.confirms() {
-        let why = if p.work_checkable_at(m.tip() + 1) { "" } else { " (they are proof of stake, which is not checked yet)" };
+        let why = if p.staked_from().is_some_and(|f| m.tip() >= f) { " (its newest block's stake isn't checked here)" } else { "" };
         return Err(format!("{}'s blocks here carry no work this arcade can check{why}: a lock on it can't be confirmed, so it can't be a swap leg", p.name));
     }
     Ok(())
@@ -792,8 +806,9 @@ fn seen(node: &Node, leg: &Value, spec: &Spec, st: &Value) -> Result<bool, Strin
     let kind = leg["kind"].as_str().unwrap_or("");
     let Ok(txid) = h256(&st["txid"]) else { return Ok(false) };
     let Some(tx) = tx_of(node, p, &txid) else { return Ok(false) };
-    // Mined under work this arcade checked, not just in a block (a made-up block costs nothing on some chains).
-    if money_depth(node, p, &txid) < 1 {
+    // Mined under work this arcade checked, not just in a block (a made-up block costs nothing on some chains); on a
+    // staked chain under ChainParams::lock_confirms checked staked blocks (6).
+    if money_depth(node, p, &txid) < p.lock_confirms() {
         return Ok(false);
     }
     let script = spec.script(kind)?;
@@ -1594,15 +1609,26 @@ fn a_lock_counts_only_under_checked_work() {
     assert_eq!(money_depth(&t.node, t.p, &t.spend.txid), 1);
     assert!(confirmable_on(&t.node, t.p).is_ok());
     assert!(confirmable(&t.node, &json!({"chain": "peptest"})).is_ok());
-    assert!(confirmable(&t.node, &json!({"chain": "kot"})).is_ok(), "not installed: refused elsewhere, not here");
-    // A staked chain (Kotia after its last PoW height): refused, saying why.
+    // A staked chain not installed in full here (borrowed, or not at all): refused, saying why.
+    let why = confirmable(&t.node, &json!({"chain": "kot"})).unwrap_err();
+    assert_eq!(why, "Kotia swaps need Kotia installed in full here");
+    // A staked chain (Kotia after its last PoW height) whose stake checks are not on: refused, saying why. (These
+    // made-up blocks are not staked at all: they break the stake rules, and the checks never go on.)
     let t = setup_with(|p| {
         p.max_easier = false;
         p.digishield_from = None;
         p.pow = arcade_chain::pow::PowRule::PowThenStake { algo: arcade_chain::pow::PowAlgo::Scrypt, last_pow_height: 0 };
     });
     let why = confirmable_on(&t.node, t.p).unwrap_err();
-    assert!(why.contains("proof of stake"), "{why}");
+    assert!(why.contains("still checking its staked blocks"), "{why}");
+    let st = t.node.chain.stake_step(t.p, 100, std::time::Duration::from_secs(5)).unwrap();
+    assert!(!st.on && st.bad == 2, "{st:?}");
+    let why = confirmable_on(&t.node, t.p).unwrap_err();
+    assert!(why.contains("broke a stake rule"), "{why}");
+    assert_eq!(money_depth(&t.node, t.p, &t.spend.txid), 0);
+    // A lock there would need 6 checked staked blocks on top; 1 elsewhere.
+    assert_eq!(t.p.lock_confirms(), 6);
+    assert_eq!(setup().p.lock_confirms(), 1);
 }
 
 #[cfg(test)]

@@ -1440,6 +1440,13 @@ impl ListCache {
     }
 }
 
+/// How a chain's confirmations count, for pages (the Swap app shows a note on a pair with a staked chain): `by`
+/// "stake" (a staked chain: blocks whose stake this arcade checked) or "work" (checked proof of work), and `needs`, the
+/// confirmations the other side's lock in a swap needs (ChainParams::lock_confirms).
+pub fn confirms_row(p: &ChainParams) -> Value {
+    json!({"by": if p.staked_from().is_some() { "stake" } else { "work" }, "needs": p.lock_confirms()})
+}
+
 /// `chains.list` rows from what is known without reading any chain: installed, borrowed or
 /// neither, with "loading" set until the first full pass is in.
 fn quick_list(node: &Node) -> Value {
@@ -1449,7 +1456,8 @@ fn quick_list(node: &Node) -> Value {
         json!({"key": p.key, "name": p.name, "installed": (home && crate::homeinst::installed()) || installed.contains(p.key) || crate::arcsvc::runs(p), "home": home, "arcade": arcade,
                "borrowed": crate::borrow::is_borrowed(p.key), "state": "loading…", "loading": true, "sizes": null, "offers": node.offers_for(p.key).len(),
                "ord": !arcade && ord_start(p).is_some(), "tokens": if arcade { None } else { arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()) },
-               "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "queued": queued_at(node, p.key)})
+               "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "queued": queued_at(node, p.key),
+               "confirms": if arcade { Value::Null } else { confirms_row(p) }})
     };
     let mut rows: Vec<Value> = ALL_CHAINS.iter().map(|p| row(p, false)).chain(crate::arcsvc::defined().map(|p| row(p, true))).collect();
     mark_rows(node, &mut rows, None);
@@ -1482,7 +1490,7 @@ pub fn list(node: &Node) -> Value {
                    "indexes": st["indexes"], "overall": st["overall"], "state": st["state"],
                    "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()),
                    "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "sizes": crate::sizes::for_chain(node, p.key),
-                   "offers": node.offers_for(p.key).len(),
+                   "offers": node.offers_for(p.key).len(), "confirms": confirms_row(p),
                    "borrowed": st["borrowed"] == true, "lenders": st["lenders"], "tip": st["tip"], "floor": st["floor"], "mismatch": st["mismatch"],
                    "queued": q.iter().position(|e| e["key"] == p.key).map(|i| i + 1),
                    "queued_mode": q.iter().find(|e| e["key"] == p.key).map(|e| e["mode"].clone()),

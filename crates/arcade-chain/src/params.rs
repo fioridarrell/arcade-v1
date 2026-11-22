@@ -240,14 +240,22 @@ impl ChainParams {
         !arcade && ((!self.max_easier && self.digishield_from.is_none()) || !matches!(self.pow, PowRule::Single(_)))
     }
 
-    /// Whether a block at `height` can carry work this arcade checks: false on Kotia after its
-    /// last proof-of-work height, where every block is staked (no stake kernel is checked
-    /// here), so nothing there can confirm a payment.
-    pub fn work_checkable_at(&self, height: u32) -> bool {
+    /// The height from which every block is staked, not mined (Kotia after its last
+    /// proof-of-work height). There a block's stake is checked as it connects
+    /// (arcade_chaindb::stake: kernel, retarget, block signature, times), and confirmations
+    /// count checked staked blocks instead of work (arcade_chaindb::proven).
+    pub fn staked_from(&self) -> Option<u32> {
         match self.pow {
-            PowRule::PowThenStake { last_pow_height, .. } => height <= last_pow_height,
-            _ => true,
+            PowRule::PowThenStake { last_pow_height, .. } => Some(last_pow_height.saturating_add(1)),
+            _ => None,
         }
+    }
+
+    /// Confirmations the other side's lock in a swap needs on this chain before it counts:
+    /// [`STAKE_LOCK_CONFIRMS`] on a staked chain (anybody holding a large share of the coin can
+    /// make blocks without spending work, so recent blocks are cheaper to replace), else 1.
+    pub fn lock_confirms(&self) -> u32 {
+        if self.staked_from().is_some() { STAKE_LOCK_CONFIRMS } else { 1 }
     }
 
     /// The checkpoint hash at `height`, if there is one.
@@ -347,6 +355,9 @@ pub fn too_easy(params: &ChainParams, bits: u32, parent_bits: u32) -> bool {
     }
     t > pt4
 }
+
+/// Confirmations a swap lock needs on a staked chain (Martin 2026-11-22: 6 for Kotia).
+pub const STAKE_LOCK_CONFIRMS: u32 = 6;
 
 /// What a header check established about its work.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1844,7 +1855,7 @@ mod tests {
     }
 
     /// Confirmations count checked work exactly on the chains whose bits aren't tied to their
-    /// difficulty here or whose work isn't always checked; Kotia confirms nothing once staked.
+    /// difficulty here or whose work isn't always checked; Kotia counts checked staked blocks once staked.
     #[test]
     fn proven_work_chains() {
         let proven: Vec<&str> = ALL_CHAINS.iter().filter(|p| p.confirms_by_proven_work()).map(|p| p.key).collect();
@@ -1852,9 +1863,11 @@ mod tests {
         // The ARCADE chain's copies (arcade_arc::store::chain_params) carry no work.
         let arc = ChainParams { chain_no: ARCADE_CHAINS[0].0, key: "arc", max_easier: false, digishield_from: None, ..WOJAKCOIN_MAIN.clone() };
         assert!(!arc.confirms_by_proven_work());
-        assert!(KOTIA_MAIN.work_checkable_at(1_000_000));
-        assert!(!KOTIA_MAIN.work_checkable_at(1_000_001));
-        assert!(DIGIBYTE_MAIN.work_checkable_at(u32::MAX) && WOJAKCOIN_MAIN.work_checkable_at(u32::MAX));
+        assert_eq!(KOTIA_MAIN.staked_from(), Some(1_000_001));
+        assert_eq!(KOTIA_MAIN.lock_confirms(), STAKE_LOCK_CONFIRMS);
+        assert_eq!(STAKE_LOCK_CONFIRMS, 6);
+        assert!(DIGIBYTE_MAIN.staked_from().is_none() && WOJAKCOIN_MAIN.staked_from().is_none());
+        assert_eq!(DIGIBYTE_MAIN.lock_confirms(), 1);
     }
 
     fn child(p: &ChainParams, parent: &Header, time: u32, bits: u32) -> Header {

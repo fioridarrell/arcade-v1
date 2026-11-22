@@ -178,9 +178,12 @@ pub fn start(node: std::sync::Arc<Node>) {
         // Every 10 minutes, or 10 blocks on a faster test chain: well inside a segment's challenge window (§15 step 11).
         let every = crate::arcsvc::svc().map_or(600, |s| (s.net().block_seconds * 10).clamp(10, 600));
         std::thread::sleep(Duration::from_secs(every));
+        let began = std::time::Instant::now();
         if let Err(e) = watch(&node) {
             eprintln!("arc: fraud watch: {e}");
         }
+        // The CPU level's share (crate::cpu): a weak machine rests in proportion to the watch's work.
+        std::thread::sleep(crate::cpu::rest_for(began.elapsed()));
     });
 }
 

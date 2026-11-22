@@ -1022,8 +1022,14 @@ fn prove_in_pieces_until(dir: &std::path::Path, challenge: &arcade_arc::merkle::
         // The last piece the cap allows takes all that is left.
         let n = if runs.len() + 1 >= most { steps - done } else { (steps - done).min(piece) };
         let from = runs.last().map(|r| r.output.clone()).unwrap_or_else(|| ChiaVdf::start().to_vec());
+        let began = Instant::now();
         runs.push(ChiaVdf.run(challenge, &from, n)?);
         done += n;
+        // The CPU level's share (crate::cpu): a weak machine rests between pieces.
+        let rest = crate::cpu::rest_for(began.elapsed());
+        if !rest.is_zero() && done < steps {
+            std::thread::sleep(rest);
+        }
         // Saved after every piece, the last too: a finished proof outlives a restart (it was removed here).
         {
             let mut raw = Vec::with_capacity(runs.len() * SEGMENT_BYTES);
@@ -1222,7 +1228,7 @@ fn run_writer_on(node: Arc<Node>, svc: Arc<Svc>, wrote: &mut VecDeque<Hash256>, 
                             // took longer than a block, each new tip started one more while the old ones were still in
                             // a piece: 28 threads and 10.8 GB on txtok.app, OOM kills on a ThinkPad). The ones whose tip
                             // moved on stop at their next piece; this tip's starts on a later turn of the loop.
-                            if running.lock().unwrap().len() >= PROOF_THREADS {
+                            if running.lock().unwrap().len() >= PROOF_THREADS.min(crate::cpu::proof_threads()) {
                                 continue;
                             }
                             p.insert(tip, None);
@@ -1655,9 +1661,12 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
                     let st = s2.st.lock().unwrap();
                     (st.chain.storage().clone(), st.chain.storage().weight(&me), st.chain.tip().height + 1)
                 };
+                let began = Instant::now();
                 crate::arcseg::round(&n, &s2.net, reg.catalog(), weight, next);
                 crate::arcseg::auto_seal(&n, &s2.net, reg.catalog(), next);
-                std::thread::sleep(Duration::from_secs(if crate::arcseg::busy() { 2 } else { 60 }));
+                // The CPU level's share (crate::cpu): a weak machine rests in proportion to the round's work.
+                let pace = crate::cpu::rest_for(began.elapsed());
+                std::thread::sleep(Duration::from_secs(if crate::arcseg::busy() { 2 } else { 60 }).max(pace));
             })
             .map_err(|e| e.to_string())?;
     }

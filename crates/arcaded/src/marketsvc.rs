@@ -506,22 +506,45 @@ fn holdings(node: &Node) -> Value {
     // doesn't hold the answer up; without a runner (tests) the chains are read in turn.
     match crate::borrow::node_handle() {
         Some(h) => {
-            let (tx, rx) = std::sync::mpsc::channel::<Vec<Value>>();
-            let mut n = 0;
+            // One read per chain at a time, its answer kept HOLDINGS_FRESH (2026-11-21: Swap asks every few seconds,
+            // a borrowed chain's read can take longer than that, and each ask started its own: 46 threads and 7 GB
+            // on the GX10 in 17 minutes). A chain still being read answers with its last answer.
+            let mut started = Vec::new();
             for key in &keys {
                 let Some(p) = crate::chains::find(key) else { continue };
-                let (tx, h) = (tx.clone(), h.clone());
+                // Kept per chain and wallet key: an account switched to never sees the last one's coins.
+                let Some(k) = holdings_key(node, p) else { continue };
+                let fresh = HOLDINGS_KEPT.lock().unwrap().get(&k).is_some_and(|(at, _)| at.elapsed() < HOLDINGS_FRESH);
+                if fresh || !HOLDINGS_READING.lock().unwrap().insert(k.clone()) {
+                    continue;
+                }
+                let (h, k2) = (h.clone(), k.clone());
                 let spawned = std::thread::Builder::new().name("market holdings".into()).spawn(move || {
-                    let _ = tx.send(chain_holdings(&h, p));
+                    let v = chain_holdings(&h, p);
+                    HOLDINGS_KEPT.lock().unwrap().insert(k2.clone(), (std::time::Instant::now(), v));
+                    HOLDINGS_READING.lock().unwrap().remove(&k2);
                 });
-                n += usize::from(spawned.is_ok());
+                match spawned {
+                    Ok(_) => started.push(k),
+                    Err(_) => {
+                        HOLDINGS_READING.lock().unwrap().remove(&k);
+                    }
+                }
             }
-            drop(tx);
+            // Wait for the reads just started (at most HOLDINGS_WAIT), then answer every chain from what is kept.
             let until = std::time::Instant::now() + HOLDINGS_WAIT;
-            for _ in 0..n {
-                match rx.recv_timeout(until.saturating_duration_since(std::time::Instant::now())) {
-                    Ok(v) => out.extend(v),
-                    Err(_) => break,
+            while !started.is_empty() && std::time::Instant::now() < until {
+                started.retain(|k| HOLDINGS_READING.lock().unwrap().contains(k));
+                if !started.is_empty() {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+            }
+            let kept = HOLDINGS_KEPT.lock().unwrap();
+            for key in &keys {
+                if let Some(k) = crate::chains::find(key).and_then(|p| holdings_key(node, p)) {
+                    if let Some((_, v)) = kept.get(&k) {
+                        out.extend(v.iter().cloned());
+                    }
                 }
             }
         }
@@ -535,6 +558,17 @@ fn holdings(node: &Node) -> Value {
     }
     json!(out)
 }
+
+/// Each chain's last holdings answer, and the chains being read now (holdings).
+static HOLDINGS_KEPT: std::sync::Mutex<std::collections::BTreeMap<String, (std::time::Instant, Vec<Value>)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+static HOLDINGS_READING: std::sync::Mutex<std::collections::BTreeSet<String>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+/// The key a chain's holdings are kept under: the chain and this wallet's key on it.
+fn holdings_key(node: &Node, p: &'static arcade_chain::params::ChainParams) -> Option<String> {
+    crate::swaps::wallet_key(node, p).ok().map(|(_, pk)| format!("{}:{}", p.key, hex::encode(pk.serialize())))
+}
+
+/// A chain's holdings answer is used again for this long before it is read afresh.
+const HOLDINGS_FRESH: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// How long holdings waits for the chains it reads through lenders (the Swap app gives up on holdings after 8 s).
 const HOLDINGS_WAIT: std::time::Duration = std::time::Duration::from_secs(6);

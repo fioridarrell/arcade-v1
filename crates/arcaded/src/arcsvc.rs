@@ -381,7 +381,7 @@ pub struct Svc {
     pub params: &'static ChainParams,
     genesis_hex: String,
     steps_per_second: u64,
-    st: Mutex<State>,
+    st: crate::heldlock::HeldLock<State>,
     peers: Mutex<HashMap<String, Peer>>,
     /// Set (under `st`) when the chain is removed: nothing is taken in or written after.
     stop: AtomicBool,
@@ -392,6 +392,7 @@ pub struct Svc {
 
 impl Svc {
     /// The chain, for a moment (time keepers, crate::arckeep).
+    #[track_caller]
     pub(crate) fn with_chain<R>(&self, f: impl FnOnce(&LocalChain) -> R) -> R {
         f(&self.st.lock().unwrap().chain)
     }
@@ -1703,7 +1704,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         params: p,
         genesis_hex: genesis.to_hex(),
         steps_per_second: s.steps_per_second,
-        st: Mutex::new(State { chain, since: Instant::now(), pool: Pool::default(), refused: HashSet::new() }),
+        st: crate::heldlock::HeldLock::new("arcade chain", State { chain, since: Instant::now(), pool: Pool::default(), refused: HashSet::new() }),
         peers: Default::default(),
         stop: AtomicBool::new(false),
         started: Instant::now(),

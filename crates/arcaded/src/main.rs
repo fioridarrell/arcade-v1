@@ -6,6 +6,7 @@
 //!           [--http-port N|0] [--http-bind ADDR] [--site DIR] [--stun-port N|0]
 
 mod accountsvc;
+mod heldlock;
 mod cpu;
 mod largeblob;
 mod webui;

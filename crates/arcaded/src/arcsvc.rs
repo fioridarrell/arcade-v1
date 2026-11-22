@@ -382,7 +382,7 @@ pub struct Svc {
     genesis_hex: String,
     steps_per_second: u64,
     st: crate::heldlock::HeldLock<State>,
-    peers: Mutex<HashMap<String, Peer>>,
+    peers: crate::heldlock::HeldLock<HashMap<String, Peer>>,
     /// Set (under `st`) when the chain is removed: nothing is taken in or written after.
     stop: AtomicBool,
     started: Instant,
@@ -1705,7 +1705,7 @@ fn run(node: &Arc<Node>, def: &Def) -> Result<(), String> {
         genesis_hex: genesis.to_hex(),
         steps_per_second: s.steps_per_second,
         st: crate::heldlock::HeldLock::new("arcade chain", State { chain, since: Instant::now(), pool: Pool::default(), refused: HashSet::new() }),
-        peers: Default::default(),
+        peers: crate::heldlock::HeldLock::new("arcade peers", HashMap::new()),
         stop: AtomicBool::new(false),
         started: Instant::now(),
         last_up: Mutex::new(None),
@@ -2379,13 +2379,17 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
         let streaming = p.parts.is_some() && p.answer_at.is_some_and(|t| t.elapsed() <= ASK_AGAIN);
         (say, first, p.wants.is_some() && !streaming && p.asked.is_none_or(|t| t.elapsed() > ASK_AGAIN))
     };
+    let mut t = Instant::now();
     if say {
         link.send(&frame(svc, "tip", json!({"id": id.to_hex(), "h": height, "w": total, "new": first})))?;
     }
+    part(link, "tip", &mut t);
     crate::arcfraud::tick(link, |op, head| frame(svc, op, head))?;
+    part(link, "fraud", &mut t);
     if ask_again {
         ask(svc, link)?;
     }
+    part(link, "ask", &mut t);
 
     // Asks of this peer that had to wait their turn.
     let (due, tx_due) = {
@@ -2394,12 +2398,15 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
         let turn = |last: Option<Instant>| last.is_none_or(|t| t.elapsed() >= SERVE_EVERY);
         (if turn(p.served) { p.waiting.take() } else { None }, if turn(p.tx_served) { p.tx_waiting.take() } else { None })
     };
+    part(link, "turns", &mut t);
     if let Some(head) = due {
         serve(svc, link, &head)?;
     }
+    part(link, "serve", &mut t);
     if let Some((id, blob)) = tx_due {
         serve_txs(svc, link, id, &blob)?;
     }
+    part(link, "serve_txs", &mut t);
 
     // Waiting transactions this peer hasn't been told of, and ones it named that we lack.
     let news: Vec<Hash256> = {
@@ -2417,15 +2424,31 @@ pub fn tick(_node: &Node, link: &mut Link) -> Result<(), LinkError> {
         f.blob = blob_of(&news);
         link.send(&f)?;
     }
+    part(link, "inv", &mut t);
     // Time keepers' frames this peer hasn't had (crate::arckeep).
     crate::arckeep::tick(&link.peer_id.clone(), link)?;
+    part(link, "keep", &mut t);
     // Storage items waiting for a block (crate::arcseg).
     for blob in crate::arcseg::due_for(&link.peer_id) {
         let mut f = frame(svc, "it", json!({}));
         f.blob = blob;
         link.send(&f)?;
     }
-    ask_txs(svc, link)
+    part(link, "items", &mut t);
+    let r = ask_txs(svc, link);
+    part(link, "ask_txs", &mut t);
+    r
+}
+
+/// One part of [`tick`] that took over PART_SLOW is said (2026-11-22: the GX10's links waited seconds in this tick
+/// while the chain's lock was never held long; this says which part).
+const PART_SLOW: Duration = Duration::from_secs(1);
+fn part(link: &Link, what: &str, t: &mut Instant) {
+    let e = t.elapsed();
+    if e > PART_SLOW {
+        eprintln!("arc: link {}: {what} took {:.1} s", link.peer_id.get(..16).unwrap_or("?"), e.as_secs_f64());
+    }
+    *t = Instant::now();
 }
 
 /// A new link to `peer`: it hears our tip again, whatever an earlier link was told.

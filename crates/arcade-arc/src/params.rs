@@ -136,10 +136,10 @@ pub const RULES_KNOWN: u32 = 7;
 /// a placeholder until then). [`TESTNET`]'s schedule reads it.
 pub const RULES_V6_HEIGHT: u64 = 2_725;
 
-/// The testnet height rules version 7 starts at. PLACEHOLDER for Martin to set in the release that ships it (CONSENSUS:
-/// a little ahead of the tip once the release is on our own arcades; never at a height ending 80 to 99, next to an
-/// epoch's end). [`TESTNET`]'s schedule reads it; nothing else names the number.
-pub const RULES_V7_HEIGHT: u64 = 5_000;
+/// The testnet height rules version 7 starts at (CONSENSUS): about 25 blocks past the tip when v0.1.164 was published
+/// (Martin, 2026-11-22: "20 to 30 blocks ahead"; most arcades update within 10 minutes). Never at a height ending 80
+/// to 99, next to an epoch's end. [`TESTNET`]'s schedule reads it; nothing else names the number.
+pub const RULES_V7_HEIGHT: u64 = 4_247;
 
 /// Whether rules version 4 applies to the block at `height` (testnet only so far; the height is set in the release
 /// that ships it, about a day ahead): Shibacoin, Bellscoin, Luckycoin and Junkcoin listed and the

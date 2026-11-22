@@ -444,6 +444,9 @@ pub fn publish(node: &Node, ask: &Ask) -> Result<Value, String> {
     jput(node, &j)?;
     let resumed = j["split"].as_str().is_some_and(|s| !s.is_empty()) || j["sending"].as_object().is_some_and(|m| !m.is_empty());
     let mut v = run(node, p, &sk, &pk, &mut j, &pieces, &outs, piece_value, rate, dust, ask)?;
+    // The App Store keeps its apps (crate::appsvc::Cache, 2026-11-21): a card this arcade just sent makes the next read
+    // read the chains again, as soon as the ledger has it, rather than when the kept copy gets old.
+    crate::appsvc::invalidate(node);
     let mut out = base;
     for (k, x) in v.as_object_mut().map(std::mem::take).unwrap_or_default() {
         out[k] = x;

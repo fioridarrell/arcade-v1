@@ -509,6 +509,75 @@
   // Trades between two players of one room (trade.js).
   const trade = window.ArcadeTrade({ api, rooms, toPage: (b) => el.contentWindow?.postMessage(b, "*"), card, oneCard, walletGate });
   doors.swap = (m) => trade.door(m);
+  // arcade.folder (2026-11-21): the app asks for one folder on this computer to read and write inside. The person picks
+  // it on a card with a folder browser (folder.browse: subfolders only, inside the home folder); the arcade keeps the
+  // grant by the app's id (apps.folder_set) and the page then uses /r/folder/*. The page never learns the path.
+  doors.folder = async (m) => {
+    if (m.op !== "ask") throw new Error("folder ops here: ask");
+    if (!id) throw new Error("only an app opened from Apps can be given a folder");
+    const why = String(m.why || "").slice(0, 200);
+    const path = await oneCard(() => pickFolder(why));
+    if (!path) throw new Error("Cancelled.");
+    const r = await api("apps.folder_set", { id, path });
+    toast(`${appName} can now use the folder “${r.name}”`);
+    return { granted: !!r.granted, name: r.name };
+  };
+  // The folder card: a breadcrumb, the subfolders of where it is, "Use this folder" and Cancel. Resolves the chosen
+  // folder's path, or null.
+  function pickFolder(why) {
+    return new Promise((resolve) => {
+      const ov = document.createElement("div"); ov.className = "ov";
+      const box = document.createElement("div"); box.className = "box";
+      const h = document.createElement("h3"); h.textContent = `${appName} asks for a folder to work in`;
+      const p = document.createElement("p"); p.textContent = why || "It gives no reason.";
+      const note = document.createElement("p"); note.className = "caution grey";
+      note.textContent = "It can read, change and remove files in the folder you pick, and nowhere else. You can take it away in Apps, Details.";
+      const crumbs = document.createElement("div"); crumbs.style.cssText = "display:flex;flex-wrap:wrap;gap:2px;margin:8px 0 4px;font-size:13px";
+      const list = document.createElement("div");
+      list.style.cssText = "max-height:240px;overflow:auto;border:1px solid #ddd;border-radius:8px;padding:4px";
+      const err = document.createElement("p"); err.style.color = "#b3261e";
+      const row = document.createElement("div"); row.className = "btns";
+      const no = document.createElement("button"); no.textContent = "Cancel";
+      const yes = document.createElement("button"); yes.textContent = "Use this folder"; yes.className = "yes";
+      let at = null;
+      const done = (v) => { ov.remove(); resolve(v); };
+      no.onclick = () => done(null);
+      yes.onclick = () => { if (at && !at.is_root) done(at.path); };
+      const link = (text, go) => {
+        const b = document.createElement("button");
+        b.textContent = text;
+        b.style.cssText = "font:inherit;border:0;background:none;padding:2px 4px;cursor:pointer;color:#2e6b3a;text-align:left";
+        b.onclick = go;
+        return b;
+      };
+      async function go(path) {
+        err.textContent = "";
+        let b;
+        try { b = await api("folder.browse", path ? { path } : {}); }
+        catch (e) { err.textContent = String(e && e.message || e); return; }
+        at = b;
+        const parts = [];
+        if ((b.roots || []).length > 1) for (const r of b.roots) parts.push(link(`[${r.name}]`, () => go(r.path)));
+        (b.crumbs || []).forEach((c, i) => {
+          if (i) { const s = document.createElement("span"); s.textContent = "›"; parts.push(s); }
+          parts.push(link(c.name, () => go(c.path)));
+        });
+        crumbs.replaceChildren(...parts);
+        const rows = (b.dirs || []).map((d) => {
+          const x = link(`📁 ${d}`, () => go(b.path.replace(/[\\/]+$/, "") + (b.path.includes("\\") ? "\\" : "/") + d));
+          x.style.display = "block"; x.style.width = "100%";
+          return x;
+        });
+        if (!rows.length) { const e = document.createElement("div"); e.style.cssText = "color:#777;padding:4px"; e.textContent = "No folders in here."; rows.push(e); }
+        list.replaceChildren(...rows);
+        yes.disabled = !!b.is_root;
+        yes.title = b.is_root ? "Pick a folder inside your home folder" : "";
+      }
+      row.append(no, yes);
+      box.append(h, p, note, crumbs, list, err, row); ov.append(box); document.body.append(ov);
+      go("");
+    });
+  }
   // Prize pools on the chain: a seed for a run (from the pool's referee) and a claim of one lot. The arcade
   // opens the lot with the page's phrase and, for a refereed pool, has its referee check the run.
   doors.seed = async (m) => {

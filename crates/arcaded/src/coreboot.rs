@@ -751,7 +751,7 @@ fn may_bootstrap(node: &Node, p: &'static arcade_chain::params::ChainParams) -> 
     crate::chaindrive::not_moving(p.key)?;
     let mode = node.mode_of(p.key).ok_or_else(|| format!("{} is not installed (install it first: arcade chain add {} full)", p.name, p.key))?;
     if p.key == node.params.key {
-        return Err("the home chain is not bootstrapped from copies".into());
+        return Err(format!("{} is not bootstrapped from copies", p.name));
     }
     if mode == "shared" {
         return Err("Shared storage keeps only part of the blocks; a copy's coin set needs every block stored".into());

@@ -565,7 +565,7 @@ fn leg_ok(node: &Node, leg: &Value) -> Result<&'static ChainParams, String> {
         return Err(format!("{} is borrowed here: a DigiDollar leg needs it installed", p.name));
     }
     if kind == "token" && p.chain_no != node.params.chain_no {
-        return Err("an arcade-ledger token leg is on this arcade's home chain (its ledger)".into());
+        return Err(format!("an arcade-ledger token leg is on {} (its ledger)", node.params.name));
     }
     // A DRC-20 / PRC-20 leg on any chain kept here with its tokens index (2026-11-12; it was the home chain only).
     if kind == "token20" && !token20_kept(node, p) {

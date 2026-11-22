@@ -50,6 +50,7 @@ mod arckeep;
 mod arcsvc;
 mod borrow;
 mod appsvc;
+mod foldersvc;
 mod apppub;
 mod walletsvc;
 mod coinsend;
@@ -387,7 +388,7 @@ const USAGE: &str = "arcaded: the Arcade V1.0 service (normally started by the i
 
 usage: arcaded [options]
   --home DIR            the arcade's folder (default: $ARCADE_HOME, else %LOCALAPPDATA%\\arcade on Windows, ~/.local/share/arcade on Linux)
-  --home-mode shared    keep the home chain in shared storage (default full)
+  --home-mode shared    keep Pepecoin testnet in shared storage (default full)
   --http-port N|0       local web port for the app (0: none)
   --http-bind ADDR      address the web port listens on
   --site DIR            serve this folder as the app
@@ -604,6 +605,7 @@ fn main() {
         my_sizes: Mutex::new(Default::default()),
         mesh_sizes: Mutex::new(Default::default()),
         list_cache: Default::default(),
+        apps_cache: Default::default(),
     });
     let _ = node.me.set(Arc::downgrade(&node));
     // Pruned blocks of coins held sealed for Earn ARCADE read back from their sealed copies.
@@ -647,7 +649,7 @@ fn main() {
         let n = node.clone();
         std::thread::Builder::new().name("api".into()).spawn(move || api::serve_on(n, listener)).unwrap();
     }
-    chains::start_home(&node).unwrap_or_else(|e| fail_start(&format!("the home chain's indexes: {e}")));
+    chains::start_home(&node).unwrap_or_else(|e| fail_start(&format!("the indexes of {}: {e}", node.params.name)));
     // A local ARCADE test chain (stand-in rules; closed test networks only), which this
     // arcade can then install in Chains & Coins: crate::arcsvc.
     if let Some(settings) = opt("--arc-local") {

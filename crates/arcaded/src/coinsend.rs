@@ -267,6 +267,13 @@ pub fn send_parts(node: &Node, key: Option<&str>, to: &str, parts: &[u64], from:
         None => node.params,
     };
     let warn = warning(p, to);
+    // The ARCADE chain not reachable yet (arcaded starting, its borrowed copy still being set up): "starting" with a
+    // retry, not "neither installed nor borrowed" (2026-11-21).
+    if crate::arcsvc::defines(p.key) {
+        if let Some(e) = crate::arcsvc::reach_pending_error() {
+            return Err(e);
+        }
+    }
     if crate::borrow::is_borrowed(p.key) {
         // An @name: its holder's address on this chain (read from lenders when the tag tables are borrowed too).
         let named = to_of_tag(node, p, to)?;
@@ -448,7 +455,11 @@ pub fn publish_blobs(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::C
 pub fn publish_blobs_spending(node: &Node, items: &[(Vec<u8>, String, arcade_arc::blob::Class, arcade_arc::blob::Encoding)], send: bool, must: &[arcade_chain::OutPoint]) -> Result<Value, String> {
     use arcade_arc::blob::{self, Record};
     // Blobs travel with their transaction from this arcade's own pool (crate::arcblob holds their bytes until a block
-    // takes them); lenders take transactions only, so a borrowed ARCADE can't carry them yet.
+    // takes them); lenders take transactions only, so a borrowed ARCADE can't carry them yet. Still starting, or the
+    // own copy still opening: "starting" with a retry, not "install it" (2026-11-21).
+    if let Some(e) = crate::arcsvc::own_pending_error(node) {
+        return Err(e);
+    }
     if crate::arcsvc::usable_chain().is_some_and(|p| !crate::arcsvc::own(p)) {
         return Err("long texts and files go on the ARCADE chain as blobs, and those need ARCADE installed here (it is only borrowed): install it in Chains & Coins".into());
     }

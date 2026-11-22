@@ -18,7 +18,7 @@ use crate::node::Node;
 use arcade_chain::params::ChainParams;
 use arcade_ledger::cards::{self, Card};
 use arcade_store::KeyBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -249,6 +249,8 @@ fn mesh_card_rows(node: &Node, p: &'static ChainParams, kept: bool) -> Vec<Value
                 };
             }
             BORROWED_CARDS.lock().unwrap().insert(p.key.to_string(), (std::time::Instant::now(), rows));
+            // The kept apps see the answer at their next read (2026-11-21: the fingerprint counts these).
+            MESH_CARDS_SEEN.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         });
     }
     rows
@@ -322,8 +324,178 @@ fn borrowed_card_rows(node: &Node, kept: &[&'static ChainParams]) -> Vec<(&'stat
     out
 }
 
-/// Every app on every ledger chain (this arcade's, and the chains it borrows), grouped and resolved.
-fn gather(node: &Node) -> Vec<App> {
+// ---------------- the cached apps (2026-11-21) ----------------
+//
+// Reading every chain's card rows and resolving them (gather_now) took about two minutes on a busy arcade, and the store,
+// one app's card, launching an app, a page's app and the installed list each did it, often twice in one request (card()
+// read the apps once to find the app and again for the copycat flags). Now the apps are kept: one copy, shared (an Arc,
+// never deep-copied), made again at most every FRESH, or sooner when this arcade itself publishes (invalidate). Only one
+// copy is made at a time: a caller waits for the one being made, or, when there is an older copy and the new one has
+// taken more than WAIT_AT_MOST already, takes the older one (it is at most a little behind). The copycat flags are kept
+// beside the copy they were made from, and made again when the operator rules on a card or trusts a publisher.
+
+/// How long a copy of the apps is used as it is.
+const FRESH: std::time::Duration = std::time::Duration::from_secs(15);
+/// A copy older than FRESH is still used while nothing it reads moved (no kept chain's tip, no answer from the mesh about
+/// a borrowed chain's cards), up to this age: rows lent by other arcades (feed acts) can change without a tip moving.
+const FRESH_IF_UNCHANGED: std::time::Duration = std::time::Duration::from_secs(60);
+/// How long a caller waits for a new copy when there is an older one to take instead.
+const WAIT_AT_MOST: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Bumped each time the mesh answers about a borrowed chain's app cards (BORROWED_CARDS), so a copy made before knows.
+static MESH_CARDS_SEEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Numbers each copy of the apps, so the flags know which copy they were made from.
+static SNAP_IDS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// What a copy of the apps was made from, cheaply read: each kept chain's tip, the chains borrowed now, and how many
+/// mesh answers about borrowed cards had come.
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
+struct Fingerprint {
+    tips: Vec<(u16, Option<(u32, [u8; 32])>)>,
+    borrowed: Vec<u16>,
+    mesh_cards: u64,
+}
+
+fn fingerprint(node: &Node) -> Fingerprint {
+    Fingerprint {
+        tips: ledger_chains(node).iter().map(|p| (p.chain_no, node.chain.tip(p.chain_no).ok().flatten().map(|t| (t.height, t.hash.0)))).collect(),
+        borrowed: arcade_chain::params::ALL_CHAINS.iter().filter(|p| crate::borrow::is_borrowed(p.key)).map(|p| p.chain_no).collect(),
+        mesh_cards: MESH_CARDS_SEEN.load(std::sync::atomic::Ordering::SeqCst),
+    }
+}
+
+/// One copy of the apps.
+struct Snap {
+    apps: Vec<App>,
+    id: u64,
+    at: std::time::Instant,
+    fp: Fingerprint,
+    /// The cache's epoch when it was begun: a write here since (invalidate) makes it old.
+    epoch: u64,
+}
+
+#[derive(Default)]
+struct CacheState {
+    snap: Option<Arc<Snap>>,
+    /// Since when a copy is being made (None: none is).
+    building: Option<std::time::Instant>,
+    epoch: u64,
+}
+
+/// The apps of this arcade, kept (one per Node: a test's arcades never share them).
+#[derive(Default)]
+pub struct Cache {
+    st: Mutex<CacheState>,
+    cv: std::sync::Condvar,
+    /// (copy id, flags epoch, flags): one made at a time.
+    flags: Mutex<Option<(u64, u64, Arc<BTreeMap<String, String>>)>>,
+    flags_epoch: std::sync::atomic::AtomicU64,
+}
+
+/// Marks the copy being made as no longer being made if making it panicked, so the callers waiting for it don't wait forever.
+struct Building<'a>(&'a Cache, bool);
+
+impl Drop for Building<'_> {
+    fn drop(&mut self) {
+        if !self.1 {
+            let mut s = self.0.st.lock().unwrap_or_else(|e| e.into_inner());
+            s.building = None;
+            self.0.cv.notify_all();
+        }
+    }
+}
+
+impl Cache {
+    fn lock(&self) -> std::sync::MutexGuard<'_, CacheState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The copy to use for `fp`, made with `build` when there is none fresh (see the notes above).
+    fn snapshot(&self, fp: Fingerprint, build: impl FnOnce() -> Vec<App>) -> Arc<Snap> {
+        let mut s = self.lock();
+        loop {
+            if let Some(sn) = &s.snap {
+                let age = sn.at.elapsed();
+                if sn.epoch == s.epoch && (age < FRESH || (age < FRESH_IF_UNCHANGED && sn.fp == fp)) {
+                    return sn.clone();
+                }
+            }
+            match s.building {
+                None => break,
+                Some(since) => match s.snap.clone() {
+                    None => s = self.cv.wait(s).unwrap_or_else(|e| e.into_inner()),
+                    Some(old) => {
+                        let left = WAIT_AT_MOST.saturating_sub(since.elapsed());
+                        if left.is_zero() {
+                            return old;
+                        }
+                        s = self.cv.wait_timeout(s, left).unwrap_or_else(|e| e.into_inner()).0;
+                    }
+                },
+            }
+        }
+        // This caller makes it.
+        s.building = Some(std::time::Instant::now());
+        let epoch = s.epoch;
+        drop(s);
+        let mut guard = Building(self, false);
+        let apps = build();
+        let snap = Arc::new(Snap { apps, id: SNAP_IDS.fetch_add(1, std::sync::atomic::Ordering::SeqCst), at: std::time::Instant::now(), fp, epoch });
+        let mut s = self.lock();
+        s.snap = Some(snap.clone());
+        s.building = None;
+        guard.1 = true;
+        self.cv.notify_all();
+        snap
+    }
+
+    /// The flags of `snap`, made with `make` when the kept ones are of another copy or older than a verdict.
+    fn flags(&self, snap: &Snap, make: impl FnOnce() -> BTreeMap<String, String>) -> Arc<BTreeMap<String, String>> {
+        let mut f = self.flags.lock().unwrap_or_else(|e| e.into_inner());
+        let fe = self.flags_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        if let Some((id, e, m)) = &*f {
+            if *id == snap.id && *e == fe {
+                return m.clone();
+            }
+        }
+        let m = Arc::new(make());
+        *f = Some((snap.id, fe, m.clone()));
+        m
+    }
+
+    fn invalidate(&self) {
+        self.lock().epoch += 1;
+        self.invalidate_flags();
+    }
+
+    fn invalidate_flags(&self) {
+        self.flags_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Make the apps again on the next read (this arcade published or withdrew a card, say).
+pub fn invalidate(node: &Node) {
+    node.apps_cache.invalidate();
+}
+
+/// Make the copycat flags again on the next read (a verdict on a card, a publisher trusted or not).
+pub fn invalidate_flags(node: &Node) {
+    node.apps_cache.invalidate_flags();
+}
+
+/// Every app on every ledger chain (this arcade's, and the chains it borrows), grouped and resolved: the kept copy
+/// ([`Cache`]), made again at most every [`FRESH`].
+fn gather(node: &Node) -> Arc<Snap> {
+    node.apps_cache.snapshot(fingerprint(node), || gather_now(node))
+}
+
+/// The copycat flags of a copy of the apps ([`flags`]), kept beside it.
+fn flags_of(node: &Node, snap: &Snap) -> Arc<BTreeMap<String, String>> {
+    node.apps_cache.flags(snap, || flags(node, &snap.apps))
+}
+
+/// [`gather`] made afresh: every chain's card rows read and resolved.
+fn gather_now(node: &Node) -> Vec<App> {
     let mut apps = Vec::new();
     let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let kept = ledger_chains(node);
@@ -610,7 +782,8 @@ pub fn add_defaults(node: &Node) {
         }
         *l = Some(std::time::Instant::now());
     }
-    let apps = gather(node);
+    let snap = gather(node);
+    let apps = &snap.apps;
     let mut done = done;
     let mut ids = installed_ids(node);
     for (id, feed) in todo {
@@ -703,8 +876,9 @@ pub fn store(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &st
 
 /// [`store`]; `withdrawn`: only the apps their publishers withdrew (never listed otherwise; 2026-11-21).
 pub fn store_with(node: &Node, sort: &str, q: &str, show_flagged: bool, category: &str, withdrawn: bool) -> Value {
-    let apps = gather(node);
-    let fl = flags(node, &apps);
+    let snap = gather(node);
+    let apps = &snap.apps;
+    let fl = flags_of(node, &snap);
     let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let fx = fixes(&acts);
     let me = me(node);
@@ -746,8 +920,9 @@ pub fn store_with(node: &Node, sort: &str, q: &str, show_flagged: bool, category
 pub fn installed(node: &Node) -> Value {
     add_defaults(node);
     let ids = installed_ids(node);
-    let apps = gather(node);
-    let fl = flags(node, &apps);
+    let snap = gather(node);
+    let apps = &snap.apps;
+    let fl = flags_of(node, &snap);
     let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let fx = fixes(&acts);
     let me = me(node);
@@ -768,10 +943,11 @@ pub fn installed(node: &Node) -> Value {
     json!(out)
 }
 
-fn find(node: &Node, chain: &str, txid: &str) -> Result<(App, String), String> {
+/// The app with a version `txid` on `chain` in `snap` (one copy of the apps: gather), and its id.
+fn find<'a>(snap: &'a Snap, chain: &str, txid: &str) -> Result<(&'a App, String), String> {
     let p = crate::chains::find(chain).ok_or_else(|| format!("unknown chain {chain}"))?;
-    let a = gather(node)
-        .into_iter()
+    let a = snap.apps
+        .iter()
         .find(|a| a.chain.chain_no == p.chain_no && a.versions.iter().any(|v| v.txid == txid))
         .ok_or("no app card with that txid here")?;
     let id = app_id(a.chain.key, &a.root, &a.versions[0].card.key());
@@ -779,7 +955,8 @@ fn find(node: &Node, chain: &str, txid: &str) -> Result<(App, String), String> {
 }
 
 pub fn install(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
-    let (a, id) = find(node, chain, txid)?;
+    let snap = gather(node);
+    let (a, id) = find(&snap, chain, txid)?;
     let mut ids = installed_ids(node);
     if !ids.iter().any(|x| x["id"] == id.as_str()) {
         ids.push(json!({"id": id, "at": arcade_app::now(), "card": a.versions[0].card.to_json()}));
@@ -796,23 +973,24 @@ pub fn uninstall(node: &Node, id: &str) -> Result<Value, String> {
 }
 
 pub fn star(node: &Node, chain: &str, txid: &str, on: bool) -> Result<Value, String> {
-    let (_, id) = find(node, chain, txid)?;
+    let (_, id) = find(&gather(node), chain, txid)?;
     let mut s = starred_ids(node);
     if on { s.insert(id.clone()); } else { s.remove(&id); }
     meta_put(node, "apps_starred", &json!(s.into_iter().collect::<Vec<_>>()))?;
     Ok(json!({"id": id, "starred": on}))
 }
 
-/// One app: card, versions, every comment, permission switches.
+/// One app: card, versions, every comment, permission switches. One copy of the apps for both the app and the copycat
+/// flags (2026-11-21: it read every chain twice before).
 pub fn card(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
-    let (a, id) = find(node, chain, txid)?;
-    let apps = vec![a];
-    let fl = flags(node, &gather(node));
+    let snap = gather(node);
+    let (a, id) = find(&snap, chain, txid)?;
+    let fl = flags_of(node, &snap);
     let acts = crate::feedsvc::ledger_rows(node, arcade_ledger::messages::ACT);
     let fx = fixes(&acts);
     let installed: BTreeSet<String> = installed_ids(node).iter().filter_map(|x| x["id"].as_str().map(String::from)).collect();
-    let mut e = entry(node, &apps[0], &acts, &fx, &me(node), fl.get(&apps[0].versions[0].txid), &installed, &starred_ids(node));
-    let txids: BTreeSet<String> = apps[0].versions.iter().map(|v| v.txid.clone()).collect();
+    let mut e = entry(node, a, &acts, &fx, &me(node), fl.get(&a.versions[0].txid), &installed, &starred_ids(node));
+    let txids: BTreeSet<String> = a.versions.iter().map(|v| v.txid.clone()).collect();
     let comments = comments_on(&acts, &fx, &txids);
     e["comments"] = json!(comments.iter().map(|a| json!({"from": a["from"], "text": a["text"], "txid": a["txid"], "height": a["h"], "stars": a["stars"]})).collect::<Vec<_>>());
     e["permissions"] = perms(node, &id);
@@ -822,7 +1000,11 @@ pub fn card(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
 /// Per-app permission switches (only the ones its card claims matter).
 pub fn perms(node: &Node, id: &str) -> Value {
     let v = meta_get(node, &format!("appperm:{id}"));
-    if v.is_object() { v } else { json!({"wallet": false, "contacts": false, "groups": false, "feed": false, "media": false, "pictures": false, "notify": false}) }
+    let mut v = if v.is_object() { v } else { json!({"wallet": false, "contacts": false, "groups": false, "feed": false, "media": false, "pictures": false, "notify": false}) };
+    // The folder the person gave the app (crate::foldersvc, 2026-11-21): {granted, name}; its path is never shown, and
+    // it is kept on its own (appfolder:<id>), not with the switches.
+    v["folder"] = crate::foldersvc::status(node, id);
+    v
 }
 
 pub fn set_perms(node: &Node, id: &str, set: &Value) -> Result<Value, String> {
@@ -851,8 +1033,16 @@ pub fn set_perms(node: &Node, id: &str, set: &Value) -> Result<Value, String> {
         }
         v["allowances"] = json!(al);
     }
+    // The folder (2026-11-21): only taken away here (folder: false); it is given by apps.folder_set, after the person
+    // picks one on the app window's card.
+    if set["folder"] == false {
+        crate::foldersvc::revoke(node, id)?;
+    }
+    if let Some(o) = v.as_object_mut() {
+        o.remove("folder");
+    }
     meta_put(node, &format!("appperm:{id}"), &v)?;
-    Ok(v)
+    Ok(perms(node, id))
 }
 
 // ---------------- spending allowances (2026-11-21) ----------------
@@ -943,7 +1133,8 @@ pub fn notify_ids(node: &Node) -> Vec<String> {
 /// The app a page belongs to (the txid of any of its versions, on any chain kept here):
 /// its id, name and chain, and the txid its card goes by.
 pub fn of_page(node: &Node, txid: &str) -> Option<Value> {
-    let a = gather(node).into_iter().find(|a| a.versions.iter().any(|v| v.txid == txid))?;
+    let snap = gather(node);
+    let a = snap.apps.iter().find(|a| a.versions.iter().any(|v| v.txid == txid))?;
     let first = &a.versions[0];
     // The page's own version: one arcade's word for it is said where the app asks for money (walletsvc::page_card).
     let this = a.versions.iter().find(|v| v.txid == txid).unwrap_or(first);
@@ -959,6 +1150,8 @@ pub fn review(node: &Node, chain: &str, txid: &str, verdict: &str) -> Result<Val
         _ => return Err("verdict is clear or confirm".into()),
     };
     meta_put(node, &format!("cardwatch:{chain}:{txid}"), &json!(v))?;
+    // The kept copycat flags are made again with this verdict (2026-11-21).
+    invalidate_flags(node);
     Ok(json!({"txid": txid, "status": v}))
 }
 
@@ -966,6 +1159,7 @@ pub fn trust(node: &Node, address: &str, on: bool) -> Result<Value, String> {
     let mut t: BTreeSet<String> = meta_get(node, "apps_trusted").as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
     if on { t.insert(address.to_string()); } else { t.remove(address); }
     meta_put(node, "apps_trusted", &json!(t.iter().collect::<Vec<_>>()))?;
+    invalidate_flags(node);
     Ok(json!({"trusted": t}))
 }
 
@@ -973,7 +1167,8 @@ pub fn trust(node: &Node, address: &str, on: bool) -> Result<Value, String> {
 /// every offered version's txid). For apps.withdraw (crate::apppub), which checks the creator.
 pub fn lookup(node: &Node, p: &ChainParams, txid: Option<&str>, family: Option<&str>) -> Vec<(String, Card, Vec<String>)> {
     gather(node)
-        .into_iter()
+        .apps
+        .iter()
         .filter(|a| a.chain.chain_no == p.chain_no)
         .filter(|a| match (txid, family) {
             (Some(t), _) => a.versions.iter().any(|v| v.txid == t),
@@ -995,6 +1190,9 @@ pub fn launch(node: &Node, chain: &str, txid: &str) -> Result<Value, String> {
     let opens = e["opens"].as_str().unwrap_or("").to_ascii_lowercase();
     let key = crate::chains::find(chain).map(|cp| crate::http::page_key(node, cp.key, &opens)).unwrap_or_default();
     // One arcade's word for the version that opens: it still opens, with a caution the app window shows.
+    // The page and its app, for the page API's folder routes (crate::foldersvc, 2026-11-21): a page's pass names only the
+    // page, and looking its app up through the whole App Store takes minutes on a busy arcade.
+    crate::foldersvc::remember_page(&opens, e["id"].as_str().unwrap_or(""));
     let caution = (e["trust"]["level"] == "yellow").then(|| e["trust"]["note"].clone());
     // Withdrawn by its publisher: it still opens (an installed copy is never taken away), and the window says so.
     let withdrawn = e["withdrawn"].as_object().map(|w| json!({"reason": w.get("reason"), "replaced_by": w.get("replaced_by")}));
@@ -1462,5 +1660,172 @@ mod transfer_tests {
 
     fn chain() -> &'static ChainParams {
         arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &arcade_chain::Hash256::ZERO)
+    }
+}
+
+#[cfg(test)]
+mod cache_tests {
+    //! The kept apps (2026-11-21): one copy within the window, made again after invalidate, one maker at a time.
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
+
+    fn chain() -> &'static ChainParams {
+        arcade_arc::store::chain_params(&arcade_arc::params::TESTNET, &arcade_chain::Hash256::ZERO)
+    }
+    /// `n` made-up apps, one version each.
+    fn many(n: usize) -> Vec<App> {
+        (0..n)
+            .map(|i| {
+                let card = cards::parse(&format!(r#"{{"app":{{"name":"App {i}","family":"app-{i}","version":"1"}}}}"#)).unwrap();
+                let creator = format!("creator{}", i % 97);
+                let v = Ver { txid: format!("{i:064x}"), number: i as u64, creator: creator.clone(), height: i as u64, position: 0, card,
+                              trust: crate::vouch::Level::Green, holders: 0, checked: true };
+                App { chain: chain(), root: creator.clone(), owner: creator, versions: vec![v], removed: false, withdrawn: None }
+            })
+            .collect()
+    }
+    fn fp(h: u32) -> Fingerprint {
+        Fingerprint { tips: vec![(1, Some((h, [0; 32])))], borrowed: vec![], mesh_cards: 0 }
+    }
+    /// Puts in a copy made `ago` back, as if read then.
+    fn aged(c: &Cache, ago: Duration, f: Fingerprint) -> Arc<Snap> {
+        let mut s = c.lock();
+        let snap = Arc::new(Snap { apps: many(1), id: SNAP_IDS.fetch_add(1, Ordering::SeqCst), at: Instant::now().checked_sub(ago).unwrap(), fp: f, epoch: s.epoch });
+        s.snap = Some(snap.clone());
+        snap
+    }
+
+    #[test]
+    fn two_reads_in_the_window_share_one_copy_and_invalidate_makes_it_again() {
+        let c = Cache::default();
+        let made = AtomicUsize::new(0);
+        let build = || { made.fetch_add(1, Ordering::SeqCst); many(3) };
+        let a = c.snapshot(fp(1), build);
+        let b = c.snapshot(fp(1), build);
+        assert!(Arc::ptr_eq(&a, &b));
+        // Within the window a moved tip waits for it to end (at most every 15 s).
+        let b2 = c.snapshot(fp(2), build);
+        assert!(Arc::ptr_eq(&a, &b2));
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+        c.invalidate();
+        let d = c.snapshot(fp(1), build);
+        assert!(!Arc::ptr_eq(&a, &d));
+        assert_eq!(made.load(Ordering::SeqCst), 2);
+        assert_eq!(d.apps.len(), 3);
+        // The flags: made once per copy, again after a verdict, and again for a new copy.
+        let fm = AtomicUsize::new(0);
+        let mk = || { fm.fetch_add(1, Ordering::SeqCst); BTreeMap::from([("t".to_string(), "flagged".to_string())]) };
+        let f1 = c.flags(&d, mk);
+        let f2 = c.flags(&d, mk);
+        assert!(Arc::ptr_eq(&f1, &f2));
+        assert_eq!(fm.load(Ordering::SeqCst), 1);
+        c.invalidate_flags();
+        let f3 = c.flags(&d, mk);
+        assert!(!Arc::ptr_eq(&f1, &f3) && *f1 == *f3);
+        assert_eq!(fm.load(Ordering::SeqCst), 2);
+        // A write here (invalidate) makes both again.
+        c.invalidate();
+        let e = c.snapshot(fp(1), build);
+        let _ = c.flags(&e, mk);
+        assert_eq!((made.load(Ordering::SeqCst), fm.load(Ordering::SeqCst)), (3, 3));
+    }
+
+    #[test]
+    fn an_older_copy_is_kept_only_while_nothing_it_read_moved() {
+        let c = Cache::default();
+        let made = AtomicUsize::new(0);
+        let build = || { made.fetch_add(1, Ordering::SeqCst); many(1) };
+        // Past the window, nothing moved: still used.
+        let old = aged(&c, FRESH + Duration::from_secs(5), fp(7));
+        assert!(Arc::ptr_eq(&old, &c.snapshot(fp(7), build)));
+        assert_eq!(made.load(Ordering::SeqCst), 0);
+        // Past the window, a tip moved: made again.
+        assert!(!Arc::ptr_eq(&old, &c.snapshot(fp(8), build)));
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+        // Too old even though nothing moved: made again.
+        let old = aged(&c, FRESH_IF_UNCHANGED + Duration::from_secs(1), fp(7));
+        assert!(!Arc::ptr_eq(&old, &c.snapshot(fp(7), build)));
+        assert_eq!(made.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn callers_at_once_wait_for_one_maker() {
+        let c = Arc::new(Cache::default());
+        let made = Arc::new(AtomicUsize::new(0));
+        let hs: Vec<_> = (0..8)
+            .map(|_| {
+                let (c, made) = (c.clone(), made.clone());
+                std::thread::spawn(move || c.snapshot(fp(1), || { made.fetch_add(1, Ordering::SeqCst); std::thread::sleep(Duration::from_millis(300)); many(2) }))
+            })
+            .collect();
+        let got: Vec<Arc<Snap>> = hs.into_iter().map(|h| h.join().unwrap()).collect();
+        assert_eq!(made.load(Ordering::SeqCst), 1);
+        assert!(got.iter().all(|s| Arc::ptr_eq(s, &got[0])));
+    }
+
+    #[test]
+    fn a_slow_remake_hands_out_the_older_copy_after_two_seconds() {
+        let c = Arc::new(Cache::default());
+        let old = c.snapshot(fp(1), || many(1));
+        c.invalidate();
+        let c2 = c.clone();
+        let maker = std::thread::spawn(move || c2.snapshot(fp(1), || { std::thread::sleep(Duration::from_secs(4)); many(2) }));
+        while c.lock().building.is_none() {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let t = Instant::now();
+        let got = c.snapshot(fp(1), || panic!("only one maker at a time"));
+        assert!(Arc::ptr_eq(&got, &old), "the older copy");
+        assert!(t.elapsed() < Duration::from_millis(3000), "{:?}", t.elapsed());
+        let new = maker.join().unwrap();
+        assert_eq!(new.apps.len(), 2);
+        assert!(Arc::ptr_eq(&new, &c.snapshot(fp(1), || panic!("the new copy is fresh"))));
+    }
+
+    #[test]
+    fn a_maker_that_panics_leaves_no_one_waiting() {
+        let c = Arc::new(Cache::default());
+        let c2 = c.clone();
+        let _ = std::thread::spawn(move || c2.snapshot(fp(1), || panic!("reading the chains failed"))).join();
+        assert!(c.lock().building.is_none());
+        assert_eq!(c.snapshot(fp(1), || many(1)).apps.len(), 1);
+    }
+
+    /// A timing note: a kept copy of many apps is handed out in microseconds (the copy is shared, never cloned).
+    #[test]
+    fn a_kept_copy_of_many_apps_is_a_pointer_copy() {
+        let c = Cache::default();
+        let t = Instant::now();
+        let first = c.snapshot(fp(1), || many(20_000));
+        let made = t.elapsed();
+        let t = Instant::now();
+        for _ in 0..1000 {
+            assert!(Arc::ptr_eq(&first, &c.snapshot(fp(1), || panic!("kept"))));
+        }
+        let kept = t.elapsed() / 1000;
+        eprintln!("20000 apps: made in {made:?}, kept copy in {kept:?} a read");
+        assert!(kept < Duration::from_millis(5), "{kept:?}");
+    }
+
+    /// The node's own reads: one copy for two reads, the same answers from it, and invalidate makes it again.
+    #[test]
+    fn the_nodes_store_reads_one_copy() {
+        let t = crate::sitesvc::tests::setup();
+        let n = &t.node;
+        let a = gather(n);
+        let b = gather(n);
+        assert!(Arc::ptr_eq(&a, &b));
+        assert!(Arc::ptr_eq(&flags_of(n, &a), &flags_of(n, &b)));
+        let before = store(n, "popular", "", false, "");
+        invalidate(n);
+        let c = gather(n);
+        assert!(!Arc::ptr_eq(&a, &c));
+        assert_eq!(store(n, "popular", "", false, ""), before);
+        // A verdict makes the flags again, not the apps.
+        let f = flags_of(n, &c);
+        review(n, "x", &"00".repeat(32), "clear").unwrap();
+        assert!(Arc::ptr_eq(&c, &gather(n)));
+        assert!(!Arc::ptr_eq(&f, &flags_of(n, &c)));
     }
 }

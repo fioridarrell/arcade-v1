@@ -105,14 +105,132 @@ struct State {
     releases: BTreeMap<String, Release>,
     /// Files this arcade holds (sha256).
     have: HashSet<String>,
+    /// Counts up each time a file is added to `have`, so links are told the new list (2026-11-21: was the list's
+    /// length, which can stay the same while the list changes).
+    have_gen: u64,
     /// Per peer: release ids told, and the files it said it holds.
     told: HashMap<String, HashSet<String>>,
     peer_has: HashMap<String, HashSet<String>>,
-    have_told: HashMap<String, usize>,
-    /// Files being fetched now.
-    fetching: HashSet<String>,
+    /// Per peer: the `have_gen` it was last told.
+    have_told: HashMap<String, u64>,
+    /// Files being fetched now, and the holder each comes from.
+    fetching: HashMap<String, String>,
     /// The last failed fetch of a file not held yet: (when, why), shown in code.status.
     fetch_err: HashMap<String, (u64, String)>,
+    /// Per (file, holder): when its last try failed and how many tries in a row failed (2026-11-21: one overloaded
+    /// holder was asked again every 3 s while other holders of the file sat unused).
+    fails: HashMap<(String, String), (Instant, u32)>,
+    /// Per file: the holder tried last, so a switch to another one is logged.
+    last_holder: HashMap<String, String>,
+    /// Files logged as having no holder left (logged once, until one is found again).
+    no_holder_logged: HashSet<String>,
+}
+
+/// Files fetched at once, each from a different holder.
+const PARALLEL: usize = 2;
+
+/// How long a holder is left alone for a file after `n` failed tries in a row: 30 s, 2 min, 8 min, then 10 min.
+fn backoff(n: u32) -> Duration {
+    let secs = 30u64.saturating_mul(4u64.saturating_pow(n.saturating_sub(1).min(8)));
+    Duration::from_secs(secs.min(600))
+}
+
+/// Whether a holder is still in its backoff for a file.
+fn resting(fails: &HashMap<(String, String), (Instant, u32)>, sha: &str, peer: &str, now: Instant) -> bool {
+    fails.get(&(sha.to_string(), peer.to_string())).is_some_and(|(at, n)| now < *at + backoff(*n))
+}
+
+/// The holder to fetch a file from, of `holders` (each linked holder of the file and whether its link is direct):
+/// none busy with another file here, none still in its backoff for this file; of those, the fewest failed tries first (so
+/// an overloaded holder is passed over while others have not failed), then a direct link, then the one that failed
+/// longest ago (so failures rotate through the holders), then by id.
+fn pick_holder(sha: &str, holders: &[(String, bool)], fails: &HashMap<(String, String), (Instant, u32)>, busy: &HashSet<String>, now: Instant) -> Option<String> {
+    let mut ok: Vec<(&String, bool, u32, Option<Instant>)> = holders
+        .iter()
+        .filter(|(p, _)| !busy.contains(p) && !resting(fails, sha, p, now))
+        .map(|(p, direct)| {
+            let f = fails.get(&(sha.to_string(), p.clone()));
+            (p, *direct, f.map_or(0, |x| x.1), f.map(|x| x.0))
+        })
+        .collect();
+    ok.sort_by(|a, b| a.2.cmp(&b.2).then(b.1.cmp(&a.1)).then(a.3.cmp(&b.3)).then(a.0.cmp(b.0)));
+    ok.first().map(|x| x.0.clone())
+}
+
+/// A fetch to start: the file, its size, and the holder.
+#[derive(Clone, Debug, PartialEq)]
+struct Job {
+    sha: String,
+    bytes: u64,
+    peer: String,
+}
+
+/// The fetches to start now (up to PARALLEL running, each from a different holder), marked as fetching; with the
+/// lines to log (a file switching holder, a file with no holder left). `link` says whether a peer is linked now
+/// (None if not), and whether directly.
+fn plan(s: &mut State, now: Instant, link: &dyn Fn(&str) -> Option<bool>) -> (Vec<Job>, Vec<String>) {
+    let (mut jobs, mut logs) = (Vec::new(), Vec::new());
+    let mut busy: HashSet<String> = s.fetching.values().cloned().collect();
+    for (sha, bytes) in wanted(s) {
+        if s.fetching.len() >= PARALLEL {
+            break;
+        }
+        if s.have.contains(&sha) || s.fetching.contains_key(&sha) {
+            continue;
+        }
+        let mut holders: Vec<(String, bool)> = s.peer_has.iter().filter(|(_, has)| has.contains(&sha)).filter_map(|(p, _)| Some((p.clone(), link(p)?))).collect();
+        holders.sort();
+        let Some(peer) = pick_holder(&sha, &holders, &s.fails, &busy, now) else {
+            // Every free holder of it busy with another file here is only a wait; no holder at all, or every one
+            // in its backoff, is logged once.
+            let all_resting = holders.iter().all(|(p, _)| resting(&s.fails, &sha, p, now));
+            if all_resting && s.no_holder_logged.insert(sha.clone()) {
+                logs.push(if holders.is_empty() {
+                    format!("arc code: {} has no linked holder", short(&sha))
+                } else {
+                    format!("arc code: {} has no holder left: all {} failed lately; trying again after their backoff", short(&sha), holders.len())
+                });
+            }
+            continue;
+        };
+        s.no_holder_logged.remove(&sha);
+        if let Some(last) = s.last_holder.get(&sha).filter(|l| **l != peer) {
+            logs.push(format!("arc code: {} switching holder from {} to {}", short(&sha), short(last), short(&peer)));
+        }
+        s.last_holder.insert(sha.clone(), peer.clone());
+        s.fetching.insert(sha.clone(), peer.clone());
+        busy.insert(peer.clone());
+        jobs.push(Job { sha, bytes, peer });
+    }
+    (jobs, logs)
+}
+
+/// A fetch ended: the file is no longer fetching; a failure starts (or lengthens) that holder's backoff for the file,
+/// a success forgets the file's failures. A holder that says it doesn't hold the file is taken off its holders.
+fn finish(s: &mut State, job: &Job, r: &Result<(), String>, now: Instant) {
+    s.fetching.remove(&job.sha);
+    match r {
+        Ok(()) => {
+            s.fetch_err.remove(&job.sha);
+            s.fails.retain(|(f, _), _| *f != job.sha);
+            s.last_holder.remove(&job.sha);
+            s.no_holder_logged.remove(&job.sha);
+        }
+        Err(e) => {
+            let n = s.fails.get(&(job.sha.clone(), job.peer.clone())).map_or(0, |x| x.1);
+            s.fails.insert((job.sha.clone(), job.peer.clone()), (now, n.saturating_add(1)));
+            s.fetch_err.insert(job.sha.clone(), (arcade_app::now(), format!("from {}: {e}", short(&job.peer))));
+            if e.contains("not held here") {
+                if let Some(h) = s.peer_has.get_mut(&job.peer) {
+                    h.remove(&job.sha);
+                }
+            }
+        }
+    }
+}
+
+fn short(id: &str) -> &str {
+    &id[..12.min(id.len())]
 }
 
 /// A release version's order: "v1.2.3" (a "-windows" or other suffix after the numbers ignored) as numbers, so v0.1.10
@@ -198,7 +316,10 @@ fn keep_file(sha: &str, src: &Path) -> Result<(), String> {
     std::fs::create_dir_all(dir().join("files")).map_err(|e| e.to_string())?;
     std::fs::copy(src, file_path(sha).with_extension("in")).map_err(|e| e.to_string())?;
     std::fs::rename(file_path(sha).with_extension("in"), file_path(sha)).map_err(|e| e.to_string())?;
-    st().have.insert(sha.to_string());
+    let mut s = st();
+    if s.have.insert(sha.to_string()) {
+        s.have_gen += 1;
+    }
     Ok(())
 }
 
@@ -223,6 +344,7 @@ pub fn start(node: &Arc<Node>, test_key: Option<String>) {
             let n = e.file_name().to_string_lossy().to_string();
             if n.len() == 64 {
                 s.have.insert(n);
+                s.have_gen += 1;
             }
         }
     }
@@ -233,36 +355,48 @@ pub fn start(node: &Arc<Node>, test_key: Option<String>) {
     });
 }
 
-/// Fetch one missing file from a linked arcade that holds it (one file at a time, in 48 kB pieces).
+/// Start fetches of missing files (in 48 kB pieces): up to PARALLEL at once, each from a different linked holder,
+/// each in a thread of its own. 2026-11-21: was one file at a time, always from the first holder found, so one
+/// overloaded holder (the publisher) held a whole rollout up while other arcades already had the files.
 fn fetch_round(_node: &Node) {
-    let job = {
-        let s = st();
-        let missing: Vec<(String, u64)> = wanted(&s).into_iter().filter(|(sha, _)| !s.have.contains(sha) && !s.fetching.contains(sha)).collect();
-        missing.into_iter().find_map(|(sha, bytes)| {
-            let peer = s.peer_has.iter().find(|(p, has)| has.contains(&sha) && crate::crvia::linked(p)).map(|(p, _)| p.clone())?;
-            Some((sha, bytes, peer))
-        })
-    };
-    let Some((sha, bytes, peer)) = job else { return };
-    st().fetching.insert(sha.clone());
-    let t0 = Instant::now();
-    let r = fetch(&peer, &sha, bytes);
-    let mut s = st();
-    s.fetching.remove(&sha);
-    match r {
-        Ok(()) => {
-            s.fetch_err.remove(&sha);
-            eprintln!("arc code: fetched {} ({bytes} bytes) from {} in {:.1} s", &sha[..12], &peer[..12], t0.elapsed().as_secs_f64())
-        }
-        Err(e) => {
-            eprintln!("arc code: fetching {} from {}: {e}", &sha[..12], &peer[..12]);
-            s.fetch_err.insert(sha, (arcade_app::now(), format!("from {}: {e}", &peer[..12.min(peer.len())])));
+    let link = |p: &str| crate::crvia::linked(p).then(|| crate::meshsvc::direct_up(p));
+    let (jobs, logs) = plan(&mut st(), Instant::now(), &link);
+    for l in logs {
+        eprintln!("{l}");
+    }
+    for job in jobs {
+        let j = job.clone();
+        if let Err(e) = std::thread::Builder::new().name("arc code fetch".into()).spawn(move || run(j)) {
+            finish(&mut st(), &job, &Err(format!("no thread: {e}")), Instant::now());
         }
     }
 }
 
-fn fetch(peer: &str, sha: &str, bytes: u64) -> Result<(), String> {
-    use crate::crsource::Pipe;
+/// One fetch, start to end; the file comes off `fetching` however it ends (a panic too, so it can't stay marked).
+fn run(job: Job) {
+    struct Done(Option<Job>);
+    impl Drop for Done {
+        fn drop(&mut self) {
+            if let Some(job) = self.0.take() {
+                finish(&mut st(), &job, &Err("the fetch stopped".into()), Instant::now());
+            }
+        }
+    }
+    let mut done = Done(Some(job.clone()));
+    let from = std::fs::metadata(file_path(&job.sha).with_extension("part")).map(|m| m.len()).unwrap_or(0);
+    let t0 = Instant::now();
+    let r = fetch(|| crate::crvia::Via::open(&job.peer).map(|v| (v.id, v)), &job.sha, job.bytes);
+    match &r {
+        Ok(()) => eprintln!("arc code: fetched {} ({} bytes, from byte {from}) from {} in {:.1} s", short(&job.sha), job.bytes, short(&job.peer), t0.elapsed().as_secs_f64()),
+        Err(e) => eprintln!("arc code: fetching {} from {} (from byte {from}): {e}", short(&job.sha), short(&job.peer)),
+    }
+    done.0 = None;
+    finish(&mut st(), &job, &r, Instant::now());
+}
+
+/// A file from one holder: `open` gives a pipe to the holder and the id its answers carry. The pieces go into
+/// `<sha>.part`, which stays when a try fails, so the next try (from any holder) goes on from the last whole piece.
+fn fetch<P: crate::crsource::Pipe>(mut open: impl FnMut() -> Result<(u64, P), String>, sha: &str, bytes: u64) -> Result<(), String> {
     std::fs::create_dir_all(dir().join("files")).map_err(|e| e.to_string())?;
     let part = file_path(sha).with_extension("part");
     let mut out = std::fs::OpenOptions::new().create(true).read(true).write(true).truncate(false).open(&part).map_err(|e| e.to_string())?;
@@ -271,14 +405,14 @@ fn fetch(peer: &str, sha: &str, bytes: u64) -> Result<(), String> {
     at -= at % CHUNK;
     out.set_len(at).map_err(|e| e.to_string())?;
     out.seek(SeekFrom::Start(at)).map_err(|e| e.to_string())?;
-    // Up to WINDOW pieces asked at once, each written at its place as it comes; a gap left by an error ends the try
-    // (the next one resumes from the last whole piece before it).
-    let mut asked: std::collections::VecDeque<(u64, crate::crvia::Via)> = std::collections::VecDeque::new();
+    // Up to WINDOW pieces asked at once, written in order as their answers come; an error ends the try (the next one
+    // resumes from the last whole piece written).
+    let mut asked: std::collections::VecDeque<(u64, P)> = std::collections::VecDeque::new();
     let mut next = at;
     while at < bytes {
         while asked.len() < WINDOW && next < bytes {
-            let mut via = crate::crvia::Via::open(peer)?;
-            via.send(&Frame::new(json!({"t": "co", "op": "g", "id": via.id, "f": sha, "at": next})))?;
+            let (id, mut via) = open()?;
+            via.send(&Frame::new(json!({"t": "co", "op": "g", "id": id, "f": sha, "at": next})))?;
             asked.push_back((next, via));
             next += CHUNK;
         }
@@ -301,6 +435,16 @@ fn fetch(peer: &str, sha: &str, bytes: u64) -> Result<(), String> {
     r
 }
 
+/// A mesh link to `peer` came up: it is told the releases and the files held here again. 2026-11-21: what a peer had
+/// been told was kept across its links, so an arcade that restarted (its list of who holds what empty) was never
+/// told again which files its peers hold, and sat with nothing to fetch ("fetching": [], 93 MB missing) until a
+/// peer happened to get a new file.
+pub fn link_up(peer: &str) {
+    let mut s = st();
+    s.told.remove(peer);
+    s.have_told.remove(peer);
+}
+
 /// What this link hasn't been told: release records, and (when it changed) the files held here.
 pub fn tick(peer: &str, link: &mut Link) -> Result<(), LinkError> {
     if KEYS.get().is_none() {
@@ -314,7 +458,7 @@ pub fn tick(peer: &str, link: &mut Link) -> Result<(), LinkError> {
         for (id, _, _) in &new {
             t.insert(id.clone());
         }
-        let n = s.have.len();
+        let n = s.have_gen;
         let have = (s.have_told.get(peer) != Some(&n)).then(|| s.have.iter().cloned().collect::<Vec<_>>());
         s.have_told.insert(peer.to_string(), n);
         (new, have)
@@ -438,8 +582,11 @@ pub fn status() -> Value {
         .iter()
         .filter(|(sha, _)| !s.have.contains(*sha))
         .map(|(sha, b)| {
-            let holders = s.peer_has.iter().filter(|(p, has)| has.contains(sha) && crate::crvia::linked(p)).count();
-            json!({"sha256": sha, "bytes": b, "linked_holders": holders, "fetching": s.fetching.contains(sha),
+            let linked: Vec<&String> = s.peer_has.iter().filter(|(p, has)| has.contains(sha) && crate::crvia::linked(p)).map(|(p, _)| p).collect();
+            // Of those, the ones not in a backoff for this file (2026-11-21).
+            let ready = linked.iter().filter(|p| !resting(&s.fails, sha, p, Instant::now())).count();
+            json!({"sha256": sha, "bytes": b, "linked_holders": linked.len(), "ready_holders": ready,
+                   "fetching": s.fetching.contains_key(sha), "from": s.fetching.get(sha),
                    "last_error": s.fetch_err.get(sha).map(|(t, e)| json!({"at": t, "why": e}))})
         })
         .collect();
@@ -449,7 +596,7 @@ pub fn status() -> Value {
         rs.first().map(|r| json!({"version": r.version, "id": r.id}))
     };
     json!({"trusted_keys": KEYS.get().map(|k| k.iter().map(|k| hex::encode(k.to_bytes())).collect::<Vec<_>>()).unwrap_or_default(),
-           "releases": releases, "files_held": s.have.len(), "bytes_missing": missing, "fetching": s.fetching.iter().collect::<Vec<_>>(),
+           "releases": releases, "files_held": s.have.len(), "bytes_missing": missing, "fetching": s.fetching.keys().collect::<Vec<_>>(),
            "missing_files": missing_files, "newest": newest})
 }
 
@@ -503,5 +650,186 @@ mod order_tests {
         v.sort_by(newest_first);
         let ids: Vec<&str> = v.iter().map(|r| r.id.as_str()).collect();
         assert_eq!(ids, ["b", "c", "a", "e", "d"]);
+    }
+}
+
+/// Fetching from any holder (2026-11-21): holder choice, rotation and backoff, two files at once, and a file that
+/// still arrives when its first holder stops answering partway.
+#[cfg(test)]
+mod fetch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    fn id(c: char) -> String {
+        c.to_string().repeat(64)
+    }
+
+    /// A state wanting `files` (sha, bytes, the peers that hold it) in one release.
+    fn state(files: &[(&str, u64, &[&str])]) -> State {
+        let mut s = State::default();
+        let mut r = Release { id: "r".into(), record: String::new(), sig: String::new(), name: ARCADE_V1.into(), version: "v1.0.0".into(), commit: String::new(), time: 0, files: Default::default() };
+        for (i, (sha, bytes, holders)) in files.iter().enumerate() {
+            r.files.insert(format!("f{i}"), (sha.to_string(), *bytes));
+            for h in *holders {
+                s.peer_has.entry(h.to_string()).or_default().insert(sha.to_string());
+            }
+        }
+        s.releases.insert("r".into(), r);
+        s
+    }
+
+    #[test]
+    fn backoff_grows_to_ten_minutes() {
+        let secs: Vec<u64> = (1..=6).map(|n| backoff(n).as_secs()).collect();
+        assert_eq!(secs, [30, 120, 480, 600, 600, 600]);
+        assert_eq!(backoff(u32::MAX).as_secs(), 600);
+    }
+
+    #[test]
+    fn holder_choice_prefers_direct_and_skips_resting_and_busy() {
+        let (a, b, c) = (id('a'), id('b'), id('c'));
+        let f = id('f');
+        let now = Instant::now();
+        let holders = vec![(a.clone(), false), (b.clone(), true), (c.clone(), false)];
+        let mut fails = HashMap::new();
+        let none = HashSet::new();
+        assert_eq!(pick_holder(&f, &holders, &fails, &none, now), Some(b.clone()), "a direct link first");
+        fails.insert((f.clone(), b.clone()), (now, 1));
+        assert_eq!(pick_holder(&f, &holders, &fails, &none, now), Some(a.clone()), "the direct one is resting: next by id");
+        let busy: HashSet<String> = [a.clone()].into();
+        assert_eq!(pick_holder(&f, &holders, &fails, &busy, now), Some(c.clone()), "one busy with another file is skipped");
+        let busy: HashSet<String> = [a.clone(), c.clone()].into();
+        assert_eq!(pick_holder(&f, &holders, &fails, &busy, now), None);
+        // After its backoff the direct one is back, but one that never failed comes before it.
+        let later = now + Duration::from_secs(31);
+        assert_eq!(pick_holder(&f, &holders, &fails, &none, later), Some(a.clone()));
+        // All failed once: the one that failed longest ago first.
+        fails.insert((f.clone(), a.clone()), (now + Duration::from_secs(2), 1));
+        fails.insert((f.clone(), c.clone()), (now + Duration::from_secs(1), 1));
+        let late = now + Duration::from_secs(60);
+        assert_eq!(pick_holder(&f, &[(a.clone(), false), (c.clone(), false)], &fails, &none, late), Some(c.clone()));
+        // A failure counts for that file only.
+        assert_eq!(pick_holder(&id('g'), &holders, &fails, &none, now), Some(b));
+    }
+
+    #[test]
+    fn failures_rotate_through_holders_then_back_off() {
+        let (a, b) = (id('a'), id('b'));
+        let f = id('f');
+        let mut s = state(&[(&f, 10, &[&a, &b])]);
+        let link = |p: &str| Some(p.starts_with('a'));
+        let t0 = Instant::now();
+        let at = |secs| t0 + Duration::from_secs(secs);
+        let (jobs, logs) = plan(&mut s, t0, &link);
+        assert_eq!(jobs, [Job { sha: f.clone(), bytes: 10, peer: a.clone() }]);
+        assert!(logs.is_empty());
+        assert!(plan(&mut s, t0, &link).0.is_empty(), "a file is fetched once at a time");
+        finish(&mut s, &jobs[0], &Err("no answer over its mesh link in time".into()), t0);
+        assert!(!s.fetching.contains_key(&f));
+        let (jobs, logs) = plan(&mut s, at(3), &link);
+        assert_eq!(jobs[0].peer, b, "the next try goes to the other holder");
+        assert_eq!(logs, [format!("arc code: {} switching holder from {} to {}", short(&f), short(&a), short(&b))]);
+        finish(&mut s, &jobs[0], &Err("its mesh link went down".into()), at(3));
+        let (jobs, logs) = plan(&mut s, at(6), &link);
+        assert!(jobs.is_empty());
+        assert_eq!(logs.len(), 1, "no holder left, logged: {logs:?}");
+        assert!(logs[0].contains("no holder left"));
+        assert!(plan(&mut s, at(9), &link).1.is_empty(), "logged once");
+        // After 30 s the first holder is tried again; failing a second time rests it 2 minutes.
+        let (jobs, _) = plan(&mut s, at(31), &link);
+        assert_eq!(jobs[0].peer, a);
+        finish(&mut s, &jobs[0], &Err("no answer over its mesh link in time".into()), at(31));
+        let (jobs, _) = plan(&mut s, at(34), &link);
+        assert_eq!(jobs[0].peer, b);
+        finish(&mut s, &jobs[0], &Err("no answer over its mesh link in time".into()), at(34));
+        assert!(plan(&mut s, at(100), &link).0.is_empty(), "both resting two minutes");
+        let (jobs, _) = plan(&mut s, at(152), &link);
+        assert_eq!(jobs[0].peer, a);
+        finish(&mut s, &jobs[0], &Ok(()), at(160));
+        assert!(s.fails.is_empty() && s.fetch_err.is_empty() && s.last_holder.is_empty());
+    }
+
+    #[test]
+    fn two_files_at_once_from_different_holders() {
+        let (a, b) = (id('a'), id('b'));
+        let (f, g, h) = (id('1'), id('2'), id('3'));
+        let mut s = state(&[(&f, 10, &[&a, &b]), (&g, 10, &[&a, &b]), (&h, 10, &[&a])]);
+        let link = |_: &str| Some(false);
+        let (jobs, _) = plan(&mut s, Instant::now(), &link);
+        assert_eq!(jobs.len(), PARALLEL);
+        assert_ne!(jobs[0].peer, jobs[1].peer);
+        assert!(plan(&mut s, Instant::now(), &link).0.is_empty(), "at most PARALLEL");
+        // A holder that isn't linked isn't a holder; one that says it doesn't hold a file is dropped for it.
+        let mut s = state(&[(&f, 10, &[&a, &b])]);
+        let only_b = |p: &str| (p == b).then_some(false);
+        let (jobs, _) = plan(&mut s, Instant::now(), &only_b);
+        assert_eq!(jobs[0].peer, b);
+        finish(&mut s, &jobs[0], &Err("peer: not held here".into()), Instant::now());
+        assert!(!s.peer_has[&b].contains(&f));
+        let (jobs, logs) = plan(&mut s, Instant::now(), &only_b);
+        assert!(jobs.is_empty());
+        assert_eq!(logs, [format!("arc code: {} has no linked holder", short(&f))]);
+    }
+
+    /// A holder over a fake mesh link: answers pieces of `data`, or (from byte `fail_at` on) no answer.
+    struct Holder {
+        data: Arc<Vec<u8>>,
+        fail_at: u64,
+        asked: Arc<Mutex<Vec<u64>>>,
+        at: Option<u64>,
+    }
+
+    impl crate::crsource::Pipe for Holder {
+        fn send(&mut self, f: &Frame) -> Result<(), String> {
+            let at = f.head["at"].as_u64().unwrap();
+            self.asked.lock().unwrap().push(at);
+            self.at = Some(at);
+            Ok(())
+        }
+        fn recv(&mut self, _until: Instant) -> Result<Frame, String> {
+            let at = self.at.take().unwrap();
+            if at >= self.fail_at {
+                return Err("no answer over its mesh link in time".into());
+            }
+            let end = (at + CHUNK).min(self.data.len() as u64);
+            Ok(Frame { head: json!({"t": "co", "op": "a"}), blob: self.data[at as usize..end as usize].to_vec() })
+        }
+    }
+
+    /// The first holder stops answering partway (and is then left alone in its backoff); the file still arrives,
+    /// from the second holder, which is asked only for the pieces not fetched yet.
+    #[test]
+    fn a_file_arrives_from_a_second_holder_resuming_where_the_first_stopped() {
+        let _ = HOME.set(std::env::temp_dir().join(format!("arccode-test-{}", std::process::id())));
+        let data: Arc<Vec<u8>> = Arc::new((0..5 * CHUNK + 1234).map(|i| (i * 7 % 251) as u8).collect());
+        let sha = sha_hex(&data);
+        let (a, b) = (id('a'), id('b'));
+        let mut s = state(&[(&sha, data.len() as u64, &[&a, &b])]);
+        let link = |p: &str| Some(p.starts_with('a'));
+        let asked: HashMap<String, Arc<Mutex<Vec<u64>>>> = [(a.clone(), Default::default()), (b.clone(), Default::default())].into();
+        static IDS: AtomicU64 = AtomicU64::new(1);
+        let mut now = Instant::now();
+        let mut from = Vec::new();
+        for _ in 0..10 {
+            for job in plan(&mut s, now, &link).0 {
+                let fail_at = if job.peer == a { 3 * CHUNK } else { u64::MAX };
+                let (log, d) = (asked[&job.peer].clone(), data.clone());
+                let r = fetch(|| Ok((IDS.fetch_add(1, Ordering::Relaxed), Holder { data: d.clone(), fail_at, asked: log.clone(), at: None })), &job.sha, job.bytes);
+                from.push((job.peer.clone(), r.is_ok()));
+                if r.is_ok() {
+                    s.have.insert(job.sha.clone());
+                }
+                finish(&mut s, &job, &r, now);
+            }
+            now += Duration::from_secs(3);
+        }
+        assert_eq!(from, [(a.clone(), false), (b.clone(), true)]);
+        assert_eq!(std::fs::read(file_path(&sha)).unwrap(), *data);
+        assert!(st().have.contains(&sha));
+        let b_asked = asked[&b].lock().unwrap().clone();
+        assert_eq!(b_asked, [3 * CHUNK, 4 * CHUNK, 5 * CHUNK], "the second holder goes on from the pieces already here");
+        assert!(!file_path(&sha).with_extension("part").exists());
+        let _ = std::fs::remove_dir_all(dir());
+        let _ = std::fs::remove_dir(dir().parent().unwrap());
     }
 }

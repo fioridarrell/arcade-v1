@@ -98,7 +98,7 @@ pub fn error_code(e: &str) -> &'static str {
         "unknown_chain"
     } else if l.starts_with("not_found") || l.starts_with("no transaction") || l.starts_with("no block") || l.starts_with("no such") || l.contains(" not found") {
         "not_found"
-    } else if l.contains("service is starting") {
+    } else if l.contains("service is starting") || l.starts_with("starting:") {
         "starting"
     } else if l.contains("service is stopping") {
         "stopping"
@@ -116,7 +116,16 @@ pub fn error_code(e: &str) -> &'static str {
 
 /// An error answer: the text and its code.
 pub fn error_reply(e: &str) -> Value {
-    json!({"ok": false, "error": e, "code": error_code(e)})
+    let code = error_code(e);
+    let mut v = json!({"ok": false, "error": e, "code": code});
+    // A call that came too early (the ARCADE chain not reachable yet, crate::arcsvc::reach_pending_error) says when to
+    // ask again, as the answer during startup does (2026-11-21).
+    if code == "starting" {
+        v["starting"] = json!(true);
+        v["state"] = json!("starting");
+        v["retry_after_s"] = json!(5);
+    }
+    v
 }
 
 fn handle(node: Arc<Node>, s: UnixStream) {
@@ -745,6 +754,15 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
                 crate::appsvc::allowance_use(node, &id, &service, amount, &s("note").unwrap_or_default(), req["undo"] == true)
             }
         }
+        // An app's folder (crate::foldersvc, 2026-11-21): given after the person picks it on the app window's card, its
+        // changes logged; the picker's subfolders; and the folder ops for programs on this computer (CLI apps), the same
+        // code as the page API's /r/folder/*.
+        "apps.folder_set" => crate::foldersvc::grant(node, &s("id").ok_or("id required")?, &s("path").ok_or("path required")?, &crate::foldersvc::browse_roots()),
+        "apps.folder_log" => Ok(crate::foldersvc::folder_log(node, &s("id").ok_or("id required")?, req["limit"].as_u64().map(|n| n as usize))),
+        "folder.browse" => crate::foldersvc::browse(req["path"].as_str()),
+        c @ ("folder.list" | "folder.stat" | "folder.read" | "folder.write" | "folder.mkdir" | "folder.remove") => {
+            crate::foldersvc::op(node, &s("id").ok_or("id required")?, &c["folder.".len()..], req)
+        }
         "apps.review" => crate::appsvc::review(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?, &s("verdict").ok_or("verdict required (clear or confirm)")?),
         "apps.trust" => crate::appsvc::trust(node, &s("address").ok_or("address required")?, req["on"] != false),
         "inscribe" | "inscribe.estimate" => {
@@ -936,6 +954,8 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "a.contact_delete" => crate::arcledger::a_contact_delete(node, &s("id").ok_or("id required")?),
         "a.wallets" => crate::walletproofs::a_wallets(node, &req),
         "a.wallets_publish" => crate::walletproofs::publish(node, req["force"] == true),
+        "a.card_addresses" => crate::walletproofs::card_addresses(node),
+        "a.card_address" => crate::walletproofs::set_card_address(node, &s("coin").ok_or("coin required")?, &s("address").ok_or("address required")?, req["show"] != false),
         "a.post" => crate::arcledger::a_post(node, &s("text").ok_or("text required")?),
         "a.reactions" => crate::asocial::reactions(node, &req),
         "a.replies" => crate::asocial::replies(node, &req),
@@ -1265,6 +1285,7 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "arc.status" => crate::arcsvc::status(node),
         "tx.status" => crate::receipts::status(node, req),
         "tx.wait" => crate::receipts::wait(node, req),
+        "tx.resend" => crate::ownwait::api_resend(node, req),
         "arc.earning" => crate::arcsvc::earning(node),
         "arc.block" => crate::arcsvc::block(req),
         "arc.submit" => crate::arcsvc::submit(req),

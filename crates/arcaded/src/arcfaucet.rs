@@ -430,6 +430,20 @@ pub fn pay(node: &Node) {
 
 /// The node faucet, paying side: one open node-gift ask from this arcade's wallet, if it can. NODE_GIFT in two coins
 /// to a node no payer has paid, at an address past no gift. Whether it paid.
+/// Why a node-gift ask wasn't paid here, said once an hour per address (2026-11-21: a new arcade's ask sat unpaid on an
+/// arcade with ARCADE to spare and nothing said why).
+fn skipped(node: &Node, id: &str, addr: &str, why: &str) {
+    static SAID: std::sync::Mutex<Option<std::collections::HashMap<String, u64>>> = std::sync::Mutex::new(None);
+    let now = arcade_app::now();
+    let mut m = SAID.lock().unwrap();
+    let m = m.get_or_insert_with(Default::default);
+    if m.get(addr).is_some_and(|t| now.saturating_sub(*t) < 3600) {
+        return;
+    }
+    m.insert(addr.to_string(), now);
+    let _ = node.app.event("faucet", &format!("node {}'s gift at {addr} not paid here: {why}", &id[..id.len().min(16)]));
+}
+
 fn pay_node_gift(node: &Node, p: &ChainParams) -> bool {
     let now = arcade_app::now();
     let me = node.id_hex();
@@ -464,6 +478,7 @@ fn pay_node_gift(node: &Node, p: &ChainParams) -> bool {
     let have_spare = spendable(node, p).saturating_sub(KEEP + FEE_MARGIN);
     for (id, addr, was_paid) in candidates {
         if paid_today.iter().any(|e| e[0] == addr.as_str() || e[1] == id.as_str()) {
+            skipped(node, &id, &addr, "paid today already");
             continue;
         }
         // Paid before (by us or as a notice said): so it stays, unless the notice's payment never came (its address
@@ -472,14 +487,17 @@ fn pay_node_gift(node: &Node, p: &ChainParams) -> bool {
             let came = script_of(p, &paid_addr).ok().and_then(|sc| node.chain.history_for_script(p.chain_no, &sc).ok()).is_some_and(|h| h.iter().map(|x| x.2).sum::<u64>() > TARGET)
                 || balance(node, p, &paid_addr).is_some_and(|b| b >= NODE_GIFT / 2);
             if came || now.saturating_sub(at) < SENT_HOLD {
+                skipped(node, &id, &addr, if came { "another arcade paid it (its coins arrived)" } else { "another arcade says it paid it; waiting for the coins" });
                 continue;
             }
         }
         if held_before(node, p, &addr) {
+            skipped(node, &id, &addr, "the address holds or received ARCADE already");
             state().lock().unwrap().gifted.insert(addr);
             continue;
         }
         if NODE_GIFT > have_spare {
+            skipped(node, &id, &addr, &format!("this wallet has {} ARCADE to spare, less than the gift", have_spare as f64 / 1e8));
             return false; // nothing to spare: someone else pays
         }
         let r = match crate::coinsend::send_parts(node, Some(p.key), &addr, &two_coins(NODE_GIFT), None, None, false, true) {

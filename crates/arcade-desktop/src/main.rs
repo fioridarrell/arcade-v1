@@ -16,6 +16,8 @@ fn home() -> std::path::PathBuf {
 /// window's. A new door in appwindow.js needs its command here (tests::app_windows_ask_only_their_doors checks).
 const APP_WINDOW_COMMANDS: &[&str] = &[
     "apps.node", "apps.owner", "apps.owner_send", "apps.perms", "apps.storage",
+    // Spending allowances and the folder card (2026-11-21), sent by the window's own scripts, never by a page.
+    "apps.allowance", "apps.allowance_use", "apps.folder_set", "folder.browse",
     "chains.list", "explorer.inscription", "explorer.ledger_inscription",
     "contacts.delete", "contacts.list", "contacts.save", "msg.who",
     // arcade.feed (the Feed app): reads, and posts, acts, follows and mutes behind the app's Feed switch (appwindow.js).

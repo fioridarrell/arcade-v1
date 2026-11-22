@@ -22,7 +22,8 @@ pub fn chain() -> Result<&'static ChainParams, String> {
 /// that needs to be sent"). Coins, waiting change and the broadcast follow whichever copy stands in (claims::arc_coins,
 /// arcsvc::waiting_outputs, ownwait::send_arc).
 pub fn write_chain() -> Result<&'static ChainParams, String> {
-    crate::arcsvc::usable_chain().ok_or_else(|| "the ARCADE chain isn't installed or borrowed here".to_string())
+    // Not reachable yet (arcaded starting, its borrowed copy still being set up): "starting" with a retry (2026-11-21).
+    crate::arcsvc::usable_chain().ok_or_else(|| crate::arcsvc::reach_pending_error().unwrap_or_else(|| "the ARCADE chain isn't installed or borrowed here".to_string()))
 }
 
 // ---------------- reads while ARCADE is only borrowed (borrowed = installed, batch 4) ----------------
@@ -867,9 +868,8 @@ pub fn a_profile_set(node: &Node, req: &Value) -> Result<Value, String> {
             v.insert(to.into(), json!(s));
         }
     }
-    if let Some(a) = req["addresses"].as_object().filter(|a| !a.is_empty()) {
-        v.insert("a".into(), json!(a.iter().filter(|(_, x)| x.as_str().is_some_and(|s| !s.is_empty())).map(|(k, x)| (k.clone(), x.clone())).collect::<serde_json::Map<_, _>>()));
-    }
+    // No stated addresses (Martin 2026-11-21: "You should not be able to change your addresses shown, they should just
+    // be automatic"): a card's addresses are only its wallet proofs (crate::walletproofs), each signed by its own key.
     let v = Value::Object(v);
     if let Some(p) = arcade_ledger::aproto::profile_problem(&v) {
         return Err(p.into());

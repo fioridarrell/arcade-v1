@@ -196,8 +196,17 @@ pub fn retry_parked(node: &Arc<Node>) {
         .unwrap();
 }
 
+/// Seeds and --peer addresses: dialed for ever, never parked, whichever dial reaches them (2026-11-21: the --peer
+/// address of the arcade beside the GX10 was dialed as a LAN address heard from a link, parked after a refusal during
+/// that arcade's restart, and the two stayed apart for 15 minutes at a time).
+fn seed_addrs() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    static S: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = std::sync::OnceLock::new();
+    S.get_or_init(Default::default).lock().unwrap()
+}
+
 /// Start a dialing thread for a mesh address unless one exists (seeds, --peer).
 pub fn dial(node: &Arc<Node>, addr: String) {
+    seed_addrs().insert(addr.clone());
     {
         let mut d = node.dialing.lock().unwrap();
         if d.contains(&addr) || d.len() >= MAX_OUTBOUND {
@@ -818,6 +827,8 @@ pub fn run(node: Arc<Node>, addr: String, heard: Option<&'static str>) {
 
 /// `run`; `redial`: a heard address whose quick tries come at REDIAL_WAITS (`link_dropped`).
 fn run_as(node: Arc<Node>, addr: String, heard: Option<&'static str>, redial: bool) {
+    // A seed or --peer address is never parked, however it came to be dialed (seed_addrs).
+    let heard = if seed_addrs().contains(&addr) { None } else { heard };
     let mut fails = 0u32;
     let mut failing_since = 0u64;
     // A parked address gets one dial a round, not another quick series (a dropped link's redials get theirs).

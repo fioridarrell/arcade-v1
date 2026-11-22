@@ -54,21 +54,30 @@
         // states.
         ...(p.wallets || []).map((w) => h("div", { class: "pp-addr", title: `Signed by this address's own key (block ${w.height})` },
           h("span", { class: "k" }, w.coin), h("span", { class: "mono" }, w.address), h("span", { class: "pp-ok" }, "✓ verified"))),
-        ...Object.entries(pr.a || {}).filter(([, v]) => !(p.wallets || []).some((w) => w.address === v)).map(([k, v]) =>
-          h("div", { class: "pp-addr", title: "Stated on the profile, not signed by its key" },
-            h("span", { class: "k" }, k), h("span", { class: "mono" }, v), h("span", { class: "pp-no" }, "not verified")))),
+        // Only proven addresses (Martin 2026-11-21: every address checked by its key, none typed in).
+      ),
       p.from_home ? h("p", { class: "s" }, `Shown from ${p.from_home.chain} until it is published on ARCADE.`) : (p.height != null ? h("p", { class: "s" }, `Published at block ${p.height} · version ${p.versions}.`) : ""),
     ];
   }
 
-  // The profile's rows: every address the wallet has (its own on each coin here, imported wallets), kept editable.
-  function profileAddrInputs(holder, values) {
-    holder.replaceChildren(...Object.entries(values).map(([k, v]) => {
-      const i = h("input", { "data-chain": k, value: v, placeholder: `${label(k)} address` });
-      i.oninput = () => { dirty = true; cost(); };
-      return h("div", { class: "pp-addr" }, h("span", { class: "k" }, label(k)), i);
+  // Every address this wallet has (each coin here, each imported wallet), shown on the card once its own key proves it
+  // (Martin 2026-11-21: automatic and verified only; nothing typed in). The owner may take one off the card, or put it
+  // back; the new proof set goes out at once.
+  async function cardAddrList(holder) {
+    let rows = [];
+    try { rows = (await api("a.card_addresses")).addresses || []; } catch (e) { holder.replaceChildren(h("span", { class: "s bad" }, e.message)); return; }
+    if (!rows.length) { holder.replaceChildren(h("span", { class: "s" }, "No addresses in this wallet yet.")); return; }
+    holder.replaceChildren(...rows.map((r) => {
+      const btn = h("button", { class: "small" }, r.state === "removed" ? "Show again" : "Remove from card");
+      btn.onclick = async () => {
+        btn.disabled = true;
+        try { await api("a.card_address", { coin: r.coin, address: r.address, show: r.state === "removed" }); }
+        catch (e) { alert(e.message); }
+        cardAddrList(holder);
+      };
+      const st = r.state === "verified" ? h("span", { class: "pp-ok" }, "✓ verified") : r.state === "waiting" ? h("span", { class: "s" }, "waiting for its proof") : h("span", { class: "pp-no" }, "removed from card");
+      return h("div", { class: "pp-addr" }, h("span", { class: "k" }, label(r.coin)), h("span", { class: "mono" }, r.address), st, btn);
     }));
-    if (!Object.keys(values).length) holder.replaceChildren(h("span", { class: "s" }, "No addresses in this wallet yet."));
   }
   function addrInputs(holder, values) {
     holder.replaceChildren(...CHAINS.map(([k, name]) => {
@@ -80,11 +89,11 @@
   const addrValues = (holder) => Object.fromEntries([...holder.querySelectorAll("input")].map((i) => [i.dataset.chain, i.value.trim()]).filter(([, v]) => v));
 
   function formProfile() {
-    return { name: $("pp-name").value.trim(), bio: $("pp-bio").value.trim(), url: $("pp-url").value.trim(), picture: picture || undefined, addresses: addrValues($("pp-addrs")) };
+    return { name: $("pp-name").value.trim(), bio: $("pp-bio").value.trim(), url: $("pp-url").value.trim(), picture: picture || undefined };
   }
   function cost() {
     const f = formProfile();
-    const body = JSON.stringify({ n: f.name || undefined, b: f.bio || undefined, u: f.url || undefined, p: f.picture, a: Object.keys(f.addresses).length ? f.addresses : undefined });
+    const body = JSON.stringify({ n: f.name || undefined, b: f.bio || undefined, u: f.url || undefined, p: f.picture });
     $("pp-cost").textContent = `One record, about ${body.length} bytes · fee about ${ARC(Math.max(45000, Math.ceil((body.length + 250) / 1000) * 100000))}`;
   }
 
@@ -95,8 +104,7 @@
       const pr = me.profile || {};
       $("pp-name").value = pr.n || ""; $("pp-bio").value = pr.b || ""; $("pp-url").value = pr.u || "";
       picture = pr.p || null;
-      // The wallet's addresses as they are now, plus any the published card shows that the wallet doesn't hold.
-      profileAddrInputs($("pp-addrs"), { ...(pr.a || {}), ...(me.wallet_addresses || {}) });
+      cardAddrList($("pp-addrs"));
       cost();
     }
     const ban = $("pp-republish");

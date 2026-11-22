@@ -936,6 +936,8 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "a.contact_delete" => crate::arcledger::a_contact_delete(node, &s("id").ok_or("id required")?),
         "a.wallets" => crate::walletproofs::a_wallets(node, &req),
         "a.wallets_publish" => crate::walletproofs::publish(node, req["force"] == true),
+        "a.card_addresses" => crate::walletproofs::card_addresses(node),
+        "a.card_address" => crate::walletproofs::set_card_address(node, &s("coin").ok_or("coin required")?, &s("address").ok_or("address required")?, req["show"] != false),
         "a.post" => crate::arcledger::a_post(node, &s("text").ok_or("text required")?),
         "a.reactions" => crate::asocial::reactions(node, &req),
         "a.replies" => crate::asocial::replies(node, &req),

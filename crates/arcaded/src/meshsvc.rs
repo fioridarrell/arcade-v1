@@ -5,7 +5,7 @@ use crate::node::{MeshTip, Node};
 use arcade_mesh::link::{Frame, Link, LinkError};
 use serde_json::{json, Value};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub const NET: &str = "arcade-main"; // one mesh for every chain (verified live)
 
@@ -919,7 +919,10 @@ fn run_as(node: Arc<Node>, addr: String, heard: Option<&'static str>, redial: bo
                 let _ = node.app.event("mesh", &format!("linked to {addr} ({})", &id[..16]));
                 let r = serve(&node, &mut link, &addr);
                 crate::node::link_remove(&node.links, &key);
-                let _ = node.app.event("mesh", &format!("link to {addr} ended: {}", r.err().map(|e| e.to_string()).unwrap_or_default()));
+                let why = r.err().map(|e| e.to_string()).unwrap_or_default();
+                // In the log too (2026-11-21: links ended every minute on a busy arcade and nothing said why).
+                eprintln!("mesh: link to {addr} ({}) ended: {why}", &id[..id.len().min(16)]);
+                let _ = node.app.event("mesh", &format!("link to {addr} ended: {why}"));
             }
         }
         std::thread::sleep(Duration::from_secs(5));
@@ -1061,7 +1064,9 @@ fn accept(node: Arc<Node>, l: std::net::TcpListener) {
             let addr = format!("{peer_ip}:{}", link.peer_listen.unwrap_or(0));
             note_direct(&link.peer_id, ip);
             let key = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
-            let _ = serve(&node, &mut link, &addr);
+            if let Err(e) = serve(&node, &mut link, &addr) {
+                eprintln!("mesh: inbound link from {addr} ({}) ended: {e}", &link.peer_id[..link.peer_id.len().min(16)]);
+            }
             crate::node::link_remove(&node.links, &key);
         });
     }
@@ -1096,7 +1101,9 @@ pub fn accept_ws(node: Arc<Node>, s: std::net::TcpStream, ip: std::net::IpAddr, 
         let Some(_held) = LinkSlot::take(ip) else { return };
         let addr = format!("{ip}:{}", link.peer_listen.unwrap_or(0));
         let k = crate::node::link_add(&node.links, &addr, &link.peer_id, now());
-        let _ = serve(&node, &mut link, &addr);
+        if let Err(e) = serve(&node, &mut link, &addr) {
+            eprintln!("mesh: inbound link from {addr} ({}) ended: {e}", &link.peer_id[..link.peer_id.len().min(16)]);
+        }
         crate::node::link_remove(&node.links, &k);
     });
 }
@@ -1211,6 +1218,16 @@ const READ_RUN: usize = 64;
 /// Most bytes a link's loop reads in a row before it sends again: about what one send turn moves (crvia::TURN_BYTES).
 const READ_RUN_BYTES: usize = 64 * 1024;
 
+/// A step of a link's loop that took longer than SLOW_STEP is said (2026-11-21: on a busy arcade link threads stalled
+/// on something for so long that their peers gave up on them, and nothing said which step).
+const SLOW_STEP: Duration = Duration::from_secs(2);
+fn slow_step(peer: &str, what: &str, t: Instant) {
+    let e = t.elapsed();
+    if e > SLOW_STEP {
+        eprintln!("mesh: link {}: {what} took {:.1} s", &peer[..peer.len().min(16)], e.as_secs_f64());
+    }
+}
+
 fn serve_loop(
     node: &Node,
     link: &mut Link,
@@ -1243,6 +1260,8 @@ fn serve_loop(
     // public address comes from STUN after the link is up.
     let mut told_lan = false;
     crate::samerouter::tell(node, link, addr, &mut told_lan)?;
+    // The frame being handled and since when (slow_step logs one that took long).
+    let mut handling: Option<(String, Instant)> = None;
     loop {
         if run == 0 || run >= READ_RUN || run_bytes >= READ_RUN_BYTES {
             run = 0;
@@ -1257,24 +1276,28 @@ fn serve_loop(
                 link.send(&Frame::new(f))?;
             }
             // Room traffic for this link (routed, not flooded).
-            for f in crate::realtime::take(peer, conn) {
-                link.send(&f)?;
+            {
+                let t = Instant::now();
+                for f in crate::realtime::take(peer, conn) {
+                    link.send(&f)?;
+                }
+                slow_step(peer, "realtime", t);
             }
             // UDP path: ask, switch over, fall back; proofs and introductions for this link.
-            crate::udpsvc::tick(node, link)?;
-            crate::coreboot::tick(node, link)?;
-            crate::vxshare::tick(node, link)?;
-            crate::arcsvc::tick(node, link)?;
-            crate::arcgenesis::tick(&link.peer_id.clone(), link)?;
-            crate::arccode::tick(&link.peer_id.clone(), link)?;
-            crate::shares::tick(link)?;
-            crate::mempoolshare::tick(node, peer, link)?;
-            crate::crvia::tick(peer, link)?;
-            crate::relaysvc::tick(node, link)?;
+            { let t = Instant::now(); crate::udpsvc::tick(node, link)?; slow_step(peer, "udpsvc", t); }
+            { let t = Instant::now(); crate::coreboot::tick(node, link)?; slow_step(peer, "coreboot", t); }
+            { let t = Instant::now(); crate::vxshare::tick(node, link)?; slow_step(peer, "vxshare", t); }
+            { let t = Instant::now(); crate::arcsvc::tick(node, link)?; slow_step(peer, "arcsvc", t); }
+            { let t = Instant::now(); crate::arcgenesis::tick(&link.peer_id.clone(), link)?; slow_step(peer, "arcgenesis", t); }
+            { let t = Instant::now(); crate::arccode::tick(&link.peer_id.clone(), link)?; slow_step(peer, "arccode", t); }
+            { let t = Instant::now(); crate::shares::tick(link)?; slow_step(peer, "shares", t); }
+            { let t = Instant::now(); crate::mempoolshare::tick(node, peer, link)?; slow_step(peer, "mempoolshare", t); }
+            { let t = Instant::now(); crate::crvia::tick(peer, link)?; slow_step(peer, "crvia", t); }
+            { let t = Instant::now(); crate::relaysvc::tick(node, link)?; slow_step(peer, "relaysvc", t); }
             #[cfg(feature = "oldimport")]
-            crate::lxfetch::tick(link)?;
+            { let t = Instant::now(); crate::lxfetch::tick(link)?; slow_step(peer, "lxfetch", t); }
             #[cfg(feature = "oldimport")]
-            crate::dxfetch::tick(link)?;
+            { let t = Instant::now(); crate::dxfetch::tick(link)?; slow_step(peer, "dxfetch", t); }
             if last_me.elapsed() > Duration::from_secs(60) {
                 link.send(&Frame::new(operator_me(node)))?;
                 crate::samerouter::tell(node, link, addr, &mut told_lan)?;
@@ -1315,6 +1338,9 @@ fn serve_loop(
             }
             continue;
         }
+        if let Some((k, t)) = handling.take() {
+            slow_step(peer, &format!("frame {k}"), t);
+        }
         let f = match link.recv() {
             Ok(f) => f,
             Err(LinkError::Io(e)) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => continue,
@@ -1323,6 +1349,7 @@ fn serve_loop(
         heard = std::time::Instant::now();
         run += 1;
         run_bytes += f.blob.len() + 256;
+        handling = Some((f.kind().to_string(), Instant::now()));
         match f.kind() {
             "ping" => link.send(&Frame::pong(&f))?,
             "pong" => crate::linkrtt::on_pong(peer, f.head["n"].as_str().unwrap_or(""), crate::relaysvc::is_relayed(link)),

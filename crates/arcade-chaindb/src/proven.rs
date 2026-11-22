@@ -19,7 +19,14 @@
 //! real blocks vary (DigiByte's algorithms differ in work by orders of magnitude, and three of
 //! its five carry none that is checked here). The count is never more than the plain depth. A
 //! chain with no proven work in that stretch confirms nothing (Kotia after its last
-//! proof-of-work height): there the answer is 0, and money paths refuse the chain.
+//! proof-of-work height, until its stake checks are on): there the answer is 0, and money paths
+//! refuse the chain.
+//!
+//! A staked chain past its last proof-of-work height ([`ChainParams::staked_from`]: Kotia)
+//! counts staked blocks whose stake was checked here as they connected (crate::stake) instead:
+//! the plain depth when every block from the payment's up to the tip was checked, 0 if any one
+//! of them wasn't, and 0 while the checks are not on. Deeper than [`STAKE_RUN`] blocks under a
+//! checked run, the plain depth.
 
 use crate::db::{ChainDb, UNDO_DEPTH};
 use arcade_chain::params::ChainParams;
@@ -32,6 +39,8 @@ pub const REFERENCE_DEPTH: u32 = UNDO_DEPTH;
 pub const REFERENCE_SPAN: u32 = 1000;
 /// A block confirms with 1/PROVEN_SHARE of the reference's average proven work per block.
 pub const PROVEN_SHARE: u64 = 2;
+/// On a staked chain: checked blocks from the tip down that settle every payment under them.
+pub const STAKE_RUN: u32 = UNDO_DEPTH;
 
 /// Counts confirmations for money on one chain, as of its tip when made ([`ChainDb::money_depth`]).
 pub struct MoneyDepth<'a> {
@@ -41,6 +50,10 @@ pub struct MoneyDepth<'a> {
     /// None: the plain depth (a chain whose blocks' work is all checked and bounded). Some:
     /// the reference stretch's proven work and its length in blocks.
     reference: Option<(U256, u32)>,
+    /// A staked chain past its last proof-of-work height: whether its checks are on, and how
+    /// many blocks from the tip down were found checked so far (Err: that many, then one that
+    /// wasn't).
+    stake: Option<(bool, std::cell::Cell<std::result::Result<u32, u32>>)>,
 }
 
 impl ChainDb {
@@ -53,10 +66,14 @@ impl ChainDb {
     /// under the tip (all of a chain no higher than `depth`).
     pub fn money_depth_with<'a>(&'a self, params: &'a ChainParams, depth: u32, span: u32) -> Result<MoneyDepth<'a>> {
         let c = params.chain_no;
-        let mut m = MoneyDepth { db: self, params, tip: None, reference: None };
+        let mut m = MoneyDepth { db: self, params, tip: None, reference: None, stake: None };
         let Some(tip) = self.tip(c)? else { return Ok(m) };
         let Some(tip_work) = self.work_at(c, tip.height)? else { return Ok(m) };
         m.tip = Some((tip.height, tip_work));
+        if params.staked_from().is_some_and(|f| tip.height >= f) {
+            m.stake = Some((self.stake_on(params)?, std::cell::Cell::new(Ok(0))));
+            return Ok(m);
+        }
         if !params.confirms_by_proven_work() {
             return Ok(m);
         }
@@ -95,7 +112,38 @@ impl MoneyDepth<'_> {
     /// Whether this chain confirms anything at all here: false where its reference stretch
     /// holds no proven work (every block staked, or none checked).
     pub fn confirms(&self) -> bool {
+        if let Some((on, _)) = &self.stake {
+            return *on && self.checked_run(1) >= 1;
+        }
         self.tip.is_some() && self.reference.is_none_or(|(w, _)| !w.is_zero())
+    }
+
+    /// Staked chain: checked blocks from the tip down, looked at up to `want` (at most STAKE_RUN).
+    /// A run reaching down past the staked stretch counts as STAKE_RUN: what lies under it was mined.
+    fn checked_run(&self, want: u32) -> u32 {
+        let (Some((_, run)), Some((tip, _))) = (&self.stake, self.tip) else { return 0 };
+        let from = self.params.staked_from().unwrap_or(0);
+        let want = want.min(STAKE_RUN).min(tip + 1);
+        let mut n = match run.get() {
+            Err(n) => return n,
+            Ok(n) if n >= want => return n,
+            Ok(n) => n,
+        };
+        let c = self.params.chain_no;
+        while n < want {
+            if tip - n < from {
+                run.set(Ok(STAKE_RUN));
+                return STAKE_RUN;
+            }
+            let ok = matches!(self.db.stake_row_at(c, tip - n), Ok(Some(r)) if r.mark == crate::stake::MARK_OK);
+            if !ok {
+                run.set(Err(n));
+                return n;
+            }
+            n += 1;
+        }
+        run.set(Ok(n));
+        n
     }
 
     /// Confirmations for money of the connected block at `height` (0 above the tip).
@@ -105,6 +153,13 @@ impl MoneyDepth<'_> {
             return 0;
         }
         let plain = tip - height + 1;
+        if let Some((on, _)) = &self.stake {
+            if !*on {
+                return 0;
+            }
+            let run = self.checked_run(plain);
+            return if run >= plain || run >= STAKE_RUN { plain } else { 0 };
+        }
         let Some((ref_work, ref_n)) = self.reference else { return plain };
         if ref_work.is_zero() {
             return 0;

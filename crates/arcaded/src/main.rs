@@ -712,6 +712,10 @@ fn main() {
     }
     {
         let n = node.clone();
+        std::thread::Builder::new().name("stake pass".into()).spawn(move || staker::pass_run(n)).unwrap();
+    }
+    {
+        let n = node.clone();
         std::thread::Builder::new().name("ord types".into()).spawn(move || ordtypes::run(n)).unwrap();
     }
     {

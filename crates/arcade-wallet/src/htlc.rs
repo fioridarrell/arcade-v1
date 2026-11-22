@@ -129,12 +129,19 @@ pub fn pay_out(coins: &[(OutPoint, u64)], to: &[u8], fee: u64) -> Result<Vec<(u6
     Ok(vec![(value, to.to_vec())])
 }
 
-fn spend(p: &ChainParams, lock: &Htlc, coins: &[(OutPoint, u64)], outputs: Vec<(u64, Vec<u8>)>, sign: &dyn Fn(&[u8; 32]) -> Vec<u8>, secret: Option<&[u8]>) -> Result<Vec<u8>, String> {
+/// The time field of a claim or refund on a chain whose transactions carry one (Kotia): now. The network takes a
+/// transaction only with a time no earlier than every transaction it spends (the lock, made minutes or hours before)
+/// and no later than its block's; it was 0 before 2026-11-22, which Kotia refuses.
+fn tx_time_now() -> u32 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as u32).unwrap_or(0)
+}
+
+fn spend(p: &ChainParams, lock: &Htlc, coins: &[(OutPoint, u64)], outputs: Vec<(u64, Vec<u8>)>, sign: &dyn Fn(&[u8; 32]) -> Vec<u8>, secret: Option<&[u8]>, time: u32) -> Result<Vec<u8>, String> {
     let redeem = lock.redeem();
     let (lock_time, sequence) = if secret.is_some() { (0, 0xffff_ffff) } else { (lock.time, NOT_FINAL) };
     let shape = Shape {
         version: 1,
-        time: p.format.tx_time.then(|| 0),
+        time: p.format.tx_time.then_some(time),
         inputs: coins.iter().map(|c| In { prevout: c.0, sequence }).collect(),
         outputs,
         lock_time,
@@ -162,12 +169,12 @@ pub fn claim(p: &ChainParams, lock: &Htlc, coins: &[(OutPoint, u64)], outputs: V
     if hash_of(secret) != lock.hash {
         return Err("that secret does not open this lock".into());
     }
-    spend(p, lock, coins, outputs, &|d| legacy::sign(key, d, ALL), Some(secret))
+    spend(p, lock, coins, outputs, &|d| legacy::sign(key, d, ALL), Some(secret), tx_time_now())
 }
 
 /// The refund, signed by the refunder, nLockTime the lock's time (htlc.refunded).
 pub fn refund(p: &ChainParams, lock: &Htlc, coins: &[(OutPoint, u64)], outputs: Vec<(u64, Vec<u8>)>, key: &SecretKey) -> Result<Vec<u8>, String> {
-    spend(p, lock, coins, outputs, &|d| legacy::sign(key, d, ALL), None)
+    spend(p, lock, coins, outputs, &|d| legacy::sign(key, d, ALL), None, tx_time_now())
 }
 
 /// The secret a claim revealed (htlc.secret_from_script_sig): any item its input script leaves whose SHA-256 is the
@@ -251,13 +258,56 @@ mod tests {
             assert_eq!(pay_out(&coins, &to, SPEND_FEE).unwrap(), outs);
             let fake = |d: &[u8; 32]| { let mut s = d.to_vec(); s.push(1); s };
             let secret = hex::decode(t["secret"].as_str().unwrap()).unwrap();
-            let claim = spend(p, &lock, &coins, outs.clone(), &fake, Some(&secret)).unwrap();
+            let claim = spend(p, &lock, &coins, outs.clone(), &fake, Some(&secret), 0).unwrap();
             assert_eq!(hex::encode(&claim), t["claim"].as_str().unwrap());
-            let refund = spend(p, &lock, &coins, outs, &fake, None).unwrap();
+            let refund = spend(p, &lock, &coins, outs, &fake, None, 0).unwrap();
             assert_eq!(hex::encode(&refund), t["refund"].as_str().unwrap());
             // The secret reads back off the claim's input script.
             let tx = arcade_chain::Tx::parse_with(&claim, &p.format).unwrap();
             assert_eq!(secret_from_script_sig(&tx.inputs[0].script_sig, &lock.redeem()), Some(secret));
+        }
+    }
+
+    /// On Kotia (transactions carry a time, Format::POS_TIMED) a claim and a refund write the time now, signed (it is
+    /// in the legacy signature hash), and every signature is low-S (Kotia requires LOW_S).
+    #[test]
+    fn kotia_claims_and_refunds_carry_the_time_and_low_s() {
+        let p = &arcade_chain::params::KOTIA_MAIN;
+        assert!(p.format.tx_time);
+        let sk = |b: u8| SecretKey::from_slice(&[b; 32]).unwrap();
+        let pk = |b: u8| secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &sk(b)).serialize().to_vec();
+        let secret = [5u8; 32];
+        let lock = Htlc { hash: hash_of(&secret), claimer: pk(1), refunder: pk(2), time: 1_794_000_000, sized: false };
+        let coins = [(OutPoint { txid: Hash256([3; 32]), vout: 1 }, 50_000_000u64)];
+        let outs = pay_out(&coins, &arcade_ledger::address::p2pkh_script(&arcade_ledger::address::hash160(&pk(1))), SPEND_FEE).unwrap();
+        let before = tx_time_now();
+        for (raw, signer, is_claim) in [
+            (claim(p, &lock, &coins, outs.clone(), &secret, &sk(1)).unwrap(), 1u8, true),
+            (refund(p, &lock, &coins, outs.clone(), &sk(2)).unwrap(), 2u8, false),
+        ] {
+            let tx = arcade_chain::Tx::parse_with(&raw, &p.format).unwrap();
+            let t = tx.time.expect("a timed transaction");
+            assert!(t >= before && t <= tx_time_now() + 1, "the time now, not 0: {t}");
+            assert_eq!(tx.lock_time, if is_claim { 0 } else { lock.time });
+            let items = pushes(&tx.inputs[0].script_sig).unwrap();
+            let sig = &items[0];
+            let s = secp256k1::ecdsa::Signature::from_der(&sig[..sig.len() - 1]).unwrap();
+            let mut low = s;
+            low.normalize_s();
+            assert_eq!(s, low, "low-S");
+            // Signed over the time: the same transaction with another time doesn't verify.
+            let shape = |time: u32| Shape {
+                version: 1,
+                time: Some(time),
+                inputs: vec![In { prevout: coins[0].0, sequence: if is_claim { 0xffff_ffff } else { NOT_FINAL } }],
+                outputs: outs.clone(),
+                lock_time: tx.lock_time,
+            };
+            assert_eq!(legacy::serialize(&shape(t), &tx.inputs.iter().map(|i| i.script_sig.clone()).collect::<Vec<_>>()), raw);
+            let d = legacy::sighash(&shape(t), 0, &lock.redeem(), ALL).unwrap();
+            assert!(legacy::verify(&pk(signer), sig, &d, ALL));
+            let d0 = legacy::sighash(&shape(0), 0, &lock.redeem(), ALL).unwrap();
+            assert!(!legacy::verify(&pk(signer), sig, &d0, ALL));
         }
     }
 

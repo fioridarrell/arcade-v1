@@ -598,12 +598,23 @@ fn a_conversion_holds_while_the_drive_is_short_then_goes_on() {
     // to the same files.
     FREE.store(1000, SeqCst);
     let mut notes = Vec::new();
+    // Room comes back once the pass has said it is held (not after a fixed time: on a loaded
+    // machine the pass may not have looked yet), or after a minute in any case.
+    let held = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            let t = std::time::Instant::now();
+            while !held.load(SeqCst) && t.elapsed() < std::time::Duration::from_secs(60) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             FREE.store(1 << 40, SeqCst);
         });
-        assert!(f.db.convert_to_index_files(f.p, &o, &AtomicBool::new(false), &mut |x| notes.push(x)).unwrap());
+        assert!(f.db.convert_to_index_files(f.p, &o, &AtomicBool::new(false), &mut |x| {
+            if x.contains("held:") {
+                held.store(true, SeqCst);
+            }
+            notes.push(x)
+        }).unwrap());
     });
     assert!(notes.iter().any(|n| n.contains("held:") && n.contains("ARCADE_IX_FREE_GB")), "{notes:?}");
     assert!(notes.iter().any(|n| n.contains("room again")), "{notes:?}");

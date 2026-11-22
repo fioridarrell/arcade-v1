@@ -101,6 +101,25 @@ files need that). If the best header chain moves between rounds, a stored block 
 branch holds its height's number: its body is dropped (header kept) and the new branch's block
 takes the number.
 
+## Memory in the blocks phase
+
+What a round holds is bounded, however the sources behave:
+
+- **Jobs are sized by bytes**, not a fixed count: a job is cut, when a worker takes it, to about
+  48 MB of blocks at the size seen so far (the larger of the running average and the last job's;
+  8 blocks while nothing is known yet, at most 250).
+- **Each job has a byte limit** (four times its expected size, 64 MB to 256 MB; 256 MB while no
+  size is known). A P2P peer stops being read there and is dropped; the job goes back in halves
+  (nobody blamed: the blocks may just be bigger than the ones before) and the size estimate rises.
+- **One budget for every job in flight**: their limits together stay under 6 GB (one job always
+  goes out). With every source padding every block, that is what fetched blocks can take.
+- **P2P blocks are checked as they arrive**: a `block` message larger than the chain's largest
+  possible block (`ChainParams::max_block_bytes`: Bitcoin 4 MB + 1 MB of slack) is refused
+  before it is read, and a block whose header is not one asked for (or comes twice) drops the
+  peer at once.
+- `init_store` parses and writes in batches of 16 MB, letting each raw block go as it is parsed:
+  the parsed copies a worker holds stay small.
+
 ## Room on the drive
 
 The blocks phase holds while the chain's drive has less free than `ARCADE_INIT_FREE_GB` (default

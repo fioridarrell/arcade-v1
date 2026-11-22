@@ -279,6 +279,18 @@ impl ChainParams {
         U256::from_be_bytes(&b)
     }
 
+    /// The most bytes one block can take on the wire. On a SegWit chain without MWEB the weight
+    /// limit bounds a block's whole serialized size (weight = base x 3 + total), plus room for
+    /// an AuxPoW proof; elsewhere the protocol's message limit (blocks there may be bigger than
+    /// their rules say: Litecoin's MWEB part is not counted, other chains' limits are not all
+    /// known exactly).
+    pub fn max_block_bytes(&self) -> usize {
+        match self.block_rules {
+            Some(r) if self.format.segwit && !self.format.mweb => (r.max_block_weight.max(r.max_block_size) + (1 << 20)).min(crate::p2p::MAX_MESSAGE),
+            _ => crate::p2p::MAX_MESSAGE,
+        }
+    }
+
     /// The highest checkpoint height at or below `height`: no fork may start under it.
     pub fn last_checkpoint(&self, height: u32) -> Option<u32> {
         self.checkpoints.iter().map(|(h, _)| *h).filter(|h| *h <= height).max()

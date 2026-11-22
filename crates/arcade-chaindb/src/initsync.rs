@@ -120,6 +120,9 @@ fn drop_body_in(w: &arcade_store::WriteTxn, params: &ChainParams, hash: &Hash256
     Ok(())
 }
 
+/// Raw block bytes init_store parses before it writes them (and lets the parsed copies go).
+pub const STORE_FLUSH_BYTES: usize = 16 << 20;
+
 /// Independent sources that must agree on the best header.
 pub const MIN_AGREE: usize = 3;
 
@@ -485,19 +488,22 @@ impl ChainDb {
     /// Store a batch a source sent for `wanted` (store-only, any order): each block must be one
     /// asked for and pass check_stored_block (rebuilds byte-identically, merkle root, witness
     /// commitment where SegWit is on). Good blocks are stored, the rest are to fetch again.
-    pub fn init_store(&self, params: &ChainParams, wanted: &[Hash256], raws: &[Vec<u8>]) -> Result<Stored> {
+    /// The blocks are taken one at a time (a batch handed over by value is freed as it goes) and
+    /// written every [`STORE_FLUSH_BYTES`], so the parsed copies held at once stay small.
+    pub fn init_store<R: AsRef<[u8]>>(&self, params: &ChainParams, wanted: &[Hash256], raws: impl IntoIterator<Item = R>) -> Result<Stored> {
         let want: HashSet<Hash256> = wanted.iter().copied().collect();
         let mut out = Stored::default();
-        let mut good: Vec<Block> = Vec::with_capacity(raws.len());
+        let mut good: Vec<Block> = Vec::new();
+        let mut good_bytes = 0usize;
         let mut got: HashSet<Hash256> = HashSet::new();
         for raw in raws {
-            let id = match Block::parse_with(raw, &params.format) {
-                Ok(b) => b.hash(),
-                Err(e) => {
-                    out.refused.push((Hash256::ZERO, e.to_string()));
-                    continue;
-                }
+            let raw = raw.as_ref();
+            // The id from the header alone: a block not asked for is never parsed.
+            let Some(h80) = raw.get(..80).and_then(|h| <&[u8; 80]>::try_from(h).ok()) else {
+                out.refused.push((Hash256::ZERO, "shorter than a block header".into()));
+                continue;
             };
+            let id = params.block_id(&arcade_chain::Header::parse(h80));
             if !want.contains(&id) || got.contains(&id) {
                 out.refused.push((id, "not a block asked for".into()));
                 continue;
@@ -505,15 +511,22 @@ impl ChainDb {
             match check_stored_block(self, params, raw) {
                 Ok(b) => {
                     got.insert(id);
+                    good_bytes += raw.len();
                     good.push(b);
                 }
                 Err(e) => out.refused.push((id, e.to_string())),
             }
+            if good_bytes >= STORE_FLUSH_BYTES {
+                self.write_stored_as(params, &good, true)?;
+                out.stored += good.len();
+                good.clear();
+                good_bytes = 0;
+            }
         }
         if !good.is_empty() {
             self.write_stored_as(params, &good, true)?;
+            out.stored += good.len();
         }
-        out.stored = good.len();
         out.again = wanted.iter().filter(|h| !got.contains(h)).copied().collect();
         Ok(out)
     }

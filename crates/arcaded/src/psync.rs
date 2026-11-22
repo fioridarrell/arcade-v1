@@ -10,7 +10,8 @@
 //!   our checked headers name that we don't have, done in ANY order; each worker stores what it
 //!   fetched itself (ChainDb::init_store: the block asked for, merkle root, witness commitment),
 //!   so the checks run on every worker at once and nothing is connected or indexed. A block
-//!   refused goes back in the queue for another source.
+//!   refused goes back in the queue for another source. Jobs there are cut by bytes, each has
+//!   a byte limit, and all jobs in flight share one byte budget (docs/INITSYNC.md, "Memory").
 //! * The chain's own thread pulls finished jobs in height order through [`Prefetched`], a
 //!   BlockSource the normal Syncer reads: so every header is checked (proof of work, links,
 //!   AuxPoW) and every block connected (merkle, byte-identical, in-commit indexes) exactly as
@@ -89,6 +90,10 @@ struct State {
     tried: HashMap<u32, std::collections::HashSet<String>>,
     /// Store-only mode: bytes of the blocks stored.
     bytes: u64,
+    /// Store-only mode: byte limits of the jobs being fetched (each job's in full), held under
+    /// the pool's budget; and the last job's bytes per block (the average lags when blocks grow).
+    fetch_bytes: usize,
+    last_block: usize,
 }
 
 /// What a store-only round did (run_store).
@@ -116,6 +121,38 @@ fn job_len(avg_block: usize) -> u32 {
     ((JOB_BYTES / avg_block.max(1)) as u32).clamp(10, JOB)
 }
 
+/// Store-only mode: blocks per job for the block size seen (`est`, 0 = none yet). The first
+/// jobs are small: a round may start anywhere in the chain, among full blocks.
+fn store_job_len(est: usize) -> u32 {
+    if est == 0 {
+        return STORE_FIRST;
+    }
+    ((JOB_BYTES / est) as u32).clamp(1, JOB)
+}
+
+/// Blocks per first job of a store-only round, before any block size is known.
+const STORE_FIRST: u32 = 8;
+
+/// Store-only mode: most bytes a job of `len` blocks may bring (Peer::get_blocks_max; a source
+/// over it is dropped and the job goes back in halves): four times the expected size, at least
+/// 64 MB, at most JOB_HARD (also the limit while no size is known). Honest blocks fit: 250
+/// blocks of 1 MB, or the ~12 4-MB blocks the largest job of those holds.
+fn job_cap(len: usize, est: usize) -> usize {
+    if est == 0 {
+        return JOB_HARD;
+    }
+    len.saturating_mul(est).saturating_mul(4).clamp(64 << 20, JOB_HARD)
+}
+
+/// The most bytes one store-only job may bring.
+const JOB_HARD: usize = 256 << 20;
+
+/// Store-only mode: the byte limits of all jobs being fetched at once, together (a job counts
+/// with its full limit until stored, however small its blocks turn out). With every source
+/// padding every block, that is what the round's fetched blocks can take in memory; the parsed
+/// copies on top are bounded per worker (ChainDb::init_store, STORE_FLUSH_BYTES).
+const FETCH_BUDGET: usize = 6 << 30;
+
 pub struct Pool {
     s: Mutex<State>,
     cv: Condvar,
@@ -123,6 +160,8 @@ pub struct Pool {
     top: u32,
     /// Store-only mode: jobs in any order, each worker stores its own (run_store).
     any_order: bool,
+    /// Store-only mode: bytes the jobs being fetched may take together (FETCH_BUDGET).
+    budget: usize,
 }
 
 impl Pool {
@@ -277,7 +316,8 @@ impl BlockSource for Prefetched<'_> {
 fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, store: Option<(&ChainDb, &'static ChainParams)>) {
     let mut fails = 0;
     while !pool.stop.load(Ordering::Relaxed) {
-        let job = {
+        // (job, its byte limit: store-only mode, counted in State::fetch_bytes until done)
+        let (job, cap) = {
             let mut st = pool.s.lock().unwrap();
             loop {
                 if pool.stop.load(Ordering::Relaxed) {
@@ -296,14 +336,22 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                 // First help with the oldest jobs still in flight: the connector waits on them
                 // while later ones pile up done (first copy wins).
                 let want = st.want;
+                // Store-only: the job sizes for the blocks seen, and the budget of bytes in flight
+                // (one job always goes out, however big).
+                let est = st.avg_block.max(st.last_block);
+                let len = if pool.any_order { store_job_len(est) } else { job_len(st.avg_block) } as usize;
+                let budget_ok = !pool.any_order || st.fetch_bytes == 0 || st.fetch_bytes + job_cap(len, est) <= pool.budget;
+                let ahead_ok = ahead_ok && budget_ok;
                 // (In any order, only once nothing is left in the queue: the last jobs.)
-                let steal_ok = !pool.any_order || st.queue.is_empty();
+                let steal_ok = !pool.any_order || (st.queue.is_empty() && budget_ok);
                 let steal = st.inflight.iter_mut().filter(|_| steal_ok).filter(|(s, _)| **s >= want).take(2).find(|(_, (_, since, copies))| copies.0 == 1 && since.elapsed() > STEAL_AFTER).map(|(s, (h, _, d))| {
                     *d = (2, Instant::now());
                     Job { start: *s, hashes: h.clone(), tries: 0 }
                 });
                 if let Some(j) = steal {
-                    break j;
+                    let cap = if pool.any_order { job_cap(j.hashes.len(), est) } else { 0 };
+                    st.fetch_bytes += cap;
+                    break (j, cap);
                 }
                 if ahead_ok {
                     let mut j = if pool.any_order {
@@ -326,13 +374,18 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                     }
                     // Jobs are cut ahead of time; blocks may have grown since: take a job's
                     // worth for today's block size and put the rest back at the front.
-                    let len = job_len(st.avg_block) as usize;
                     if j.hashes.len() > len && !st.inflight.contains_key(&j.start) {
                         let rest = j.hashes.split_off(len);
                         st.queue.push_front(Job { start: j.start + len as u32, hashes: rest, tries: 0 });
+                        // (Store-only: the rest keeps the sources that failed this job already.)
+                        if let Some(t) = st.tried.get(&j.start).cloned() {
+                            st.tried.insert(j.start + len as u32, t);
+                        }
                     }
                     st.inflight.entry(j.start).or_insert((j.hashes.clone(), Instant::now(), (1, Instant::now())));
-                    break j;
+                    let cap = if pool.any_order { job_cap(j.hashes.len(), est) } else { 0 };
+                    st.fetch_bytes += cap;
+                    break (j, cap);
                 }
                 if st.want > pool.top {
                     st.workers -= 1;
@@ -344,24 +397,32 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
         };
         let t_job = Instant::now();
         if let Some((db, p)) = store {
-            // Store-only: this worker checks and stores what it fetched (any order).
-            let got = src.get_blocks(&job.hashes);
+            // Store-only: this worker checks and stores what it fetched (any order), no more
+            // than the job's byte limit (a source past it is dropped).
+            let got = src.get_blocks_max(&job.hashes, cap);
             {
-                let st = pool.s.lock().unwrap();
+                let mut st = pool.s.lock().unwrap();
                 // The round is over (stopped, or the chain removed): nothing more is written.
                 if pool.stop.load(Ordering::Relaxed) {
+                    st.fetch_bytes -= cap;
                     drop(st);
                     break;
                 }
                 if st.taken.contains(&job.start) {
+                    st.fetch_bytes -= cap;
                     continue;
                 }
             }
+            let over = matches!(&got, Err(e) if e.contains(arcade_chaindb::sync::OVER_BYTE_LIMIT));
             let res = match got {
-                Ok(raws) => db.init_store(p, &job.hashes, &raws).map(|r| (r, raws.iter().map(|x| x.len()).sum::<usize>(), raws.len())).map_err(|e| Some(e.to_string())),
+                Ok(raws) => {
+                    let (bytes, sent) = (raws.iter().map(|x| x.len()).sum::<usize>(), raws.len());
+                    db.init_store(p, &job.hashes, raws).map(|r| (r, bytes, sent)).map_err(|e| Some(e.to_string()))
+                }
                 Err(_) => Err(None),
             };
             let mut st = pool.s.lock().unwrap();
+            st.fetch_bytes -= cap;
             match res {
                 Ok((r, bytes, sent)) => {
                     st.inflight.remove(&job.start);
@@ -372,6 +433,7 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                     if r.stored > 0 {
                         let per = bytes / r.stored.max(1);
                         st.avg_block = if st.avg_block == 0 { per } else { (st.avg_block * 4 + per) / 5 };
+                        st.last_block = per;
                         *st.stats.entry(name.clone()).or_insert(0) += r.stored as u64;
                     }
                     let mut tried = st.tried.remove(&job.start).unwrap_or_default();
@@ -399,12 +461,34 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
                     pool.cv.notify_all();
                     break;
                 }
+                Err(None) if over && job.hashes.len() > 1 => {
+                    // More bytes than the job was sized for: maybe honest blocks bigger than
+                    // the ones before. The job goes back in halves (no source blamed); this
+                    // source was dropped (the rest of its answer was still on the wire).
+                    st.inflight.remove(&job.start);
+                    // Its blocks average at least cap / len: the next jobs are cut smaller.
+                    st.last_block = st.last_block.max(cap / job.hashes.len());
+                    let mut first = job.hashes;
+                    let half = first.len() / 2;
+                    let second = first.split_off(half);
+                    let tried = st.tried.get(&job.start).cloned();
+                    if let Some(t) = tried {
+                        st.tried.insert(job.start + half as u32, t);
+                    }
+                    st.queue.push_front(Job { start: job.start + half as u32, hashes: second, tries: job.tries });
+                    st.queue.push_front(Job { start: job.start, hashes: first, tries: job.tries });
+                    pool.cv.notify_all();
+                    drop(st);
+                    if src.dropped() {
+                        break;
+                    }
+                }
                 Err(None) => {
                     st.tried.entry(job.start).or_default().insert(name.clone());
                     drop(st);
                     pool.put_back(job);
                     fails += 1;
-                    if fails >= 3 {
+                    if fails >= 3 || src.dropped() {
                         break;
                     }
                     std::thread::sleep(Duration::from_secs(2));
@@ -441,7 +525,7 @@ fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>, 
             _ => {
                 pool.put_back(job);
                 fails += 1;
-                if fails >= 3 {
+                if fails >= 3 || src.dropped() {
                     break;
                 }
                 std::thread::sleep(Duration::from_secs(2));
@@ -645,7 +729,7 @@ pub fn run(node: &Node, p: &'static ChainParams, syncer: &Syncer, top: u32, on_p
         .or_else(|| cr.iter().find_map(|o| crate::crsource::CoreShareSource::dial(node, &o.1, p).ok()).map(HashSource::Core))
         .ok_or("no source for block hashes")?;
     syncer.known_top.set(syncer.known_top.get().max(top));
-    let pool = Pool { s: Mutex::new(State { next: tip + 1, want: tip + 1, ..Default::default() }), cv: Condvar::new(), stop: AtomicBool::new(false), top, any_order: false };
+    let pool = Pool { s: Mutex::new(State { next: tip + 1, want: tip + 1, ..Default::default() }), cv: Condvar::new(), stop: AtomicBool::new(false), top, any_order: false, budget: 0 };
     std::thread::scope(|sc| -> Result<(), String> {
         sc.spawn(|| feeder(node, &pool, feeder_src, tip_hash));
         spawn_sources(sc, node, p, &pool, &offers, tip + 10, false);
@@ -752,13 +836,32 @@ pub(crate) fn store_round<'a>(
     if hashes.is_empty() {
         return Round::default();
     }
+    store_round_in(db, p, hashes, sources, recruit, idle, on_progress, room, stop, FETCH_BUDGET)
+}
+
+/// [`store_round`] with its budget of bytes in flight (tests use a small one).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn store_round_in<'a>(
+    db: &'a ChainDb,
+    p: &'static ChainParams,
+    hashes: &[Hash256],
+    sources: Vec<(String, Box<dyn BlockSource + Send + 'a>)>,
+    recruit: Option<(&'a Node, u32)>,
+    idle: Duration,
+    on_progress: &dyn Fn(String),
+    room: &dyn Fn() -> Result<(), String>,
+    stop: &AtomicBool,
+    budget: usize,
+) -> Round {
     let n = hashes.len() as u32;
     let mut st = State { next_id: n, ..Default::default() };
-    // Jobs by position in `hashes` (a job split later keeps its range); refetches get ids past n.
+    // Ranges of `hashes` by position (refetches get ids past n). Each is cut further when it is
+    // taken, to the bytes of a job for the block size seen (store_job_len, job_cap): blocks
+    // are sized by bytes, never a fixed count, and the bytes in flight stay under `budget`.
     for (i, chunk) in hashes.chunks(JOB as usize).enumerate() {
         st.queue.push_back(Job { start: i as u32 * JOB, hashes: chunk.to_vec(), tries: 0 });
     }
-    let pool = Pool { s: Mutex::new(st), cv: Condvar::new(), stop: AtomicBool::new(false), top: n, any_order: true };
+    let pool = Pool { s: Mutex::new(st), cv: Condvar::new(), stop: AtomicBool::new(false), top: n, any_order: true, budget };
     let t0 = Instant::now();
     let res = std::thread::scope(|sc| -> Result<(), String> {
         let pool = &pool;
@@ -957,6 +1060,75 @@ pub(crate) mod tests {
         // Each bad source stepped aside after a few batches (it never stalls the round).
         assert!(mute_asked.load(Ordering::Relaxed) <= 3 * JOB as usize, "{}", mute_asked.load(Ordering::Relaxed));
         assert!(bad_asked.load(Ordering::Relaxed) <= 3 * JOB as usize, "{}", bad_asked.load(Ordering::Relaxed));
+    }
+
+    /// A source that counts the requests it is answering at once (and the most seen), and
+    /// answers slowly enough for them to overlap; with `over`, a request of more than that many
+    /// blocks comes back over its byte limit (blocks bigger than the job was sized for).
+    struct Counted {
+        inner: Src,
+        now: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        most: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        over: Option<usize>,
+    }
+
+    impl BlockSource for Counted {
+        fn get_headers(&mut self, locator: &[Hash256]) -> Result<Vec<HeaderEntry>, String> {
+            self.inner.get_headers(locator)
+        }
+        fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>, String> {
+            let n = self.now.fetch_add(1, Ordering::SeqCst) + 1;
+            self.most.fetch_max(n, Ordering::SeqCst);
+            std::thread::sleep(Duration::from_millis(15));
+            let r = match self.over {
+                Some(k) if hashes.len() > k => Err(format!("peer: {}: test", arcade_chaindb::sync::OVER_BYTE_LIMIT)),
+                _ => self.inner.get_blocks(hashes),
+            };
+            self.now.fetch_sub(1, Ordering::SeqCst);
+            r
+        }
+        fn describe(&self) -> String {
+            "counted".into()
+        }
+    }
+
+    #[test]
+    fn store_jobs_are_sized_by_bytes_and_held_under_the_budget() {
+        // Nothing known yet: small first jobs, each allowed the most a job may bring.
+        assert_eq!(store_job_len(0), STORE_FIRST);
+        assert_eq!(job_cap(STORE_FIRST as usize, 0), JOB_HARD);
+        // Full 2 MB blocks: 24 a job, allowed 4x that (192 MB); tiny ones: 250, at least 64 MB.
+        assert_eq!(store_job_len(2 << 20), 24);
+        assert_eq!(job_cap(24, 2 << 20), 192 << 20);
+        assert_eq!(store_job_len(200), JOB);
+        assert_eq!(job_cap(JOB as usize, 200), 64 << 20);
+        // A padded or huge block can't make a job bigger than JOB_HARD.
+        assert_eq!(store_job_len(64 << 20), 1);
+        assert_eq!(job_cap(1, 64 << 20), JOB_HARD);
+
+        // Six sources, a budget of two 64 MB jobs: never more than two requests out at once
+        // (one, the first job alone, while no size is known), and every block stored.
+        let (_d, db, p, blocks) = setup(1500);
+        let missing = db.init_missing(p.chain_no).unwrap();
+        let (now, most) = (std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)), std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)));
+        let sources: Vec<(String, Box<dyn BlockSource + Send>)> = (0..6)
+            .map(|i| (format!("s{i}"), Box::new(Counted { inner: src(&blocks, 0).0, now: now.clone(), most: most.clone(), over: None }) as Box<dyn BlockSource + Send>))
+            .collect();
+        let r = store_round_in(&db, p, &missing, sources, None, Duration::from_secs(5), &|_| {}, &|| Ok(()), &AtomicBool::new(false), 128 << 20);
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.stored, 1500);
+        assert!(most.load(Ordering::SeqCst) <= 2, "{} requests out at once", most.load(Ordering::SeqCst));
+
+        // Answers over their byte limit: the jobs go back in halves until they fit, no source
+        // blamed, and the round still ends with every block.
+        let (_d, db, p, blocks) = setup(300);
+        let missing = db.init_missing(p.chain_no).unwrap();
+        let sources: Vec<(String, Box<dyn BlockSource + Send>)> =
+            vec![("big".into(), Box::new(Counted { inner: src(&blocks, 0).0, now: now.clone(), most: most.clone(), over: Some(3) }) as Box<dyn BlockSource + Send>)];
+        let r = store_round_in(&db, p, &missing, sources, None, Duration::from_secs(5), &|_| {}, &|| Ok(()), &AtomicBool::new(false), FETCH_BUDGET);
+        assert!(r.error.is_none(), "{:?}", r.error);
+        assert_eq!(r.stored, 300);
+        assert!(db.init_missing(p.chain_no).unwrap().is_empty());
     }
 
     #[test]

@@ -146,7 +146,7 @@ fn bench(a: &[String]) {
     let (first, last) = rows.iter().fold((u32::MAX, 0), |(lo, hi), r| (lo.min(kind.height_of(r)), hi.max(kind.height_of(r))));
     let t = std::time::Instant::now();
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
-    let mut w = Writer::create(out, Meta { kind, chain: 0, first, last, last_hash: [0; 32] }, LEVEL, threads).unwrap();
+    let mut w = Writer::create(out, Meta { kind, chain: 0, first, last, last_hash: [0; 32], range: last - first + 1, era_ranges: 1 }, LEVEL, threads).unwrap();
     for r in &rows {
         w.push(r).unwrap();
     }
@@ -190,7 +190,7 @@ fn main() {
                     // The drive is watched: held under ARCADE_IX_FREE_GB (default 50) plus a
                     // pass's estimated size.
                     let floor = std::env::var("ARCADE_IX_FREE_GB").ok().map(|v| v.trim().parse::<u64>().expect("ARCADE_IX_FREE_GB: a number of GB")).map(|g| g.saturating_mul(1 << 30));
-                    let o = Options { free_bytes: Some(free_bytes), floor_bytes: floor.unwrap_or(arcade_chaindb::ixconv::FLOOR_BYTES), ..Options::default() };
+                    let o = Options { free_bytes: Some(free_bytes), floor_bytes: floor.unwrap_or(arcade_chaindb::ixconv::FLOOR_BYTES), layout: arcade_chaindb::ixconv::Layout::for_chain(p), ..Options::default() };
                     let done = db.convert_to_index_files(p, &o, &STOP, &mut |s| println!("{s}")).unwrap();
                     println!("{}", if done { "done" } else { "stopped" });
                 }

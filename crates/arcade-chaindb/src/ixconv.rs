@@ -28,7 +28,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// How heights are cut into files. Every arcade must use the same cut for its files to
-/// equal another's: [`Layout::STANDARD`]. (Tests use small spans.)
+/// equal another's: [`Layout::for_chain`], pinned in every file's header (format 3).
+/// (Tests use small spans.)
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Layout {
     /// Heights per range file.
@@ -40,7 +41,28 @@ pub struct Layout {
 }
 
 impl Layout {
+    /// Bitcoin's: 10,000-height ranges (about ten weeks), eras of ten.
     pub const STANDARD: Layout = Layout { range: 10_000, era_ranges: 10, depth: UNDO_DEPTH };
+
+    /// A chain's layout: a range is about the same stretch of time on every chain (about ten
+    /// weeks, 10,000 Bitcoin blocks), so its rows and the number of files a lookup opens stay
+    /// alike whatever the block interval: DigiByte's 24.5 M heights make 7 eras, not 245.
+    /// Fixed per chain forever: a change cuts other files (a new format version).
+    pub fn for_chain(p: &ChainParams) -> Layout {
+        let range = match p.key {
+            // 15-second blocks.
+            "dgb" | "dgbtest" => 400_000,
+            // 2.5-minute blocks.
+            "ltc" | "ltctest" => 40_000,
+            // 2-minute blocks.
+            "wjk" => 50_000,
+            // One-minute blocks (the Dogecoin family, Luckycoin, Junkcoin, Kotia).
+            "doge" | "pep" | "peptest" | "lky" | "flop" | "shic" | "bel" | "jkc" | "kot" => 100_000,
+            // Bitcoin, and any chain not listed: Bitcoin's.
+            _ => 10_000,
+        };
+        Layout { range, era_ranges: 10, depth: UNDO_DEPTH }
+    }
 
     fn era(&self) -> u64 {
         self.range as u64 * self.era_ranges as u64
@@ -472,7 +494,7 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
                 .iter()
                 .map(|(first, last, state)| {
                     let last_hash = db.hash_at(c, *last)?.ok_or_else(|| other("no block at a file's last height"))?.0;
-                    Writer::resume(&dir, Meta { kind, chain: c, first: *first, last: *last, last_hash }, o.level, o.threads, state)
+                    Writer::resume(&dir, Meta { kind, chain: c, first: *first, last: *last, last_hash, range: o.layout.range, era_ranges: o.layout.era_ranges }, o.level, o.threads, state)
                 })
                 .collect();
             match writers {
@@ -529,7 +551,7 @@ fn pass(db: &ChainDb, params: &ChainParams, kind: Kind, o: &Options, stop: &Atom
                 .layout
                 .units(next, target)
                 .into_iter()
-                .map(|(first, last)| Writer::create(&dir, Meta { kind, chain: c, first, last, last_hash: hs.hashes[last as usize] }, o.level, o.threads))
+                .map(|(first, last)| Writer::create(&dir, Meta { kind, chain: c, first, last, last_hash: hs.hashes[last as usize], range: o.layout.range, era_ranges: o.layout.era_ranges }, o.level, o.threads))
                 .collect::<Result<Vec<_>>>()?;
             (Out { kind, writers, group_key: Vec::new(), group: Vec::new(), group_src: None, done_src: None }, 0u64)
         }
@@ -706,9 +728,10 @@ impl ChainDb {
             return Err(other(format!("a range must have heights, an era ranges, and the sealing depth be at least {UNDO_DEPTH}")));
         }
         // Files cut another way would not equal other arcades' (and could not be tiled with
-        // standard ones): only the tests use small layouts.
-        if o.layout != Layout::STANDARD && !cfg!(test) {
-            return Err(other("index files are cut by the standard layout only (10,000-height ranges, eras of ten)"));
+        // the chain's own): only the tests use small layouts.
+        let want = Layout::for_chain(params);
+        if o.layout != want && !cfg!(test) {
+            return Err(other(format!("{} index files are cut by its own layout only ({}-height ranges, eras of {})", params.name, want.range, want.era_ranges)));
         }
         // Rows still in the address log or the tx index runs are in no table yet.
         if self.addresses_pending(c)? || self.txs_pending(c)? || crate::txruns::of(self.store(c).id(), c).is_some() {
@@ -758,6 +781,34 @@ mod tests {
         assert_eq!(l.units(0, 1299), [(0, 999), (1000, 1099), (1100, 1199), (1200, 1299)]);
         assert_eq!(l.units(300, 2099), [(300, 399), (400, 499), (500, 599), (600, 699), (700, 799), (800, 899), (900, 999), (1000, 1999), (2000, 2099)]);
         assert!(l.units(300, 299).is_empty());
+    }
+
+    #[test]
+    fn every_chain_has_few_eras() {
+        use arcade_chain::params::{ALL_CHAINS, BITCOIN_MAIN, DIGIBYTE_MAIN};
+        assert_eq!(Layout::for_chain(&BITCOIN_MAIN), Layout::STANDARD);
+        // Heights in late 2026, with room: no lookup opens more than about a dozen eras.
+        let heights = [("btc", 930_000), ("ltc", 3_300_000), ("ltctest", 3_400_000), ("doge", 6_500_000), ("dgb", 24_700_000), ("dgbtest", 700_000), ("pep", 1_310_000), ("peptest", 1_580_000), ("lky", 1_200_000), ("flop", 950_000), ("jkc", 1_200_000)];
+        for (k, h) in heights {
+            let p = ALL_CHAINS.iter().find(|p| p.key == k).unwrap();
+            let l = Layout::for_chain(p);
+            assert!(h / (l.range * l.era_ranges) <= 12, "{k}: {} eras", h / (l.range * l.era_ranges));
+        }
+        let d = Layout::for_chain(&DIGIBYTE_MAIN);
+        assert_eq!(24_500_000 / (d.range * d.era_ranges), 6);
+        for p in ALL_CHAINS.iter() {
+            let l = Layout::for_chain(p);
+            assert!(l.range >= 10_000 && l.era_ranges == 10 && l.depth == UNDO_DEPTH, "{}", p.key);
+            // Boundaries are fixed: every unit is a whole range or era on its own boundary,
+            // whether a pass starts at 0 or carries on from a range edge.
+            let era = l.range * l.era_ranges;
+            for (from, upto) in [(0, era * 3 - 1), (l.range * 7, era * 3 + l.range * 2 - 1)] {
+                for (a, b) in l.units(from, upto) {
+                    let len = b - a + 1;
+                    assert!((len == l.range || len == era) && a % len == 0, "{}: {a}..={b}", p.key);
+                }
+            }
+        }
     }
 
     #[test]

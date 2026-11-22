@@ -598,7 +598,7 @@ fn a_file_not_checked_here_is_read_whole_before_it_is_used() {
     convert(&f, &opts());
     let dir = f.db.index_dir(c);
     let upto = f.db.index_files_upto(c, Kind::Hist).unwrap().unwrap();
-    let load = || KindSet::load(&dir, Kind::Hist, c, upto, |h| Ok(f.db.hash_at(c, h)?.map(|x| x.0)));
+    let load = || KindSet::load(&dir, Kind::Hist, c, upto, None, |h| Ok(f.db.hash_at(c, h)?.map(|x| x.0)));
     // Every file written here is marked as read back whole.
     let set = load().unwrap();
     for r in &set.files {
@@ -621,4 +621,9 @@ fn a_file_not_checked_here_is_read_whole_before_it_is_used() {
     std::fs::remove_file(checked_mark(&path)).ok();
     load().unwrap();
     assert!(checked_mark(&other).exists() && checked_mark(&path).exists());
+    // Files cut by another layout than the chain's (format 3 pins it in each header): refused.
+    let with = |l| KindSet::load(&dir, Kind::Hist, c, upto, Some(l), |h| Ok(f.db.hash_at(c, h)?.map(|x| x.0)));
+    assert!(with((100, 2)).is_ok());
+    assert!(with((100, 10)).err().is_some_and(|e| e.to_string().contains("layout")));
+    assert!(with((10_000, 10)).is_err());
 }

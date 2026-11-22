@@ -1266,6 +1266,7 @@ fn serve_loop(
     let mut handling: Option<(String, Instant)> = None;
     loop {
         if run == 0 || run >= READ_RUN || run_bytes >= READ_RUN_BYTES {
+            let turn_t = Instant::now();
             run = 0;
             run_bytes = 0;
             // Queued frames: every link sends every frame once (those still in the ring).
@@ -1326,6 +1327,12 @@ fn serve_loop(
                 link.send(&Frame::new(json!({"t": "ping", "n": crate::linkrtt::ping_n(peer)})))?;
                 crate::udpsvc::keepalive(link)?;
                 *last_ping = std::time::Instant::now();
+            }
+            // The whole turn of chores (each one under SLOW_STEP can still add up), and the frame being handled is
+            // timed without it (2026-11-22: "frame sub took 13 s" counted the turn that came after the frame).
+            slow_step(peer, "turn", turn_t);
+            if let Some((_, t)) = handling.as_mut() {
+                *t += turn_t.elapsed();
             }
             // Wait briefly for a frame, so queued room frames go out within ~50 ms (2 ms while the
             // fast lane is busy).

@@ -1431,13 +1431,17 @@ fn serve_loop(
                     note_offer(node, &link.peer_id, addr, "cr", &f.head["nets"]);
                 }
                 // An answer to a batch we sent over this link, as a borrower (crvia).
-                if crate::crvia::on_answer(peer, &f) {
-                    continue;
+                if !crate::crvia::on_answer(peer, &f) {
+                    crate::borrow::on_link_push(peer, &f);
+                    crate::coreshare::handle(node, link, cr_reqs, &f)?
                 }
-                crate::borrow::on_link_push(peer, &f);
-                crate::coreshare::handle(node, link, cr_reqs, &f)?
             }
             _ => {} // unknown kinds are ignored, as the existing arcade does
+        }
+        // Timed here, right after its handler: timed at the next frame's read, the wait for that frame counted too, and
+        // a quiet link made its last frame look slow ("frame pong took 12 s", 2026-11-22: the wait, not the handler).
+        if let Some((k, t)) = handling.take() {
+            slow_step(peer, &format!("frame {k}"), t);
         }
     }
 }

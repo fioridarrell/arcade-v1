@@ -247,6 +247,8 @@ pub struct Node {
     pub mesh_sizes: Mutex<BTreeMap<String, (u64, serde_json::Value)>>,
     /// `chains.list` made in the background (crate::chains::list_cached).
     pub list_cache: crate::chains::ListCache,
+    /// The App Store's apps, kept (crate::appsvc::Cache, 2026-11-21: reading them all took minutes on a busy arcade).
+    pub apps_cache: crate::appsvc::Cache,
     /// Chains installed by hand (Chains & Coins), by key.
     pub extra: Mutex<BTreeMap<String, std::sync::Arc<crate::chains::ChainRun>>>,
     /// Weak self-reference so API handlers can start threads that own the node.

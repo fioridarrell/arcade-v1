@@ -2841,6 +2841,11 @@ pub fn raw_block(id: &Hash256) -> Option<Vec<u8>> {
 
 /// Block `h` of the branch this arcade is on, as the chain writes it: what a segment of the
 /// ARCADE chain holds (block 0 has no bytes). None past the tip.
+/// The id of the ARCADE chain's block at height `h` on the best chain here.
+pub fn id_at(h: u64) -> Option<Hash256> {
+    svc()?.st.lock().unwrap().chain.id_at(h)
+}
+
 pub fn raw_block_at(h: u64) -> Option<Vec<u8>> {
     let svc = svc()?;
     let st = svc.st.lock().unwrap();

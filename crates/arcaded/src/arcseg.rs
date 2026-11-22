@@ -339,22 +339,77 @@ pub fn spans(c: u16, family: u8, full: u64) -> Vec<Span> {
 
 /// A segment's (bytes, root), made from the stored units (and kept).
 pub fn root_of(node: &Node, p: &ChainParams, family: u8, first: u64, last: u64) -> Option<(u64, Hash)> {
-    if let Some((l, bytes, root)) = CUTS.lock().unwrap().get(&(p.chain_no, family)).and_then(|c| c.roots.get(&first).copied()) {
-        if l == last {
-            return Some((bytes, root));
-        }
+    if let Some(hit) = cut_root(p, family, first, last) {
+        return Some(hit);
+    }
+    // One root is made at a time (2026-11-22: the catalog and the fraud watch made the same roots at once after a
+    // restart); whoever waited finds it made.
+    static MAKING: Mutex<()> = Mutex::new(());
+    let _one = MAKING.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(hit) = cut_root(p, family, first, last) {
+        return Some(hit);
+    }
+    let last_id = last_id(node, p, last);
+    if let Some(hit) = last_id.as_deref().and_then(|id| kept_root(node, p, family, first, last, id)) {
+        CUTS.lock().unwrap().entry((p.chain_no, family)).or_default().roots.insert(first, (last, hit.0, hit.1));
+        return Some(hit);
     }
     let mut sizes = Vec::with_capacity((last - first + 1) as usize);
     let mut r = Rooter::new();
+    let mut slice = std::time::Instant::now();
     for h in first..=last {
         let u = unit_bytes(node, p, family, h as u32)?;
         sizes.push(u.len() as u64);
         r.push(&u);
+        // A short rest every MAKE_SLICE: reading the units takes locks link threads wait on (the ARCADE chain's own,
+        // for its blocks), and a thread taking one thousands of times a second starved them for seconds (2026-11-22:
+        // the GX10's links ended one after another while its catalog and fraud watch remade every root).
+        if slice.elapsed() >= MAKE_SLICE {
+            std::thread::sleep(MAKE_REST);
+            slice = std::time::Instant::now();
+        }
     }
     r.push(&segment::table(&sizes));
     let (root, bytes) = r.finish().ok()?;
     CUTS.lock().unwrap().entry((p.chain_no, family)).or_default().roots.insert(first, (last, bytes, root));
+    if let Some(id) = last_id {
+        keep_root(node, p, family, first, last, &id, bytes, root);
+    }
     Some((bytes, root))
+}
+
+/// Work between rests while a root is made, and the rest.
+const MAKE_SLICE: std::time::Duration = std::time::Duration::from_millis(20);
+const MAKE_REST: std::time::Duration = std::time::Duration::from_millis(5);
+
+fn cut_root(p: &ChainParams, family: u8, first: u64, last: u64) -> Option<(u64, Hash)> {
+    let (l, bytes, root) = CUTS.lock().unwrap().get(&(p.chain_no, family)).and_then(|c| c.roots.get(&first).copied())?;
+    (l == last).then_some((bytes, root))
+}
+
+/// The id of block `last`: roots kept on disk are kept under it, so a chain that reorganized below it never gets back
+/// the root of blocks it no longer has.
+fn last_id(node: &Node, p: &ChainParams, last: u64) -> Option<String> {
+    let id = if crate::arcsvc::runs(p) { crate::arcsvc::id_at(last)? } else { node.chain.hash_at(p.chain_no, u32::try_from(last).ok()?).ok()?? };
+    Some(hex::encode(id.0))
+}
+
+/// Roots made here, kept on disk (META `segroot:<chain>:<family>:<first>:<last>:<last block id>`): a restart used to
+/// remake every listed segment's root from its blocks.
+fn root_key(p: &ChainParams, family: u8, first: u64, last: u64, id: &str) -> Vec<u8> {
+    format!("segroot:{}:{family}:{first}:{last}:{id}", p.chain_no).into_bytes()
+}
+
+fn kept_root(node: &Node, p: &ChainParams, family: u8, first: u64, last: u64, id: &str) -> Option<(u64, Hash)> {
+    let raw = node.app.store.read(|r| r.get(arcade_app::META, &root_key(p, family, first, last, id))).ok()??;
+    let v: serde_json::Value = serde_json::from_slice(&raw).ok()?;
+    let root: Hash = hex::decode(v["root"].as_str()?).ok()?.try_into().ok()?;
+    Some((v["bytes"].as_u64()?, root))
+}
+
+fn keep_root(node: &Node, p: &ChainParams, family: u8, first: u64, last: u64, id: &str, bytes: u64, root: Hash) {
+    let v = serde_json::json!({"bytes": bytes, "root": hex::encode(root)}).to_string();
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, &root_key(p, family, first, last, id), v.as_bytes()));
 }
 
 /// The listed chains of `net` this arcade keeps in full, as listed for the block at `height` (the next block's: a

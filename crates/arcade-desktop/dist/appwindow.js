@@ -26,14 +26,22 @@
   let homeChain = null;
   const homeReady = api("chains.list").then((l) => { const h = (l.chains || l || []).find((c) => c.home); homeChain = h ? h.key : null; }).catch(() => {});
   const WRITES = { inscribe: () => true, swap: (m) => m.op !== "items", seed: () => true, claim: () => true, owner: (m) => m.op === "send" };
-  let appState = { state: "open", timeout: null, closesAt: null, inShell: false };
+  let appState = { state: "open", timeout: null, closesAt: null, inShell: false, card: null };
 
   const perms = async () => (id ? await api("apps.perms", { id }) : {});
   const appName = document.title;
 
   // Cards drawn over the app, outside its sandbox: the app can't see, draw or press them.
   let busy = false;
+  // The app hears when a card waits on the person and when it is answered (arcade.app's state: card = its title, or
+  // null), so it can say "answer the card" instead of looking stuck (2026-11-22: a page waiting on a card in a window
+  // nobody watched looked like a hang).
+  function cardState(title) {
+    appState = { ...appState, card: title };
+    el.contentWindow?.postMessage({ arcade: "app", event: true, ...appState }, "*");
+  }
   function card(title, lines, yes, no = "No") {
+    cardState(title);
     return new Promise((resolve) => {
       const ov = document.createElement("div"); ov.className = "ov";
       const box = document.createElement("div"); box.className = "box";
@@ -42,7 +50,7 @@
       const row = document.createElement("div"); row.className = "btns";
       const n = document.createElement("button"); n.textContent = no;
       const y = document.createElement("button"); y.textContent = yes; y.className = "yes";
-      const done = (v) => { ov.remove(); resolve(v); };
+      const done = (v) => { ov.remove(); cardState(null); resolve(v); };
       n.onclick = () => done(false); y.onclick = () => done(true);
       row.append(n, y); box.append(row); ov.append(box); document.body.append(ov);
       y.focus();

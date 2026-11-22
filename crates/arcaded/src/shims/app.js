@@ -1,9 +1,11 @@
-/* Arcade V1.0: arcade.app for app pages (the original arcade's app.js API): open / minimized / restored / closing. */
+/* Arcade V1.0: arcade.app for app pages (the original arcade's app.js API): open / minimized / restored / closing.
+   The state also carries `card`: the title of a card the arcade window shows the person for this page (a yes it waits
+   on), or null; an "arcade:app" event comes when one opens and when it is answered. */
 (function () {
   'use strict';
   window.arcade = window.arcade || {};
   if (window.arcade.app) return;
-  var now = { state: 'open', timeout: null, closesAt: null, inShell: false }, fns = [], seq = 0, waiting = {};
+  var now = { state: 'open', timeout: null, closesAt: null, inShell: false, card: null }, fns = [], seq = 0, waiting = {};
   function strip(m) { var o = {}; for (var k in m) if (k !== 'arcade' && k !== 'seq' && k !== 'event' && k !== 'ok') o[k] = m[k]; return o; }
   window.addEventListener('message', function (e) {
     if (e.source !== window.parent) return;          // only the arcade window that framed this page

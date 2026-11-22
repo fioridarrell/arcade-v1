@@ -323,14 +323,16 @@ fn busy_runs(node: &Node) -> Vec<&'static ChainParams> {
 /// Whether the home chain isn't caught up: no block yet, more than 10 behind the best height
 /// anyone tells us (headers, arcades on the mesh, lenders), or its address rows still building.
 /// The same test as an installed chain's (borrow::installed_ready).
+/// A home chain that is borrowed (not installed here: homeinst) has no blocks of its own and is
+/// never caught up; it holds nothing up.
 fn home_syncing(node: &Node) -> bool {
     let tip = node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
     let (lag, addresses_ready) = crate::borrow::home_lag(node);
-    home_busy(tip, lag, addresses_ready)
+    home_busy(crate::homeinst::installed(), tip, lag, addresses_ready)
 }
 
-fn home_busy(tip: u32, lag: u32, addresses_ready: bool) -> bool {
-    tip == 0 || lag > 10 || !addresses_ready
+fn home_busy(installed: bool, tip: u32, lag: u32, addresses_ready: bool) -> bool {
+    installed && (tip == 0 || lag > 10 || !addresses_ready)
 }
 
 /// Whether a queue entry resumes a paused chain (rather than installing one).
@@ -2150,11 +2152,13 @@ mod home_queue_tests {
 
     #[test]
     fn installs_wait_while_the_home_chain_syncs() {
-        assert!(home_busy(0, 0, true), "no home block yet");
-        assert!(home_busy(1_000, 50_000, true), "far behind");
-        assert!(home_busy(1_000, 11, true), "just past the margin");
-        assert!(home_busy(1_000, 0, false), "address rows still building");
-        assert!(!home_busy(1_000, 10, true), "caught up: installs go ahead");
+        assert!(home_busy(true, 0, 0, true), "no home block yet");
+        assert!(home_busy(true, 1_000, 50_000, true), "far behind");
+        assert!(home_busy(true, 1_000, 11, true), "just past the margin");
+        assert!(home_busy(true, 1_000, 0, false), "address rows still building");
+        assert!(!home_busy(true, 1_000, 10, true), "caught up: installs go ahead");
+        // Borrowed (a new arcade's home chain until it is installed): never holds the queue.
+        assert!(!home_busy(false, 0, 0, true), "borrowed home, no blocks of its own");
     }
 
     fn with(ix: &[&str]) -> Vec<String> {

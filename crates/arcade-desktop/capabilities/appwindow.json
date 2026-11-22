@@ -1,7 +1,7 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "appwindow",
-  "description": "App windows (our wrapper; the app itself is a sandboxed frame inside) may call the arcade API for their app's doors only (main.rs APP_WINDOW_COMMANDS) and save a file the app hands over.",
+  "description": "App windows (our wrapper; the app itself is a sandboxed frame inside) may call the arcade API for their app's doors only (main.rs APP_WINDOW_COMMANDS), save a file the app hands over, and open another app the person said yes to (arcade.apps.open).",
   "windows": ["app-*"],
-  "permissions": ["core:default", "allow-api", "allow-save-file"]
+  "permissions": ["core:default", "allow-api", "allow-open-app", "allow-save-file"]
 }

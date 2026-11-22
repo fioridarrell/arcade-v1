@@ -735,6 +735,10 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "apps.install" => crate::appsvc::install(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
         "apps.uninstall" => crate::appsvc::uninstall(node, &s("id").ok_or("id required")?),
         "apps.star" => crate::appsvc::star(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?, req["on"] != false),
+        // arcade.apps for app pages (2026-11-22): the rows GET /r/apps answers, and what a window needs to open another app.
+        "apps.rows" => Ok(crate::appsvc::page_list(node, &s("q").unwrap_or_default(), req["offset"].as_u64().unwrap_or(0) as usize,
+                                                   req["limit"].as_u64().map(|n| n as usize).unwrap_or(crate::appsvc::PAGE_ROWS_DEFAULT))),
+        "apps.open" => crate::appsvc::open(node, &s("id").ok_or("id required")?, &s("from").unwrap_or_default(), &s("page").unwrap_or_default()),
         "apps.card" => crate::appsvc::card(node, &s("chain").ok_or("chain required")?, &s("txid").ok_or("txid required")?),
         "apps.perms" => {
             let id = s("id").ok_or("id required")?;

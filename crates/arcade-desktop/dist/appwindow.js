@@ -578,6 +578,23 @@
       go("");
     });
   }
+  // arcade.apps (2026-11-22): the page lists the arcade's apps itself (GET /r/apps) and asks to open one here. The arcade
+  // checks the app (one the App Store lists, not this one) and gives what its window needs; the person says yes on a card;
+  // then it opens in its own window, as Apps opens it. The page never sees the other app's key.
+  doors.apps = async (m) => {
+    if (m.op !== "open") throw new Error("apps ops here: open (the list is GET /r/apps)");
+    const other = String(m.id || "").trim();
+    if (!other) throw new Error("which app? give its id (from arcade.apps.list)");
+    if (id && other === id) throw new Error("an app can't open itself: it is already open");
+    const l = await api("apps.open", { id: other, from: id, page: here });
+    const lines = [`${appName} wants to open ${l.title} in its own window.`];
+    if (l.caution) lines.push(String(l.caution));
+    if (l.withdrawn) lines.push(`Its publisher withdrew ${l.title}${l.withdrawn.reason ? ": " + l.withdrawn.reason : ""}.`);
+    const yes = await oneCard(() => card(`${appName} wants to open ${l.title}`, lines, "Allow"));
+    if (!yes) throw new Error("declined");
+    await invoke("open_app", { id: l.id, title: l.title, frame: l.frame });
+    return { opened: l.id, title: l.title };
+  };
   // Prize pools on the chain: a seed for a run (from the pool's referee) and a claim of one lot. The arcade
   // opens the lot with the page's phrase and, for a refereed pool, has its referee check the run.
   doors.seed = async (m) => {

@@ -42,7 +42,7 @@ pub struct LinkInfo {
 /// Each live link has an entry of its own: two arcades behind one public address (one router,
 /// the same mesh port) are two links, and one closing leaves the other listed. The key is the
 /// address and a number for this link; `LinkInfo.addr` stays the address.
-pub fn link_add(links: &Mutex<BTreeMap<String, LinkInfo>>, addr: &str, node_id: &str, since: u64) -> String {
+pub fn link_add(links: &crate::heldlock::HeldLock<BTreeMap<String, LinkInfo>>, addr: &str, node_id: &str, since: u64) -> String {
     static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let key = format!("{addr}#{}", N.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
     links.lock().unwrap().insert(key.clone(), LinkInfo { addr: addr.to_string(), node_id: node_id.to_string(), since });
@@ -64,17 +64,17 @@ fn a_tip_more_than_a_day_old_is_old() {
 }
 
 /// Remove the entry `link_add` made for one link.
-pub fn link_remove(links: &Mutex<BTreeMap<String, LinkInfo>>, key: &str) {
+pub fn link_remove(links: &crate::heldlock::HeldLock<BTreeMap<String, LinkInfo>>, key: &str) {
     links.lock().unwrap().remove(key);
 }
 
 #[cfg(test)]
 #[test]
 fn two_arcades_behind_one_address_are_two_links() {
-    let links = Mutex::new(BTreeMap::new());
+    let links = crate::heldlock::HeldLock::new("test", BTreeMap::new());
     let a = link_add(&links, "129.0.0.1:8421", "aaaa", 1);
     let b = link_add(&links, "129.0.0.1:8421", "bbbb", 2);
-    let ids = |l: &Mutex<BTreeMap<String, LinkInfo>>| l.lock().unwrap().values().map(|x| x.node_id.clone()).collect::<Vec<_>>();
+    let ids = |l: &crate::heldlock::HeldLock<BTreeMap<String, LinkInfo>>| l.lock().unwrap().values().map(|x| x.node_id.clone()).collect::<Vec<_>>();
     assert_eq!(ids(&links), vec!["aaaa", "bbbb"], "both listed");
     link_remove(&links, &a);
     assert_eq!(ids(&links), vec!["bbbb"], "one closing leaves the other");
@@ -213,8 +213,8 @@ pub struct Node {
     /// Raw transactions waiting to be sent to coin peers.
     pub tx_outbox: Mutex<Vec<Vec<u8>>>,
     /// Frames waiting to be sent to every mesh link.
-    pub mesh_outbox: Mutex<Outbox>,
-    pub links: Mutex<BTreeMap<String, LinkInfo>>,
+    pub mesh_outbox: crate::heldlock::HeldLock<Outbox>,
+    pub links: crate::heldlock::HeldLock<BTreeMap<String, LinkInfo>>,
     pub mesh_tips: Mutex<BTreeMap<String, MeshTip>>,
     pub sync_state: Mutex<String>,
     /// V1.0 arcades that serve blocks: dial address -> their tip height.

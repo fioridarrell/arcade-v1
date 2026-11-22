@@ -33,9 +33,10 @@ struct St {
     by_peer: BTreeMap<String, Rtt>,
 }
 
-fn st() -> std::sync::MutexGuard<'static, St> {
-    static S: OnceLock<Mutex<St>> = OnceLock::new();
-    S.get_or_init(Default::default).lock().unwrap()
+#[track_caller]
+fn st() -> crate::heldlock::Held<'static, St> {
+    static S: OnceLock<crate::heldlock::HeldLock<St>> = OnceLock::new();
+    S.get_or_init(|| crate::heldlock::HeldLock::new("link rtt", St::default())).lock().unwrap_or_else(|e| e.into_inner())
 }
 
 /// A new ping's "n" for a link to `peer`: 8 hex digits, unique among the pings waiting (pongs echo it).

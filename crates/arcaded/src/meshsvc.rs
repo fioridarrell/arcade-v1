@@ -1179,6 +1179,8 @@ pub fn serve(node: &Node, link: &mut Link, addr: &str) -> Result<(), LinkError> 
     crate::relaysvc::link_up(link);
     // Borrowers here may send their batches over this link (a lender they can't dial).
     crate::crvia::up(&peer);
+    // Code releases and the files held here are told again on each new link (arccode::link_up, 2026-11-21).
+    crate::arccode::link_up(&peer);
     let mut last_me = std::time::Instant::now();
     let mut last_offer = crate::coreshare::offer(node).map(|o| o.head["nets"].clone()).unwrap_or(Value::Null);
     // Core-style calls over this link (coreshare) are answered for this peer: the addresses

@@ -20,6 +20,8 @@ const APP_WINDOW_COMMANDS: &[&str] = &[
     "apps.allowance", "apps.allowance_use", "apps.folder_set", "folder.browse",
     // arcade.apps.open (2026-11-22): the window checks the other app and opens it in its own window after a yes on its card.
     "apps.open",
+    // Which helpers run here (2026-11-22): a page's svc.local for one that isn't attached is refused before any card.
+    "svc.services",
     "chains.list", "explorer.inscription", "explorer.ledger_inscription",
     "contacts.delete", "contacts.list", "contacts.save", "msg.who",
     // arcade.feed (the Feed app): reads, and posts, acts, follows and mutes behind the app's Feed switch (appwindow.js).

@@ -150,6 +150,10 @@
       if (m.op === "local") {
         const body = m.body && typeof m.body === "object" ? m.body : {};
         const what = String(body.what || "");
+        // A helper that isn't attached here is refused at once, before any card (2026-11-22: a page asking for one
+        // that only its author runs showed "manage your <name> helper?" on every arcade, and its other asks hit "busy").
+        const attached = await api("svc.services", {}).then((l) => (l || []).some((x) => x.service === service)).catch(() => true);
+        if (!attached) throw new Error(`no ${service} helper on this arcade`);
         // A payment within the app's allowance for this service needs neither card (counted at once; given back if it
         // fails below).
         let reserved = 0;

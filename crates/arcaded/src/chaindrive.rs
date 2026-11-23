@@ -19,7 +19,7 @@ pub const DIR: &str = "arcade-chains";
 const KEEP_FREE: u64 = 5 << 30;
 
 #[cfg(unix)]
-fn free_bytes(p: &Path) -> Option<(u64, u64)> {
+pub(crate) fn free_bytes(p: &Path) -> Option<(u64, u64)> {
     let c = std::ffi::CString::new(p.as_os_str().as_encoded_bytes()).ok()?;
     let mut s: libc::statvfs = unsafe { std::mem::zeroed() };
     if unsafe { libc::statvfs(c.as_ptr(), &mut s) } != 0 {
@@ -30,7 +30,7 @@ fn free_bytes(p: &Path) -> Option<(u64, u64)> {
 
 /// Windows: free and total bytes of the volume that holds `p` (GetDiskFreeSpaceExW).
 #[cfg(windows)]
-fn free_bytes(p: &Path) -> Option<(u64, u64)> {
+pub(crate) fn free_bytes(p: &Path) -> Option<(u64, u64)> {
     let wide = win::wide(p);
     let (mut free, mut total) = (0u64, 0u64);
     let ok = unsafe { win::GetDiskFreeSpaceExW(wide.as_ptr(), &mut free, &mut total, std::ptr::null_mut()) };
@@ -324,6 +324,9 @@ pub fn start(node: &Arc<Node>, key: &str, id: &str) -> Result<Value, String> {
     }
     if crate::coreboot::held(key) {
         return Err(format!("{} is taking in a copy; move it when that is done", p.name));
+    }
+    if node.chain.init_active(c) {
+        return Err(format!("{} is in an init install (its build's scratch sits beside it); move it when that is done", p.name));
     }
     if crate::refill::status(Some(key)).get("finished").is_some_and(|f| f.is_null()) {
         return Err(format!("{} is refilling blocks; move it when that is done", p.name));

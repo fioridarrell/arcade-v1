@@ -112,6 +112,7 @@ mod ordsafe;
 mod ordsend;
 mod peerbook;
 mod psync;
+mod initsync;
 mod realtime;
 mod refill;
 mod pagechain;

@@ -319,6 +319,15 @@ pub(crate) fn locate<R: Rd>(r: &R, params: &ChainParams, txid: &Hash256) -> Resu
     Ok(found)
 }
 
+/// Coins and addresses of a chain in an init install (crate::initsync) are not answered until it
+/// is built: its coin set is being derived from blocks whose rules aren't checked yet.
+pub(crate) fn not_in_init<R: Rd>(r: &R, c: u16) -> Result<()> {
+    match r.get(STATE, &k_state(c, crate::initsync::INIT))? {
+        Some(v) if v.as_slice() != b"done" => Err(StoreError::Other("this chain is in an init install: its coins and addresses are not answered until it is built".into())),
+        _ => Ok(()),
+    }
+}
+
 pub(crate) fn coin_at<R: Rd>(r: &R, params: &ChainParams, b: u32, p: u32, vout: u32) -> Result<Option<Coin>> {
     let c = params.chain_no;
     let Some(v) = r.get(OUTPUTS, &k_pos(c, b, p, vout))? else { return Ok(None) };
@@ -1855,7 +1864,7 @@ impl ChainDb {
 
     /// An unspent output.
     pub fn coin(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<Coin>> {
-        self.store(params.chain_no).read(|r| match locate(r, params, &op.txid)? {
+        self.store(params.chain_no).read(|r| match not_in_init(r, params.chain_no).and_then(|_| locate(r, params, &op.txid))? {
             Some((b, p)) => coin_at(r, params, b, p, op.vout),
             None => Ok(None),
         })
@@ -1866,6 +1875,7 @@ impl ChainDb {
         let c = params.chain_no;
         let sid = script_id(script);
         self.store(c).read(|r| {
+            not_in_init(r, c)?;
             let pre = k_sid(c, &sid);
             let mut out = Vec::new();
             for (k, v) in r.scan_prefix(BY_SCRIPT, &pre)? {
@@ -1949,7 +1959,7 @@ impl ChainDb {
         let sid = script_id(script);
         Ok(self
             .store(c)
-            .read(|r| r.scan_prefix(BY_SCRIPT, &k_sid(c, &sid)))?
+            .read(|r| not_in_init(r, c).and_then(|_| r.scan_prefix(BY_SCRIPT, &k_sid(c, &sid))))?
             .iter()
             .map(|(_, v)| u64::from_le_bytes(v[0..8].try_into().unwrap()))
             .sum())
@@ -1961,7 +1971,7 @@ impl ChainDb {
         let pre = k_sid(c, &sid);
         Ok(self
             .store(c)
-            .read(|r| r.scan_prefix(SCRIPT_HIST, &pre))?
+            .read(|r| not_in_init(r, c).and_then(|_| r.scan_prefix(SCRIPT_HIST, &pre)))?
             .iter()
             .map(|(k, v)| {
                 let n = pre.len();
@@ -1973,7 +1983,7 @@ impl ChainDb {
     /// Who spent an outpoint: (block number, position, input index).
     pub fn spender(&self, params: &ChainParams, op: &OutPoint) -> Result<Option<(u32, u32, u32)>> {
         let c = params.chain_no;
-        self.store(c).read(|r| match locate(r, params, &op.txid)? {
+        self.store(c).read(|r| match not_in_init(r, c).and_then(|_| locate(r, params, &op.txid))? {
             Some((b, p)) => Ok(r
                 .get(SPENDS, &k_pos(c, b, p, op.vout))?
                 .map(|v| (be_u32(&v, 0), be_u32(&v, 4), be_u32(&v, 8)))),

@@ -8,6 +8,7 @@ pub mod cpushare;
 pub mod copyout;
 pub mod db;
 pub mod indexer;
+pub mod initsync;
 pub mod journal;
 pub mod rules;
 pub mod proven;
@@ -28,3 +29,5 @@ mod tests;
 mod coreimport_tests;
 #[cfg(test)]
 mod stake_tests;
+#[cfg(test)]
+mod initsync_tests;

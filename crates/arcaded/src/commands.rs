@@ -327,7 +327,7 @@ cmds! {
     "chains.status" Public "key" "One chain's staged progress. `recovered_at_start` is `{from, to}` when this start wound the tip back (the last stop left without writing the coin caches, exit code 3), else null.";
     "chains.offers" Public "" "Chains other arcades offer over the mesh.";
     "chains.sizes" Admin "" "Measure this arcade's disk use per chain now.";
-    "chains.add" Admin "key, mode?, with?, drive?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
+    "chains.add" Admin "key, mode?, with?, drive?, init?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own; init = true: headers agreed by several sources first, then every block stored only, then built in bulk, for a big chain such as Bitcoin, docs/INITSYNC.md). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
     "chains.queue" Public "" "Chains waiting in the queue, next first (position, key, name, mode, with; resume = a chain paused by chains.start_now that continues at its turn), the chain being installed now that they wait behind, the hidden chains, and plan_done (whether the startup chooser was answered).";
     "chains.unqueue" Admin "key" "Take a chain out of the install queue.";
     "chains.queue_first" Admin "key" "Move a queued chain to the front of the queue: it is next.";
@@ -603,6 +603,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("here_only", "boolean", "Only what this arcade holds."),
     ("hex", "string", "Bytes as hex."),
     ("hidden", "boolean", "Hide (true) or show (false)."),
+    ("init", "boolean", "true: an init install (headers agreed by several sources, every block stored only, then built in bulk; docs/INITSYNC.md)."),
     ("history", "boolean", "Include history rows."),
     ("history_limit", "integer", "History rows per page."),
     ("history_offset", "integer", "History rows to skip."),

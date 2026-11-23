@@ -750,6 +750,9 @@ pub fn chain_status(node: &Node, key: &str) -> Value {
 fn may_bootstrap(node: &Node, p: &'static arcade_chain::params::ChainParams) -> Result<(), String> {
     crate::chaindrive::not_moving(p.key)?;
     let mode = node.mode_of(p.key).ok_or_else(|| format!("{} is not installed (install it first: arcade chain add {} full)", p.name, p.key))?;
+    if node.chain.init_active(p.chain_no) {
+        return Err(format!("{} is in an init install (it builds itself from its blocks); no copies meanwhile", p.name));
+    }
     if p.key == node.params.key {
         return Err(format!("{} is not bootstrapped from copies", p.name));
     }

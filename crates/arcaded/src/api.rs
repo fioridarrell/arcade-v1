@@ -1416,8 +1416,28 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "chains.add" => {
             let with: Vec<String> = req["with"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
             let key = s("key").ok_or("key required")?;
+            let mode = s("mode").unwrap_or_else(|| "full".into());
+            // init: headers agreed by several sources, blocks stored only, then built in bulk
+            // (crate::initsync, docs/INITSYNC.md). Remembered until the install starts.
+            let init = req["init"] == true;
+            let canon = arcade_chain::params::by_key(&key).map(|p| p.key.to_string()).unwrap_or_else(|| key.clone());
+            if init {
+                let p = arcade_chain::params::by_key(&canon).ok_or_else(|| format!("{key}: no such chain"))?;
+                crate::initsync::check(p, &mode)?;
+                if node.chain_params(&canon).is_some() {
+                    return Err(format!("{canon} is installed already; an init install starts from nothing"));
+                }
+                crate::initsync::request(node, &canon, true);
+            } else if node.chain_params(&canon).is_none() {
+                // A plain add of a chain queued earlier with init: it is a plain install now.
+                crate::initsync::request(node, &canon, false);
+            }
             // The drive chosen for it, else this arcade's own (crate::chaindrive): its file starts there.
-            crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &s("mode").unwrap_or_else(|| "full".into()), with))
+            let r = crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &mode, with));
+            if init && r.is_err() {
+                crate::initsync::request(node, &canon, false);
+            }
+            r
         }
         "chains.queue" => Ok(crate::chains::queue_list(node)),
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),

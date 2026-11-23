@@ -243,18 +243,30 @@ impl ChainDb {
     /// no witness data: txids don't cover witnesses, so a copy with them stripped would
     /// otherwise pass. Returns their block numbers.
     pub fn store_blocks_only(&self, params: &ChainParams, raws: &[Vec<u8>]) -> Result<Vec<u32>> {
-        let c = params.chain_no;
         let mut blocks = Vec::with_capacity(raws.len());
         for raw in raws {
             blocks.push(check_stored_block(self, params, raw)?);
         }
+        self.write_stored(params, &blocks)
+    }
+
+    /// Store checked blocks (check_stored_block) without connecting them; their block numbers.
+    pub(crate) fn write_stored(&self, params: &ChainParams, blocks: &[Block]) -> Result<Vec<u32>> {
+        self.write_stored_as(params, blocks, false)
+    }
+
+    /// [`ChainDb::write_stored`]; `by_height`: an init install's blocks, which arrive in any
+    /// order, take the block number of their height (crate::initsync::init_slot), so the main
+    /// chain's block numbers run in height order as a block-by-block sync leaves them.
+    pub(crate) fn write_stored_as(&self, params: &ChainParams, blocks: &[Block], by_height: bool) -> Result<Vec<u32>> {
+        let c = params.chain_no;
         self.wstore(c)?.write(|w| {
             let mut out = Vec::with_capacity(blocks.len());
-            for blk in &blocks {
+            for blk in blocks {
                 let hash = blk.hash();
                 let mut rec = header_rec(w, c, &hash)?.ok_or_else(|| err(format!("block {hash}: its header is not in our header chain")))?;
                 if rec.b == 0 {
-                    rec.b = next_b(w, c)?;
+                    rec.b = if by_height { crate::initsync::init_slot(w, params, rec.height)? } else { next_b(w, c)? };
                     w.put(BLOCK_META, &k_block(c, rec.b), &block_meta(blk))?;
                     for (p, tx) in blk.txs.iter().enumerate() {
                         w.put(BLOCK_TX, &k_block_tx(c, rec.b, p as u32), &tx.raw)?;
@@ -575,7 +587,7 @@ impl ChainDb {
     }
 
     /// Heights base+1.. of `path` become the main chain (HEIGHT rows, header status).
-    fn join_main(&self, params: &ChainParams, path: &[Hash256], base: u32) -> Result<()> {
+    pub(crate) fn join_main(&self, params: &ChainParams, path: &[Hash256], base: u32) -> Result<()> {
         let c = params.chain_no;
         for (i, chunk) in path.chunks(50_000).enumerate() {
             self.wstore(c)?.write(|w| {
@@ -999,8 +1011,12 @@ impl DiskReplay {
                         let tx = Tx::parse_with(&raw, &params.format).map_err(err)?;
                         if !tx.is_coinbase() {
                             for i in &tx.inputs {
+                                // Where it is spent: height and position, so a spend of an output a later
+                                // transaction of the same block makes is no spend (as Replay, as Core).
+                                let mut at = h.to_be_bytes().to_vec();
+                                at.extend_from_slice(&p.to_be_bytes());
                                 match crate::db::locate(r, params, &i.prevout.txid)? {
-                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &h.to_be_bytes())?,
+                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &at)?,
                                     None => self.missing += 1,
                                 }
                             }
@@ -1011,6 +1027,7 @@ impl DiskReplay {
                                 continue;
                             }
                             let mut v = h.to_be_bytes().to_vec();
+                            v.extend_from_slice(&p.to_be_bytes());
                             v.extend_from_slice(&encode_coin(o.value, h, coinbase, &o.script_pubkey));
                             self.made.push(&k_pos(c, b, p, vout as u32), &v)?;
                         }
@@ -1027,9 +1044,14 @@ impl DiskReplay {
     /// The derived set, read in key order from `DiskRows::next_kv`.
     pub fn finish(self) -> Result<DiskRows> {
         let mut spent = self.spent.finish()?;
-        let next_spend = spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        let next_spend = spent.next_kv()?.map(|(k, v)| (k, at_of(&v)));
         Ok(DiskRows { made: self.made.finish()?, spent, next_spend, missing: self.missing })
     }
+}
+
+/// (height, position) at the front of a DiskReplay row.
+fn at_of(v: &[u8]) -> (u32, u32) {
+    (be_u32(v, 0), be_u32(v, 4))
 }
 
 /// The coin set a DiskReplay derived: outputs made and not spent by a later input, as OUTPUTS
@@ -1037,7 +1059,7 @@ impl DiskReplay {
 pub struct DiskRows {
     made: Sorted,
     spent: Sorted,
-    next_spend: Option<(Vec<u8>, u32)>,
+    next_spend: Option<(Vec<u8>, (u32, u32))>,
     /// Inputs that spent a coin not made before them (a broken chain: never expected); complete
     /// once `next_kv` returned None.
     pub missing: u64,
@@ -1045,7 +1067,7 @@ pub struct DiskRows {
 
 impl DiskRows {
     fn pull(&mut self) -> Result<()> {
-        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, at_of(&v)));
         Ok(())
     }
 
@@ -1058,19 +1080,20 @@ impl DiskRows {
                 }
                 return Ok(None);
             };
-            let made_at = be_u32(&v, 0);
+            let made_at = at_of(&v);
             let mut spent = false;
             while let Some((sk, at)) = &self.next_spend {
                 match sk.as_slice().cmp(k.as_slice()) {
                     std::cmp::Ordering::Greater => break,
-                    // Spent once, at or after it was made; any other spend of it finds nothing (as Replay).
-                    std::cmp::Ordering::Equal if !spent && *at >= made_at => spent = true,
+                    // Spent once, by a transaction after the one that made it (a later block, or
+                    // later in the same block); any other spend of it finds nothing (as Replay).
+                    std::cmp::Ordering::Equal if !spent && *at > made_at => spent = true,
                     _ => self.missing += 1,
                 }
                 self.pull()?;
             }
             if !spent {
-                return Ok(Some((k, v[4..].to_vec())));
+                return Ok(Some((k, v[8..].to_vec())));
             }
         }
     }

@@ -159,6 +159,9 @@ cmds! {
     "ledger.write_chains" Read "" "Where this wallet can write its posts, acts and messages (ARCADE, Pepecoin testnet, and Pepecoin, Dogecoin, DigiByte where kept or borrowed): each with its balance, which is the default now, and whether ARCADE is stalled (writes then go to Pepecoin testnet). feed.post, feed.act, follow and msg.send take chain to pick one.";
     "ledger.lent" Read "" "Chains whose posts, acts, messages and profiles are also read from other arcades (their copy here borrowed or still catching up): rows held per table and how fresh.";
     "faucet.arc_status" Read "" "The ARCADE top-up asks this arcade knows and how many it paid today; node_faucet: node-gift asks, gifts paid today, nodes known paid, and this arcade's own gift.";
+    "faucet.newcomers" Read "" "New arcades waiting for their welcome (1 ARCADE, so they can claim a @handle at once), this arcade's welcome settings, whether it can send one now, and the welcomers' high scores (who welcomed each new arcade first, read from the chain).";
+    "faucet.welcome" Wallet "node, amount?" "Welcome a new arcade now from this wallet (\"Welcome to the arcade\"): this arcade's welcome amount, or amount (1 to 100 ARCADE, in satoshis). Refused once any arcade has welcomed it; the first payment on the chain gets the high-score point.";
+    "faucet.welcome_set" Admin "auto?, amount?" "Welcome new arcades automatically (on unless turned off; after a 3-minute head start for people pressing the button) and the amount each gets (in satoshis: 1 to 100 ARCADE, 1 ARCADE unless set).";
     // Messaging
     "msg.me" Read "" "Your messaging key, fingerprint and whether it is published.";
     "msg.stats" Public "" "How many message candidates, posts, acts and machine records the ARCADE chain holds (Pepecoin testnet's when ARCADE can't be used here).";
@@ -526,6 +529,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("amount", "integer|string", "An amount in the chain's smallest unit (satoshis; 8 decimals unless the answer says otherwise)."),
     ("args", "object", "The read's own arguments."),
     ("author", "string", "An author's @tag or address."),
+    ("auto", "boolean", "Do it automatically (true) or only when asked (false)."),
     ("b64", "string", "Bytes as base64."),
     ("base", "string", "A base: a manifest blob id (64 hex) for a push, or a market's base asset."),
     ("before", "integer", "Only below this height or position (exclusive)."),

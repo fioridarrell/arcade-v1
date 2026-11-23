@@ -48,10 +48,20 @@
       <div class="row"><button class="primary" id="h-keep-go">Choose a keep share…</button><button id="h-keep-no">Not now</button></div>
       <p class="msg" id="h-keep-msg"></p>
     </div>
+    <div class="pp-banner" id="h-welcome" hidden>
+      <b>New arcades</b> <span id="h-welcome-text"></span>
+      <ul class="welcome-list" id="h-welcome-list"></ul>
+      <p class="msg" id="h-welcome-msg"></p>
+    </div>
     <h1>Arcade mesh</h1>
     <div class="arcades" id="h-top"><div class="arcade"><div class="meta">Asking the mesh…</div></div></div>
     <h2>Other arcades</h2>
     <div class="arcades" id="h-arcades"></div>
+    <div id="h-welcomers" hidden>
+      <h2>Welcomers high scores</h2>
+      <p class="hint">Who welcomed new arcades first: the first payment of 1 ARCADE or more to a new arcade's wallet, as the chain shows it, gets the point.</p>
+      <ol class="welcomers" id="h-welcomers-list"></ol>
+    </div>
   </section>
 
   <!-- Wallet -->
@@ -462,6 +472,11 @@
     <p class="opt">This arcade's links through a relay that charges are paid from this wallet, a little ahead, never past the month's cap, and never more than what this arcade sent through it. Off by default.</p>
     <ul class="opt" id="o-pay-list"></ul>
     <p class="msg" id="o-pay-msg"></p>
+    <h3>Welcoming new arcades</h3>
+    <div class="row"><label class="sw"><input type="checkbox" id="o-wel-auto"> Welcome new arcades automatically</label></div>
+    <div class="row">Each new arcade gets <input type="number" id="o-wel-amount" min="1" max="100" step="1" style="width:5em"> ARCADE <button id="o-wel-set">Set</button></div>
+    <p class="opt">A new arcade needs 1 ARCADE to claim its @handle. Home shows each new arcade with a "Welcome to the arcade" button; the first arcade whose payment lands welcomes it and gets a point in the welcomers high scores. With automatic welcomes on, this arcade sends it by itself after people's 3-minute head start, from this wallet (it always keeps 1 ARCADE for itself, and sends at most 100 welcomes a day).</p>
+    <p class="msg" id="o-wel-msg"></p>
 
     <h2 id="o-cpu">How much of this computer the arcade uses</h2>
     <div class="row"><select id="o-cpu-level" title="How much of this computer the arcade takes">

@@ -288,6 +288,8 @@ pub fn on_frame(node: &Node, head: &Value) {
                     let newer = st.nodes.get(id).map(|o| o["at"].as_u64() < Some(at) || o["addr"] != r["addr"]).unwrap_or(true);
                     if newer {
                         st.nodes.insert(id.to_string(), r.clone());
+                        drop(st);
+                        note_welcome(node, id, addr, at);
                     }
                     newer
                 }
@@ -356,6 +358,7 @@ pub fn pay(node: &Node) {
     if crate::arcsvc::lends().is_none() || !node.app.has_wallet().unwrap_or(false) {
         return;
     }
+    resolve_welcomes(node, p);
     if pay_node_gift(node, p) {
         return; // one payment per pass
     }
@@ -444,85 +447,335 @@ fn skipped(node: &Node, id: &str, addr: &str, why: &str) {
     let _ = node.app.event("faucet", &format!("node {}'s gift at {addr} not paid here: {why}", &id[..id.len().min(16)]));
 }
 
-fn pay_node_gift(node: &Node, p: &ChainParams) -> bool {
+/// The open node-gift asks as this arcade knows them: (node, address, asked at, paid as a notice said), without this
+/// arcade's own, addresses found past their gift, and addresses with a payment notice lately (their coins decide once
+/// they arrive). The chain checks are [`gift_open`]'s.
+fn open_asks(node: &Node, now: u64) -> Vec<(String, String, u64, Option<(String, u64)>)> {
+    let me = node.id_hex();
+    let mut st = state().lock().unwrap();
+    st.nodes.retain(|_, r| r["at"].as_u64().is_some_and(|t| fresh(t, now)));
+    let gifted = st.gifted.clone();
+    let sent = st.sent.clone();
+    let asks: Vec<(String, Value)> = st.nodes.iter().map(|(id, r)| (id.clone(), r.clone())).collect();
+    let paid = paid_nodes(node, &mut st).clone();
+    asks.into_iter()
+        .filter(|(id, _)| *id != me)
+        .filter_map(|(id, r)| {
+            let addr = r["addr"].as_str()?.to_string();
+            let at = r["at"].as_u64()?;
+            if gifted.contains(&addr) || sent.get(&addr).is_some_and(|l| l.iter().any(|(_, t)| now.saturating_sub(*t) < SENT_HOLD)) {
+                return None;
+            }
+            Some((id.clone(), addr, at, paid.get(&id).cloned()))
+        })
+        .collect()
+}
+
+/// Whether node `id`'s gift at `addr` is still open on this arcade's copy of the chain, or why not. The same checks for
+/// the automatic payer, a "Welcome to the arcade" press and the new-arcade notice, so the notice goes away for every
+/// arcade the moment one of them would no longer pay it.
+fn gift_open(node: &Node, p: &ChainParams, addr: &str, was_paid: Option<(String, u64)>, now: u64) -> Result<(), String> {
+    // Paid before (by us or as a notice said): so it stays, unless the notice's payment never came (its address
+    // received no gift on this copy after the hold; a notice is only its sender's word).
+    if let Some((paid_addr, at)) = was_paid {
+        let came = script_of(p, &paid_addr).ok().and_then(|sc| node.chain.history_for_script(p.chain_no, &sc).ok()).is_some_and(|h| h.iter().map(|x| x.2).sum::<u64>() > TARGET)
+            || balance(node, p, &paid_addr).is_some_and(|b| b >= NODE_GIFT / 2);
+        if came || now.saturating_sub(at) < SENT_HOLD {
+            return Err(if came { "another arcade paid it (its coins arrived)" } else { "another arcade says it paid it; waiting for the coins" }.into());
+        }
+    }
+    if held_before(node, p, addr) {
+        state().lock().unwrap().gifted.insert(addr.to_string());
+        return Err("the address holds or received ARCADE already".into());
+    }
+    Ok(())
+}
+
+/// One welcome sent at a time from this arcade (the automatic payer and a "Welcome to the arcade" press).
+static SENDING: Mutex<()> = Mutex::new(());
+
+/// Send node `id` its welcome at `addr`: `amount` in two coins, the signed payment notice to the mesh (it clears the
+/// new-arcade notice on every arcade it reaches), noted as paid and in today's list. The txid.
+fn send_gift(node: &Node, p: &ChainParams, id: &str, addr: &str, amount: u64, how: &str) -> Result<String, String> {
     let now = arcade_app::now();
     let me = node.id_hex();
+    let r = crate::coinsend::send_parts(node, Some(p.key), addr, &two_coins(amount), None, None, false, true)
+        .map_err(|e| format!("could not give node {} its ARCADE at {addr}: {e}", &id[..id.len().min(16)]))?;
+    let txid = r["broadcast"]["txid"].as_str().or(r["txid"].as_str()).unwrap_or("").to_string();
+    let sent = arcade_mesh::welcome::sign(json!({"a": me, "addr": addr, "at": now, "k": "sent", "txid": txid, "node": id}), &node.identity);
+    node.mesh_outbox.lock().unwrap().push(frame(sent));
+    {
+        let mut st = state().lock().unwrap();
+        st.gifted.insert(addr.to_string());
+        st.sent.entry(addr.to_string()).or_default().push((txid.clone(), now));
+    }
+    note_paid_node(node, id, addr, now);
+    note_welcome(node, id, addr, now);
     let key = day_key("arc_node_paid_day", now);
-    let paid_today = read_list(node, &key); // [[addr, node], ...]
+    let mut list = read_list(node, &key);
+    list.push(json!([addr, id]));
+    write_list(node, &key, &list);
+    let _ = node.app.event("faucet", &format!("{how} node {} with {} ARCADE (two coins) at {addr} in {txid}", &id[..id.len().min(16)], amount as f64 / 1e8));
+    Ok(txid)
+}
+
+/// The node faucet, paying side: one open node-gift ask from this arcade's wallet, if its operator leaves automatic
+/// welcomes on (Options) and it can. The operator's amount (1 ARCADE unless set) in two coins to a node no payer has
+/// paid, at an address past no gift, after people's head start. Whether it paid.
+fn pay_node_gift(node: &Node, p: &ChainParams) -> bool {
+    if !auto_on(node) {
+        return false;
+    }
+    let now = arcade_app::now();
+    let me = node.id_hex();
+    let paid_today = read_list(node, &day_key("arc_node_paid_day", now)); // [[addr, node], ...]
     if paid_today.len() >= NODE_DAILY_CAP {
         return false;
     }
-    let candidates: Vec<(String, String, Option<(String, u64)>)> = {
-        let mut st = state().lock().unwrap();
-        st.nodes.retain(|_, r| r["at"].as_u64().is_some_and(|t| fresh(t, now)));
-        let gifted = st.gifted.clone();
-        let sent = st.sent.clone();
-        let asks: Vec<(String, Value)> = st.nodes.iter().map(|(id, r)| (id.clone(), r.clone())).collect();
-        let paid = paid_nodes(node, &mut st).clone();
-        asks.into_iter()
-            .filter(|(id, _)| *id != me)
-            .filter_map(|(id, r)| {
-                let addr = r["addr"].as_str()?.to_string();
-                let at = r["at"].as_u64()?;
-                if gifted.contains(&addr) {
-                    return None;
-                }
-                // A payment announced lately: its coins decide once they arrive.
-                if sent.get(&addr).is_some_and(|l| l.iter().any(|(_, t)| now.saturating_sub(*t) < SENT_HOLD)) {
-                    return None;
-                }
-                (now >= at + delay(&me, &addr)).then(|| (id.clone(), addr, paid.get(&id).cloned()))
-            })
-            .collect()
-    };
+    let amount = welcome_amount(node);
+    let candidates: Vec<_> = open_asks(node, now).into_iter().filter(|(_, addr, at, _)| now >= at + HEAD_START_SECS + delay(&me, addr)).collect();
     let have_spare = spendable(node, p).saturating_sub(KEEP + FEE_MARGIN);
-    for (id, addr, was_paid) in candidates {
+    for (id, addr, _, was_paid) in candidates {
         if paid_today.iter().any(|e| e[0] == addr.as_str() || e[1] == id.as_str()) {
             skipped(node, &id, &addr, "paid today already");
             continue;
         }
-        // Paid before (by us or as a notice said): so it stays, unless the notice's payment never came (its address
-        // received no gift on this copy after the hold; a notice is only its sender's word).
-        if let Some((paid_addr, at)) = was_paid {
-            let came = script_of(p, &paid_addr).ok().and_then(|sc| node.chain.history_for_script(p.chain_no, &sc).ok()).is_some_and(|h| h.iter().map(|x| x.2).sum::<u64>() > TARGET)
-                || balance(node, p, &paid_addr).is_some_and(|b| b >= NODE_GIFT / 2);
-            if came || now.saturating_sub(at) < SENT_HOLD {
-                skipped(node, &id, &addr, if came { "another arcade paid it (its coins arrived)" } else { "another arcade says it paid it; waiting for the coins" });
-                continue;
-            }
-        }
-        if held_before(node, p, &addr) {
-            skipped(node, &id, &addr, "the address holds or received ARCADE already");
-            state().lock().unwrap().gifted.insert(addr);
+        if let Err(why) = gift_open(node, p, &addr, was_paid, now) {
+            skipped(node, &id, &addr, &why);
             continue;
         }
-        if NODE_GIFT > have_spare {
-            skipped(node, &id, &addr, &format!("this wallet has {} ARCADE to spare, less than the gift", have_spare as f64 / 1e8));
+        if amount > have_spare {
+            skipped(node, &id, &addr, &format!("this wallet has {} ARCADE to spare, less than the welcome", have_spare as f64 / 1e8));
             return false; // nothing to spare: someone else pays
         }
-        let r = match crate::coinsend::send_parts(node, Some(p.key), &addr, &two_coins(NODE_GIFT), None, None, false, true) {
-            Ok(r) => r,
+        let _one = SENDING.lock().unwrap();
+        // A press may have welcomed it while this pass looked.
+        if state().lock().unwrap().gifted.contains(&addr) {
+            continue;
+        }
+        return match send_gift(node, p, &id, &addr, amount, "welcomed (automatically)") {
+            Ok(_) => true,
             Err(e) => {
-                let _ = node.app.event("faucet", &format!("could not give node {} its ARCADE at {addr}: {e}", &id[..id.len().min(16)]));
-                return false;
+                let _ = node.app.event("faucet", &e);
+                false
             }
         };
-        let txid = r["broadcast"]["txid"].as_str().or(r["txid"].as_str()).unwrap_or("").to_string();
-        let sent = arcade_mesh::welcome::sign(json!({"a": me, "addr": addr, "at": now, "k": "sent", "txid": txid, "node": id}), &node.identity);
-        node.mesh_outbox.lock().unwrap().push(frame(sent));
-        {
-            let mut st = state().lock().unwrap();
-            st.gifted.insert(addr.clone());
-            st.sent.entry(addr.clone()).or_default().push((txid.clone(), now));
-        }
-        note_paid_node(node, &id, &addr, now);
-        let mut list = paid_today;
-        list.push(json!([addr, id]));
-        write_list(node, &key, &list);
-        let _ = node.app.event("faucet", &format!("gave node {} its 1 ARCADE (two coins) at {addr} in {txid}", &id[..id.len().min(16)]));
-        return true;
     }
     false
+}
+
+// ---------------------------------------------------------------- welcomes: the notice, the button, the high scores
+//
+// A new arcade asks the mesh for its node gift (the `node` record above). Every arcade lists the open asks as a
+// "new arcade" notice with a "Welcome to the arcade" button; the first arcade whose payment lands welcomes it. The
+// notice goes away on every arcade once one of them would no longer pay (a payment notice heard, or the coins seen).
+// Automatic welcomes (on unless the operator turns them off in Options, with the amount the operator sets) wait
+// HEAD_START_SECS first, so a person pressing the button can be first. The welcomers' high scores count, per wallet
+// address, the welcomes whose payment came first on the chain: read from the chain alone (the earliest payment of a
+// welcome's size to the new arcade's address, and the address its first input spends), so a payment notice can't
+// claim another arcade's welcome.
+
+/// People's head start: automatic welcomes wait this long after a new arcade's ask (plus their spread).
+const HEAD_START_SECS: u64 = 180;
+/// The welcome amounts an operator may set: 1 to 100 ARCADE.
+const WELCOME_MIN: u64 = NODE_GIFT;
+const WELCOME_MAX: u64 = 100 * NODE_GIFT;
+/// Welcomes kept for the high scores, and how many are looked up on the chain per pass.
+const MAX_WELCOMES: usize = 20_000;
+const RESOLVE_PER_PASS: usize = 3;
+/// A welcome not found on the chain this long after the ask is given up on.
+const RESOLVE_SECS: u64 = 7 * 86_400;
+
+fn welcome_cfg(node: &Node) -> Value {
+    node.app.store.read(|r| r.get(arcade_app::META, b"arc_welcome")).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or(json!({}))
+}
+
+/// Whether this arcade welcomes new arcades by itself (on unless its operator turned it off).
+pub fn auto_on(node: &Node) -> bool {
+    welcome_cfg(node)["auto"].as_bool().unwrap_or(true)
+}
+
+/// What this arcade gives a new arcade (1 ARCADE unless its operator set more).
+pub fn welcome_amount(node: &Node) -> u64 {
+    welcome_cfg(node)["amount"].as_u64().filter(|a| (WELCOME_MIN..=WELCOME_MAX).contains(a)).unwrap_or(NODE_GIFT)
+}
+
+/// A welcome amount as the API gives it (satoshis: an integer, or a string of one), or why it can't be one.
+fn amount_of(v: &Value) -> Result<u64, String> {
+    let u = v.as_u64().or_else(|| v.as_str().and_then(|s| s.trim().parse().ok())).ok_or("amount: satoshis of ARCADE (100000000 is 1 ARCADE)")?;
+    if !(WELCOME_MIN..=WELCOME_MAX).contains(&u) {
+        return Err(format!("amount: {} to {} ARCADE ({WELCOME_MIN} to {WELCOME_MAX} satoshis)", WELCOME_MIN / 100_000_000, WELCOME_MAX / 100_000_000));
+    }
+    Ok(u)
+}
+
+/// `faucet.welcome_set {auto?, amount?}` (Admin): automatic welcomes on or off, and the amount (satoshis).
+pub fn welcome_set(node: &Node, req: &Value) -> Result<Value, String> {
+    let mut c = welcome_cfg(node);
+    if let Some(on) = req["auto"].as_bool() {
+        c["auto"] = json!(on);
+    }
+    if let Some(a) = req.get("amount").filter(|v| !v.is_null()) {
+        c["amount"] = json!(amount_of(a)?);
+    }
+    node.app.store.write(|w| w.put(arcade_app::META, b"arc_welcome", &serde_json::to_vec(&c).unwrap())).map_err(|e| e.to_string())?;
+    let (auto, amount) = (auto_on(node), welcome_amount(node));
+    let _ = node.app.event("faucet", &format!("welcomes: automatic {}, {} ARCADE each", if auto { "on" } else { "off" }, amount as f64 / 1e8));
+    Ok(json!({"auto": auto, "amount": amount}))
+}
+
+/// `faucet.welcome {node, amount?}` (Wallet): welcome a new arcade now, from this wallet ("Welcome to the arcade").
+/// Refused once it is welcomed (by anyone), so a second press, here or on another arcade, sends nothing.
+pub fn welcome(node: &Node, id: &str, amount: Option<&Value>) -> Result<Value, String> {
+    let p = chain().map_err(|_| "this arcade doesn't run the ARCADE chain: welcomes are sent from an arcade that does".to_string())?;
+    if crate::arcsvc::lends().is_none() {
+        return Err("this arcade's ARCADE copy is still catching up: welcomes are sent once it has".into());
+    }
+    if !node.app.has_wallet().unwrap_or(false) {
+        return Err("make a wallet first".into());
+    }
+    let amount = match amount.filter(|v| !v.is_null()) {
+        Some(v) => amount_of(v)?,
+        None => welcome_amount(node),
+    };
+    let now = arcade_app::now();
+    let _one = SENDING.lock().unwrap();
+    let Some((_, addr, _, was_paid)) = open_asks(node, now).into_iter().find(|(n, ..)| n == id) else {
+        return Err("that arcade is welcomed already (or its ask is gone)".into());
+    };
+    gift_open(node, p, &addr, was_paid, now).map_err(|why| format!("not sent: {why}"))?;
+    let spare = spendable(node, p).saturating_sub(KEEP + FEE_MARGIN);
+    if amount > spare {
+        return Err(format!("this wallet has {} ARCADE to spare (it keeps {} for itself)", spare as f64 / 1e8, KEEP as f64 / 1e8));
+    }
+    let txid = send_gift(node, p, id, &addr, amount, "welcomed")?;
+    Ok(json!({"txid": txid, "node": id, "address": addr, "amount": amount}))
+}
+
+fn welcomes(node: &Node) -> serde_json::Map<String, Value> {
+    node.app.store.read(|r| r.get(arcade_app::META, b"arc_welcomes")).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+fn save_welcomes(node: &Node, w: &serde_json::Map<String, Value>) {
+    let _ = node.app.store.write(|x| x.put(arcade_app::META, b"arc_welcomes", &serde_json::to_vec(w).unwrap()));
+}
+
+/// Note a new arcade (node `id`, its wallet's `addr`) for the high scores, once.
+fn note_welcome(node: &Node, id: &str, addr: &str, at: u64) {
+    let mut w = welcomes(node);
+    if w.get(id).is_some_and(|e| e["addr"] == addr) || w.len() >= MAX_WELCOMES {
+        return;
+    }
+    w.insert(id.to_string(), json!({"addr": addr, "at": at, "winner": Value::Null}));
+    save_welcomes(node, &w);
+}
+
+/// Who welcomed the arcade at `addr` first, on this copy of the chain: the earliest payment of a welcome's size
+/// (1 ARCADE or more in one transaction; its block, then its place in the block), as (txid, height, the address its
+/// first input spends, that address's @tag). None while no such payment is in a block.
+fn first_welcome(node: &Node, p: &'static ChainParams, addr: &str) -> Option<(String, u32, String, Option<String>)> {
+    let hist = node.chain.history_for_script(p.chain_no, &script_of(p, addr).ok()?).ok()?;
+    let h = hist.iter().filter(|x| x.2 >= WELCOME_MIN).map(|x| x.0).min()?;
+    let mut best: Option<(u32, arcade_chain::Hash256)> = None;
+    for (_, t12, _, _) in hist.iter().filter(|x| x.0 == h && x.2 >= WELCOME_MIN) {
+        for txid in node.chain.txids_by_t12(p, t12).ok()? {
+            if let Some((bh, idx)) = node.chain.tx_location(p, &txid).ok().flatten() {
+                if bh == h && best.as_ref().map_or(true, |(i, _)| idx < *i) {
+                    best = Some((idx, txid));
+                }
+            }
+        }
+    }
+    let txid = best?.1.to_hex();
+    let tx = crate::explorer::handle(node, "explorer.tx", &json!({"chain": p.key, "txid": txid})).ok()?;
+    let first = &tx["inputs"].as_array()?.first()?;
+    let from = first["address"].as_str()?.to_string();
+    let tag = first["tag"].as_str().map(String::from);
+    Some((txid, h, from, tag))
+}
+
+/// Look up who welcomed the new arcades not looked up yet (a few per pass, from this arcade's own caught-up copy).
+fn resolve_welcomes(node: &Node, p: &'static ChainParams) {
+    // When each open welcome was last looked up (in memory: the least lately looked-up go first, so a few that are
+    // never paid don't hold the others back; only an answer is written to the store).
+    static LOOKED: Mutex<Option<HashMap<String, u64>>> = Mutex::new(None);
+    let now = arcade_app::now();
+    let mut w = welcomes(node);
+    let open: Vec<(String, String)> = {
+        let mut looked = LOOKED.lock().unwrap();
+        let looked = looked.get_or_insert_with(HashMap::new);
+        let mut open: Vec<(u64, String, String)> = w
+            .iter()
+            .filter(|(_, e)| e["winner"].is_null() && e["gave_up"].is_null())
+            .filter_map(|(id, e)| Some((looked.get(id).copied().unwrap_or(0), id.clone(), e["addr"].as_str()?.to_string())))
+            .filter(|(t, ..)| now.saturating_sub(*t) >= 60)
+            .collect();
+        open.sort();
+        open.truncate(RESOLVE_PER_PASS);
+        for (_, id, _) in &open {
+            looked.insert(id.clone(), now);
+        }
+        open.into_iter().map(|(_, id, a)| (id, a)).collect()
+    };
+    let mut changed = false;
+    for (id, addr) in open {
+        let e = w.get_mut(&id).unwrap();
+        match first_welcome(node, p, &addr) {
+            Some((txid, height, from, tag)) => e["winner"] = json!({"address": from, "tag": tag, "txid": txid, "height": height}),
+            None if now.saturating_sub(e["at"].as_u64().unwrap_or(0)) > RESOLVE_SECS => e["gave_up"] = json!(true),
+            None => continue,
+        }
+        changed = true;
+    }
+    if changed {
+        save_welcomes(node, &w);
+    }
+}
+
+/// The welcomers' high scores: per wallet address, the new arcades it welcomed first (with its @tag where known),
+/// most first; and the latest welcomes.
+pub fn scores(node: &Node) -> Value {
+    let w = welcomes(node);
+    let mut per: HashMap<String, (u64, Option<String>, u64)> = HashMap::new();
+    let mut recent: Vec<Value> = Vec::new();
+    for (id, e) in &w {
+        let Some(win) = e["winner"].as_object() else { continue };
+        let Some(a) = win["address"].as_str() else { continue };
+        let s = per.entry(a.to_string()).or_insert((0, None, 0));
+        s.0 += 1;
+        if let Some(t) = win["tag"].as_str() {
+            s.1 = Some(t.to_string());
+        }
+        let h = win["height"].as_u64().unwrap_or(0);
+        s.2 = s.2.max(h);
+        recent.push(json!({"node": id, "name": crate::meshview::name_of_peer(id), "by": a, "tag": win["tag"], "txid": win["txid"], "height": h}));
+    }
+    let mut top: Vec<(String, (u64, Option<String>, u64))> = per.into_iter().collect();
+    // Most welcomes first; a tie goes to the one that reached it first (the lower latest height).
+    top.sort_by(|a, b| b.1 .0.cmp(&a.1 .0).then(a.1 .2.cmp(&b.1 .2)).then(a.0.cmp(&b.0)));
+    recent.sort_by(|a, b| b["height"].as_u64().cmp(&a["height"].as_u64()));
+    recent.truncate(10);
+    json!({"top": top.iter().take(20).map(|(a, (n, t, _))| json!({"address": a, "tag": t, "welcomes": n})).collect::<Vec<_>>(),
+           "recent": recent, "counted": w.values().filter(|e| e["winner"].is_object()).count()})
+}
+
+/// `faucet.newcomers` (Read): the new arcades waiting for their welcome (for the Home notice and its button), this
+/// arcade's welcome settings, whether it can send one now, and the welcomers' high scores.
+pub fn newcomers(node: &Node) -> Value {
+    let now = arcade_app::now();
+    let mut open = Vec::new();
+    if let Ok(p) = chain() {
+        for (id, addr, at, was_paid) in open_asks(node, now) {
+            if gift_open(node, p, &addr, was_paid, now).is_ok() {
+                open.push(json!({"node": id, "name": crate::meshview::name_of_peer(&id), "address": addr, "at": at,
+                                 "auto_after": at + HEAD_START_SECS}));
+            }
+        }
+    }
+    open.sort_by(|a, b| b["at"].as_u64().cmp(&a["at"].as_u64()));
+    let can = chain().is_ok() && crate::arcsvc::lends().is_some() && node.app.has_wallet().unwrap_or(false);
+    json!({"open": open, "auto": auto_on(node), "amount": welcome_amount(node), "head_start": HEAD_START_SECS,
+           "min": WELCOME_MIN, "max": WELCOME_MAX, "can_send": can, "scores": scores(node)})
 }
 
 /// For the Home tab: `addr`'s top-up as the welcome faucet's is shown ({status: "paid", txid, by} once a payment notice
@@ -611,4 +864,88 @@ mod tests {
         bad["addr"] = json!("aY");
         assert!(!arcade_mesh::welcome::verify(&bad));
     }
+    #[test]
+    fn welcome_amounts_are_1_to_100_arcade() {
+        assert_eq!(amount_of(&json!(NODE_GIFT)).unwrap(), NODE_GIFT);
+        assert_eq!(amount_of(&json!("250000000")).unwrap(), 250_000_000);
+        assert_eq!(amount_of(&json!(100 * NODE_GIFT)).unwrap(), 100 * NODE_GIFT);
+        for bad in [json!(NODE_GIFT / 2), json!(0), json!(101 * NODE_GIFT), json!(-1), json!(1.5), json!("1 ARCADE")] {
+            assert!(amount_of(&bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn welcome_settings_are_kept_and_checked() {
+        let (_g, t) = crate::http::tests::node();
+        assert!(auto_on(&t.node), "automatic welcomes are on unless the operator turns them off");
+        assert_eq!(welcome_amount(&t.node), NODE_GIFT);
+        let r = welcome_set(&t.node, &json!({"auto": false, "amount": 2 * NODE_GIFT})).unwrap();
+        assert_eq!((r["auto"].clone(), r["amount"].clone()), (json!(false), json!(2 * NODE_GIFT)));
+        assert!(!auto_on(&t.node));
+        assert_eq!(welcome_amount(&t.node), 2 * NODE_GIFT);
+        assert!(welcome_set(&t.node, &json!({"amount": 500 * NODE_GIFT})).is_err());
+        assert_eq!(welcome_amount(&t.node), 2 * NODE_GIFT, "a refused amount changes nothing");
+        // A pass with automatic welcomes off pays nothing, whatever is open.
+        if let Ok(p) = chain() {
+            assert!(!pay_node_gift(&t.node, p));
+        }
+    }
+
+    /// SadFrog 2026-11-22: once one arcade has welcomed a new arcade, the notice must not stay up for everyone. Its
+    /// payment notice (`sent` with the node) reaches the others over the mesh; from then on no arcade lists the new
+    /// arcade as open, and every arcade has it as paid (so a press elsewhere is refused and no automatic payer pays).
+    #[test]
+    fn a_welcome_clears_the_notice_on_every_arcade() {
+        let (_g, t) = crate::http::tests::node();
+        let now = arcade_app::now();
+        let newbie = ed25519_dalek::SigningKey::from_bytes(&[41; 32]);
+        let payer = ed25519_dalek::SigningKey::from_bytes(&[42; 32]);
+        let id = hex::encode(newbie.verifying_key().to_bytes());
+        let addr = match crate::arcsvc::defined() {
+            Some(p) => arcade_ledger::address::base58check(p.p2pkh_version, &[41; 20]),
+            None => "aWelcomeTestAddress41".to_string(),
+        };
+        let ask = arcade_mesh::welcome::sign(json!({"a": id, "addr": addr, "at": now, "k": "node"}), &newbie);
+        on_frame(&t.node, &json!({"recs": [ask]}));
+        let open = |n: &Node| open_asks(n, arcade_app::now()).into_iter().any(|(n, ..)| n == id);
+        assert!(open(&t.node), "a new arcade's ask shows as a notice");
+        assert!(welcomes(&t.node).contains_key(&id), "and is noted for the high scores");
+        // Another arcade welcomes it: its signed payment notice arrives.
+        let sent = arcade_mesh::welcome::sign(
+            json!({"a": hex::encode(payer.verifying_key().to_bytes()), "addr": addr, "at": now, "k": "sent", "txid": "ab".repeat(32), "node": id}), &payer);
+        on_frame(&t.node, &json!({"recs": [sent.clone()]}));
+        assert!(!open(&t.node), "the notice goes away once any arcade has welcomed it");
+        assert!(paid_nodes(&t.node, &mut state().lock().unwrap()).contains_key(&id), "kept as paid (in the store too)");
+        // The notice is passed on, so the arcades after this one clear it too; the same notice again is not.
+        let passed = t.node.mesh_outbox.lock().unwrap().since(0).0.iter().filter(|f| f["recs"][0] == sent).count();
+        assert_eq!(passed, 1);
+        on_frame(&t.node, &json!({"recs": [sent]}));
+        assert_eq!(t.node.mesh_outbox.lock().unwrap().since(0).0.iter().filter(|f| f["recs"][0]["k"] == "sent" && f["recs"][0]["node"] == id.as_str()).count(), 1);
+        // The new arcade saying its ask again doesn't bring the notice back.
+        let again = arcade_mesh::welcome::sign(json!({"a": id, "addr": addr, "at": now + 1, "k": "node"}), &newbie);
+        on_frame(&t.node, &json!({"recs": [again]}));
+        assert!(!open(&t.node));
+        // A press on this arcade is refused (nothing is sent).
+        assert!(welcome(&t.node, &id, None).is_err());
+    }
+
+    #[test]
+    fn high_scores_count_first_welcomes_per_wallet() {
+        let (_g, t) = crate::http::tests::node();
+        let mut w = welcomes(&t.node);
+        for (n, by, tag, h) in [("n1", "aA", Some("alice"), 10), ("n2", "aB", None, 11), ("n3", "aA", Some("alice"), 12)] {
+            w.insert(format!("hs-{n}"), json!({"addr": format!("x{n}"), "at": 1, "winner": {"address": by, "tag": tag, "txid": "t", "height": h}}));
+        }
+        w.insert("hs-open".into(), json!({"addr": "xo", "at": 1, "winner": null}));
+        save_welcomes(&t.node, &w);
+        let s = scores(&t.node);
+        let top = s["top"].as_array().unwrap();
+        let a = top.iter().position(|x| x["address"] == "aA").unwrap();
+        let b = top.iter().position(|x| x["address"] == "aB").unwrap();
+        assert!(a < b, "more welcomes first");
+        assert_eq!(top[a]["welcomes"], 2);
+        assert_eq!(top[a]["tag"], "alice");
+        assert!(s["recent"].as_array().unwrap().iter().all(|r| r["node"] != "hs-open"), "an open welcome scores nobody");
+    }
 }
+

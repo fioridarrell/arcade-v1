@@ -990,6 +990,9 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             }
         }
         "faucet.arc_status" => Ok(crate::arcfaucet::status(node)),
+        "faucet.newcomers" => Ok(crate::arcfaucet::newcomers(node)),
+        "faucet.welcome" => crate::arcfaucet::welcome(node, &s("node").ok_or("give the new arcade's node")?, req.get("amount")),
+        "faucet.welcome_set" => crate::arcfaucet::welcome_set(node, req),
         "mempool" => {
             // The chain asked for (`--chain`), the home chain by default; the ARCADE chain's pool is its own.
             let (p, borrowed) = crate::sitesvc::chain_or_borrowed(node, req)?;

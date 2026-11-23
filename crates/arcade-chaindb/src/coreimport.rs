@@ -236,18 +236,17 @@ impl ChainDb {
     }
 
     /// Store blocks without connecting them (bytes only, as connect stores them; their headers
-    /// must be known). Each block is checked as a sync checks it: it rebuilds byte-identically,
-    /// has a coinbase first, and its merkle root matches its header. Returns their block numbers.
+    /// must be known). Each block passes [`check_stored_block`]: it rebuilds byte-identically,
+    /// has a coinbase first, its merkle root matches its header (no mutated tree), no bytes
+    /// follow its transactions, its own AuxPoW proves the work, and where SegWit is on at the
+    /// block's height (its header's), the witness commitment matches, even in a block carrying
+    /// no witness data: txids don't cover witnesses, so a copy with them stripped would
+    /// otherwise pass. Returns their block numbers.
     pub fn store_blocks_only(&self, params: &ChainParams, raws: &[Vec<u8>]) -> Result<Vec<u32>> {
         let c = params.chain_no;
         let mut blocks = Vec::with_capacity(raws.len());
         for raw in raws {
-            let b = Block::parse_with(raw, &params.format).map_err(err)?;
-            if b.encode() != *raw {
-                return Err(err(format!("block {} does not rebuild byte-identically", b.hash())));
-            }
-            arcade_chain::params::check_block_body(params, &b).map_err(|e| err(format!("block {}: {e}", b.hash())))?;
-            blocks.push(b);
+            blocks.push(check_stored_block(self, params, raw)?);
         }
         self.wstore(c)?.write(|w| {
             let mut out = Vec::with_capacity(blocks.len());
@@ -753,6 +752,63 @@ impl ChainDb {
         }
         Ok((n, sum))
     }
+}
+
+/// The checks a block stored without connecting passes (see `store_blocks_only`).
+pub(crate) fn check_stored_block(db: &ChainDb, params: &ChainParams, raw: &[u8]) -> Result<Block> {
+    let b = Block::parse_with(raw, &params.format).map_err(err)?;
+    if b.encode() != *raw {
+        return Err(err(format!("block {} does not rebuild byte-identically", b.hash())));
+    }
+    arcade_chain::params::check_block_body(params, &b).map_err(|e| err(format!("block {}: {e}", b.hash())))?;
+    // Bytes the merkle root doesn't cover. After the transactions only Litecoin's MWEB block may
+    // follow; anything else is junk a source added (it would be stored and served as the block).
+    if !b.extra.is_empty() && !params.format.mweb {
+        return Err(err(format!("block {}: {} bytes after its transactions", b.hash(), b.extra.len())));
+    }
+    // The block's own AuxPoW is what is kept (block_meta) and served with its header: it must
+    // prove the work itself, as the header check does (sync.rs), not only the one the headers
+    // round saw.
+    if let Some(a) = &b.auxpow {
+        let hash = params.block_id(&b.header);
+        let chain_id = params.auxpow_chain_id.unwrap_or(b.header.chain_id());
+        a.check(hash, chain_id, params.auxpow_strict_chain_id).map_err(|e| err(format!("block {hash}: AuxPoW: {e}")))?;
+        let ph = arcade_chain::pow::pow_hash(arcade_chain::pow::PowAlgo::Scrypt, &a.parent.encode());
+        if !arcade_chain::pow::meets_target(&ph, b.header.bits) {
+            return Err(err(format!("block {hash}: AuxPoW parent misses target")));
+        }
+    }
+    // Its height on our header chain. A block whose header we don't hold can't be stored, and is
+    // never checked as if at height 0 (where SegWit is off, so a stripped copy would pass).
+    let height = db.header(params.chain_no, &b.hash())?.map(|r| r.height).ok_or_else(|| err(format!("block {}: its header is not in our header chain", b.hash())))?;
+    if let Some(br) = params.block_rules {
+        if (br.script_flags)(height) & arcade_chain::params::SCRIPT_WITNESS != 0 {
+            b.check_witness_commitment().map_err(|e| err(format!("block {}: {e}", b.hash())))?;
+        }
+    }
+    if let Some(tx) = tx_of_64_bytes(params, height, &b) {
+        return Err(err(format!("block {}: transaction {tx} is 64 bytes without its witness (it could stand for two merkle-tree hashes)", b.hash())));
+    }
+    Ok(b)
+}
+
+/// Above this height a stored block may carry no transaction of exactly 64 bytes without its
+/// witness: such a transaction can stand for an inner node of the merkle tree, so another list
+/// of transactions could be passed off under the same header ("Weaknesses in Bitcoin's Merkle
+/// Root Construction", 3.1; BIP54). They are valid by consensus, so only where none is known:
+/// Bitcoin (non-standard for years, a handful before 2016, none since) above block 691,719.
+/// Other chains: not refused (their histories have not been checked for them).
+pub(crate) fn no_64_byte_txs_above(params: &ChainParams) -> Option<u32> {
+    (params.genesis == arcade_chain::params::BITCOIN_MAIN.genesis).then_some(691_719)
+}
+
+/// The first transaction of 64 bytes (witness stripped) in `b`, where the chain refuses them
+/// at `height` (no_64_byte_txs_above).
+pub(crate) fn tx_of_64_bytes(params: &ChainParams, height: u32, b: &Block) -> Option<Hash256> {
+    if no_64_byte_txs_above(params).is_none_or(|h| height <= h) {
+        return None;
+    }
+    b.txs.iter().find(|t| (if t.has_witness() { t.encode_legacy().len() } else { t.raw.len() }) == 64).map(|t| t.txid)
 }
 
 // ---------------- each coin against its own block ----------------

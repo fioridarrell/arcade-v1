@@ -278,6 +278,7 @@ impl ChainDb {
         let c = params.chain_no;
         let mut s = Sorter::new(tmp, &format!("txs-{c}"))?;
         for (i, chunk) in bs.chunks(500).enumerate() {
+            crate::cpushare::pace();
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
@@ -384,6 +385,7 @@ impl ChainDb {
         let mut anchor = Anchor::default();
         let mut done = false;
         while !done {
+            crate::cpushare::pace();
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
@@ -454,6 +456,7 @@ impl ChainDb {
         let mut anchor = Anchor::default();
         let mut done = false;
         while !done {
+            crate::cpushare::pace();
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }

@@ -367,6 +367,8 @@ impl<'a> Syncer<'a> {
         // what it has, and one damaged block doesn't hold back the good ones before it).
         let check_chunk = move |raws: Vec<Vec<u8>>, first_height: u32| -> (HashMap<Hash256, Block>, Option<SyncError>) {
             let one = |(i, raw): (usize, &Vec<u8>)| -> std::result::Result<Block, SyncError> {
+                // Parsing, checking and warming each block is the heavy part: within the CPU share (crate::cpushare).
+                crate::cpushare::pace();
                 let b = Block::parse_with(raw, format).map_err(|e| SyncError::BadBlock { hash: Hash256::ZERO, why: e.to_string() })?;
                 if b.encode() != *raw {
                     return Err(SyncError::BadBlock { hash: b.hash(), why: "does not rebuild byte-identically".into() });
@@ -379,7 +381,7 @@ impl<'a> Syncer<'a> {
                 db.warm(params, &b, first_height + i as u32, addresses_live);
                 Ok(b)
             };
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+            let threads = crate::cpushare::threads(crate::cpushare::all_cores().min(8));
             let parsed: Vec<std::result::Result<Block, SyncError>> = if raws.len() < 32 || threads == 1 {
                 raws.iter().enumerate().map(one).collect()
             } else {

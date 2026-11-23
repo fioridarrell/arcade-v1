@@ -245,6 +245,8 @@ impl BlockSource for Prefetched<'_> {
 fn worker(pool: &Pool, name: String, mut src: Box<dyn BlockSource + Send + '_>) {
     let mut fails = 0;
     while !pool.stop.load(Ordering::Relaxed) {
+        // Each job's blocks are parsed and checked here: within the CPU share (crate::cpu).
+        arcade_chaindb::cpushare::pace();
         let job = {
             let mut st = pool.s.lock().unwrap();
             loop {

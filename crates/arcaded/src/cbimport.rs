@@ -179,6 +179,7 @@ fn fetch_blocks(node: &Node, p: &'static ChainParams, path: &[Hash256], cancel: 
                 sc.spawn(move || {
                     let mut fails = 0;
                     while fails < 3 && !cancel.load(Ordering::Relaxed) {
+                        arcade_chaindb::cpushare::pace();
                         let Some(chunk) = queue.lock().unwrap().pop_front() else { return };
                         let r = src.get_blocks(&chunk).and_then(|raws| node.chain.store_blocks_only(p, &raws).map_err(|e| e.to_string()));
                         match r {

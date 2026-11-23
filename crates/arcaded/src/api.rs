@@ -1031,7 +1031,8 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             if !crate::homeinst::installed() {
                 return Err(format!("{} is borrowed here, not installed: install it in Chains & Coins to mine it", node.params.name));
             }
-            let threads = s("threads").and_then(|t| t.parse().ok()).unwrap_or_else(|| std::thread::available_parallelism().map(|n| n.get() as u64).unwrap_or(1));
+            // Unless asked for more: the cores the CPU level allows (crate::cpu; half by default).
+            let threads = s("threads").and_then(|t| t.parse().ok()).unwrap_or(crate::cpu::cores() as u64);
             if node.miner.running.swap(true, Ordering::Relaxed) {
                 return Ok(json!({"running": true, "note": "already mining"}));
             }

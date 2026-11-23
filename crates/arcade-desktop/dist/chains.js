@@ -321,9 +321,11 @@
     try {
       const st = await api("chains.add", open.arcade ? { key: open.key } : { key: open.key, mode, with: withIdx, drive });
       if (st.queued) {
-        // Another chain is still being installed: this one starts by itself after it.
+        // Another chain is still being installed, or others wait: this one starts by itself at its turn (smallest first).
         $("c-installer").hidden = true;
-        msg(`${open.name} waits its turn (#${st.position} in the queue); it installs by itself once ${st.behind.toUpperCase()} has caught up. One install runs at a time.`);
+        msg(st.behind
+          ? `${open.name} waits its turn (#${st.position} in the queue); it installs by itself once ${st.behind.toUpperCase()} has caught up. One install runs at a time, smallest first.`
+          : `${open.name} is #${st.position} in the queue; it installs by itself at its turn. One install runs at a time, smallest first.`);
         refresh();
         return;
       }

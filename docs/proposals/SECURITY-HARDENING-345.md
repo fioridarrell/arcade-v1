@@ -1,6 +1,5 @@
 # Security hardening proposal (issue #345)
 
-Security hardening in response to #345: signed Windows installer, wallet signer out of arcaded, update and API defaults locked down, install-page warning
 
 ## Description
 Issue #345 lists five risks in how Arcade V1 is installed and run. Some are already handled in the code: the API binds to 127.0.0.1 by default (`--http-bind`, main.rs), and the updater only accepts releases signed by the release key, with every file hash-checked and the old binaries kept as `.prev` (updater.rs). This PR closes the gaps that remain and makes the safe behavior something you can enforce and test, not just a default.

@@ -693,8 +693,8 @@ fn answer(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
                 // its balance and history, NFTs, tokens, and arcade ledger holdings.
                 let parts: [(&str, &[&str]); 4] = [
                     ("addresses", &["balance", "tx_count", "history"]),
-                    ("ord", &["inscriptions", "inscription_count"]),
-                    ("tokens", &["tokens"]),
+                    ("ord", &["inscriptions", "inscription_count", "ord_indexed_to", "ord_tip", "ord_start"]),
+                    ("tokens", &["tokens", "ord_indexed_to", "ord_tip", "ord_start"]),
                     ("ledger", &["ledger_tokens", "ledger_inscriptions", "ledger_inscription_count"]),
                 ];
                 for (ix, keys) in parts {
@@ -1818,6 +1818,13 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
         }).collect::<Vec<_>>());
         v["inscription_count"] = json!(held.len());
     }
+    if x.has("ord") || x.has("tokens") {
+        // How far the ord index (inscriptions and tokens) has read: an empty list from an index still catching up
+        // isn't "none in this wallet" (a borrowed Dogecoin showed "No NFTs" while its keeper's index had 0).
+        v["ord_indexed_to"] = json!(x.node.chain.indexed_to(c, crate::chains::indexer_name("ord")).ok().flatten());
+        v["ord_tip"] = json!(tip(x));
+        v["ord_start"] = json!(ord::ord_start(x.p));
+    }
     if x.has("tokens") {
         v["tokens"] = json!(tokens::balances(&x.node.chain, c, a).into_iter().map(|(t, o, tr)| {
             let dec = tokens::tick(&x.node.chain, c, &t).and_then(|i| i["dec"].as_u64()).unwrap_or(18);
@@ -1845,7 +1852,15 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
         v["ledger_inscription_count"] = json!(owned.len());
         let mut newest = owned;
         newest.sort_by(|p, q| q["number"].as_u64().cmp(&p["number"].as_u64()));
-        v["ledger_inscriptions"] = json!(newest.iter().take(60).map(|i| json!({"txid": i["txid"], "number": i["number"], "content_type": i["content_type"]})).collect::<Vec<_>>());
+        // With previews (as for ord inscriptions): each one's content, so a wallet can show its arcade inscriptions too.
+        let previews = want("content") && want("inscriptions");
+        v["ledger_inscriptions"] = json!(newest.iter().take(60).map(|i| {
+            let mut r = json!({"txid": i["txid"], "number": i["number"], "content_type": i["content_type"]});
+            if previews {
+                r["content"] = ledger_content(x, i["txid"].as_str().unwrap_or(""), 64 << 10);
+            }
+            r
+        }).collect::<Vec<_>>());
     }
     Ok(v)
 }
@@ -2362,6 +2377,8 @@ mod tests {
         assert!(lean["inscriptions"][0].get("content").is_none());
         let bare = handle_here(&t.node, "explorer.address", &json!({"address": a, "history": false, "inscriptions": false}), false).unwrap();
         assert!(bare.get("inscriptions").is_none() && bare.get("inscription_count").is_none());
+        // How far the ord index has read rides along, so a wallet can tell "none" from "not read yet".
+        assert!(lean.get("ord_indexed_to").is_some() && lean["ord_tip"].as_u64().is_some() && lean.get("ord_start").is_some());
     }
 
     /// Names and block maps list newest first (by inscription number); order "name" keeps the alphabetical pages.

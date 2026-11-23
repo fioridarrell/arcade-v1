@@ -122,6 +122,7 @@ mod ringsvc;
 mod rtcsvc;
 mod rpc;
 mod sizes;
+mod screening;
 mod sysinfo;
 mod linkrtt;
 mod udpsvc;
@@ -683,6 +684,7 @@ fn main() {
     v1import::auto_home(node.clone());
     sizes::load(&node);
     sysinfo::load(&node);
+    screening::load(&node);
     if node.home_mode == "shared" {
         // Shared home chain (test setups): keep our share of its blocks right.
         let n = node.clone();
@@ -762,6 +764,12 @@ fn main() {
         // This machine, told to the mesh when the operator shares it (off by default).
         let n = node.clone();
         std::thread::Builder::new().name("sysinfo".into()).spawn(move || sysinfo::run(n)).unwrap();
+    }
+    {
+        // Content screening: keeps a screener chosen (borrowed, the operator's own, or off) and checks pictures and
+        // text before the public routes show them (screening.rs).
+        let n = node.clone();
+        std::thread::Builder::new().name("screening".into()).spawn(move || screening::run(n)).unwrap();
     }
     {
         // This arcade's own waiting transactions: put back after a restart, dropped ones shown (ownwait.rs).

@@ -37,6 +37,13 @@
 <main>
   <!-- Home: the arcade mesh at a glance -->
   <section id="home" class="tab on">
+    <div class="pp-banner" id="h-screen" hidden>
+      <b>Content screening</b> <span id="h-screen-text"></span>
+      <p class="warn" id="h-screen-warn"></p>
+      <p class="hint" id="h-screen-how"></p>
+      <div class="row" id="h-screen-btns"></div>
+      <p class="msg" id="h-screen-msg"></p>
+    </div>
     <div id="h-start" class="start" hidden>
       <h2>Getting started</h2>
       <p class="hint">Three steps to get going: a wallet, then your @handle. Test coins for the handle come from the mesh by themselves.</p>
@@ -428,6 +435,41 @@
       <button id="o-look-store">Find themes…</button></div>
     <p class="opt">Themes are apps from the App Store's Themes category. One changes how this window looks and is laid out (an application window with menus, or a desktop with windows and a taskbar), never what it does: every screen is still this one's. It is checked before it is worn: its text must be readable, and its style can only reach its own frame. This window keeps its own choice; the desktop app and each browser choose for themselves.</p>
     <p class="msg" id="o-look-msg"></p>
+    <h2 id="o-screen">Content screening</h2>
+    <p class="warn"><b>Strangers' content.</b> This arcade shows what anyone puts on the chains it reads. Pictures and text there can be sexual, violent or illegal, including child sexual abuse material. If other people can reach this arcade's pages, you may be responsible for what it shows. Screening checks each picture and text with a model before it is shown: sensitive content is covered (click to show), illegal content is never served.</p>
+    <div class="row"><select id="o-scr-mode" title="How pictures and text are checked">
+      <option value="borrow">Borrow a screening model from the mesh (the cheapest that passes the test)</option>
+      <option value="own">My own screening model (recommended: the same verdicts every day)</option>
+      <option value="off">Off: show everything unchecked</option>
+    </select></div>
+    <div class="grid">
+      <div class="card"><div class="k">Screening</div><div class="v" id="o-scr-state" style="font-size:.85em">—</div></div>
+      <div class="card"><div class="k">Model in use</div><div class="v" id="o-scr-model-in-use" style="font-size:.85em">—</div></div>
+      <div class="card"><div class="k">About a check</div><div class="v" id="o-scr-cost" style="font-size:.85em">—</div></div>
+      <div class="card"><div class="k">Credit there</div><div class="v" id="o-scr-credit">—</div></div>
+      <div class="card"><div class="k">Today</div><div class="v" id="o-scr-today" style="font-size:.85em">—</div></div>
+      <div class="card"><div class="k">Checked</div><div class="v" id="o-scr-counts" style="font-size:.85em">—</div></div>
+    </div>
+    <div id="o-scr-borrow">
+      <div class="row">Top up <input type="number" id="o-scr-amt" value="0.1" min="0.01" max="10" step="0.01" style="width:6em"> ARCADE <button id="o-scr-topup">Top up</button>
+        <button id="o-scr-test">Test now</button></div>
+      <div class="row">Spend at most <input type="number" id="o-scr-cap" min="0" step="0.1" style="width:6em"> ARCADE a day on screening <button id="o-scr-cap-set">Set</button></div>
+      <p class="opt">Borrowing uses a screening model another arcade sells on the Models marketplace (a model with "screen" in its name), asked straight from here over the mesh. The cheapest one that passes a built-in test is used. Offers are looked at every 30 minutes, the one in use is tested again every 6 hours, and if it drops (gone, down, failing, or a test fails) the next cheapest that passes takes over by itself. Checks are paid from your credit at that seller: top up a little from this wallet (0.1 ARCADE covers hundreds of checks at today's prices). Each picture or text is checked once; the verdict is kept here.</p>
+      <ul class="opt" id="o-scr-offers"></ul>
+    </div>
+    <div id="o-scr-own" hidden>
+      <div class="row">Address <input type="text" id="o-scr-url" placeholder="http://127.0.0.1:8080/v1" style="width:20em" autocomplete="off" spellcheck="false">
+        Model <input type="text" id="o-scr-model" placeholder="the model's name" style="width:12em" autocomplete="off" spellcheck="false">
+        Key <input type="password" id="o-scr-key" placeholder="(none)" style="width:9em" autocomplete="off">
+        <button class="primary" id="o-scr-save">Save and test</button></div>
+      <p class="opt">Any OpenAI-compatible server with a vision model works: llama.cpp (with its --mmproj file), vLLM, Ollama, LM Studio. Running your own is the best choice: your verdicts come from the same model every day, and nothing leaves this computer. It gets the same question every screener gets, and the built-in test checks it answers right (again every 6 hours).</p>
+    </div>
+    <div class="row"><select id="o-scr-unchecked" title="When no screener answers">
+      <option value="show_here">When screening isn't working: show on this computer, cover for others</option>
+      <option value="cover">When screening isn't working: cover everywhere</option>
+    </select></div>
+    <p class="msg" id="o-scr-msg"></p>
+
     <h2>Updates</h2>
     <div class="grid">
       <div class="card"><div class="k">This version</div><div class="v" id="o-ver">—</div></div>

@@ -81,6 +81,10 @@ cmds! {
     "mesh.sysinfo" Public "" "The machines behind the mesh, as their operators share them (opt-in, sysinfo.set): every other arcade's newest record heard in the last 24 h (CPU, cores, RAM, GPUs, disk, OS, version; seal speed in core-seconds per GiB, measured from its own seals), arcades sharing of arcades heard, network totals (cores, RAM, disk total and free, GPUs and VRAM where known, fastest, median and slowest seal speed), and this arcade's own. Reported, rounded, never on a chain.";
     "cpu.status" Read "" "How much of the computer this arcade takes: its CPU level (low, balanced, full = unthrottled), the cores background work may use of all this machine's, its priority (nice), the cap on the whole arcade in percent of the machine (none when unthrottled), the arcade's CPU use over the last two seconds, whether heavy work is holding back for the cap now, and the levels there are.";
     "cpu.set" Admin "level" "Set the CPU level: low (lowest priority, at most a quarter of the machine), balanced (low priority, at most half the machine; the default) or full, also called unthrottled (normal priority, every core, no cap: recommended only for machines dedicated to running an arcade). Kept across restarts; the cap applies at once, a lower priority too, a higher one may wait for the next start. Below full the cap covers all heavy work: script checks, block downloads and parsing, address builds, Core-copy imports, sealing, and the ARCADE chain's proofs of time, catalog and fraud watch.";
+    "screening.status" Read "" "Content screening: the mode (borrow, own or off), whether a screener answers now and why not, the borrowed screening model in use (seller, prices, about what a text and a picture check cost, credit there, its last test) and every screening model on offer, the own model's address and last test, what was checked, and today's spending.";
+    "screening.set" Admin "mode?, url?, model?, key?, pin?, unchecked?, day_cap?" "Choose how pictures and text from the chains are checked before this arcade's pages show them: borrow (the default: the cheapest screening model on the mesh that passes the built-in test, tested again every 6 hours and replaced when it drops), own (your own OpenAI-compatible model with vision at url, with model and key), or off. pin: borrow only \"model@<arcade id>\" (\"\" for the cheapest). unchecked: show_here (content not checked yet is shown on this computer, covered for others; the default) or cover (covered everywhere). day_cap: ARCADE base units a day for borrowed checks (1 ARCADE unless set).";
+    "screening.test" Admin "" "Test the screening now: borrow looks at the offers again and tests the cheapest; own runs the built-in test on your model.";
+    "screening.topup" Admin "amount" "Pay credit to the screening seller (the one in use, or the cheapest that needs credit), with the Models marketplace's memo, from this wallet. amount: ARCADE base units, at most 10 ARCADE. It counts once in a block.";
     "sysinfo.status" Read "" "Whether this arcade shares its system info, and the exact record it sends (or would send), field by field: what is reported, what is measured (seal speed, after 64 MiB sealed) and what is never shared.";
     "sysinfo.set" Admin "on" "Share this arcade's system info with the mesh (on: true) or stop (on: false; every arcade drops it at once). Off by default; kept across restarts and updates.";
     "mesh.name_set" Admin "name" "Set the public name other arcades may dial this arcade by (wss://host/mesh or host:port, a host name): shared with every link, so networks that reach only names can find it. \"\" clears it.";
@@ -751,6 +755,10 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("until", "string", "The state to wait for."),
     ("uri", "string", "A digiid:// URI."),
     ("url", "string", "A URL."),
+    ("model", "string", "A model's name, as its server lists it."),
+    ("pin", "string", "One offer to use only: \"model@<arcade id>\"; \"\" for none."),
+    ("unchecked", "string", "What happens to content not checked yet: show_here or cover."),
+    ("day_cap", "integer", "A daily spending cap, in ARCADE base units."),
     ("value", "string", "A value."),
     ("verdict", "string", "A verdict."),
     ("via", "string", "This arcade's https address."),
@@ -766,6 +774,8 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
 pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
     ("fog.keep", "mode", "segment,pin", "\"segment\"", 0),
     ("cpu.set", "level", "low,balanced,full,unthrottled", "", 0),
+    ("screening.set", "mode", "borrow,own,off", "", 0),
+    ("screening.set", "unchecked", "show_here,cover", "", 0),
     ("tx.wait", "until", "accepted_local,broadcast_ok,seen_in_peer_mempool,confirmed", "\"confirmed\"", 0),
     ("tx.wait", "timeout", "", "60", 300),
     ("chains.wait", "timeout", "", "60", 600),

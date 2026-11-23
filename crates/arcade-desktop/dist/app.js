@@ -31,7 +31,58 @@ async function refreshHome() {
   $("w-loading").hidden = true;
   if (!$("home").classList.contains("on")) return;
   // Side by side: the mesh doesn't wait for the getting-started card.
-  await Promise.all([drawStart(), api("mesh.overview").then(drawMesh), drawWelcome()]);
+  await Promise.all([drawStart(), api("mesh.overview").then(drawMesh), drawWelcome(), drawScreening()]);
+}
+
+// Home: content screening (screening.status), shown until the operator chose how pictures and text are checked, and
+// again whenever the screening stops working. Borrowing is one click; their own model is encouraged.
+const ARC = (u) => { const a = u / 1e8; return a >= 0.01 ? a.toFixed(2) : a >= 0.0001 ? a.toFixed(4) : a > 0 ? a.toPrecision(2) : "0"; };
+const SCR = { busy: false, sig: null };
+async function drawScreening() {
+  const st = await api("screening.status").catch(() => null);
+  const box = $("h-screen");
+  if (!st || (st.chosen && (st.working || st.mode === "off"))) { box.hidden = true; SCR.sig = null; return; }
+  const cur = st.borrow && st.borrow.current;
+  const top = st.borrow && st.borrow.top_up;
+  const needsCredit = /credit/.test(st.why || "");
+  const sig = JSON.stringify([st.chosen, st.mode, st.working, st.why, cur && [cur.model, cur.who, cur.per_text, cur.per_picture], top && top.who, SCR.busy]);
+  box.hidden = false;
+  if (sig === SCR.sig) return;
+  SCR.sig = sig;
+  $("h-screen-text").textContent = !st.chosen
+    ? "Choose how this arcade checks pictures and text before showing them."
+    : `Screening isn't working: ${st.why}.`;
+  $("h-screen-warn").textContent = "This arcade shows what anyone puts on the chains it reads: pictures and text can be sexual, violent or illegal, including child sexual abuse material. Screening checks each one with a model first: sensitive content is covered, illegal content is never served.";
+  $("h-screen-how").textContent = cur
+    ? `Borrowing ${cur.model} from ${cur.who}: about ${ARC(cur.per_text)} ARCADE a text, ${ARC(cur.per_picture)} a picture. The cheapest screening model that passes the test is used; it is tested again every 6 hours and replaced if it drops. Running your own model is best: the same verdicts every day.`
+    : st.mode === "borrow" ? `Borrowing: ${st.why || "looking for a screening model on the mesh"}. Running your own model is best: the same verdicts every day.`
+    : "Running your own screening model is best: the same verdicts every day. Borrowing is the easy start.";
+  const set = async (body, said) => {
+    SCR.busy = true; drawScreening();
+    try { await api("screening.set", body); say("h-screen-msg", said); }
+    catch (e) { say("h-screen-msg", e.message, true); }
+    SCR.busy = false; SCR.sig = null; drawScreening();
+  };
+  const btns = [];
+  if (!st.chosen || st.mode !== "borrow") {
+    btns.push(h("button", { class: "primary", disabled: SCR.busy, onclick: () => set({ mode: "borrow" }, "Borrowing the cheapest screening model that passes the test.") }, "Borrow screening (easy start)"));
+  }
+  if (needsCredit && top) {
+    btns.push(h("button", { class: st.chosen ? "primary" : "", disabled: SCR.busy, onclick: async () => {
+      SCR.busy = true;
+      try { const r = await api("screening.topup", { amount: 10000000 }); say("h-screen-msg", `Paid 0.1 ARCADE of screening credit to ${r.to}. It counts once in a block (about 2.5 minutes); screening starts by itself.`); }
+      catch (e) { say("h-screen-msg", e.message, true); }
+      SCR.busy = false; SCR.sig = null; drawScreening();
+    } }, `Top up 0.1 ARCADE at ${top.who}`));
+  }
+  btns.push(h("button", { onclick: () => { goTab("options"); setTimeout(() => $("o-screen").scrollIntoView({ block: "start" }), 50); } }, st.chosen ? "Screening settings…" : "Use my own model…"));
+  if (!st.chosen) {
+    btns.push(h("button", { disabled: SCR.busy, onclick: () => {
+      if (!confirm("Turn screening off? Pictures and text from the chains are then shown unchecked, here and to anyone who can reach this arcade's pages, including content that may be illegal.")) return;
+      set({ mode: "off" }, "Screening is off. You can turn it on again in Options.");
+    } }, "Turn off"));
+  }
+  $("h-screen-btns").replaceChildren(...btns);
 }
 
 // Home: new arcades waiting for their welcome (faucet.newcomers), each with a "Welcome to the arcade" button, and the

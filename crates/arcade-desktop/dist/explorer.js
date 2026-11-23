@@ -867,6 +867,7 @@
   // #explorer/<page>/<arg> opens that page.
   const hp = (location.hash || "").slice(1).split("/");
   if (hp[0] === "explorer") { if (hp[1]) { page = hp[1]; arg = hp.slice(2).join("/") || null; } render(); }
-  window.arcadeExplorer = { go, chain: () => chain };
+  // pickKey: another part of the window (the ArcadeCore Balances column) picks a chain as the selector does.
+  window.arcadeExplorer = { go, chain: () => chain, pickKey: (k) => { const c = chains.find((x) => x.key === k && (x.installed || x.borrowed)); if (c && c.key !== chain?.key) pick(c); } };
   window.arcadeChain = () => chain;
 })();

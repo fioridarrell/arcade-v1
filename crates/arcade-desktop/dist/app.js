@@ -561,13 +561,34 @@ function drawCard(ch) {
   const rows = [[ak ? `${tk} address · ${ak.label} (${ak.path})` : `${tk} address`, w.address]];
   if (ddOn) rows.push(["DigiDollar address", W.dd.address]);
   $("w-recv-list").replaceChildren(...[...rows.map(([l, a]) => h("div", { class: "wl-recv" }, h("span", { class: "lbl" }, l),
-      h("div", {}, h("code", {}, a), " ", h("button", { class: "small", onclick: (e) => copyText(a, e.target) }, "Copy")))),
+      h("div", {}, h("code", {}, a), " ", h("button", { class: "small", onclick: (e) => copyText(a, e.target) }, "Copy")), qrImg(a))),
     // DigiByte's Legacy address is the D... form, the very same string as on Dogecoin (same key, same version byte).
     /^D/.test(w.address || "") && ch.key === "dgb" ? h("p", { class: "note warn" }, "This address is the same on Dogecoin and DigiByte. Check the chain before sending.") : null,
     w.legacy ? h("p", { class: "note" }, /^D/.test(w.address || "")
       ? `Coins sent to ${w.legacy} (the SegWit form of the same key) are counted too.`
       : `Coins sent to ${w.legacy} (the older D... form of the same key) are counted too. Give people the dgb1... address: D... addresses look the same on Dogecoin.`) : null,
     ddOn && !W.dd.whole ? h("p", { class: "note" }, "DigiByte is borrowed here, so DigiDollar coins received before this arcade began following it aren't seen. Installing DigiByte finds them all.") : null].filter(Boolean));
+}
+
+/* Receive's QR code: the address alone (what every wallet's scanner reads), drawn here as a picture (qrcode.js, MIT,
+ * loaded the first time it's needed), dark on white in every theme and colour scheme so a phone can read it. Kept per
+ * address: the panel is drawn again on every wallet refresh. */
+let qrLib = null;
+const QR_CACHE = new Map();
+function loadQr() {
+  return qrLib || (qrLib = new Promise((ok, no) => { const s = document.createElement("script"); s.src = "qrcode.js"; s.onload = () => (window.qrcode ? ok(window.qrcode) : no(new Error("no QR maker"))); s.onerror = () => { qrLib = null; no(new Error("the QR maker didn't load")); }; document.head.append(s); }));
+}
+function qrImg(text) {
+  if (!text) return null;
+  const img = h("img", { class: "wl-qr", alt: "QR code of the address", title: text });
+  const put = (url) => { img.src = url; };
+  if (QR_CACHE.has(text)) put(QR_CACHE.get(text));
+  else loadQr().then((make) => {
+    const q = make(0, "M"); q.addData(text); q.make();
+    const url = q.createDataURL(6, 3);
+    QR_CACHE.set(text, url); put(url);
+  }).catch(() => img.remove());
+  return img;
 }
 
 /** An inscription's Send: the Send panel with it picked; the amount is the inscription itself. */

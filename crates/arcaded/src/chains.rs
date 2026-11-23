@@ -367,10 +367,36 @@ pub(crate) fn by_size(mut keys: Vec<(String, Option<u64>)>) -> Vec<String> {
     keys.into_iter().map(|(k, _)| k).collect()
 }
 
-/// chains.queue_first: `key`'s entry moves to the front of the queue.
+/// Whether a queue entry keeps its place whatever is queued after it: a chain moved to the front by hand
+/// (chains.queue_first) or one that continues after chains.start_now.
+fn pinned(e: &Value) -> bool {
+    is_resume(e) || e["first"] == true
+}
+
+/// A queued install's reported size, as kept in its entry when it was queued.
+fn entry_bytes(e: &Value) -> Option<u64> {
+    e["bytes"].as_u64()
+}
+
+/// Put install entry `e` into the queue in size order (2026-11-23: several chains at once ran machines at 100%; one
+/// at a time, smallest first, however they were added): after the entries placed by hand (pinned), before the first
+/// other entry that is larger; unknown sizes go last, and equal sizes keep the order they were added in. `size` gives
+/// an entry's size (None: not reported). Returns where it went (0 = next).
+pub(crate) fn insert_by_size(q: &mut Vec<Value>, e: Value, size: impl Fn(&Value) -> Option<u64>) -> usize {
+    let rank = |b: Option<u64>| (b.is_none(), b.unwrap_or(0));
+    let mine = rank(size(&e));
+    let at = q.iter().position(|x| !pinned(x) && rank(size(x)) > mine).unwrap_or(q.len());
+    q.insert(at, e);
+    at
+}
+
+/// chains.queue_first: `key`'s entry moves to the front of the queue, and stays ahead of chains queued later.
 pub(crate) fn move_first(q: &mut Vec<Value>, key: &str) -> Result<(), String> {
     let i = q.iter().position(|e| e["key"] == key).ok_or_else(|| format!("{key} isn't waiting in the queue"))?;
-    let e = q.remove(i);
+    let mut e = q.remove(i);
+    if !is_resume(&e) {
+        e["first"] = json!(true);
+    }
     q.insert(0, e);
     Ok(())
 }
@@ -501,6 +527,15 @@ fn queue_step(node: &Arc<Node>) {
             }
         },
     }
+}
+
+/// A queued install's size: as kept in its entry, else what arcades report now for its mode (entries queued before
+/// sizes were kept).
+fn queued_bytes(node: &Node, e: &Value) -> Option<u64> {
+    entry_bytes(e).or_else(|| {
+        let key = e["key"].as_str()?;
+        crate::sizes::for_chain(node, key)["modes"][e["mode"].as_str().unwrap_or("full")].as_u64()
+    })
 }
 
 /// A queued chain's key as the queue holds it (any capitalisation, old mesh names).
@@ -671,10 +706,12 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
             .filter(|p| p.chain_no != node.params.chain_no && !installed.iter().any(|k| k == p.key) && !q.iter().any(|e| e["key"] == p.key))
             .map(|p| (p.key.to_string(), crate::sizes::for_chain(node, p.key)["modes"][mode].as_u64()))
             .collect();
+        let bytes: std::collections::HashMap<String, Option<u64>> = fresh.iter().cloned().collect();
         let order = by_size(fresh);
         let at = arcade_app::now();
+        // Into the queue by size, with any chains already waiting (one install at a time, smallest first).
         for k in &order {
-            q.push(json!({"key": k, "mode": mode, "with": [], "at": at}));
+            insert_by_size(&mut q, json!({"key": k, "mode": mode, "with": [], "at": at, "bytes": bytes[k]}), |e| queued_bytes(node, e));
         }
         save_queue(node, &q);
         order
@@ -704,21 +741,35 @@ pub fn add(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
         return install_home(node);
     }
     // Headers only is small and quick (§15 step 15): it never waits behind another chain's install.
-    if let Some(busy) = installing_now(node).filter(|b| b.key != p.key && mode != "light") {
+    // Any other install waits while a chain is being installed, and also while chains are waiting their turn: one
+    // added by hand doesn't jump them, it takes its place by size (insert_by_size).
+    let busy = installing_now(node).filter(|b| b.key != p.key);
+    if mode != "light" && (busy.is_some() || !queue(node).is_empty()) {
         if node.extra.lock().unwrap().contains_key(p.key) {
             return Err(format!("{} is already installed", p.name));
         }
         // The same checks as at its turn, so a typo fails now and not hours later; the queue keeps the checked list.
         let indexes = check(p, mode, &indexes)?;
-        let _g = QLOCK.lock().unwrap();
-        let mut q = queue(node);
-        if let Some(i) = q.iter().position(|e| e["key"] == p.key) {
-            return Ok(json!({"queued": true, "key": p.key, "position": i + 1, "behind": busy.key}));
+        let behind = busy.map(|b| b.key);
+        let at = {
+            let _g = QLOCK.lock().unwrap();
+            let mut q = queue(node);
+            if let Some(i) = q.iter().position(|e| e["key"] == p.key) {
+                return Ok(json!({"queued": true, "key": p.key, "position": i + 1, "behind": behind}));
+            }
+            let bytes = crate::sizes::for_chain(node, p.key)["modes"][mode].as_u64();
+            let at = insert_by_size(&mut q, json!({"key": p.key, "mode": mode, "with": indexes, "at": arcade_app::now(), "bytes": bytes}), |e| queued_bytes(node, e));
+            save_queue(node, &q);
+            at
+        };
+        let after = busy.map(|b| format!(" after {}", b.name)).unwrap_or_default();
+        let _ = node.app.event("chains", &format!("{} waits to be installed (#{}{after}, smallest first)", p.name, at + 1));
+        // Nothing installing: the queue's next entry (perhaps this one) starts now, not at the next 20 s turn.
+        if busy.is_none() {
+            let n = node.clone();
+            std::thread::spawn(move || queue_step(&n));
         }
-        q.push(json!({"key": p.key, "mode": mode, "with": indexes, "at": arcade_app::now()}));
-        save_queue(node, &q);
-        let _ = node.app.event("chains", &format!("{} waits to be installed (#{} after {})", p.name, q.len(), busy.name));
-        return Ok(json!({"queued": true, "key": p.key, "position": q.len(), "behind": busy.key}));
+        return Ok(json!({"queued": true, "key": p.key, "position": at + 1, "behind": behind}));
     }
     add_now(node, key, mode, indexes)
 }
@@ -2289,6 +2340,38 @@ mod plan_queue_tests {
         ]);
         assert_eq!(order, ["flop", "dgb", "doge", "btc", "kot", "wjk"], "equal sizes and unknown sizes keep the order given");
         assert!(by_size(vec![]).is_empty());
+    }
+
+    fn sized(key: &str, bytes: Option<u64>) -> Value {
+        json!({"key": key, "mode": "full", "with": [], "at": 1, "bytes": bytes})
+    }
+
+    #[test]
+    fn chains_added_by_hand_take_their_place_by_size() {
+        const G: u64 = 1_000_000_000;
+        let mut q = Vec::new();
+        // Added one after another, largest first: they still install smallest first.
+        assert_eq!(insert_by_size(&mut q, sized("btc", Some(700 * G)), entry_bytes), 0);
+        assert_eq!(insert_by_size(&mut q, sized("doge", Some(90 * G)), entry_bytes), 0);
+        assert_eq!(insert_by_size(&mut q, sized("kot", None), entry_bytes), 2, "unknown size: last");
+        assert_eq!(insert_by_size(&mut q, sized("flop", Some(2 * G)), entry_bytes), 0);
+        assert_eq!(insert_by_size(&mut q, sized("dgb", Some(2 * G)), entry_bytes), 1, "equal size: after the one added first");
+        assert_eq!(insert_by_size(&mut q, sized("wjk", None), entry_bytes), 5, "unknown sizes keep the order added");
+        assert_eq!(keys(&q), ["flop", "dgb", "doge", "btc", "kot", "wjk"]);
+    }
+
+    #[test]
+    fn chains_placed_by_hand_stay_ahead_of_later_ones() {
+        const G: u64 = 1_000_000_000;
+        let mut q = vec![sized("doge", Some(90 * G)), sized("btc", Some(700 * G))];
+        // The operator puts btc first: a smaller chain added later doesn't push in front of it.
+        move_first(&mut q, "btc").unwrap();
+        assert_eq!(insert_by_size(&mut q, sized("flop", Some(2 * G)), entry_bytes), 1);
+        assert_eq!(keys(&q), ["btc", "flop", "doge"]);
+        // A chain paused to make way for another continues before anything queued after it.
+        let mut q = vec![resume_entry("ltc", 1), sized("doge", Some(90 * G))];
+        assert_eq!(insert_by_size(&mut q, sized("flop", Some(2 * G)), entry_bytes), 1);
+        assert_eq!(keys(&q), ["ltc+resume", "flop", "doge"]);
     }
 
     #[test]

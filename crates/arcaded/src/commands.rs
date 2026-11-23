@@ -79,8 +79,8 @@ cmds! {
     "mesh.dials" Read "" "The last mesh dials (to a bare IP or a name, how long, why they failed), and a note when this network seems to refuse bare IPs while names connect (ARCADE #12).";
     "mesh.name" Read "" "The public name other arcades dial this one by, if set.";
     "mesh.sysinfo" Public "" "The machines behind the mesh, as their operators share them (opt-in, sysinfo.set): every other arcade's newest record heard in the last 24 h (CPU, cores, RAM, GPUs, disk, OS, version; seal speed in core-seconds per GiB, measured from its own seals), arcades sharing of arcades heard, network totals (cores, RAM, disk total and free, GPUs and VRAM where known, fastest, median and slowest seal speed), and this arcade's own. Reported, rounded, never on a chain.";
-    "cpu.status" Read "" "How much of the computer this arcade takes: its CPU level (low, balanced, full), the cores background work may use of all this machine's, its priority (nice), and the levels there are.";
-    "cpu.set" Admin "level" "Set the CPU level: low (lowest priority, a quarter of the cores), balanced (low priority, half the cores; the default) or full (normal priority, every core). Kept across restarts; a lower priority applies at once, a higher one may wait for the next start. The level covers sealing and the ARCADE chain's proofs of time, catalog and fraud watch: on low they share a quarter of the cores and one own proof runs at a time.";
+    "cpu.status" Read "" "How much of the computer this arcade takes: its CPU level (low, balanced, full = unthrottled), the cores background work may use of all this machine's, its priority (nice), the cap on the whole arcade in percent of the machine (none when unthrottled), the arcade's CPU use over the last two seconds, whether heavy work is holding back for the cap now, and the levels there are.";
+    "cpu.set" Admin "level" "Set the CPU level: low (lowest priority, at most a quarter of the machine), balanced (low priority, at most half the machine; the default) or full, also called unthrottled (normal priority, every core, no cap: recommended only for machines dedicated to running an arcade). Kept across restarts; the cap applies at once, a lower priority too, a higher one may wait for the next start. Below full the cap covers all heavy work: script checks, block downloads and parsing, address builds, Core-copy imports, sealing, and the ARCADE chain's proofs of time, catalog and fraud watch.";
     "sysinfo.status" Read "" "Whether this arcade shares its system info, and the exact record it sends (or would send), field by field: what is reported, what is measured (seal speed, after 64 MiB sealed) and what is never shared.";
     "sysinfo.set" Admin "on" "Share this arcade's system info with the mesh (on: true) or stop (on: false; every arcade drops it at once). Off by default; kept across restarts and updates.";
     "mesh.name_set" Admin "name" "Set the public name other arcades may dial this arcade by (wss://host/mesh or host:port, a host name): shared with every link, so networks that reach only names can find it. \"\" clears it.";
@@ -765,7 +765,7 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
 /// "" none), most (a number's limit, 0 none)).
 pub const PARAM_RULES: &[(&str, &str, &str, &str, u64)] = &[
     ("fog.keep", "mode", "segment,pin", "\"segment\"", 0),
-    ("cpu.set", "level", "low,balanced,full", "", 0),
+    ("cpu.set", "level", "low,balanced,full,unthrottled", "", 0),
     ("tx.wait", "until", "accepted_local,broadcast_ok,seen_in_peer_mempool,confirmed", "\"confirmed\"", 0),
     ("tx.wait", "timeout", "", "60", 300),
     ("chains.wait", "timeout", "", "60", 600),

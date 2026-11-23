@@ -180,13 +180,26 @@ async function refreshCpu() {
   let st;
   try { st = await api("cpu.status"); } catch (e) { say("o-cpu-msg", e.message, true); return; }
   if (document.activeElement !== $("o-cpu-level")) $("o-cpu-level").value = st.level;
-  if (!$("o-cpu-msg").dataset.kept) say("o-cpu-msg", `${st.cores} of this computer's ${st.all_cores} cores for heavy work${st.nice ? ", below your own programs" : ""}${st.nice_from_env != null ? " (priority set by ARCADE_NICE)" : ""}.`);
+  $("o-cpu-warn").hidden = !st.unthrottled;
+  if (!$("o-cpu-msg").dataset.kept) say("o-cpu-msg", cpuLine(st));
+}
+// One line on the level in force: the cap, the arcade's use now, and whether heavy work is holding back for it.
+function cpuLine(st) {
+  const prio = `${st.nice ? ", below your own programs" : ""}${st.nice_from_env != null ? " (priority set by ARCADE_NICE)" : ""}`;
+  const now = `Using about ${st.used_percent || 0}% now`;
+  if (st.unthrottled) return `Unthrottled: every core (${st.all_cores}), no cap. ${now}.`;
+  return `At most ${st.cap_percent}% of this computer's CPU (${st.cores} of ${st.all_cores} cores for heavy work)${prio}. ${now}${st.holding_back ? ", holding back to stay under the cap" : ""}.`;
 }
 $("o-cpu-level").addEventListener("change", async (e) => {
+  if (e.target.value === "full" && !confirm("Unthrottled lets the arcade use every core, up to 100% of the CPU while chains sync. Recommended only for machines dedicated to running an arcade. Turn the cap off?")) {
+    refreshCpu();
+    return;
+  }
   try {
     const r = await api("cpu.set", { level: e.target.value });
     $("o-cpu-msg").dataset.kept = "1";
-    say("o-cpu-msg", r.applied_now ? `Now ${r.level}: ${r.cores} of ${r.all_cores} cores for heavy work.` : `Kept: ${r.level}. ${r.note || ""}`);
+    $("o-cpu-warn").hidden = !r.unthrottled;
+    say("o-cpu-msg", r.applied_now ? `Now: ${cpuLine(r)}` : `Kept. ${r.note || ""}`);
   } catch (err) { say("o-cpu-msg", err.message, true); }
   setTimeout(() => { delete $("o-cpu-msg").dataset.kept; refreshCpu(); }, 4000);
 });

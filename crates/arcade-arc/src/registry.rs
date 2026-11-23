@@ -1134,6 +1134,24 @@ impl Registry {
         self.audits.get(owner).map(|a| a.picks.clone()).unwrap_or_default()
     }
 
+    /// Whether the block after `tip` can still take audit answer `item` (a commit or an opening), whoever's replica it
+    /// is: an arcade carrying another's answer keeps it until then. None for any other item.
+    pub fn audit_answer_open(&self, item: &Item, tip: u64) -> Option<bool> {
+        let replica = match item {
+            Item::AuditCommit(c) => c.replica,
+            Item::AuditOpening(o) => o.replica,
+            _ => return None,
+        };
+        let picks = self.replica(&replica).map(|(_, owner, _)| self.audits_of(&owner)).unwrap_or_default();
+        let mut mine = picks.iter().filter(|p| p.replica == replica);
+        Some(match item {
+            // Kept through its pick's window unless that pick is answered already: an arcade a few blocks behind may
+            // not have the pick yet.
+            Item::AuditCommit(c) => tip < c.pick + params::ANSWER_WINDOW && !mine.any(|p| p.at == c.pick && (p.commit.is_some() || p.passed)),
+            _ => mine.any(|p| !p.passed && p.commit.is_some_and(|(_, hc)| tip < hc + params::CHALLENGE_DELAY + params::ANSWER_WINDOW)),
+        })
+    }
+
     /// A registered replica's sealed-leaf root and the audits it missed in a row.
     pub fn replica_audit(&self, id: &Hash) -> Option<(Hash, u32)> {
         self.replicas.get(id).map(|r| (r.root, r.missed))
@@ -2183,6 +2201,12 @@ mod tests {
         // Period 1: committed and opened in time.
         run_to(&mut r, pk.at);
         let (ac, pick_seed) = answer(&r, &x, &segs[0], &id, pk.at);
+        // Its answer is open to any arcade that carries it (not only its owner's), until the window ends.
+        assert_eq!(r.audit_answer_open(&Item::AuditCommit(ac.clone()), pk.at), Some(true));
+        assert_eq!(r.audit_answer_open(&Item::AuditCommit(ac.clone()), pk.at + params::ANSWER_WINDOW), Some(false));
+        let mut other = ac.clone();
+        other.pick = pk.at + 1;
+        assert_eq!(r.audit_answer_open(&Item::AuditCommit(other), pk.at + 1 + params::ANSWER_WINDOW), Some(false), "a pick that isn't one: gone with its window");
         let mut forged = ac.clone();
         forged.root = [9; 32];
         assert!(r.items(&[Item::AuditCommit(forged)], pk.at + 1).is_err(), "the signature covers the root");
@@ -2196,8 +2220,11 @@ mod tests {
         let mut bad = op.clone();
         bad.leaves[0].0.sealed = x3.sealed[draw::leaf_pick(&NET, &r.block_at(challenge).unwrap().1, &id, 0, segs[0].e.leaves()) as usize];
         assert!(r.items(&[Item::AuditOpening(bad)], challenge + 1).is_err());
-        r.step(&[Item::AuditOpening(op)], &at(challenge + 1)).unwrap();
+        assert_eq!(r.audit_answer_open(&Item::AuditCommit(ac.clone()), challenge), Some(false), "committed: the commit is done");
+        assert_eq!(r.audit_answer_open(&Item::AuditOpening(op.clone()), challenge), Some(true));
+        r.step(&[Item::AuditOpening(op.clone())], &at(challenge + 1)).unwrap();
         assert!(r.audits_of(&k2)[0].passed);
+        assert_eq!(r.audit_answer_open(&Item::AuditOpening(op), challenge + 1), Some(false), "passed: nothing left to open");
         // Its next turn pays everything accrued: the period was covered.
         let owed = r.accrued_of(&Earner::Owner(k2));
         let paid = run_to(&mut r, first + P);

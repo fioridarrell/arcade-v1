@@ -25,7 +25,8 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
   arcade chain list                         chains you can install, and their state (queued ones with their place)
-  arcade chain add <key> [--mode full|chain|light] [--with <index>,<index>,...] [--drive <mount>] [--init]
+  arcade chain add <key> [--mode full|chain|light] [--with <index>,<index>,...] [--drive <mount>] [--init|--no-init]
+                     init (headers first, blocks stored, then built in bulk) is the default where the chain allows it
                      every index is opt-in (--mode chain: addresses only; light: none):
                        addresses, ledger, profiles     any chain
                        ord                             chains with inscriptions: pep, peptest, doge, dgb, ltc, ltctest, shic, flop, wjk
@@ -507,21 +508,22 @@ fn main() {
             let mut mode = "full".to_string();
             let mut with: Vec<String> = vec![];
             let mut drive = String::new();
-            let mut init = false;
+            let mut init: Option<bool> = None;
             let mut i = 0;
             while i < rest.len() {
                 match rest[i] {
                     "--mode" if i + 1 < rest.len() => { mode = rest[i + 1].to_string(); i += 1; }
                     "--with" if i + 1 < rest.len() => { with = rest[i + 1].split(',').map(String::from).collect(); i += 1; }
                     "--drive" if i + 1 < rest.len() => { drive = rest[i + 1].to_string(); i += 1; }
-                    "--init" => init = true,
+                    "--init" => init = Some(true),
+                    "--no-init" => init = Some(false),
                     _ => {}
                 }
                 i += 1;
             }
             let mut v = json!({"cmd": "chains.add", "key": k, "mode": mode, "with": with, "drive": drive});
-            if init {
-                v["init"] = json!(true);
+            if let Some(on) = init {
+                v["init"] = json!(on);
             }
             v
         }

@@ -116,6 +116,39 @@ pub fn check(p: &arcade_chain::params::ChainParams, mode: &str) -> Result<(), St
     Ok(())
 }
 
+/// Whether installs use init when chains.add doesn't say (ARCADE_INIT_DEFAULT, default on;
+/// 0, off, no or false turn it off).
+pub fn default_on() -> bool {
+    default_on_of(std::env::var("ARCADE_INIT_DEFAULT").ok().as_deref())
+}
+
+fn default_on_of(v: Option<&str>) -> bool {
+    !matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "off" | "no" | "false"))
+}
+
+/// The init choice for an install. `asked`: chains.add's init (None: not said, so init where the
+/// chain allows it); `fresh`: the chain isn't installed here yet; `allowed`: `check` for the chain
+/// and mode. Ok((true, _)): an init install; Ok((false, why)): a plain one, with the reason when
+/// the default couldn't use init. Err: init was asked for and can't be.
+pub fn choose(asked: Option<bool>, fresh: bool, allowed: Result<(), String>, default: bool) -> Result<(bool, Option<String>), String> {
+    match asked {
+        Some(true) => {
+            allowed?;
+            if !fresh {
+                return Err("installed already; an init install starts from nothing".into());
+            }
+            Ok((true, None))
+        }
+        Some(false) => Ok((false, None)),
+        None if !fresh => Ok((false, None)),
+        None if !default => Ok((false, Some("init installs are off by default here (ARCADE_INIT_DEFAULT)".into()))),
+        None => match allowed {
+            Ok(()) => Ok((true, None)),
+            Err(why) => Ok((false, Some(why))),
+        },
+    }
+}
+
 /// The init phases, until done (true) or the chain stops (false). Pausing waits here.
 pub fn run(node: &Arc<Node>, run: &ChainRun, syncer: &Syncer) -> bool {
     let _running = Running::enter(run.params.chain_no);
@@ -936,6 +969,34 @@ mod tests {
         for p in ALL_CHAINS.iter().filter(|p| check(p, "full").is_ok()) {
             assert!(p.init_floor().is_some(), "{}", p.key);
             assert!(p.min_chain_work.is_empty() || !p.min_chain_work().is_zero(), "{}", p.key);
+        }
+    }
+
+    #[test]
+    fn init_is_the_default_where_the_chain_allows_it() {
+        use arcade_chain::params::{BITCOIN_MAIN, DIGIBYTE_MAIN, DOGECOIN_MAIN, KOTIA_MAIN, LITECOIN_MAIN};
+        let ok = || Ok::<(), String>(());
+        // Not said: init on a new chain that allows it, plain (with the reason) on one that doesn't.
+        assert_eq!(choose(None, true, check(&BITCOIN_MAIN, "full"), true), Ok((true, None)));
+        assert_eq!(choose(None, true, check(&DOGECOIN_MAIN, "full"), true), Ok((true, None)));
+        for p in [&DIGIBYTE_MAIN, &KOTIA_MAIN, &LITECOIN_MAIN] {
+            let (init, why) = choose(None, true, check(p, "full"), true).unwrap();
+            assert!(!init && why.is_some(), "{}", p.key);
+        }
+        // A mode that doesn't keep every block: plain, not refused.
+        assert!(!choose(None, true, check(&BITCOIN_MAIN, "light"), true).unwrap().0);
+        // Installed already, or the default turned off: plain.
+        assert_eq!(choose(None, false, ok(), true), Ok((false, None)));
+        assert!(matches!(choose(None, true, ok(), false), Ok((false, Some(_)))));
+        // Said: false is plain; true is init or a refusal.
+        assert_eq!(choose(Some(false), true, ok(), true), Ok((false, None)));
+        assert_eq!(choose(Some(true), true, ok(), false), Ok((true, None)));
+        assert!(choose(Some(true), true, check(&KOTIA_MAIN, "full"), true).unwrap_err().contains("proof-of-stake"));
+        assert!(choose(Some(true), false, ok(), true).unwrap_err().contains("installed already"));
+        // ARCADE_INIT_DEFAULT
+        assert!(default_on_of(None) && default_on_of(Some("1")) && default_on_of(Some("on")));
+        for v in ["0", "off", "OFF", "no", "false", " 0 "] {
+            assert!(!default_on_of(Some(v)), "{v}");
         }
     }
 

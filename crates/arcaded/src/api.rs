@@ -1418,26 +1418,44 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             let key = s("key").ok_or("key required")?;
             let mode = s("mode").unwrap_or_else(|| "full".into());
             // init: headers agreed by several sources, blocks stored only, then built in bulk
-            // (crate::initsync, docs/INITSYNC.md). Remembered until the install starts.
-            let init = req["init"] == true;
+            // (crate::initsync, docs/INITSYNC.md). Remembered until the install starts. Not said:
+            // init wherever the chain allows it (crate::initsync::choose); false: a plain install.
+            let asked = req["init"].as_bool();
             let canon = arcade_chain::params::by_key(&key).map(|p| p.key.to_string()).unwrap_or_else(|| key.clone());
-            if init {
-                let p = arcade_chain::params::by_key(&canon).ok_or_else(|| format!("{key}: no such chain"))?;
-                crate::initsync::check(p, &mode)?;
-                if node.chain_params(&canon).is_some() {
-                    return Err(format!("{canon} is installed already; an init install starts from nothing"));
-                }
-                crate::initsync::request(node, &canon, true);
-            } else if node.chain_params(&canon).is_none() {
-                // A plain add of a chain queued earlier with init: it is a plain install now.
-                crate::initsync::request(node, &canon, false);
+            let param = arcade_chain::params::by_key(&canon);
+            // The ARCADE chain and the home chain have installs of their own (crate::chains::add).
+            let own_install = crate::arcsvc::defines(&canon) || param.is_some_and(|p| p.chain_no == node.params.chain_no);
+            let fresh = node.chain_params(&canon).is_none();
+            let allowed = match param {
+                Some(_) if own_install => Err("this chain installs its own way".to_string()),
+                Some(p) => crate::initsync::check(p, &mode),
+                None => Err(format!("{key}: no such chain")),
+            };
+            if asked == Some(true) && param.is_none() {
+                return Err(format!("{key}: no such chain"));
+            }
+            let (init, why_not) = crate::initsync::choose(asked, fresh, allowed, crate::initsync::default_on()).map_err(|e| format!("{canon}: {e}"))?;
+            if fresh && !own_install {
+                // Also turns off init for a chain queued earlier with it, when this add says plain.
+                crate::initsync::request(node, &canon, init);
             }
             // The drive chosen for it, else this arcade's own (crate::chaindrive): its file starts there.
             let r = crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &mode, with));
             if init && r.is_err() {
                 crate::initsync::request(node, &canon, false);
             }
-            r
+            r.map(|mut v| {
+                if fresh && !own_install {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("init_install".into(), json!(init));
+                        if let Some(w) = why_not {
+                            let w = w.replace(" (install it without --init)", "").replace(": install it without --init", "");
+                            o.insert("init_why_not".into(), json!(w));
+                        }
+                    }
+                }
+                v
+            })
         }
         "chains.queue" => Ok(crate::chains::queue_list(node)),
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),

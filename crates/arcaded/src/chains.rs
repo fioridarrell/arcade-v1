@@ -717,6 +717,11 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
         // Into the queue by size, with any chains already waiting (one install at a time, smallest first).
         for k in &order {
             insert_by_size(&mut q, json!({"key": k, "mode": mode, "with": [], "at": at, "bytes": bytes[k]}), |e| queued_bytes(node, e));
+            // Init where the chain allows it, as chains.add does when it isn't told.
+            let allowed = by_key(k).ok_or_else(|| format!("unknown chain {k}")).and_then(|p| crate::initsync::check(p, mode));
+            if let Ok((init, _)) = crate::initsync::choose(None, true, allowed, crate::initsync::default_on()) {
+                crate::initsync::request(node, k, init);
+            }
         }
         save_queue(node, &q);
         order

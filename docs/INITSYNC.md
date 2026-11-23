@@ -1,16 +1,25 @@
 # Init installs: store first, build in bulk
 
-Status: **built on `team/init-sync`, every chain with a checkpoint on `team/all-chains`, opt-in, not yet run against Bitcoin mainnet.** 2026-11-22.
+Status: **built on `team/init-sync`, every chain with a checkpoint on `team/all-chains`; the default where the chain allows it on `team/init-default` (2026-11-23). Not yet run to the end against Bitcoin or Dogecoin mainnet.** 2026-11-22.
 
 ```
-arcade chain add btc --init            # CLI
-{"cmd": "chains.add", "key": "btc", "init": true}   # API
+arcade chain add btc                   # init where the chain allows it (the default)
+arcade chain add btc --init            # init or a refusal with the reason
+arcade chain add btc --no-init         # a plain install: blocks connected one after the other
+{"cmd": "chains.add", "key": "btc"}                 # API: init where allowed
+{"cmd": "chains.add", "key": "btc", "init": true}   # API: init or refuse
+{"cmd": "chains.add", "key": "btc", "init": false}  # API: plain
 ```
 
-Without `--init` nothing changes: blocks are connected one after the other as before.
+**The default.** A new install that doesn't say (chains.add with no `init`, the app's Install
+button, the startup chooser's queue) is an init install when `check` allows the chain and mode
+(the table below; mode full or chain), and a plain one otherwise. chains.add's answer says which:
+`init_install` true or false, and `init_why_not` with the reason when the default couldn't use it.
+An installed chain, the home chain and the ARCADE chain keep their own installs. An operator turns
+the default off with `ARCADE_INIT_DEFAULT=0` in arcaded's environment.
 
 **Which chains:** those with an **init checkpoint** in the release (`ChainParams::init_checkpoint`),
-no proof of stake and no MWEB. `chains.add` with init refuses the others with the reason:
+no proof of stake and no MWEB. `chains.add` with init refuses the others with the reason (by default they install plain):
 
 | Chain | Init | Checkpoint (height) | Sources | `min_chain_work` |
 |---|---|---|---|---|

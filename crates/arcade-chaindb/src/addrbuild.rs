@@ -450,7 +450,7 @@ impl ChainDb {
         self.set_step(c, 0, 0, span, "blocks", 1);
         let failed: Mutex<Option<arcade_store::StoreError>> = Mutex::new(None);
         const SPAN: u32 = 500;
-        let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+        let threads = crate::cpushare::threads(crate::cpushare::all_cores().min(8));
         // The block each thread is reading now (0 = between spans), shown in the progress note.
         let at: Vec<std::sync::atomic::AtomicU32> = (0..threads).map(|_| std::sync::atomic::AtomicU32::new(0)).collect();
         let work = |slot: usize| -> Result<()> {
@@ -458,6 +458,7 @@ impl ChainDb {
                 if stop.load(Ordering::Relaxed) || failed.lock().unwrap().is_some() {
                     return Ok(());
                 }
+                crate::cpushare::pace();
                 let from = next_h.fetch_add(SPAN, Ordering::Relaxed);
                 if from > upto {
                     return Ok(());
@@ -760,7 +761,7 @@ impl ChainDb {
         };
         if kind == COIN {
             // Fault the coins in from several threads first (the database may not fit in memory).
-            let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1).clamp(1, 8);
+            let threads = crate::cpushare::threads(crate::cpushare::all_cores().min(8));
             let per = batch.len().div_ceil(threads);
             std::thread::scope(|sc| {
                 for part in batch.chunks(per) {

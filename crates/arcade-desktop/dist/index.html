@@ -480,11 +480,12 @@
 
     <h2 id="o-cpu">How much of this computer the arcade uses</h2>
     <div class="row"><select id="o-cpu-level" title="How much of this computer the arcade takes">
-      <option value="low">Low: lowest priority, a quarter of the cores</option>
-      <option value="balanced">Balanced: low priority, half the cores (default)</option>
-      <option value="full">Full: normal priority, every core</option>
+      <option value="low">Low: lowest priority, at most a quarter of the CPU</option>
+      <option value="balanced">Balanced: low priority, at most half the CPU (default)</option>
+      <option value="full">Unthrottled: normal priority, every core, no cap</option>
     </select></div>
-    <p class="opt">Your own programs always come first: at Low and Balanced the arcade runs below them, and its heavy work (sealing data it keeps) uses only part of the cores. Full is the fastest, for a computer that does little else.</p>
+    <p class="opt">Your own programs always come first: at Low and Balanced the arcade runs below them, and all its heavy work (syncing and checking chains, building indexes, sealing) is held to a quarter or half of this computer's CPU, however many chains install at once. Chains install one at a time, smallest first.</p>
+    <p class="warn" id="o-cpu-warn" hidden><b>Unthrottled</b> lets the arcade use every core, up to 100% of the CPU while chains sync. Recommended only for machines dedicated to running an arcade.</p>
     <p class="msg" id="o-cpu-msg"></p>
 
     <h2 id="o-sysinfo">Share system info</h2>

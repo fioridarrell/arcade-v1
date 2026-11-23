@@ -216,6 +216,7 @@ fn seal_into(node: &Node, p: &ChainParams, family: u8, dir: &std::path::Path, se
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| loop {
+                arcade_chaindb::cpushare::pace();
                 let start = next.fetch_add(CHUNK, Ordering::Relaxed);
                 if start >= leaves || failed.lock().unwrap().is_some() {
                     return;
@@ -556,7 +557,7 @@ pub fn opens(node: &Node, net: &Net) -> Vec<Open> {
 }
 
 /// Seal `data`, which starts at leaf `start` of a segment, into `file` at that leaf (the last leaf filled with zeros),
-/// on every core.
+/// on the cores the CPU level allows.
 fn seal_run(me: &[u8; 32], mask: &Hash, start: u64, data: &[u8], file: &std::fs::File) -> Result<(), String> {
     let leaves = (data.len() as u64).div_ceil(DATA_LEAF as u64);
     let next = AtomicU64::new(0);
@@ -566,6 +567,7 @@ fn seal_run(me: &[u8; 32], mask: &Hash, start: u64, data: &[u8], file: &std::fs:
     std::thread::scope(|sc| {
         for _ in 0..threads {
             sc.spawn(|| loop {
+                arcade_chaindb::cpushare::pace();
                 let a = next.fetch_add(CHUNK, Ordering::Relaxed);
                 if a >= leaves || failed.lock().unwrap().is_some() {
                     return;

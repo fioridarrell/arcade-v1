@@ -396,6 +396,8 @@ struct Asm {
     buf: Vec<u8>,
     seq: u64,
     at: Option<Instant>,
+    /// Pieces that came before an earlier one (two links to one arcade): (blob, end), by seq.
+    ahead: std::collections::BTreeMap<u64, (Vec<u8>, bool)>,
 }
 
 fn asm() -> &'static Mutex<HashMap<(String, u64), Asm>> {
@@ -426,16 +428,28 @@ fn on_piece(node: &Node, peer: &str, f: &Frame) {
             drop(a);
             return mesh_err(peer, id, "that arcade is taking too many requests");
         }
-        let x = a.entry((peer.to_string(), id)).or_insert(Asm { buf: Vec::new(), seq: 0, at: None });
+        let x = a.entry((peer.to_string(), id)).or_insert(Asm { buf: Vec::new(), seq: 0, at: None, ahead: Default::default() });
         x.at.get_or_insert_with(Instant::now);
-        if seq != x.seq || x.buf.len() + f.blob.len() > MAX_REQUEST {
+        if seq < x.seq {
+            return; // again: had already
+        }
+        let held: usize = x.ahead.values().map(|(b, _)| b.len()).sum();
+        if x.buf.len() + held + f.blob.len() > MAX_REQUEST {
             a.remove(&(peer.to_string(), id));
             drop(a);
             return mesh_err(peer, id, "the request came in broken or too large");
         }
-        x.seq += 1;
-        x.buf.extend_from_slice(&f.blob);
-        if f.head["end"] != true {
+        x.ahead.insert(seq, (f.blob.clone(), f.head["end"] == true));
+        let mut done = false;
+        while let Some((blob, end)) = x.ahead.remove(&x.seq) {
+            x.seq += 1;
+            x.buf.extend_from_slice(&blob);
+            done = end;
+            if end {
+                break;
+            }
+        }
+        if !done {
             return;
         }
         a.remove(&(peer.to_string(), id)).map(|x| x.buf).unwrap_or_default()
@@ -574,19 +588,38 @@ pub fn ask(node: &Node, to: &str, service: &str, body: Value, total: Duration, e
     answers(&mut |until| crate::crsource::Pipe::recv(&mut via, until), total, true, each)
 }
 
+/// Answers held for a later place in the order, at most (each up to a PIECE): one answer's frames can come over two
+/// links to the same arcade (crvia sends a peer's queue by whichever of its links runs next), so a later one can
+/// arrive first ("the answers came out of order", 2026-11-23: 17 of a buyer's long answers in 9 hours).
+const AHEAD_MAX: usize = 256;
+
 fn answers(recv: &mut dyn FnMut(Instant) -> Result<Frame, String>, total: Duration, ordered: bool, each: &mut dyn FnMut(&Value, &[u8]) -> Result<(), String>) -> Result<Value, String> {
     let end = Instant::now() + total;
     let mut want = 0u64;
+    let mut ahead: std::collections::BTreeMap<u64, Frame> = std::collections::BTreeMap::new();
     loop {
-        let f = recv((Instant::now() + GAP_TIME).min(end))?;
-        if ordered {
-            if f.head["seq"].as_u64() != Some(want) {
-                return Err("the answers came out of order".into());
-            }
-            want += 1;
-        }
+        let f = match ahead.remove(&want) {
+            Some(f) => f,
+            None => recv((Instant::now() + GAP_TIME).min(end))?,
+        };
+        // An error ends the ask whatever its place (one sent after a stop carries the seq it was at).
         if let Some(e) = f.head["err"].as_str() {
             return Err(e.to_string());
+        }
+        if ordered {
+            match f.head["seq"].as_u64() {
+                Some(s) if s == want => want += 1,
+                // Again (a resend after a link ended): had already.
+                Some(s) if s < want => continue,
+                Some(s) => {
+                    if ahead.len() >= AHEAD_MAX {
+                        return Err("the answers came out of order".into());
+                    }
+                    ahead.insert(s, f);
+                    continue;
+                }
+                None => return Err("an answer without its place in the order".into()),
+            }
         }
         if f.head["end"] == true {
             if !f.blob.is_empty() {
@@ -771,6 +804,25 @@ mod tests {
         assert_eq!(seen, vec![(json!({"n": 1}), 0), (Value::Null, 3)]);
         tx.send(Frame::new(json!({"op": "a", "end": true, "err": "nope"}))).unwrap();
         assert_eq!(answers(&mut |u| rx.recv_timeout(u.saturating_duration_since(Instant::now())).map_err(|e| e.to_string()), Duration::from_secs(5), false, &mut |_, _| Ok(())).unwrap_err(), "nope");
+    }
+
+    /// One answer's frames over two links to one arcade: a later one first, one again; all taken in their order.
+    #[test]
+    fn mesh_answers_are_put_back_in_order() {
+        let (tx, rx) = mpsc::channel::<Frame>();
+        let a = |seq: u64, end: bool, n: u64| Frame::new(json!({"op": "a", "seq": seq, "end": end, "ev": {"n": n}}));
+        for f in [a(1, false, 1), a(0, false, 0), a(0, false, 0), a(3, true, 3), a(2, false, 2)] {
+            tx.send(f).unwrap();
+        }
+        let mut seen = Vec::new();
+        let last = answers(&mut |u| rx.recv_timeout(u.saturating_duration_since(Instant::now())).map_err(|e| e.to_string()), Duration::from_secs(5), true,
+            &mut |ev, _| { seen.push(ev["n"].as_u64().unwrap()); Ok(()) }).unwrap();
+        assert_eq!(last, json!({"n": 3}));
+        assert_eq!(seen, vec![0, 1, 2]);
+        // An error stops it whatever its place in the order.
+        tx.send(a(0, false, 0)).unwrap();
+        tx.send(Frame::new(json!({"op": "a", "seq": 7, "end": true, "err": "the service stopped on that arcade"}))).unwrap();
+        assert_eq!(answers(&mut |u| rx.recv_timeout(u.saturating_duration_since(Instant::now())).map_err(|e| e.to_string()), Duration::from_secs(5), true, &mut |_, _| Ok(())).unwrap_err(), "the service stopped on that arcade");
     }
 
     #[test]

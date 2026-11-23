@@ -63,6 +63,9 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade map [<n>.<namespace>] [--chain k] a block map claim (or claims per namespace)
   arcade token [tick] [--chain k]          a PRC-20/DRC-20 token
   arcade tokens <address> [--chain k]      token balances of an address
+  arcade cpu                     how much of this computer the arcade takes (level, cap, use now)
+  arcade cpu <low|balanced|unthrottled>  set it: balanced caps the arcade at half the CPU (the default);
+                                 unthrottled is recommended only for machines dedicated to running an arcade
   arcade mine start [threads]    mine Pepecoin testnet on this PC (pays your wallet)
   arcade mine stop | status
 
@@ -518,6 +521,8 @@ fn main() {
         }
         ["ledger"] => json!({"cmd": "ledger"}),
         ["ledger", h] => json!({"cmd": "ledger", "height": h}),
+        ["cpu"] => json!({"cmd": "cpu.status"}),
+        ["cpu", level] => json!({"cmd": "cpu.set", "level": level}),
         ["mine", "start"] => json!({"cmd": "mine.start"}),
         ["mine", "start", n] => json!({"cmd": "mine.start", "threads": n}),
         ["mine", "stop"] => json!({"cmd": "mine.stop"}),

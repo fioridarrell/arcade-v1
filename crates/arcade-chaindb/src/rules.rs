@@ -303,13 +303,12 @@ struct ScriptJob {
     prefix: Option<&'static [u8; 32]>,
 }
 
-/// Threads that check scripts: ARCADE_SCRIPT_THREADS, or every core but one (at least one).
+/// Threads that check scripts: ARCADE_SCRIPT_THREADS, or every core but one (at least one), within the CPU share
+/// (crate::cpushare: half the cores by default).
 pub fn script_threads() -> usize {
-    static N: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *N.get_or_init(|| {
-        std::env::var("ARCADE_SCRIPT_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0)
-            .unwrap_or_else(|| std::thread::available_parallelism().map_or(1, |n| n.get().saturating_sub(1).max(1)))
-    })
+    static N: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    let set = *N.get_or_init(|| std::env::var("ARCADE_SCRIPT_THREADS").ok().and_then(|v| v.trim().parse::<usize>().ok()).filter(|n| *n > 0));
+    set.unwrap_or_else(|| crate::cpushare::threads(crate::cpushare::all_cores().saturating_sub(1).max(1)))
 }
 
 /// One job's inputs, in order: the first that fails, as the block's reason.
@@ -359,6 +358,7 @@ fn run_scripts_on(blk: &Block, spent: &[Vec<Spent>], jobs: &[ScriptJob], threads
     let first_bad = AtomicUsize::new(usize::MAX);
     let reason: std::sync::Mutex<Option<(usize, Broken)>> = std::sync::Mutex::new(None);
     let work = || loop {
+        crate::cpushare::pace();
         let k = next.fetch_add(1, Ordering::Relaxed);
         if k >= jobs.len() || k > first_bad.load(Ordering::Relaxed) {
             return;
@@ -546,6 +546,7 @@ pub fn replay(db: &crate::ChainDb, params: &ChainParams, from: u32, to: u32, thr
     use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
     use std::sync::{Arc, Mutex};
     const CHUNK: u32 = 32;
+    let threads = crate::cpushare::threads(threads);
     let c = params.chain_no;
     let next = AtomicU32::new(from);
     let report = Mutex::new(Report { from, to, done_to: from.saturating_sub(1), ..Default::default() });
@@ -573,6 +574,7 @@ pub fn replay(db: &crate::ChainDb, params: &ChainParams, from: u32, to: u32, thr
                     if stop.load(Relaxed) {
                         break;
                     }
+                    crate::cpushare::pace();
                     let start = next.fetch_add(CHUNK, Relaxed);
                     if start > to {
                         break;

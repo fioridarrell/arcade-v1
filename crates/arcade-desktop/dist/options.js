@@ -175,7 +175,7 @@ $("o-si-on").addEventListener("change", async (e) => {
   refreshSysinfo();
 });
 
-// Content screening (screening.status / .set / .test / .topup): borrow (the default), the operator's own model, or off.
+// Content screening (screening.status / .set / .test / .topup): off (the default), borrowing within a daily cap, or the operator's own model.
 async function refreshScreening() {
   let st;
   try { st = await api("screening.status"); } catch (e) { say("o-scr-msg", e.message, true); return; }

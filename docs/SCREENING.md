@@ -23,7 +23,9 @@ app), `/ord/<chain>/<id>` (the Explorer's previews) and `/app/<chain>/<id>` when
 
 `screening.set {mode}`:
 
-- **borrow** (the default): a screening model another arcade sells on the Models marketplace (service `models`, a chat
+- **off** (the default until the operator chooses): nothing is checked. Screening is optional: nothing is bought
+  until the operator picks borrow (or their own model).
+- **borrow**: within the daily cap (`day_cap`, 1 ARCADE by default), a screening model another arcade sells on the Models marketplace (service `models`, a chat
   model whose id contains `screen`), asked straight from arcaded over the mesh (`svc.ask`, `what: chat`) and paid from
   this wallet's credit at that seller. No Models app or helper is needed on the buying side.
   - The cheapest offer (an arcade's own is free) that passes the built-in test is used.
@@ -35,7 +37,6 @@ app), `/ord/<chain>/<id>` (the Explorer's previews) and `/app/<chain>/<id>` when
 - **own**: the operator's own OpenAI-compatible server with a vision model (`url`, `model`, `key`): llama.cpp with
   `--mmproj`, vLLM, Ollama, LM Studio. Encouraged: the verdicts come from the same model every day, and nothing leaves
   the computer. It runs the same test when set and every 6 hours.
-- **off**: nothing is checked (the window warns first).
 
 Every screener is asked the same question (`screening::PROMPT`, the Python arcade's words) and answers
 `{"verdict": "ok"|"sensitive"|"illegal", "reason"}`. A seller of a screening model should answer with that JSON.
@@ -48,7 +49,7 @@ ever used for testing.
 
 ## In the window
 
-- **Home** shows a Content screening notice until the operator chooses (Borrow screening, Use my own model, Turn off),
+- **Home** shows a Content screening notice until the operator chooses (Borrow screening up to the daily cap, Use my own model, Keep it off),
   and again whenever screening stops working (with a top-up button when the seller needs credit).
 - **Options → Content screening**: the warning, the mode, what is in use and what a check costs, the credit there,
   today's spending and cap, the offers with their test results, the own model's settings, and the unchecked policy.

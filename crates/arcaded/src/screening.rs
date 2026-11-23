@@ -1,14 +1,15 @@
 //! Content screening (docs/SCREENING.md, 2026-11-23): pictures and text that strangers put on the chains this arcade
 //! reads are checked by a model before its pages show them, and what isn't safe is covered.
 //!
-//! - **Borrow** (the default): a screening model another arcade sells through the Models marketplace (`svc` service
+//! - **Off** (the default until the operator chooses, Martin 2026-11-23: screening is optional, never bought on its own):
+//!   nothing is checked; Home asks the operator to choose.
+//! - **Borrow**: a screening model another arcade sells through the Models marketplace (`svc` service
 //!   `models`, a model whose id has "screen" in it), asked straight from here over the mesh and paid from this
 //!   wallet's credit at that seller. The cheapest one that passes a built-in test is used; offers are looked at every
 //!   30 minutes, the one in use is tested again every 6 hours, and when it drops (gone, down, failing three times in a
 //!   row, or a test fails) the next cheapest that passes takes over.
 //! - **Own**: the operator's own model, any OpenAI-compatible server with vision (llama.cpp, vLLM, Ollama ...).
 //!   Encouraged: the verdicts then come from the same model every day.
-//! - **Off**: nothing is checked (the operator was warned).
 //!
 //! Verdicts are kept per content (its sha256) with the prompt they answered: `ok` is shown, `sensitive` gets a
 //! click-to-show cover (`?show=1`), `illegal` is never served (451). Content not checked yet is covered while a check
@@ -102,7 +103,7 @@ impl Mode {
 #[derive(Clone, Debug)]
 struct Cfg {
     mode: Mode,
-    /// The operator chose (Home's notice goes away); until then the default (borrow) runs.
+    /// The operator chose (Home's notice goes away); until then the default (off) holds.
     chosen: bool,
     url: String,
     model: String,
@@ -117,7 +118,7 @@ struct Cfg {
 
 impl Default for Cfg {
     fn default() -> Self {
-        Cfg { mode: Mode::Borrow, chosen: false, url: String::new(), model: String::new(), key: String::new(), pin: String::new(), show_here: true, day_cap: DAY_CAP }
+        Cfg { mode: Mode::Off, chosen: false, url: String::new(), model: String::new(), key: String::new(), pin: String::new(), show_here: true, day_cap: DAY_CAP }
     }
 }
 
@@ -1007,6 +1008,6 @@ mod tests {
         let d = Cfg::from_json(&c.to_json());
         assert_eq!((d.mode, d.chosen, d.url, d.show_here, d.day_cap), (Mode::Own, true, c.url, false, 5));
         let fresh = Cfg::from_json(&Value::Null);
-        assert_eq!((fresh.mode, fresh.chosen, fresh.show_here), (Mode::Borrow, false, true));
+        assert_eq!((fresh.mode, fresh.chosen, fresh.show_here), (Mode::Off, false, true));
     }
 }

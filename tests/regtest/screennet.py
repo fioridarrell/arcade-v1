@@ -5,7 +5,7 @@ S sells four models with the Models helper (arcade-models) from a fake model ser
 it calls everything "ok"), a-screen and b-screen (right answers; b dearer) and a chat model (not a screener). B runs
 no helper at all: arcaded asks S's models service itself.
 
-- A new arcade borrows by default (not chosen yet), sees the three screeners cheapest first and not the chat model.
+- A new arcade starts with screening off (not chosen yet), borrows when asked, sees the three screeners cheapest first and not the chat model.
 - No credit at S: screening says so and names S for a top-up; screening.topup pays S with the marketplace's memo.
 - With credit: cheap-screen fails the built-in test (wrong answers), a-screen passes and is used; credit and costs show.
 - a-screen drops (its server stops listing it): the next look switches to b-screen.
@@ -194,10 +194,11 @@ def main():
     res = {}
     res["helper attached at S"] = wait("helper attached", lambda: any(x["service"] == "models" for x in call("S", "svc.services")), 60)
 
-    print("1. a new arcade borrows by default, not chosen yet")
+    print("1. a new arcade starts with screening off, not chosen yet; then it borrows")
     st = scr()
     print("   ", {k: st[k] for k in ("mode", "chosen", "working", "why", "unchecked", "day_cap")})
-    res["default: borrow, not chosen, show_here, 1 ARCADE a day"] = st["mode"] == "borrow" and st["chosen"] is False and st["unchecked"] == "show_here" and st["day_cap"] == 100_000_000
+    res["default: off, not chosen, show_here, 1 ARCADE a day"] = st["mode"] == "off" and st["chosen"] is False and st["unchecked"] == "show_here" and st["day_cap"] == 100_000_000
+    call("B", "screening.set", mode="borrow")
 
     print("2. S sells three screeners and a chat model; B sees the screeners cheapest first")
     url = f"http://127.0.0.1:{FAKE}/v1"

@@ -35,7 +35,8 @@ async function refreshHome() {
 }
 
 // Home: content screening (screening.status), shown until the operator chose how pictures and text are checked, and
-// again whenever the screening stops working. Borrowing is one click; their own model is encouraged.
+// again whenever the screening stops working. Off until chosen: borrowing (within a daily cap) is one click; their own model
+// is encouraged.
 const ARC = (u) => { const a = u / 1e8; return a >= 0.01 ? a.toFixed(2) : a >= 0.0001 ? a.toFixed(4) : a > 0 ? a.toPrecision(2) : "0"; };
 const SCR = { busy: false, sig: null };
 async function drawScreening() {
@@ -50,13 +51,13 @@ async function drawScreening() {
   if (sig === SCR.sig) return;
   SCR.sig = sig;
   $("h-screen-text").textContent = !st.chosen
-    ? "Choose how this arcade checks pictures and text before showing them."
+    ? "Screening is off: choose whether this arcade checks pictures and text before showing them."
     : `Screening isn't working: ${st.why}.`;
   $("h-screen-warn").textContent = "This arcade shows what anyone puts on the chains it reads: pictures and text can be sexual, violent or illegal, including child sexual abuse material. Screening checks each one with a model first: sensitive content is covered, illegal content is never served.";
   $("h-screen-how").textContent = cur
     ? `Borrowing ${cur.model} from ${cur.who}: about ${ARC(cur.per_text)} ARCADE a text, ${ARC(cur.per_picture)} a picture. The cheapest screening model that passes the test is used; it is tested again every 6 hours and replaced if it drops. Running your own model is best: the same verdicts every day.`
     : st.mode === "borrow" ? `Borrowing: ${st.why || "looking for a screening model on the mesh"}. Running your own model is best: the same verdicts every day.`
-    : "Running your own screening model is best: the same verdicts every day. Borrowing is the easy start.";
+    : `Running your own screening model is best: the same verdicts every day. Borrowing is the easy start: it pays a screening model on the mesh from this wallet, at most ${ARC(st.day_cap)} ARCADE a day (change it in Options).`;
   const set = async (body, said) => {
     SCR.busy = true; drawScreening();
     try { await api("screening.set", body); say("h-screen-msg", said); }
@@ -65,7 +66,7 @@ async function drawScreening() {
   };
   const btns = [];
   if (!st.chosen || st.mode !== "borrow") {
-    btns.push(h("button", { class: "primary", disabled: SCR.busy, onclick: () => set({ mode: "borrow" }, "Borrowing the cheapest screening model that passes the test.") }, "Borrow screening (easy start)"));
+    btns.push(h("button", { class: "primary", disabled: SCR.busy, onclick: () => set({ mode: "borrow" }, "Borrowing the cheapest screening model that passes the test.") }, `Borrow screening (up to ${ARC(st.day_cap)} ARCADE a day)`));
   }
   if (needsCredit && top) {
     btns.push(h("button", { class: st.chosen ? "primary" : "", disabled: SCR.busy, onclick: async () => {
@@ -78,9 +79,9 @@ async function drawScreening() {
   btns.push(h("button", { onclick: () => { goTab("options"); setTimeout(() => $("o-screen").scrollIntoView({ block: "start" }), 50); } }, st.chosen ? "Screening settings…" : "Use my own model…"));
   if (!st.chosen) {
     btns.push(h("button", { disabled: SCR.busy, onclick: () => {
-      if (!confirm("Turn screening off? Pictures and text from the chains are then shown unchecked, here and to anyone who can reach this arcade's pages, including content that may be illegal.")) return;
+      if (!confirm("Keep screening off? Pictures and text from the chains are then shown unchecked, here and to anyone who can reach this arcade's pages, including content that may be illegal.")) return;
       set({ mode: "off" }, "Screening is off. You can turn it on again in Options.");
-    } }, "Turn off"));
+    } }, "Keep it off"));
   }
   $("h-screen-btns").replaceChildren(...btns);
 }

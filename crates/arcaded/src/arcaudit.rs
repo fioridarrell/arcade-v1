@@ -48,20 +48,20 @@ pub(crate) fn audit_leaves(net: &Net, r: &crate::arcseal::Replica, seed: &Hash) 
     Ok(out)
 }
 
+/// The audit answers waiting here that the chain can no longer take: each checked against the picks of its own
+/// replica's owner. Checked against this arcade's own picks only (2026-11-12 to 2026-11-23), every other arcade's
+/// commit and opening was dropped by the first arcade that carried it (writers too, unless a block took it first):
+/// an arcade without a writer among its links missed every audit ("an audit was missed" on a first install).
+fn stale_answers(reg: &Registry, waiting: &[Item], tip: u64) -> Vec<Item> {
+    waiting.iter().filter(|i| reg.audit_answer_open(i, tip) == Some(false)).cloned().collect()
+}
+
 /// Answer what the chain asks of this arcade's audits now (the chain's tip is `tip`).
 pub fn round(node: &Node, net: &Net, reg: &Registry, tip: u64) {
     let me = node.identity.verifying_key().to_bytes();
     let picks = reg.audits_of(&me);
     // Answers the chain can no longer take go, and leaves no pick needs any more.
-    let stale: Vec<Item> = crate::arcseg::waiting()
-        .into_iter()
-        .filter(|i| match i {
-            Item::AuditCommit(c) => !picks.iter().any(|p| p.replica == c.replica && p.at == c.pick && p.commit.is_none() && tip < p.at + params::ANSWER_WINDOW),
-            Item::AuditOpening(o) => !picks.iter().any(|p| p.replica == o.replica && !p.passed && p.commit.is_some_and(|(_, hc)| tip < hc + params::CHALLENGE_DELAY + params::ANSWER_WINDOW)),
-            _ => false,
-        })
-        .collect();
-    crate::arcseg::forget(&stale);
+    crate::arcseg::forget(&stale_answers(reg, &crate::arcseg::waiting(), tip));
     LEAVES.lock().unwrap().retain(|k, _| picks.iter().any(|p| (p.replica, p.at) == *k && !p.passed));
     let waiting = crate::arcseg::waiting();
     let mine = crate::arcseal::replicas(node, net);

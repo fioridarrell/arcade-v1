@@ -55,6 +55,7 @@ The card is an ordinary app card with `"category": "themes"`, e.g.
 | `brand` | Text in the menu bar and at the head of the start menu. |
 | `desktop` | `bar` (taskbar: bottom, top, none), `dock` (none, left, bottom), `topbar` (none; `clock`: a bar with the start button and a clock; `menus`: a menu bar), `start` (its label), `icons` (on the desktop), `clock`, `buttons` (a window's buttons at the left or right). |
 | `icons` | Pictures for the app's tabs (`home wallet messages feed people apps explorer chains mine activity apitab options`) and `start`; a tab the app adds later shows in every theme by itself, with a line icon until the theme gives it a picture, as base64 `data:image/png`, `gif`, `webp` or `svg+xml` (under 12,000 characters each). Without them, plain line icons. |
+| `window` | For `"layout": "window"`: `toolbar` (the toolbar of the screens) and `balances` (a Balances column down the right: every installed or borrowed chain's balance for the account in use, as Legacy's ArcadeCore window shows them; a row opens that chain's wallet). Both on unless set to `false`. |
 | `chrome` | CSS for the frame only (below). |
 
 The page must be under 64 KB: the window reads it as the Explorer does (`explorer.ledger_inscription`).
@@ -71,7 +72,7 @@ worn**, and a theme that fails isn't worn at all (the reason is shown):
   frame's own class names: `frame layout-window layout-desktop menubar mbitem menu mitem msep check
   toolbar tbitem ticon statusbar sync links brand wbody desk icons icon icon-img icon-label win active
   max titlebar title ticn tbtns tbtn tmin tmax tclose bar bar-top bar-bottom start tasks task on tray
-  clock dock dock-left dock-bottom ditem open startmenu smhead smitem topbar chain conn selected`, plus
+  clock dock dock-left dock-bottom ditem open startmenu smhead smitem topbar chain conn selected wmain wside`, plus
   `:hover :active :focus-visible :first-child :last-child :not(.x)`. There are no element, id, attribute,
   `:host` or `::slotted` selectors, and no pseudo-elements.
 - **Properties**: colours, backgrounds, borders, corners, shadows, fonts, spacing, `gap`, `outline`,

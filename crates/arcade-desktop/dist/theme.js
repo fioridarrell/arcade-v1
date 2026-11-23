@@ -50,7 +50,7 @@ const THEME = (() => {
     "check", "toolbar", "tbitem", "ticon", "statusbar", "sync", "links", "brand", "wbody", "desk", "icons", "icon",
     "icon-img", "icon-label", "win", "active", "max", "titlebar", "title", "ticn", "tbtns", "tbtn", "tmin", "tmax",
     "tclose", "bar", "bar-top", "bar-bottom", "start", "tasks", "task", "on", "tray", "clock", "dock", "dock-left",
-    "dock-bottom", "ditem", "open", "startmenu", "smhead", "smitem", "topbar", "chain", "conn", "selected"]);
+    "dock-bottom", "ditem", "open", "startmenu", "smhead", "smitem", "topbar", "chain", "conn", "selected", "wmain", "wside"]);
   const SMALL = new Set(["titlebar", "tbtn", "tmin", "tmax", "tclose", "bar", "start", "task", "tray", "clock",
     "menubar", "mbitem", "mitem", "toolbar", "tbitem", "ticon", "statusbar", "dock", "ditem", "icon", "icon-img",
     "ticn", "topbar", "smhead", "smitem", "brand", "msep"]);
@@ -227,7 +227,7 @@ const THEME = (() => {
     const icons = {};
     for (const k of [...TABS.map((x) => x[0]), "start"]) { const p = pic(t.icons?.[k]); if (p) icons[k] = p; }
     const brand = word(t.brand || "", 24);
-    return { layout, light, dark, single: !t.colors?.dark, font, size, radius, desktop, icons, brand, window: { toolbar: t.window?.toolbar !== false },
+    return { layout, light, dark, single: !t.colors?.dark, font, size, radius, desktop, icons, brand, window: { toolbar: t.window?.toolbar !== false, balances: t.window?.balances !== false },
       chrome: chromeCss(t.chrome || ""), name: word(t.name || "", 40) };
   }
 
@@ -253,7 +253,23 @@ body[data-themed=desktop] section.tab{display:block}
 body[data-themed] .chainsel .menu{z-index:50}
 body[data-themed] .chainsel .menu{left:auto;right:0;max-height:70vh;overflow:auto}
 body[data-themed][data-chain=bottom] .chainsel .menu{top:auto;bottom:calc(100% + 6px)}
-body[data-themed] #conn{white-space:nowrap}`;
+body[data-themed] #conn{white-space:nowrap}
+#bal-side{display:block;min-height:100%;padding:10px 10px 16px;color:var(--ink);background:var(--panel)}
+#bal-side .bal-head{font-weight:700;margin:0 0 6px}
+#bal-side table{width:100%;border-collapse:collapse;border:0;border-radius:0;background:none;font-size:.95em}
+#bal-side th{text-align:left;font-weight:600;font-size:.9em;color:var(--muted);padding:3px 4px;border-bottom:1px solid var(--line)}
+#bal-side td{padding:5px 4px;border-bottom:1px solid var(--line);vertical-align:middle;overflow-wrap:normal}
+#bal-side tr.bal-row{cursor:pointer}
+#bal-side tr.bal-row:hover td{background:var(--accent-soft)}
+#bal-side tr.on td{font-weight:600}
+#bal-side .num{text-align:right;white-space:nowrap;font-variant-numeric:tabular-nums}
+#bal-side .tk{font-size:.85em;color:var(--muted)}
+#bal-side .old{color:var(--muted)}
+#bal-side .arr{display:block;font-size:.85em;color:var(--muted)}
+#bal-side .nm{display:flex;align-items:center;gap:6px}
+#bal-side .nm .coin{width:18px;height:18px;font-size:10px;flex:none}
+#bal-side .bal-note{color:var(--muted);font-size:.85em;margin:8px 0 0}
+#bal-side .bal-note:empty{display:none}`;
   }
 
   // --- the frame -------------------------------------------------------------------------------------------------
@@ -277,6 +293,10 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
 .ticon img,.ticn img,.icon-img img,.ditem img{width:100%;height:100%;object-fit:contain}
 .wbody{flex:1;overflow:auto;position:relative;min-height:0}
 .layout-window>.wbody{display:block}
+.wmain{flex:1;display:flex;min-height:0}
+.wmain>.wbody{display:block;min-width:0}
+.wside{flex:none;width:300px;overflow:auto;border-left:1px solid var(--line,#c4c4c4)}
+.narrow .wside{display:none}
 .statusbar{display:flex;justify-content:space-between;align-items:center;gap:12px;flex:none}
 .middle{flex:1;display:flex;min-height:0;position:relative}
 .desk{flex:1;position:relative;overflow:hidden}
@@ -400,12 +420,80 @@ button{font:inherit;color:inherit;background:none;border:0;padding:0;cursor:defa
     tb.append(...items);
     const body = el("div", "wbody"); const all = document.createElement("slot"); all.name = "screens"; body.append(all);
     const status = el("div", "statusbar"); status.append(...statusParts());
-    frame.append(bar); if (th.window.toolbar) frame.append(tb); frame.append(body, status);
+    // Every wallet's balance down the right, as Legacy's ArcadeCore window shows them (2026-11-23).
+    const main = el("div", "wmain"); main.append(body);
+    if (th.window.balances) { const side = el("div", "wside"); const s = document.createElement("slot"); s.name = "balances"; side.append(s); main.append(side); balancesSide(); }
+    frame.append(bar); if (th.window.toolbar) frame.append(tb); frame.append(main, status);
     new ResizeObserver(() => frame.classList.toggle("narrow", frame.clientWidth < 640)).observe(frame);
     const mark = () => { const on = document.querySelector("section.tab.on")?.id; items.forEach((b) => b.classList.toggle("selected", b.dataset.tab === on)); };
     new MutationObserver(mark).observe(document.body, { subtree: true, attributes: true, attributeFilter: ["class"] });
     mark();
     for (const s of document.querySelectorAll("section.tab")) s.slot = "screens";
+  }
+
+  /* The Balances column: one row per chain installed or borrowed, this account's own addresses added up (wallet.keys:
+   * the balance follows the mempool, "arriving" is the part not in a block yet). Kept in this browser per account so
+   * a reload shows the last list at once (greyed until read again); read one chain at a time, so no two borrowed
+   * chains are asked together, again every few minutes while the window is in view. A row opens that chain's wallet. */
+  const BAL = "arcade.balances:", FRESH = 2 * 60 * 1000, EVERY = 5 * 60 * 1000;
+  function balancesSide() {
+    const box = el("aside"); box.id = "bal-side"; box.slot = "balances";
+    const tb = el("tbody"); const note = el("p", "bal-note");
+    const table = el("table"); const hr = el("tr"); hr.append(el("th", "", "Wallet"), el("th", "num", "Balance"));
+    const thead = el("thead"); thead.append(hr); table.append(thead, tb);
+    box.append(el("div", "bal-head", "Balances"), table, note);
+    shell.append(box);
+    let who = null, kept = {}, list = [], busy = false;
+    const pickedKey = () => (window.arcadeChain && window.arcadeChain())?.key;
+    function paint() {
+      const on = pickedKey();
+      tb.replaceChildren(...list.map((c) => {
+        const k = kept[c.key], tr = el("tr", "bal-row" + (c.key === on ? " on" : ""));
+        const name = el("td"); const nm = el("span", "nm"); nm.append(coinLogo(c.key, c.name, "span", "coin"), el("span", "", c.name)); name.append(nm);
+        const amt = el("td", "num");
+        if (!k) amt.textContent = "…";
+        else if (k.bal == null) { amt.textContent = "—"; if (k.err) tr.title = k.err; }
+        else {
+          amt.append(el("span", k.old ? "old" : "", coinNum(k.bal)), " ", el("span", "tk", TICKERS[c.key] || ""));
+          if (k.pend > 0) amt.append(el("span", "arr", coinNum(k.pend) + " arriving"));
+          if (k.old) tr.title = "as read " + new Date(k.at).toLocaleTimeString() + "; reading again…";
+        }
+        tr.append(name, amt);
+        tr.onclick = () => { window.arcadeExplorer?.pickKey?.(c.key); go("wallet"); paint(); };
+        return tr;
+      }));
+      note.textContent = list.length ? "" : "No wallet is ready yet: add a chain in Chains & Coins.";
+    }
+    async function run(force) {
+      if (busy) return; busy = true;
+      try {
+        let accs = [], chains;
+        try { [accs, chains] = await Promise.all([api("account.list").catch(() => []), api("chains.list")]); } catch { return; }
+        const id = (accs.find((a) => a.active) || {}).id || "node";
+        if (id !== who) { who = id; kept = read(BAL + id) || {}; for (const k of Object.values(kept)) k.old = true; }
+        list = chains.filter((c) => c.installed || c.borrowed);
+        paint();
+        for (const c of list) {
+          const k = kept[c.key];
+          if (!force && k && !k.old && Date.now() - k.at < FRESH) continue;
+          let row;
+          try {
+            const keys = await api("wallet.keys", { chain: c.key });
+            const known = keys.filter((x) => x.balance != null);
+            row = { bal: known.length ? known.reduce((n, x) => n + x.balance, 0) : null, pend: keys.reduce((n, x) => n + (x.pending || 0), 0), at: Date.now() };
+          } catch (e) { row = { bal: null, err: e.message, at: Date.now() }; }
+          if (who !== id) return;                                // the account changed meanwhile: its own run follows
+          kept[c.key] = row;
+          const save = {}; for (const [kk, v] of Object.entries(kept)) if (v.bal != null) save[kk] = { bal: v.bal, pend: v.pend, at: v.at };
+          write(BAL + id, save);
+          paint();
+        }
+      } finally { busy = false; }
+    }
+    run(false);
+    setInterval(() => { if (!document.hidden) run(true); }, EVERY);
+    document.addEventListener("visibilitychange", () => { if (!document.hidden) run(false); });
+    window.addEventListener("arcade:chain", paint);
   }
 
   function buildDesktop(th, frame, id) {

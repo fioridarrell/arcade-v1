@@ -581,14 +581,19 @@ function drawPane(ch) {
         h("span", { class: "amt" }, t.balance)));
     // Chain tokens (PRC-20, DRC-20...): from the tokens index here, else from an arcade keeping it.
     const none = !v.tokens && !v.ledger_tokens;
-    const note = v.tokens ? "" : `${ch.name}'s chain tokens aren't shown: no arcade keeping its tokens index answered (add the index in Chains & Coins to keep it here).`;
-    pane.replaceChildren(list.length ? h("div", { class: "wl-rows" }, list) : h("div", { class: "x-empty" }, none ? note : "No tokens in this wallet."),
+    const lag = ordLag(v);
+    const note = !v.tokens ? `${ch.name}'s chain tokens aren't shown: no arcade keeping its tokens index answered (add the index in Chains & Coins to keep it here).`
+      : lag ? `${ch.name}'s token index is still catching up (block ${num(lag.to)} of ${num(lag.tip)}), so tokens you hold may not show yet.` : "";
+    pane.replaceChildren(list.length ? h("div", { class: "wl-rows" }, list) : h("div", { class: "x-empty" }, none || lag ? note : "No tokens in this wallet."),
       note && !none ? h("p", { class: "note" }, note) : "");
   } else {
     const ins = v.inscriptions;
     if (!ins) { pane.replaceChildren(h("div", { class: "x-empty" }, `No NFTs shown: ${ch.name} needs its ord index here (Chains & Coins).`)); return; }
-    if (!ins.length) { pane.replaceChildren(h("div", { class: "x-empty" }, "No NFTs in this wallet.")); return; }
+    const lag = ordLag(v);
+    const lagNote = lag ? `${ch.name}'s NFT index is still catching up (block ${num(lag.to)} of ${num(lag.tip)}), so NFTs you hold may not show yet.` : "";
+    if (!ins.length) { pane.replaceChildren(h("div", { class: "x-empty" }, lagNote || "No NFTs in this wallet.")); return; }
     pane.replaceChildren(
+      lagNote ? h("p", { class: "note" }, lagNote) : "",
       v.inscription_count > ins.length ? h("p", { class: "note" }, `Showing ${ins.length} of ${num(v.inscription_count)}.`) : "",
       h("div", { class: "x-grid" }, ins.map((i) => {
         const c = i.content || {}, t = h("div", { class: "x-thumb" });
@@ -602,6 +607,14 @@ function drawPane(ch) {
         return h("div", { class: "x-ins", onclick: () => openExplorer("inscription", i.id) }, t, h("div", { class: "cap" }, h("b", {}, `#${num(i.n)}`), " ", send));
       })));
   }
+}
+
+// How far behind the ord index that answered (inscriptions and chain tokens) is, when more than a few blocks: an empty
+// list from an index still catching up isn't "none in this wallet". Null when caught up or not told (older arcades).
+function ordLag(v) {
+  if (!v || v.ord_tip == null) return null;
+  const to = v.ord_indexed_to || 0, tip = v.ord_tip;
+  return tip - to > 6 ? { to, tip } : null;
 }
 
 function copyText(text, btn) {

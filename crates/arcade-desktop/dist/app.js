@@ -418,6 +418,11 @@ async function refreshWallet() {
         view.inscriptions = (view.inscriptions || []).concat(o.inscriptions.filter((i) => !seen.has(i.id)).map((i) => ({ ...i, other: true })));
         view.inscription_count = (view.inscription_count || 0) + (o.inscription_count || 0);
       }
+      if (o.ledger_inscriptions) {
+        const seen = new Set((view.ledger_inscriptions || []).map((i) => i.txid));
+        view.ledger_inscriptions = (view.ledger_inscriptions || []).concat(o.ledger_inscriptions.filter((i) => !seen.has(i.txid)));
+        view.ledger_inscription_count = (view.ledger_inscription_count || 0) + (o.ledger_inscription_count || 0);
+      }
     }
     if (view && view.history && others.length) view.history.sort((a, b) => (b.height || 1e12) - (a.height || 1e12));
     W.view = view;
@@ -587,25 +592,37 @@ function drawPane(ch) {
     pane.replaceChildren(list.length ? h("div", { class: "wl-rows" }, list) : h("div", { class: "x-empty" }, none || lag ? note : "No tokens in this wallet."),
       note && !none ? h("p", { class: "note" }, note) : "");
   } else {
-    const ins = v.inscriptions;
-    if (!ins) { pane.replaceChildren(h("div", { class: "x-empty" }, `No NFTs shown: ${ch.name} needs its ord index here (Chains & Coins).`)); return; }
-    const lag = ordLag(v);
+    const ins = v.inscriptions, lins = v.ledger_inscriptions || [];
+    if (!ins && !lins.length) { pane.replaceChildren(h("div", { class: "x-empty" }, `No NFTs shown: ${ch.name} needs its ord index here (Chains & Coins).`)); return; }
+    const lag = ins ? ordLag(v) : null;
     const lagNote = lag ? `${ch.name}'s NFT index is still catching up (block ${num(lag.to)} of ${num(lag.tip)}), so NFTs you hold may not show yet.` : "";
-    if (!ins.length) { pane.replaceChildren(h("div", { class: "x-empty" }, lagNote || "No NFTs in this wallet.")); return; }
+    if (!(ins || []).length && !lins.length) { pane.replaceChildren(h("div", { class: "x-empty" }, lagNote || "No NFTs in this wallet.")); return; }
+    const thumb = (c, n) => {
+      const t = h("div", { class: "x-thumb" });
+      if (c.kind === "image") t.append(h("img", { src: c.data, alt: `inscription ${n}`, loading: "lazy" }));
+      else if (c.kind === "text") t.append(h("pre", {}, c.text.slice(0, 400)));
+      else t.append(h("div", { class: "x-ph" }, c.kind === "html" ? "HTML" : c.kind === "missing" ? "content not stored" : (c.type || "binary")));
+      return t;
+    };
+    const both = (ins || []).length && lins.length;
     pane.replaceChildren(
       lagNote ? h("p", { class: "note" }, lagNote) : "",
-      v.inscription_count > ins.length ? h("p", { class: "note" }, `Showing ${ins.length} of ${num(v.inscription_count)}.`) : "",
-      h("div", { class: "x-grid" }, ins.map((i) => {
-        const c = i.content || {}, t = h("div", { class: "x-thumb" });
-        if (c.kind === "image") t.append(h("img", { src: c.data, alt: `inscription ${i.n}`, loading: "lazy" }));
-        else if (c.kind === "text") t.append(h("pre", {}, c.text.slice(0, 400)));
-        else t.append(h("div", { class: "x-ph" }, c.kind === "html" ? "HTML" : c.kind === "missing" ? "content not stored" : (c.type || "binary")));
-        // Send (2026-11-12, ord.send): from this wallet's own address 0, the coin whole to the recipient.
-        // (Legacy coins only: ord.send signs with the Legacy key.)
-        const sendable = w && w.own && w.index === 0 && !i.other && (!w.akind || w.akind.id === "legacy");
-        const send = sendable ? h("button", { class: "small", onclick: (e) => { e.stopPropagation(); pickOrd(i); } }, "Send") : "";
-        return h("div", { class: "x-ins", onclick: () => openExplorer("inscription", i.id) }, t, h("div", { class: "cap" }, h("b", {}, `#${num(i.n)}`), " ", send));
-      })));
+      ins && ins.length ? h("div", {},
+        both ? h("h3", {}, "Inscriptions") : "",
+        v.inscription_count > ins.length ? h("p", { class: "note" }, `Showing ${ins.length} of ${num(v.inscription_count)}.`) : "",
+        h("div", { class: "x-grid" }, ins.map((i) => {
+          // Send (2026-11-12, ord.send): from this wallet's own address 0, the coin whole to the recipient.
+          // (Legacy coins only: ord.send signs with the Legacy key.)
+          const sendable = w && w.own && w.index === 0 && !i.other && (!w.akind || w.akind.id === "legacy");
+          const send = sendable ? h("button", { class: "small", onclick: (e) => { e.stopPropagation(); pickOrd(i); } }, "Send") : "";
+          return h("div", { class: "x-ins", onclick: () => openExplorer("inscription", i.id) }, thumb(i.content || {}, i.n), h("div", { class: "cap" }, h("b", {}, `#${num(i.n)}`), " ", send));
+        }))) : "",
+      // Arcade inscriptions (the arcade ledger's own, e.g. game items): kept here, or from an arcade keeping the ledger.
+      lins.length ? h("div", {},
+        both ? h("h3", {}, "Arcade inscriptions") : "",
+        v.ledger_inscription_count > lins.length ? h("p", { class: "note" }, `Showing ${lins.length} of ${num(v.ledger_inscription_count)} arcade inscriptions.`) : "",
+        h("div", { class: "x-grid" }, lins.map((i) => h("div", { class: "x-ins", onclick: () => openExplorer("linsc", i.txid) },
+          thumb(i.content || { type: i.content_type }, i.number), h("div", { class: "cap" }, h("b", {}, `#${num(i.number)}`), " ", h("span", { class: "faint" }, "arcade")))))) : "");
   }
 }
 

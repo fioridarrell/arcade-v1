@@ -1852,7 +1852,15 @@ fn addr(x: &Ctx, a: &str, req: &Value) -> R {
         v["ledger_inscription_count"] = json!(owned.len());
         let mut newest = owned;
         newest.sort_by(|p, q| q["number"].as_u64().cmp(&p["number"].as_u64()));
-        v["ledger_inscriptions"] = json!(newest.iter().take(60).map(|i| json!({"txid": i["txid"], "number": i["number"], "content_type": i["content_type"]})).collect::<Vec<_>>());
+        // With previews (as for ord inscriptions): each one's content, so a wallet can show its arcade inscriptions too.
+        let previews = want("content") && want("inscriptions");
+        v["ledger_inscriptions"] = json!(newest.iter().take(60).map(|i| {
+            let mut r = json!({"txid": i["txid"], "number": i["number"], "content_type": i["content_type"]});
+            if previews {
+                r["content"] = ledger_content(x, i["txid"].as_str().unwrap_or(""), 64 << 10);
+            }
+            r
+        }).collect::<Vec<_>>());
     }
     Ok(v)
 }

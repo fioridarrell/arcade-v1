@@ -18,7 +18,7 @@ pub mod sync;
 pub mod txruns;
 pub mod undo;
 
-pub use db::{ChainDb, Coin, HeaderRec, Tip};
+pub use db::{ChainDb, Coin, HeaderRec, RichList, RichRow, Tip};
 pub use proven::MoneyDepth;
 pub use indexer::{BlockCtx, Indexer, Prevout};
 

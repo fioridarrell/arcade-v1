@@ -4,12 +4,12 @@
   // A chain's coin: the original arcade's icon, or a letter on the chain's colour.
   const coinEl = (c) => coinLogo(c.key, c.name, "span", "coin");
   const SECTIONS = [
-    ["home", "Overview"], ["blocks", "Blocks"], ["mempool", "Mempool"], ["inscriptions", "Inscriptions", "ord"],
+    ["home", "Overview"], ["blocks", "Blocks"], ["mempool", "Mempool"], ["rich", "Rich list", "addresses"], ["inscriptions", "Inscriptions", "ord"],
     ["collections", "Collections", "collections"], ["tokens", "Tokens", "tokens"], ["names", "Names", "names"], ["maps", "Maps", "maps"], ["dogefeed", "DogeFeed", "dogefeed"], ["ledger", "Arcade ledger", "ledger"],
     // Runes and dunes join here (with their index keys) when those indexes exist.
   ];
   // Pages and the index each needs; a page comes online only when its index is on the chain.
-  const NEEDS = { collections: "collections", collection: "collections", inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", dogefeed: "dogefeed", dfpost: "dogefeed", dfaddr: "dogefeed", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
+  const NEEDS = { rich: "addresses", collections: "collections", collection: "collections", inscriptions: "ord", inscription: "ord", tokens: "tokens", token: "tokens", names: "names", name: "names", maps: "maps", map: "maps", dogefeed: "dogefeed", dfpost: "dogefeed", dfaddr: "dogefeed", ledger: "ledger", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger" };
   const DETAIL_PARENT = { collection: "collections", block: "blocks", tx: "blocks", address: "home", inscription: "inscriptions", token: "tokens", name: "names", map: "maps", dfpost: "dogefeed", dfaddr: "dogefeed", ltokens: "ledger", linscs: "ledger", ltoken: "ledger", linsc: "ledger", tag: "home", results: "home" };
 
   let chains = [], chain = null, sum = null, page = "home", arg = null, seq = 0;
@@ -301,6 +301,36 @@
     return h("div", {}, sect(`Mempool · ${fmt(m.count ?? m.txs.length)}`, null, body),
       m.pending_tags.length ? h("p", { class: "x-note" }, `Tag claims waiting for a block: ${m.pending_tags.map((t) => "@" + (t.tag || t)).join(", ")}`) : "",
       h("p", { class: "x-note" }, m.lender_pool !== undefined ? "The whole mempool, read from a lender's node (newest 500 shown)." : "This arcade's mempool, shared with the other V1.0 arcades on the mesh: a transaction any of them hears shows here within seconds. Spending with zero confirmations is fine on chains without RBF."));
+  }
+  // The coin's rich list (explorer.richlist): its biggest holders by unspent coins, made in the background from the
+  // Addresses index (by another arcade on the mesh when this one doesn't keep it); 50 a page, the 500 biggest.
+  async function vRich() {
+    const size = 50, page = pageOf();
+    const r = await xapi("explorer.richlist", { chain: chain.key, offset: (page - 1) * size, limit: size });
+    const unit = r.unit || sum?.unit || "";
+    const amt = (v) => coinNum(v, "en-US") + " " + unit;
+    if (!r.rows.length) {
+      return sect("Rich list", null, h("div", { class: "x-empty" }, r.building ? "Adding up every address's coins for the first rich list: it shows here in a few minutes." : "No address holds any yet."));
+    }
+    const pct = (x) => { const v = x * 100; return v >= 0.01 ? `${v.toFixed(2)}%` : "<0.01%"; };
+    const rows = r.rows.map((x) => ({
+      go: x.address ? () => go("address", x.address) : null,
+      cells: [[fmt(x.rank), 1], [x.address ? addrLink(x.address, x.tag) : h("span", { class: "faint" }, "a script no address names")], [amt(x.balance), 1],
+        [h("span", {}, h("span", { class: "x-meter", title: pct(x.share), style: "display:inline-block;width:4em;vertical-align:middle;margin-right:6px" }, h("i", { style: `width:${Math.max(1, Math.min(100, x.share * 100))}%` })), pct(x.share)), 1], [fmt(x.coins), 1]],
+    }));
+    const listed = r.listed || r.rows.length;
+    const facts = [
+      r.holders != null && `${fmt(r.holders)} addresses hold ${chain.name}`,
+      r.total != null && `${amt(r.total)} in unspent coins`,
+      r.height != null && `as of block ${fmt(r.height)}${r.at ? ` (${ago(r.at)})` : ""}`,
+      r.building && "a newer list is being made",
+    ].filter(Boolean).join(" · ");
+    return h("div", {}, sect(`Rich list · top ${fmt(listed)}`, null, h("div", {},
+      pager(listed, size, page, "rich"),
+      table([["#", 1], ["Address"], ["Balance", 1], ["Share", 1], ["Coins", 1]], rows),
+      pager(listed, size, page, "rich"))),
+      h("p", { class: "x-note" }, facts),
+      h("p", { class: "x-note" }, "Balances add up each address's unspent coins on this chain, the same way its address page counts them. An exchange or a pool often shows as one big address."));
   }
   // Filter by content type (MIME type): groups, newest first; "Show older" goes on.
   const INS_TYPES = [["", "All"], ["image", "Images"], ["svg", "SVG"], ["text", "Text"], ["html", "HTML"], ["json", "JSON"], ["audio", "Audio"], ["video", "Video"], ["model", "3D"], ["other", "Other"]];
@@ -770,7 +800,7 @@
       (c.linked_keys || []).length ? sect("Linked keys", null, kv(c.linked_keys.map((k) => [k.label || "key", h("span", { class: "mono" }, k.key, " · ", (k.ops || []).join(", "))]))) : "",
       sect("Activity", null, h("div", {}, h("div", { class: "df-chips" }, h("button", { class: "df-chip on" }, "What it did"), inBtn), box, more)));
   }
-  const VIEWS = { collections: vCollections, collection: vCollection, home: vHome, blocks: vBlocks, mempool: vMempool, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, dogefeed: vDogeFeed, dfpost: vDfPost, dfaddr: vDfAddr, ledger: vLedger,
+  const VIEWS = { collections: vCollections, collection: vCollection, home: vHome, blocks: vBlocks, mempool: vMempool, rich: vRich, inscriptions: vInscriptions, tokens: vTokens, names: vNames, maps: vMaps, dogefeed: vDogeFeed, dfpost: vDfPost, dfaddr: vDfAddr, ledger: vLedger,
     block: vBlock, tx: vTx, address: vAddress, inscription: vInscription, token: vToken, name: vName, map: vMap,
     ltokens: vLTokens, linscs: vLInscs, ltoken: vLToken, linsc: vLInsc, tag: vTag, results: vResults };
 

@@ -90,6 +90,7 @@ mod meshsvc;
 mod ddmarket;
 mod marketsvc;
 mod swaps;
+mod richlist;
 mod tokensend;
 mod meshview;
 mod mempoolshare;
@@ -675,6 +676,7 @@ fn main() {
     chains::start_saved(&node);
     borrow::start(node.clone());
     swaps::start(node.clone());
+    richlist::start(node.clone());
     tokensend::start(node.clone());
     ordtypes::init(&node);
     namesites::init(&node);

@@ -132,6 +132,7 @@ pub const FORWARDABLE: &[&str] = &[
     "explorer.msg_rows", "explorer.msg_file", "explorer.a_reactions", "explorer.a_replies", "explorer.activity",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
     "explorer.arc_ledger", "explorer.token_note", "explorer.prize_rows", "explorer.arc_blobs", "explorer.arc_fog_nodes",
+    "explorer.richlist",
 ];
 
 /// What apps may read through the page API (GET /r/explorer/<name>?args=<json>, `page_read`): the public
@@ -147,7 +148,7 @@ pub const PAGE_READS: &[&str] = &[
     "explorer.dogefeed_address", "explorer.dogefeed_keys", "explorer.earn", "explorer.a_reactions", "explorer.a_replies",
     "explorer.arc_storage_summary", "explorer.arc_segments", "explorer.arc_holders", "explorer.arc_payouts",
     "explorer.arc_machines", "explorer.arc_nodes", "explorer.arc_blobs", "explorer.arc_fog_nodes",
-    "explorer.msg_rows", "explorer.msg_file",
+    "explorer.msg_rows", "explorer.msg_file", "explorer.richlist",
 ];
 
 /// GET /r/explorer/<name>?args=<json>: the public read explorer.<name> (/r/explorer/chains: chains.list),
@@ -278,7 +279,7 @@ fn needed_index(cmd: &str, req: &Value) -> Option<&'static str> {
             Some("tag") => "ledger",
             _ => "messages",
         },
-        "explorer.activity" => "addresses",
+        "explorer.activity" | "explorer.richlist" => "addresses",
         "explorer.page" | "explorer.app_cards" | "explorer.a_reactions" | "explorer.a_replies" | "explorer.prize_rows" => "ledger",
         c if c.starts_with("explorer.ledger") || c.starts_with("explorer.arc_") => "ledger",
         _ => return None,
@@ -878,6 +879,11 @@ fn handle_here(node: &Node, cmd: &str, req: &Value, img_links: bool) -> R {
             }
         }
         "explorer.address" => addr(&x, &s("address").ok_or("give an address")?, req),
+        // The biggest holders (crate::richlist): made here from this arcade's own address index.
+        "explorer.richlist" => {
+            x.need("addresses")?;
+            crate::richlist::read(x.node, x.p, req)
+        }
         "explorer.held" => {
             x.need("ord")?;
             held(&x, &s("address").ok_or("give an address")?, req)

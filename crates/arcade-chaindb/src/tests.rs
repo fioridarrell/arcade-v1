@@ -87,6 +87,30 @@ fn fixture() -> Fixture {
     Fixture { _dir: dir, db, p, g }
 }
 
+/// The rich list adds up each address's unspent coins: spent ones and emptied addresses drop out, the biggest first,
+/// and its first coin says where to read the script it pays.
+#[test]
+fn the_rich_list_adds_up_unspent_coins_per_address() {
+    let f = fixture();
+    let c = f.p.chain_no;
+    let cb1 = tx(&[], &[(5000, p2pkh(1)), (700, p2pkh(4)), (300, p2pkh(4))], 1);
+    let b1 = block(f.g.hash(), vec![cb1.clone()], 2);
+    let spend = tx(&[(cb1.txid, 0)], &[(3000, p2pkh(2)), (1900, p2pkh(1))], 0);
+    let cb2 = tx(&[], &[(5000, p2pkh(3))], 2);
+    let b2 = block(b1.hash(), vec![cb2, spend.clone()], 3);
+    f.db.connect_blocks(f.p, &[b1, b2]).unwrap();
+    let mut paced = 0;
+    let r = f.db.rich_list(c, 3, || paced += 1).unwrap();
+    let sid = |n: u8| crate::schema::script_id(&p2pkh(n));
+    assert_eq!(r.top.iter().map(|x| (x.sid, x.balance, x.coins)).collect::<Vec<_>>(), vec![(sid(3), 5000, 1), (sid(2), 3000, 1), (sid(1), 1900, 1)]);
+    assert_eq!((r.holders, r.coins, r.total), (4, 5, 5000 + 3000 + 1900 + 1000), "address 4 holds 1000 in two coins, below the top 3");
+    // Its first coin reads back the script it pays (spend's output 0).
+    let (b, pos, vout) = r.top[1].first;
+    assert_eq!(f.db.tx_at(f.p, b, pos).unwrap().unwrap().outputs[vout as usize].script_pubkey, p2pkh(2));
+    let all = f.db.rich_list(c, 10, || {}).unwrap();
+    assert_eq!(all.top.iter().find(|x| x.sid == sid(4)).map(|x| (x.balance, x.coins)), Some((1000, 2)));
+}
+
 #[test]
 fn coins_spends_history_and_raw_reads() {
     let f = fixture();

@@ -11,6 +11,25 @@ use arcade_store::key::{be_u32, be_u64};
 use arcade_store::{ReadTxn, Result, Store, StoreError, WriteTxn};
 use std::path::Path;
 
+/// One address of a rich list ([`ChainDb::rich_list`]): its script id, what its unspent coins add up to, how many coins,
+/// and where its first coin is (block, position, output), to read the script it pays (a SegWit address isn't in its id).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RichRow {
+    pub sid: [u8; 21],
+    pub balance: u64,
+    pub coins: u64,
+    pub first: (u32, u32, u32),
+}
+
+/// A chain's rich list: the biggest holders, and how many addresses hold any, their coins and the amount in all.
+#[derive(Debug, Clone, Default)]
+pub struct RichList {
+    pub top: Vec<RichRow>,
+    pub holders: u64,
+    pub coins: u64,
+    pub total: u64,
+}
+
 /// Headers kept in the undo window; deeper reorgs are refused.
 pub const UNDO_DEPTH: u32 = 1000;
 /// How long one protocol-index backfill write runs before it commits (see ChainDb::backfill_for).
@@ -1862,6 +1881,67 @@ impl ChainDb {
             }
             Ok(out)
         })
+    }
+
+    /// The `n` addresses holding the most of chain `c` (its unspent coins added up per address), biggest first, and how
+    /// many addresses hold any, the coins and the amount they hold. One walk through the address index in short reads
+    /// (RICH_STEP rows each, so a sync isn't held up by one long read), with `pace` between them (the CPU share).
+    pub fn rich_list(&self, c: u16, n: usize, mut pace: impl FnMut()) -> Result<RichList> {
+        const RICH_STEP: usize = 50_000;
+        let store = self.store(c);
+        let pre = k_chain(c);
+        let sid_end = pre.len() + 21;
+        let mut out = RichList::default();
+        // A min-heap of the biggest n so far: (balance, sid, coins, first coin (b, p, vout)).
+        let mut top: std::collections::BinaryHeap<std::cmp::Reverse<(u64, [u8; 21], u64, (u32, u32, u32))>> = Default::default();
+        let mut cur: Option<([u8; 21], u64, u64, (u32, u32, u32))> = None;
+        let done = |cur: Option<([u8; 21], u64, u64, (u32, u32, u32))>, out: &mut RichList, top: &mut std::collections::BinaryHeap<_>| {
+            if let Some((sid, bal, coins, first)) = cur {
+                if bal == 0 {
+                    return;
+                }
+                out.holders += 1;
+                top.push(std::cmp::Reverse((bal, sid, coins, first)));
+                if top.len() > n {
+                    top.pop();
+                }
+            }
+        };
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let rows = store.read(|r| r.scan_after(BY_SCRIPT, &pre, after.as_deref(), RICH_STEP))?;
+            let Some((last, _)) = rows.last() else { break };
+            after = Some(last.clone());
+            for (k, v) in &rows {
+                if k.len() < sid_end + 12 || v.len() < 8 {
+                    continue;
+                }
+                let sid: [u8; 21] = k[pre.len()..sid_end].try_into().expect("21 bytes");
+                let value = u64::from_le_bytes(v[0..8].try_into().expect("8 bytes"));
+                let at = (be_u32(k, sid_end), be_u32(k, sid_end + 4), be_u32(k, sid_end + 8));
+                out.coins += 1;
+                out.total = out.total.saturating_add(value);
+                match cur.as_mut() {
+                    Some(x) if x.0 == sid => {
+                        x.1 = x.1.saturating_add(value);
+                        x.2 += 1;
+                    }
+                    _ => {
+                        done(cur.take(), &mut out, &mut top);
+                        cur = Some((sid, value, 1, at));
+                    }
+                }
+            }
+            if rows.len() < RICH_STEP {
+                break;
+            }
+            pace();
+        }
+        done(cur.take(), &mut out, &mut top);
+        let mut v: Vec<_> = top.into_iter().map(|r| r.0).collect();
+        v.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.cmp(&b.1)));
+        out.top = v.into_iter().map(|(balance, sid, coins, first)| RichRow { sid, balance, coins, first }).collect();
+        Ok(out)
     }
 
     /// Sum of an address's unspent coins (no transaction reads).

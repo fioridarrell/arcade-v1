@@ -175,6 +175,76 @@ $("o-si-on").addEventListener("change", async (e) => {
   refreshSysinfo();
 });
 
+// Content screening (screening.status / .set / .test / .topup): off (the default), borrowing within a daily cap, or the operator's own model.
+async function refreshScreening() {
+  let st;
+  try { st = await api("screening.status"); } catch (e) { say("o-scr-msg", e.message, true); return; }
+  if (document.activeElement !== $("o-scr-mode")) $("o-scr-mode").value = st.mode;
+  if (document.activeElement !== $("o-scr-unchecked")) $("o-scr-unchecked").value = st.unchecked;
+  $("o-scr-borrow").hidden = st.mode !== "borrow";
+  $("o-scr-own").hidden = st.mode !== "own";
+  const cur = st.borrow.current;
+  $("o-scr-state").textContent = st.mode === "off" ? "Off" : st.working ? "Working" : `Not working: ${st.why}`;
+  $("o-scr-state").className = "v " + (st.mode === "off" || !st.working ? "bad" : "ok");
+  $("o-scr-model-in-use").textContent = st.mode === "own" ? (st.own.model || st.own.url || "—") : cur ? `${cur.model} at ${cur.who}` : "—";
+  $("o-scr-cost").textContent = st.mode === "own" ? "free (your own)" : cur ? (cur.here ? "free (this arcade's own)" : `${ARC(cur.per_text)} a text, ${ARC(cur.per_picture)} a picture`) : "—";
+  $("o-scr-credit").textContent = st.mode === "borrow" && cur ? (cur.credit != null ? String(cur.credit) : "asking…") : "—";
+  $("o-scr-today").textContent = `${ARC(st.spent_today)} of ${ARC(st.day_cap)} ARCADE`;
+  const c = st.checked;
+  $("o-scr-counts").textContent = `${c.ok} ok, ${c.sensitive} covered, ${c.illegal} refused${c.waiting ? `, ${c.waiting} waiting` : ""}`;
+  if (document.activeElement !== $("o-scr-cap")) $("o-scr-cap").value = st.day_cap / 1e8;
+  if (document.activeElement !== $("o-scr-url") && !$("o-scr-url").value) $("o-scr-url").value = st.own.url || "";
+  if (document.activeElement !== $("o-scr-model") && !$("o-scr-model").value) $("o-scr-model").value = st.own.model || "";
+  $("o-scr-key").placeholder = st.own.key_set ? "(kept: type to change)" : "(none)";
+  const testLine = (t) => !t ? "not tested yet" : t.ok ? `passed the test ${agoText(t.at)}` : `failed the test ${agoText(t.at)}: ${t.error || `${t.passed} of ${t.of} right`}`;
+  $("o-scr-offers").replaceChildren(...(st.borrow.offers.length ? st.borrow.offers.map((o) => h("li", {},
+    h("b", { translate: "no" }, o.model), ` at ${o.who}${o.here ? " (this arcade)" : ""}: `,
+    o.here ? "free" : `about ${ARC(o.per_text)} ARCADE a text, ${ARC(o.per_picture)} a picture`,
+    `; ${o.state}; ${testLine(o.test)}${cur && cur.model === o.model && cur.arcade === o.arcade ? " (in use)" : ""}.`))
+    : [h("li", {}, st.borrow.last_look ? "No arcade offers a screening model right now." : "Looking at the mesh's offers…")]));
+  if (st.mode === "own" && st.own.test && !$("o-scr-msg").dataset.kept) say("o-scr-msg", `Your model ${testLine(st.own.test)}.`, !st.own.test.ok);
+}
+const scrSet = async (body, said) => {
+  try { await api("screening.set", body); say("o-scr-msg", said); }
+  catch (e) { say("o-scr-msg", e.message, true); }
+  refreshScreening();
+};
+$("o-scr-mode").addEventListener("change", (e) => {
+  const m = e.target.value;
+  if (m === "off" && !confirm("Turn screening off? Pictures and text from the chains are then shown unchecked, here and to anyone who can reach this arcade's pages, including content that may be illegal.")) { refreshScreening(); return; }
+  if (m === "own" && !$("o-scr-url").value.trim()) { $("o-scr-borrow").hidden = true; $("o-scr-own").hidden = false; say("o-scr-msg", "Give your model's address, then Save and test."); return; }
+  scrSet(m === "own" ? { mode: "own", url: $("o-scr-url").value.trim(), model: $("o-scr-model").value.trim() } : { mode: m },
+    m === "borrow" ? "Borrowing the cheapest screening model that passes the test." : m === "off" ? "Screening is off." : "Using your own model; testing it.");
+});
+$("o-scr-save").addEventListener("click", async () => {
+  const body = { mode: "own", url: $("o-scr-url").value.trim(), model: $("o-scr-model").value.trim() };
+  if ($("o-scr-key").value) body.key = $("o-scr-key").value;
+  say("o-scr-msg", "Saving and testing your model…");
+  try {
+    await api("screening.set", body);
+    $("o-scr-key").value = "";
+    const st = await api("screening.test");
+    const t = st.own.test;
+    say("o-scr-msg", t && t.ok ? "Your model passed the test: screening uses it now." : `Your model didn't pass: ${t ? t.error || `${t.passed} of ${t.of} right` : st.why}`, !(t && t.ok));
+  } catch (e) { say("o-scr-msg", e.message, true); }
+  refreshScreening();
+});
+$("o-scr-test").addEventListener("click", async () => {
+  say("o-scr-msg", "Testing…");
+  try { const st = await api("screening.test"); say("o-scr-msg", st.working ? "Screening works." : `Not working: ${st.why}`, !st.working); }
+  catch (e) { say("o-scr-msg", e.message, true); }
+  refreshScreening();
+});
+$("o-scr-topup").addEventListener("click", async () => {
+  const amount = Math.round(Number($("o-scr-amt").value) * 1e8);
+  try { const r = await api("screening.topup", { amount }); say("o-scr-msg", `Paid ${amount / 1e8} ARCADE of screening credit to ${r.to}. It counts once in a block (about 2.5 minutes).`); }
+  catch (e) { say("o-scr-msg", e.message, true); }
+  refreshScreening();
+});
+$("o-scr-cap-set").addEventListener("click", () => scrSet({ day_cap: Math.round(Number($("o-scr-cap").value) * 1e8) }, "Daily screening budget set."));
+$("o-scr-unchecked").addEventListener("change", (e) => scrSet({ unchecked: e.target.value },
+  e.target.value === "cover" ? "When screening isn't working, unchecked content is covered everywhere." : "When screening isn't working, unchecked content shows on this computer and is covered for others."));
+
 // How much of this computer the arcade uses (cpu.status / cpu.set; Martin 2026-11-20: "we need to chill out a bit").
 async function refreshCpu() {
   let st;
@@ -226,6 +296,7 @@ $("o-wel-set").addEventListener("click", async () => {
 
 async function refreshOptions() {
   refreshCpu();
+  refreshScreening();
   refreshDisk();
   refreshRelay();
   refreshWelcomeOpts();

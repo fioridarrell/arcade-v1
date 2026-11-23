@@ -31,7 +31,59 @@ async function refreshHome() {
   $("w-loading").hidden = true;
   if (!$("home").classList.contains("on")) return;
   // Side by side: the mesh doesn't wait for the getting-started card.
-  await Promise.all([drawStart(), api("mesh.overview").then(drawMesh), drawWelcome()]);
+  await Promise.all([drawStart(), api("mesh.overview").then(drawMesh), drawWelcome(), drawScreening()]);
+}
+
+// Home: content screening (screening.status), shown until the operator chose how pictures and text are checked, and
+// again whenever the screening stops working. Off until chosen: borrowing (within a daily cap) is one click; their own model
+// is encouraged.
+const ARC = (u) => { const a = u / 1e8; return a >= 0.01 ? a.toFixed(2) : a >= 0.0001 ? a.toFixed(4) : a > 0 ? a.toPrecision(2) : "0"; };
+const SCR = { busy: false, sig: null };
+async function drawScreening() {
+  const st = await api("screening.status").catch(() => null);
+  const box = $("h-screen");
+  if (!st || (st.chosen && (st.working || st.mode === "off"))) { box.hidden = true; SCR.sig = null; return; }
+  const cur = st.borrow && st.borrow.current;
+  const top = st.borrow && st.borrow.top_up;
+  const needsCredit = /credit/.test(st.why || "");
+  const sig = JSON.stringify([st.chosen, st.mode, st.working, st.why, cur && [cur.model, cur.who, cur.per_text, cur.per_picture], top && top.who, SCR.busy]);
+  box.hidden = false;
+  if (sig === SCR.sig) return;
+  SCR.sig = sig;
+  $("h-screen-text").textContent = !st.chosen
+    ? "Screening is off: choose whether this arcade checks pictures and text before showing them."
+    : `Screening isn't working: ${st.why}.`;
+  $("h-screen-warn").textContent = "This arcade shows what anyone puts on the chains it reads: pictures and text can be sexual, violent or illegal, including child sexual abuse material. Screening checks each one with a model first: sensitive content is covered, illegal content is never served.";
+  $("h-screen-how").textContent = cur
+    ? `Borrowing ${cur.model} from ${cur.who}: about ${ARC(cur.per_text)} ARCADE a text, ${ARC(cur.per_picture)} a picture. The cheapest screening model that passes the test is used; it is tested again every 6 hours and replaced if it drops. Running your own model is best: the same verdicts every day.`
+    : st.mode === "borrow" ? `Borrowing: ${st.why || "looking for a screening model on the mesh"}. Running your own model is best: the same verdicts every day.`
+    : `Running your own screening model is best: the same verdicts every day. Borrowing is the easy start: it pays a screening model on the mesh from this wallet, at most ${ARC(st.day_cap)} ARCADE a day (change it in Options).`;
+  const set = async (body, said) => {
+    SCR.busy = true; drawScreening();
+    try { await api("screening.set", body); say("h-screen-msg", said); }
+    catch (e) { say("h-screen-msg", e.message, true); }
+    SCR.busy = false; SCR.sig = null; drawScreening();
+  };
+  const btns = [];
+  if (!st.chosen || st.mode !== "borrow") {
+    btns.push(h("button", { class: "primary", disabled: SCR.busy, onclick: () => set({ mode: "borrow" }, "Borrowing the cheapest screening model that passes the test.") }, `Borrow screening (up to ${ARC(st.day_cap)} ARCADE a day)`));
+  }
+  if (needsCredit && top) {
+    btns.push(h("button", { class: st.chosen ? "primary" : "", disabled: SCR.busy, onclick: async () => {
+      SCR.busy = true;
+      try { const r = await api("screening.topup", { amount: 10000000 }); say("h-screen-msg", `Paid 0.1 ARCADE of screening credit to ${r.to}. It counts once in a block (about 2.5 minutes); screening starts by itself.`); }
+      catch (e) { say("h-screen-msg", e.message, true); }
+      SCR.busy = false; SCR.sig = null; drawScreening();
+    } }, `Top up 0.1 ARCADE at ${top.who}`));
+  }
+  btns.push(h("button", { onclick: () => { goTab("options"); setTimeout(() => $("o-screen").scrollIntoView({ block: "start" }), 50); } }, st.chosen ? "Screening settings…" : "Use my own model…"));
+  if (!st.chosen) {
+    btns.push(h("button", { disabled: SCR.busy, onclick: () => {
+      if (!confirm("Keep screening off? Pictures and text from the chains are then shown unchecked, here and to anyone who can reach this arcade's pages, including content that may be illegal.")) return;
+      set({ mode: "off" }, "Screening is off. You can turn it on again in Options.");
+    } }, "Keep it off"));
+  }
+  $("h-screen-btns").replaceChildren(...btns);
 }
 
 // Home: new arcades waiting for their welcome (faucet.newcomers), each with a "Welcome to the arcade" button, and the
@@ -561,13 +613,34 @@ function drawCard(ch) {
   const rows = [[ak ? `${tk} address · ${ak.label} (${ak.path})` : `${tk} address`, w.address]];
   if (ddOn) rows.push(["DigiDollar address", W.dd.address]);
   $("w-recv-list").replaceChildren(...[...rows.map(([l, a]) => h("div", { class: "wl-recv" }, h("span", { class: "lbl" }, l),
-      h("div", {}, h("code", {}, a), " ", h("button", { class: "small", onclick: (e) => copyText(a, e.target) }, "Copy")))),
+      h("div", {}, h("code", {}, a), " ", h("button", { class: "small", onclick: (e) => copyText(a, e.target) }, "Copy")), qrImg(a))),
     // DigiByte's Legacy address is the D... form, the very same string as on Dogecoin (same key, same version byte).
     /^D/.test(w.address || "") && ch.key === "dgb" ? h("p", { class: "note warn" }, "This address is the same on Dogecoin and DigiByte. Check the chain before sending.") : null,
     w.legacy ? h("p", { class: "note" }, /^D/.test(w.address || "")
       ? `Coins sent to ${w.legacy} (the SegWit form of the same key) are counted too.`
       : `Coins sent to ${w.legacy} (the older D... form of the same key) are counted too. Give people the dgb1... address: D... addresses look the same on Dogecoin.`) : null,
     ddOn && !W.dd.whole ? h("p", { class: "note" }, "DigiByte is borrowed here, so DigiDollar coins received before this arcade began following it aren't seen. Installing DigiByte finds them all.") : null].filter(Boolean));
+}
+
+/* Receive's QR code: the address alone (what every wallet's scanner reads), drawn here as a picture (qrcode.js, MIT,
+ * loaded the first time it's needed), dark on white in every theme and colour scheme so a phone can read it. Kept per
+ * address: the panel is drawn again on every wallet refresh. */
+let qrLib = null;
+const QR_CACHE = new Map();
+function loadQr() {
+  return qrLib || (qrLib = new Promise((ok, no) => { const s = document.createElement("script"); s.src = "qrcode.js"; s.onload = () => (window.qrcode ? ok(window.qrcode) : no(new Error("no QR maker"))); s.onerror = () => { qrLib = null; no(new Error("the QR maker didn't load")); }; document.head.append(s); }));
+}
+function qrImg(text) {
+  if (!text) return null;
+  const img = h("img", { class: "wl-qr", alt: "QR code of the address", title: text });
+  const put = (url) => { img.src = url; };
+  if (QR_CACHE.has(text)) put(QR_CACHE.get(text));
+  else loadQr().then((make) => {
+    const q = make(0, "M"); q.addData(text); q.make();
+    const url = q.createDataURL(6, 3);
+    QR_CACHE.set(text, url); put(url);
+  }).catch(() => img.remove());
+  return img;
 }
 
 /** An inscription's Send: the Send panel with it picked; the amount is the inscription itself. */

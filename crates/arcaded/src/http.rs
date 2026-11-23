@@ -255,6 +255,28 @@ fn body_cap(node: &Node, r: &Req, is_local: bool) -> usize {
     }
 }
 
+/// Content from strangers, through this arcade's screening (crate::screening) on the way out: shown, covered (a
+/// "checking" or "sensitive" cover, never cached), or refused (451). `?show=1` opens a sensitive cover.
+fn screened(node: &Node, s: &mut TcpStream, r: &Req, is_local: bool, ctype: &str, head: &[(&str, String)], bytes: &[u8]) {
+    let reveal = r.query.split('&').any(|kv| kv == "show=1");
+    match crate::screening::gate(node, is_local, reveal, ctype, bytes) {
+        crate::screening::Gate::Show => respond(s, "200 OK", ctype, head, if r.method == "HEAD" { &[] } else { bytes }),
+        crate::screening::Gate::Cover { ctype, body, why } => {
+            let mut h: Vec<(&str, String)> = head.iter().filter(|(k, _)| !matches!(*k, "ETag" | "Cache-Control")).cloned().collect();
+            h.push(("Cache-Control", "no-store".into()));
+            h.push(("X-Arcade-Screening", why.into()));
+            respond(s, "200 OK", ctype, &h, if r.method == "HEAD" { &[] } else { &body })
+        }
+        crate::screening::Gate::Refuse => respond(
+            s,
+            "451 Unavailable For Legal Reasons",
+            "text/plain",
+            &[("Cache-Control", "no-store".into()), ("X-Arcade-Screening", "illegal".into())],
+            b"this arcade's screening refused to show this content\n",
+        ),
+    }
+}
+
 fn respond(s: &mut TcpStream, status: &str, ctype: &str, extra: &[(&str, String)], body: &[u8]) {
     let _ = s.write_all(head(status, ctype, extra, body.len()).as_bytes());
     let _ = s.write_all(body);
@@ -651,18 +673,19 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                 let pass = html && asks_with_key(node, &r, cp.key, &txid);
                 let with = if pass { with_pass(&c.2, &page_pass(node, cp.key, &txid)) } else { Vec::new() };
                 let body: &[u8] = if pass { &with } else { &c.2 };
-                respond(
-                    &mut s,
-                    "200 OK",
-                    if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
-                    &[
-                        ("ETag", format!("\"{}\"", c.1)),
-                        ("Cache-Control", if html { "private, no-cache".into() } else { "public, max-age=31536000, immutable".into() }),
-                        ("Content-Security-Policy", csp),
-                        ("Referrer-Policy", "unsafe-url".into()),
-                    ],
-                    if r.method == "HEAD" { &[] } else { body },
-                )
+                let head = [
+                    ("ETag", format!("\"{}\"", c.1)),
+                    ("Cache-Control", if html { "private, no-cache".into() } else { "public, max-age=31536000, immutable".into() }),
+                    ("Content-Security-Policy", csp),
+                    ("Referrer-Policy", "unsafe-url".into()),
+                ];
+                let ctype = if c.0.is_empty() { "application/octet-stream" } else { &c.0 };
+                // An app page is code (not screened); a picture or text shown this way is.
+                if html {
+                    respond(&mut s, "200 OK", ctype, &head, if r.method == "HEAD" { &[] } else { body })
+                } else {
+                    screened(node, &mut s, &r, is_local, ctype, &head, body)
+                }
             }
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
         };
@@ -673,15 +696,17 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         let (chain, id) = rest.split_once('/').unwrap_or(("", ""));
         let Some(cp) = crate::chains::find(chain) else { return respond(&mut s, "404 Not Found", "text/plain", &[], b"unknown chain\n") };
         return match arcade_ledger::ord::content(&node.chain, cp, id) {
-            Ok((ct, bytes)) if ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase().starts_with("image/") => respond(
+            Ok((ct, bytes)) if ct.split(';').next().unwrap_or("").trim().to_ascii_lowercase().starts_with("image/") => screened(
+                node,
                 &mut s,
-                "200 OK",
+                &r,
+                is_local,
                 &ct,
                 &[
                     ("Content-Security-Policy", "sandbox; default-src 'none'; img-src data:; style-src 'unsafe-inline'".into()),
                     ("X-Content-Type-Options", "nosniff".into()),
                 ],
-                if r.method == "HEAD" { &[] } else { &bytes },
+                &bytes,
             ),
             Ok(_) => respond(&mut s, "404 Not Found", "text/plain", &[], b"not an image\n"),
             Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
@@ -890,9 +915,11 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
     if let (["content", id], Some(pc)) = (seg.as_slice(), r.headers.get("referer").and_then(|v| v.as_str()).and_then(crate::pagechain::of_referer).filter(|pc| pc.chain_no != node.params.chain_no)) {
         if !arcade_ledger::sites::is_inscription_id(&id.to_lowercase()) {
             return match crate::pagechain::content(node, pc, id) {
-                Ok(c) => respond(
+                Ok(c) => screened(
+                    node,
                     &mut s,
-                    "200 OK",
+                    &r,
+                    is_local,
                     if c.0.is_empty() { "application/octet-stream" } else { &c.0 },
                     &[
                         ("ETag", format!("\"{}\"", c.1)),
@@ -900,7 +927,7 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                         ("Content-Security-Policy", CONTENT_CSP.into()),
                         ("Access-Control-Allow-Origin", "*".into()),
                     ],
-                    if r.method == "HEAD" { &[] } else { &c.2 },
+                    &c.2,
                 ),
                 Err(e) => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
             };
@@ -954,9 +981,11 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
         // An ord inscription by its id (the pictures and pages a site names; the arcade ledger's
         // own content is asked by txid or number below).
         ["content", id] if arcade_ledger::sites::is_inscription_id(&id.to_lowercase()) => match crate::namesites::content(node, id, is_local) {
-            Some((ctype, bytes, vouched)) => respond(
+            Some((ctype, bytes, vouched)) => screened(
+                node,
                 &mut s,
-                "200 OK",
+                &r,
+                is_local,
                 if ctype.is_empty() { "application/octet-stream" } else { &ctype },
                 &[
                     // The chain's bytes never change; bytes only arcades on the mesh vouch for are not kept by the browser.
@@ -968,14 +997,16 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                     // green: the chain's (or 2+ arcades agree); yellow: one arcade's word, not checked here.
                     ("X-Arcade-Trust", vouched.level().as_str().into()),
                 ],
-                if r.method == "HEAD" { &[] } else { &bytes },
+                &bytes,
             ),
             None => respond(&mut s, "404 Not Found", "text/plain", &[], b"no such inscription on a chain this arcade can read\n"),
         },
         ["content", id] => match arcade_ledger::content::content(&node.chain, p, id) {
-            Ok(c) => respond(
+            Ok(c) => screened(
+                node,
                 &mut s,
-                "200 OK",
+                &r,
+                is_local,
                 if c.content_type.is_empty() { "application/octet-stream" } else { &c.content_type },
                 &[
                     ("ETag", format!("\"{}\"", c.sha256)),
@@ -984,20 +1015,20 @@ fn handle(node: &Node, mut s: TcpStream, conf: &Conf) {
                     // Apps (opaque origin) read their parts from here, as on the original.
                     ("Access-Control-Allow-Origin", "*".into()),
                 ],
-                if r.method == "HEAD" { &[] } else { &c.bytes },
+                &c.bytes,
             ),
             // Not an arcade-ledger inscription: an ord inscription on a chain kept here
             // (recursive Doginals/Pepinals ask /content/<id>; Martin 2026-11-10).
             Err(e) => match ord_content(node, id) {
-                Some((ct, bytes)) => {
-                    respond(
-                        &mut s,
-                        "200 OK",
-                        if ct.is_empty() { "application/octet-stream" } else { &ct },
-                        &[("Content-Security-Policy", ord_csp(node)), ("Access-Control-Allow-Origin", "*".into()), ("X-Content-Type-Options", "nosniff".into())],
-                        if r.method == "HEAD" { &[] } else { &bytes },
-                    )
-                }
+                Some((ct, bytes)) => screened(
+                    node,
+                    &mut s,
+                    &r,
+                    is_local,
+                    if ct.is_empty() { "application/octet-stream" } else { &ct },
+                    &[("Content-Security-Policy", ord_csp(node)), ("Access-Control-Allow-Origin", "*".into()), ("X-Content-Type-Options", "nosniff".into())],
+                    &bytes,
+                ),
                 None => respond(&mut s, "404 Not Found", "text/plain", &[], format!("{e}\n").as_bytes()),
             },
         },

@@ -674,9 +674,23 @@ pub fn read(node: &Node, name: &str, q: &Map<String, Value>) -> Result<Value, St
         "holdings" => Ok(holdings(node)),
         // Swaps of any leg for any leg (swaps.rs): every open order this arcade and its links know, and this
         // wallet's own orders and swaps.
-        "swaps" => Ok(json!({"book": crate::swaps::book(node), "mine": crate::swaps::own_orders(node), "running": crate::swaps::swaps(node), "me": node.id_hex()})),
+        // `confirms`: the chains whose confirmations don't count by work (a staked chain), keyed by chain, as chains.list
+        // has them: the Swap app shows its note on a pair with one (it can't read chains.list; the website's answer has it).
+        "swaps" => Ok(json!({"book": crate::swaps::book(node), "mine": crate::swaps::own_orders(node), "running": crate::swaps::swaps(node), "me": node.id_hex(), "confirms": swap_confirms()})),
         _ => Err(format!("{name} is not a market read")),
     }
+}
+
+/// The chains whose confirmations count by stake, not work: {chain key: {by, needs}} (chains::confirms_row).
+fn swap_confirms() -> Value {
+    let mut m = Map::new();
+    for p in crate::chains::all() {
+        let row = crate::chains::confirms_row(p);
+        if row["by"] != "work" {
+            m.insert(p.key.to_string(), row);
+        }
+    }
+    Value::Object(m)
 }
 
 /// A GET under /r/ this module answers: Some((status, JSON text)), or None for another module's path.

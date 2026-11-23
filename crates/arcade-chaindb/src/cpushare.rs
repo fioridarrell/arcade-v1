@@ -68,19 +68,50 @@ pub fn over() -> bool {
 }
 
 /// Between pieces of heavy work: while the process is over its share, wait (at most 2 s). Cheap when under it.
+///
+/// A thread that waited the whole MOST then runs MOST without waiting: work the governor counts but `pace` doesn't hold
+/// (a writer's proofs of time, two cores on its own; the mesh) can keep the process over its share for good, and every
+/// paced piece waiting 2 s would stop a chain's checks of its new blocks altogether (a 4-core writer: the JB20B,
+/// 2026-11-23). So at worst paced work runs at half speed.
 pub fn pace() {
     if !OVER.load(Ordering::Relaxed) {
+        return;
+    }
+    thread_local!(static FREE_UNTIL: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) });
+    if FREE_UNTIL.with(|f| f.get()).is_some_and(|t| Instant::now() < t) {
         return;
     }
     let began = Instant::now();
     while OVER.load(Ordering::Relaxed) && began.elapsed() < MOST {
         std::thread::sleep(STEP);
     }
+    if began.elapsed() >= MOST {
+        FREE_UNTIL.with(|f| f.set(Some(Instant::now() + MOST)));
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Held for good (the process over its share through work pace doesn't hold): a thread waits at most MOST, then
+    /// runs MOST freely, never stalled for good.
+    #[test]
+    fn pace_never_holds_a_thread_for_good() {
+        set_share(1);
+        set_over(true);
+        let t = Instant::now();
+        pace();
+        let waited = t.elapsed();
+        assert!(waited >= MOST && waited < MOST + Duration::from_secs(1), "{waited:?}");
+        let t = Instant::now();
+        for _ in 0..1000 {
+            pace();
+        }
+        assert!(t.elapsed() < Duration::from_millis(200), "free after a whole wait");
+        set_share(0);
+        assert!(!over());
+    }
 
     #[test]
     fn pools_stay_within_the_share() {

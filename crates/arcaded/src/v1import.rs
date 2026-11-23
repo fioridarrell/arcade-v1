@@ -106,6 +106,9 @@ pub fn auto_home(node: Arc<Node>) {
 
 fn start_with(node: Arc<Node>, key: &str, wait_secs: u64) -> Result<Value, String> {
     let p = node.chain_params(key).ok_or_else(|| format!("{key} is not installed here (add it first)"))?;
+    if node.chain.init_active(p.chain_no) {
+        return Err(format!("{} is in an init install (it builds itself from its blocks); no copies meanwhile", p.name));
+    }
     let cancel = Arc::new(AtomicBool::new(false));
     {
         let mut j = jobs();

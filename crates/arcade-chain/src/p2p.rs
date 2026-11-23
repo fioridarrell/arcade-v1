@@ -55,6 +55,13 @@ pub fn encode_message(magic: [u8; 4], command: &str, payload: &[u8]) -> Vec<u8> 
 }
 
 pub fn read_message(r: &mut impl Read, magic: [u8; 4]) -> Result<Message> {
+    read_message_capped(r, magic, MAX_MESSAGE)
+}
+
+/// [`read_message`] with a tighter limit for `block` messages (the chain's largest possible
+/// block, [`ChainParams::max_block_bytes`]): a bigger one is refused before anything is read
+/// into memory.
+pub fn read_message_capped(r: &mut impl Read, magic: [u8; 4], block_max: usize) -> Result<Message> {
     let mut head = [0u8; 24];
     r.read_exact(&mut head)?;
     if head[..4] != magic {
@@ -63,7 +70,7 @@ pub fn read_message(r: &mut impl Read, magic: [u8; 4]) -> Result<Message> {
     let end = head[4..16].iter().position(|&b| b == 0).unwrap_or(12);
     let command = String::from_utf8_lossy(&head[4..4 + end]).into_owned();
     let len = u32::from_le_bytes(head[16..20].try_into().unwrap()) as usize;
-    if len > MAX_MESSAGE {
+    if len > MAX_MESSAGE || (command == "block" && len > block_max) {
         return Err(P2pError::TooLarge(len));
     }
     let mut payload = vec![0u8; len];
@@ -210,7 +217,17 @@ pub struct Peer {
     pub version: PeerVersion,
     protocol_version: i32,
     pub format: Format,
+    /// The largest `block` message taken from this peer (ChainParams::max_block_bytes).
+    block_max: usize,
+    /// The peer broke the protocol (a block not asked for, too big, over a request's byte
+    /// limit): the connection is shut and the peer is of no further use.
+    dropped: bool,
 }
+
+/// Part of the error a block request gives when the peer sent more bytes than the request
+/// allowed ([`Peer::get_blocks_max`]): the blocks may be honest but bigger than expected (ask
+/// for fewer at once), and the peer was dropped since the rest is still on the wire.
+pub const OVER_BYTE_LIMIT: &str = "over the request's byte limit";
 
 impl Peer {
     pub fn connect(params: &ChainParams, addr: &str, timeout: Duration) -> Result<Peer> {
@@ -245,7 +262,7 @@ impl Peer {
         }
         let version = version.unwrap();
         let protocol_version = version.version.min(params.protocol_version);
-        Ok(Peer { stream, magic, addr: sa, version, protocol_version, format: params.format })
+        Ok(Peer { stream, magic, addr: sa, version, protocol_version, format: params.format, block_max: params.max_block_bytes(), dropped: false })
     }
 
     pub fn send(&mut self, command: &str, payload: &[u8]) -> Result<()> {
@@ -259,7 +276,16 @@ impl Peer {
     /// Next message, answering pings transparently.
     pub fn recv(&mut self) -> Result<Message> {
         loop {
-            let m = read_message(&mut self.stream, self.magic)?;
+            let m = match read_message_capped(&mut self.stream, self.magic, self.block_max) {
+                Ok(m) => m,
+                Err(e) => {
+                    // Whatever went wrong, the stream is out of step now (or gone).
+                    if !matches!(&e, P2pError::Io(x) if matches!(x.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut)) {
+                        self.drop_peer();
+                    }
+                    return Err(e);
+                }
+            };
             if std::env::var_os("ARCADE_P2P_DEBUG").is_some() {
                 eprintln!("<- {} ({} bytes) {}", m.command, m.payload.len(),
                     if m.command == "reject" { String::from_utf8_lossy(&m.payload).into_owned() } else { String::new() });
@@ -293,25 +319,70 @@ impl Peer {
         parse_headers(&m.payload, &self.format)
     }
 
-    /// Request blocks; returns raw block bytes in the order received.
+    /// Request blocks; returns raw block bytes in the order received. Every block must be one
+    /// asked for (its header's id), each once: anything else drops the peer.
     pub fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>> {
+        self.get_blocks_max(hashes, usize::MAX)
+    }
+
+    /// [`Peer::get_blocks`], refusing (and dropping the peer) once the blocks received pass
+    /// `max_bytes` in all: what one request can make us hold is bounded however a peer pads its
+    /// blocks. The error then contains [`OVER_BYTE_LIMIT`].
+    pub fn get_blocks_max(&mut self, hashes: &[Hash256], max_bytes: usize) -> Result<Vec<Vec<u8>>> {
+        if self.dropped {
+            return Err(P2pError::Protocol("the peer was dropped".into()));
+        }
         self.send("getdata", &getdata_payload(self.format.block_inv(), hashes))?;
+        let mut want: std::collections::HashSet<Hash256> = hashes.iter().copied().collect();
         let mut out = Vec::with_capacity(hashes.len());
+        let mut bytes = 0usize;
         // A whole-request limit: a peer that keeps talking (pings, inv, addr) but never sends
         // the blocks would otherwise keep this waiting forever (the read timeout never fires).
         let deadline = std::time::Instant::now() + Duration::from_secs(60 + 2 * hashes.len() as u64);
         while out.len() < hashes.len() {
             if std::time::Instant::now() > deadline {
+                self.drop_peer();
                 return Err(P2pError::Protocol(format!("peer sent {} of {} blocks in time", out.len(), hashes.len())));
             }
             let m = self.recv()?;
             match m.command.as_str() {
-                "block" => out.push(m.payload),
-                "notfound" => return Err(P2pError::Protocol("peer does not have a requested block".into())),
+                "block" => {
+                    let id = m.payload.get(..80).and_then(|h| <&[u8; 80]>::try_from(h).ok()).map(|h| self.format.block_id(&Header::parse(h)));
+                    if !id.is_some_and(|id| want.remove(&id)) {
+                        self.drop_peer();
+                        return Err(P2pError::Protocol(match id {
+                            Some(id) => format!("peer sent block {id}, not one asked for (or twice)"),
+                            None => "peer sent a block shorter than a header".into(),
+                        }));
+                    }
+                    bytes += m.payload.len();
+                    if bytes > max_bytes {
+                        self.drop_peer();
+                        return Err(P2pError::Protocol(format!("{OVER_BYTE_LIMIT}: {} of {} blocks came to {bytes} bytes, over {max_bytes}", out.len() + 1, hashes.len())));
+                    }
+                    out.push(m.payload);
+                }
+                "notfound" => {
+                    // The blocks it does have may still come: they'd answer the next request.
+                    self.drop_peer();
+                    return Err(P2pError::Protocol("peer does not have a requested block".into()));
+                }
                 _ => {}
             }
         }
         Ok(out)
+    }
+
+    /// Shut the connection: the peer broke the protocol, or what it still sends would be read
+    /// as the answer to the next request.
+    fn drop_peer(&mut self) {
+        self.dropped = true;
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+    }
+
+    /// The connection was shut ([`Peer::get_blocks_max`]): use another peer.
+    pub fn dropped(&self) -> bool {
+        self.dropped
     }
 
     /// Ask the peer which other nodes it knows (getaddr) and collect the addresses it sends
@@ -384,6 +455,76 @@ mod tests {
         assert_eq!(m.command, "ping");
         assert_eq!(m.payload, vec![1, 2, 3, 4, 5, 6, 7, 8]);
         assert!(matches!(read_message(&mut &bytes[..], [0; 4]), Err(P2pError::BadMagic)));
+    }
+
+    #[test]
+    fn a_block_message_over_the_chains_largest_block_is_refused_unread() {
+        use crate::params::BITCOIN_MAIN;
+        let max = BITCOIN_MAIN.max_block_bytes();
+        assert!((4_000_000..=5_100_000).contains(&max), "{max}");
+        // Only the 24-byte head: refused before the payload is read (or allocated).
+        let mut head = encode_message(BITCOIN_MAIN.magic, "block", &[]);
+        head[16..20].copy_from_slice(&((max + 1) as u32).to_le_bytes());
+        assert!(matches!(read_message_capped(&mut &head[..], BITCOIN_MAIN.magic, max), Err(P2pError::TooLarge(n)) if n == max + 1));
+        // Other messages keep the protocol's own limit.
+        head[4..9].copy_from_slice(b"other");
+        assert!(matches!(read_message_capped(&mut &head[..], BITCOIN_MAIN.magic, max), Err(P2pError::Io(_))));
+        // Chains whose limits aren't exact keep the message limit.
+        assert_eq!(crate::params::LITECOIN_MAIN.max_block_bytes(), MAX_MESSAGE);
+    }
+
+    /// A peer on loopback that answers the handshake, then sends `blocks` after the first
+    /// getdata.
+    fn fake_peer(blocks: Vec<Vec<u8>>) -> String {
+        use crate::params::BITCOIN_MAIN;
+        let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = l.local_addr().unwrap().to_string();
+        std::thread::spawn(move || {
+            let (mut s, _) = l.accept().unwrap();
+            let magic = BITCOIN_MAIN.magic;
+            let _ = read_message(&mut s, magic).unwrap();
+            s.write_all(&encode_message(magic, "version", &version_payload(&BITCOIN_MAIN, None, 1, false))).unwrap();
+            s.write_all(&encode_message(magic, "verack", &[])).unwrap();
+            loop {
+                let Ok(m) = read_message(&mut s, magic) else { return };
+                if m.command == "getdata" {
+                    for b in &blocks {
+                        if s.write_all(&encode_message(magic, "block", b)).is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn a_block_not_asked_for_or_over_the_byte_limit_drops_the_peer() {
+        use crate::params::BITCOIN_MAIN;
+        let genesis = hex::decode(BITCOIN_MAIN.genesis_header).unwrap();
+        let mut other = genesis.clone();
+        other[76] ^= 1; // another nonce: another block id
+        let gid = BITCOIN_MAIN.genesis_hash();
+        // Asked for genesis, sent another block: refused, and the peer is shut.
+        let mut p = Peer::connect(&BITCOIN_MAIN, &fake_peer(vec![other.clone()]), Duration::from_secs(5)).unwrap();
+        let e = p.get_blocks(&[gid]).unwrap_err().to_string();
+        assert!(e.contains("not one asked for"), "{e}");
+        assert!(p.dropped());
+        assert!(p.get_blocks(&[gid]).is_err());
+        // The same block twice for one asked: refused too.
+        let mut p = Peer::connect(&BITCOIN_MAIN, &fake_peer(vec![genesis.clone(), genesis.clone()]), Duration::from_secs(5)).unwrap();
+        let other_id = BITCOIN_MAIN.block_id(&Header::parse(other[..80].try_into().unwrap()));
+        assert!(p.get_blocks(&[gid, other_id]).unwrap_err().to_string().contains("not one asked for"));
+        // Over the request's byte limit: refused with OVER_BYTE_LIMIT, the peer shut.
+        let mut p = Peer::connect(&BITCOIN_MAIN, &fake_peer(vec![genesis.clone(), other.clone()]), Duration::from_secs(5)).unwrap();
+        let e = p.get_blocks_max(&[gid, other_id], genesis.len() + 10).unwrap_err().to_string();
+        assert!(e.contains(OVER_BYTE_LIMIT), "{e}");
+        assert!(p.dropped());
+        // Both asked for, within the limit: taken.
+        let mut p = Peer::connect(&BITCOIN_MAIN, &fake_peer(vec![other.clone(), genesis.clone()]), Duration::from_secs(5)).unwrap();
+        assert_eq!(p.get_blocks_max(&[gid, other_id], 2 * genesis.len()).unwrap(), vec![other, genesis]);
+        assert!(!p.dropped());
     }
 
     #[test]

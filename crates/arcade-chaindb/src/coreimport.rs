@@ -236,26 +236,37 @@ impl ChainDb {
     }
 
     /// Store blocks without connecting them (bytes only, as connect stores them; their headers
-    /// must be known). Each block is checked as a sync checks it: it rebuilds byte-identically,
-    /// has a coinbase first, and its merkle root matches its header. Returns their block numbers.
+    /// must be known). Each block passes [`check_stored_block`]: it rebuilds byte-identically,
+    /// has a coinbase first, its merkle root matches its header (no mutated tree), no bytes
+    /// follow its transactions, its own AuxPoW proves the work, and where SegWit is on at the
+    /// block's height (its header's), the witness commitment matches, even in a block carrying
+    /// no witness data: txids don't cover witnesses, so a copy with them stripped would
+    /// otherwise pass. Returns their block numbers.
     pub fn store_blocks_only(&self, params: &ChainParams, raws: &[Vec<u8>]) -> Result<Vec<u32>> {
-        let c = params.chain_no;
         let mut blocks = Vec::with_capacity(raws.len());
         for raw in raws {
-            let b = Block::parse_with(raw, &params.format).map_err(err)?;
-            if b.encode() != *raw {
-                return Err(err(format!("block {} does not rebuild byte-identically", b.hash())));
-            }
-            arcade_chain::params::check_block_body(params, &b).map_err(|e| err(format!("block {}: {e}", b.hash())))?;
-            blocks.push(b);
+            blocks.push(check_stored_block(self, params, raw)?);
         }
+        self.write_stored(params, &blocks)
+    }
+
+    /// Store checked blocks (check_stored_block) without connecting them; their block numbers.
+    pub(crate) fn write_stored(&self, params: &ChainParams, blocks: &[Block]) -> Result<Vec<u32>> {
+        self.write_stored_as(params, blocks, false)
+    }
+
+    /// [`ChainDb::write_stored`]; `by_height`: an init install's blocks, which arrive in any
+    /// order, take the block number of their height (crate::initsync::init_slot), so the main
+    /// chain's block numbers run in height order as a block-by-block sync leaves them.
+    pub(crate) fn write_stored_as(&self, params: &ChainParams, blocks: &[Block], by_height: bool) -> Result<Vec<u32>> {
+        let c = params.chain_no;
         self.wstore(c)?.write(|w| {
             let mut out = Vec::with_capacity(blocks.len());
-            for blk in &blocks {
+            for blk in blocks {
                 let hash = blk.hash();
                 let mut rec = header_rec(w, c, &hash)?.ok_or_else(|| err(format!("block {hash}: its header is not in our header chain")))?;
                 if rec.b == 0 {
-                    rec.b = next_b(w, c)?;
+                    rec.b = if by_height { crate::initsync::init_slot(w, params, rec.height)? } else { next_b(w, c)? };
                     w.put(BLOCK_META, &k_block(c, rec.b), &block_meta(blk))?;
                     for (p, tx) in blk.txs.iter().enumerate() {
                         w.put(BLOCK_TX, &k_block_tx(c, rec.b, p as u32), &tx.raw)?;
@@ -576,7 +587,7 @@ impl ChainDb {
     }
 
     /// Heights base+1.. of `path` become the main chain (HEIGHT rows, header status).
-    fn join_main(&self, params: &ChainParams, path: &[Hash256], base: u32) -> Result<()> {
+    pub(crate) fn join_main(&self, params: &ChainParams, path: &[Hash256], base: u32) -> Result<()> {
         let c = params.chain_no;
         for (i, chunk) in path.chunks(50_000).enumerate() {
             self.wstore(c)?.write(|w| {
@@ -753,6 +764,63 @@ impl ChainDb {
         }
         Ok((n, sum))
     }
+}
+
+/// The checks a block stored without connecting passes (see `store_blocks_only`).
+pub(crate) fn check_stored_block(db: &ChainDb, params: &ChainParams, raw: &[u8]) -> Result<Block> {
+    let b = Block::parse_with(raw, &params.format).map_err(err)?;
+    if b.encode() != *raw {
+        return Err(err(format!("block {} does not rebuild byte-identically", b.hash())));
+    }
+    arcade_chain::params::check_block_body(params, &b).map_err(|e| err(format!("block {}: {e}", b.hash())))?;
+    // Bytes the merkle root doesn't cover. After the transactions only Litecoin's MWEB block may
+    // follow; anything else is junk a source added (it would be stored and served as the block).
+    if !b.extra.is_empty() && !params.format.mweb {
+        return Err(err(format!("block {}: {} bytes after its transactions", b.hash(), b.extra.len())));
+    }
+    // The block's own AuxPoW is what is kept (block_meta) and served with its header: it must
+    // prove the work itself, as the header check does (sync.rs), not only the one the headers
+    // round saw.
+    if let Some(a) = &b.auxpow {
+        let hash = params.block_id(&b.header);
+        let chain_id = params.auxpow_chain_id.unwrap_or(b.header.chain_id());
+        a.check(hash, chain_id, params.auxpow_strict_chain_id).map_err(|e| err(format!("block {hash}: AuxPoW: {e}")))?;
+        let ph = arcade_chain::pow::pow_hash(arcade_chain::pow::PowAlgo::Scrypt, &a.parent.encode());
+        if !arcade_chain::pow::meets_target(&ph, b.header.bits) {
+            return Err(err(format!("block {hash}: AuxPoW parent misses target")));
+        }
+    }
+    // Its height on our header chain. A block whose header we don't hold can't be stored, and is
+    // never checked as if at height 0 (where SegWit is off, so a stripped copy would pass).
+    let height = db.header(params.chain_no, &b.hash())?.map(|r| r.height).ok_or_else(|| err(format!("block {}: its header is not in our header chain", b.hash())))?;
+    if let Some(br) = params.block_rules {
+        if (br.script_flags)(height) & arcade_chain::params::SCRIPT_WITNESS != 0 {
+            b.check_witness_commitment().map_err(|e| err(format!("block {}: {e}", b.hash())))?;
+        }
+    }
+    if let Some(tx) = tx_of_64_bytes(params, height, &b) {
+        return Err(err(format!("block {}: transaction {tx} is 64 bytes without its witness (it could stand for two merkle-tree hashes)", b.hash())));
+    }
+    Ok(b)
+}
+
+/// Above this height a stored block may carry no transaction of exactly 64 bytes without its
+/// witness: such a transaction can stand for an inner node of the merkle tree, so another list
+/// of transactions could be passed off under the same header ("Weaknesses in Bitcoin's Merkle
+/// Root Construction", 3.1; BIP54). They are valid by consensus, so only where none is known:
+/// Bitcoin (non-standard for years, a handful before 2016, none since) above block 691,719.
+/// Other chains: not refused (their histories have not been checked for them).
+pub(crate) fn no_64_byte_txs_above(params: &ChainParams) -> Option<u32> {
+    (params.genesis == arcade_chain::params::BITCOIN_MAIN.genesis).then_some(691_719)
+}
+
+/// The first transaction of 64 bytes (witness stripped) in `b`, where the chain refuses them
+/// at `height` (no_64_byte_txs_above).
+pub(crate) fn tx_of_64_bytes(params: &ChainParams, height: u32, b: &Block) -> Option<Hash256> {
+    if no_64_byte_txs_above(params).is_none_or(|h| height <= h) {
+        return None;
+    }
+    b.txs.iter().find(|t| (if t.has_witness() { t.encode_legacy().len() } else { t.raw.len() }) == 64).map(|t| t.txid)
 }
 
 // ---------------- each coin against its own block ----------------
@@ -943,8 +1011,12 @@ impl DiskReplay {
                         let tx = Tx::parse_with(&raw, &params.format).map_err(err)?;
                         if !tx.is_coinbase() {
                             for i in &tx.inputs {
+                                // Where it is spent: height and position, so a spend of an output a later
+                                // transaction of the same block makes is no spend (as Replay, as Core).
+                                let mut at = h.to_be_bytes().to_vec();
+                                at.extend_from_slice(&p.to_be_bytes());
                                 match crate::db::locate(r, params, &i.prevout.txid)? {
-                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &h.to_be_bytes())?,
+                                    Some((pb, pp)) => self.spent.push(&k_pos(c, pb, pp, i.prevout.vout), &at)?,
                                     None => self.missing += 1,
                                 }
                             }
@@ -955,6 +1027,7 @@ impl DiskReplay {
                                 continue;
                             }
                             let mut v = h.to_be_bytes().to_vec();
+                            v.extend_from_slice(&p.to_be_bytes());
                             v.extend_from_slice(&encode_coin(o.value, h, coinbase, &o.script_pubkey));
                             self.made.push(&k_pos(c, b, p, vout as u32), &v)?;
                         }
@@ -971,9 +1044,14 @@ impl DiskReplay {
     /// The derived set, read in key order from `DiskRows::next_kv`.
     pub fn finish(self) -> Result<DiskRows> {
         let mut spent = self.spent.finish()?;
-        let next_spend = spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        let next_spend = spent.next_kv()?.map(|(k, v)| (k, at_of(&v)));
         Ok(DiskRows { made: self.made.finish()?, spent, next_spend, missing: self.missing })
     }
+}
+
+/// (height, position) at the front of a DiskReplay row.
+fn at_of(v: &[u8]) -> (u32, u32) {
+    (be_u32(v, 0), be_u32(v, 4))
 }
 
 /// The coin set a DiskReplay derived: outputs made and not spent by a later input, as OUTPUTS
@@ -981,7 +1059,7 @@ impl DiskReplay {
 pub struct DiskRows {
     made: Sorted,
     spent: Sorted,
-    next_spend: Option<(Vec<u8>, u32)>,
+    next_spend: Option<(Vec<u8>, (u32, u32))>,
     /// Inputs that spent a coin not made before them (a broken chain: never expected); complete
     /// once `next_kv` returned None.
     pub missing: u64,
@@ -989,7 +1067,7 @@ pub struct DiskRows {
 
 impl DiskRows {
     fn pull(&mut self) -> Result<()> {
-        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, be_u32(&v, 0)));
+        self.next_spend = self.spent.next_kv()?.map(|(k, v)| (k, at_of(&v)));
         Ok(())
     }
 
@@ -1002,19 +1080,20 @@ impl DiskRows {
                 }
                 return Ok(None);
             };
-            let made_at = be_u32(&v, 0);
+            let made_at = at_of(&v);
             let mut spent = false;
             while let Some((sk, at)) = &self.next_spend {
                 match sk.as_slice().cmp(k.as_slice()) {
                     std::cmp::Ordering::Greater => break,
-                    // Spent once, at or after it was made; any other spend of it finds nothing (as Replay).
-                    std::cmp::Ordering::Equal if !spent && *at >= made_at => spent = true,
+                    // Spent once, by a transaction after the one that made it (a later block, or
+                    // later in the same block); any other spend of it finds nothing (as Replay).
+                    std::cmp::Ordering::Equal if !spent && *at > made_at => spent = true,
                     _ => self.missing += 1,
                 }
                 self.pull()?;
             }
             if !spent {
-                return Ok(Some((k, v[4..].to_vec())));
+                return Ok(Some((k, v[8..].to_vec())));
             }
         }
     }

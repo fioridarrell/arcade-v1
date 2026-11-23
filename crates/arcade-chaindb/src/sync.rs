@@ -48,7 +48,24 @@ pub trait BlockSource {
     fn get_headers(&mut self, locator: &[Hash256]) -> std::result::Result<Vec<HeaderEntry>, String>;
     fn get_blocks(&mut self, hashes: &[Hash256]) -> std::result::Result<Vec<Vec<u8>>, String>;
     fn describe(&self) -> String;
+    /// [`BlockSource::get_blocks`], refused once the blocks pass `max_bytes` in all (the error
+    /// then contains [`OVER_BYTE_LIMIT`]). A P2P peer stops reading there; other sources
+    /// (their answers bounded by their own frame limits) are checked once they answered.
+    fn get_blocks_max(&mut self, hashes: &[Hash256], max_bytes: usize) -> std::result::Result<Vec<Vec<u8>>, String> {
+        let raws = self.get_blocks(hashes)?;
+        let bytes: usize = raws.iter().map(|r| r.len()).sum();
+        if bytes > max_bytes {
+            return Err(format!("{OVER_BYTE_LIMIT}: {} blocks came to {bytes} bytes, over {max_bytes}", raws.len()));
+        }
+        Ok(raws)
+    }
+    /// The source is of no further use (a P2P peer that broke the protocol and was shut).
+    fn dropped(&self) -> bool {
+        false
+    }
 }
+
+pub use arcade_chain::p2p::OVER_BYTE_LIMIT;
 
 impl BlockSource for Peer {
     fn get_headers(&mut self, locator: &[Hash256]) -> std::result::Result<Vec<HeaderEntry>, String> {
@@ -57,8 +74,14 @@ impl BlockSource for Peer {
     fn get_blocks(&mut self, hashes: &[Hash256]) -> std::result::Result<Vec<Vec<u8>>, String> {
         Peer::get_blocks(self, hashes).map_err(|e| e.to_string())
     }
+    fn get_blocks_max(&mut self, hashes: &[Hash256], max_bytes: usize) -> std::result::Result<Vec<Vec<u8>>, String> {
+        Peer::get_blocks_max(self, hashes, max_bytes).map_err(|e| e.to_string())
+    }
     fn describe(&self) -> String {
         format!("p2p {} {}", self.addr, self.version.user_agent)
+    }
+    fn dropped(&self) -> bool {
+        Peer::dropped(self)
     }
 }
 

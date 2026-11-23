@@ -55,6 +55,10 @@ pub fn call_on(node: &Node, p: &'static arcade_chain::params::ChainParams, metho
     let db = &node.chain;
     let e = |x: arcade_store::StoreError| err(-1, x.to_string());
     let tip = db.tip(c).map_err(e)?.ok_or_else(|| err(-28, "chain is not loaded yet"))?;
+    // An init install (crate::initsync) answers nothing, to us or a borrower, until it is built.
+    if db.init_active(c) {
+        return Err(err(-28, format!("{} is in an init install: not answered until it is built", p.name)));
+    }
     let param = |i: usize| params.get(i).cloned().unwrap_or(Value::Null);
     // A transaction's or coin's confirmations as they count for money (arcade_chaindb::proven: on DigiByte, Kotia
     // and Wojakcoin only the checked work above it counts), for a program that pays out on them.

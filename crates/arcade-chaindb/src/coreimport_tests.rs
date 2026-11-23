@@ -498,3 +498,135 @@ fn sorter_spills_and_merges() {
     drop(m);
     assert_eq!(std::fs::read_dir(d.path()).unwrap().count(), 0, "runs deleted");
 }
+
+/// A coinbase paying 50 to OP_TRUE, with an extra output (the witness commitment) and, with
+/// `witness_nonce`, the BIP141 witness reserved value.
+fn sw_coinbase(tag: u32, extra_out: Option<Vec<u8>>, witness_nonce: bool) -> Tx {
+    let mut o = 1i32.to_le_bytes().to_vec();
+    if witness_nonce {
+        o.extend_from_slice(&[0, 1]);
+    }
+    write_varint(&mut o, 1);
+    o.extend_from_slice(&[0; 32]);
+    o.extend_from_slice(&u32::MAX.to_le_bytes());
+    write_varint(&mut o, 4);
+    o.extend_from_slice(&tag.to_le_bytes());
+    o.extend_from_slice(&u32::MAX.to_le_bytes());
+    let outs: Vec<(u64, Vec<u8>)> = std::iter::once((50, vec![0x51])).chain(extra_out.map(|s| (0, s))).collect();
+    write_varint(&mut o, outs.len() as u64);
+    for (v, s) in &outs {
+        o.extend_from_slice(&v.to_le_bytes());
+        write_varint(&mut o, s.len() as u64);
+        o.extend_from_slice(s);
+    }
+    if witness_nonce {
+        write_varint(&mut o, 1);
+        write_varint(&mut o, 32);
+        o.extend_from_slice(&[0; 32]);
+    }
+    o.extend_from_slice(&0u32.to_le_bytes());
+    Tx::parse(&o).unwrap()
+}
+
+/// A transaction spending `prev`:0, with a witness or (stripped) without one: the same txid.
+fn sw_spend(prev: Hash256, witness: bool) -> Tx {
+    let mut o = 2i32.to_le_bytes().to_vec();
+    if witness {
+        o.extend_from_slice(&[0, 1]);
+    }
+    write_varint(&mut o, 1);
+    o.extend_from_slice(&prev.0);
+    o.extend_from_slice(&0u32.to_le_bytes());
+    write_varint(&mut o, 0);
+    o.extend_from_slice(&u32::MAX.to_le_bytes());
+    write_varint(&mut o, 1);
+    o.extend_from_slice(&40u64.to_le_bytes());
+    write_varint(&mut o, 2);
+    o.extend_from_slice(&[0x51, 0x52]);
+    if witness {
+        write_varint(&mut o, 2);
+        write_varint(&mut o, 3);
+        o.extend_from_slice(&[1, 2, 3]);
+        write_varint(&mut o, 1);
+        o.push(0x51);
+    }
+    o.extend_from_slice(&0u32.to_le_bytes());
+    Tx::parse(&o).unwrap()
+}
+
+#[test]
+fn a_block_stored_only_with_its_witnesses_stripped_is_refused() {
+    use arcade_chain::hash::sha256d;
+    use arcade_chain::params::{BlockRules, BITCOIN_BLOCK_RULES, SCRIPT_WITNESS};
+    let g = block(Hash256::ZERO, vec![sw_coinbase(0, None, false)], 1);
+    let b1 = block(g.hash(), vec![sw_coinbase(1, None, false)], 2);
+    // Block 2: a transaction with a witness, committed to in the coinbase (BIP141).
+    let full = sw_spend(b1.txs[0].txid, true);
+    let stripped = sw_spend(b1.txs[0].txid, false);
+    assert_eq!(full.txid, stripped.txid);
+    let mut buf = merkle_root(&[Hash256::ZERO, sha256d(&full.raw)]).0.to_vec();
+    buf.extend_from_slice(&[0u8; 32]);
+    let mut commit = vec![0x6a, 0x24, 0xaa, 0x21, 0xa9, 0xed];
+    commit.extend_from_slice(&sha256d(&buf).0);
+    let b2 = block(b1.hash(), vec![sw_coinbase(2, Some(commit.clone()), true), full], 3);
+    let b2_stripped = {
+        let mut raw = b2.header.encode().to_vec();
+        write_varint(&mut raw, 2);
+        raw.extend_from_slice(&sw_coinbase(2, Some(commit), false).raw);
+        raw.extend_from_slice(&stripped.raw);
+        raw
+    };
+    // Same txids, same merkle root: the checks store_blocks_only had pass the stripped copy.
+    assert!(Block::parse(&b2_stripped).unwrap().check().is_ok());
+    // A SegWit chain (its witness rules on at every height).
+    let mut p = PEPECOIN_TEST.clone();
+    p.value_rules = None;
+    p.block_rules = None;
+    p.format = arcade_chain::Format::BITCOIN;
+    p.genesis = Box::leak(g.hash().to_hex().into_boxed_str());
+    p.genesis_header = "";
+    let plain: &'static ChainParams = Box::leak(Box::new(p.clone()));
+    p.block_rules = Some(BlockRules { script_flags: |_| SCRIPT_WITNESS, ..BITCOIN_BLOCK_RULES });
+    let segwit: &'static ChainParams = Box::leak(Box::new(p));
+    let c = segwit.chain_no;
+    let d = tempfile::tempdir().unwrap();
+    let db = ChainDb::open(d.path().join("x.mdbx")).unwrap();
+    db.connect_blocks(plain, std::slice::from_ref(&g)).unwrap();
+    put_all_headers(&db, segwit, &[g.clone(), b1.clone(), b2.clone()]);
+    // Refused, and nothing of the batch stored.
+    let e = db.store_blocks_only(segwit, &[b1.encode(), b2_stripped.clone()]).unwrap_err().to_string();
+    assert!(e.contains("witness"), "{e}");
+    assert_eq!(db.stored_b(c, &b1.hash()).unwrap(), Some(0));
+    assert_eq!(db.stored_b(c, &b2.hash()).unwrap(), Some(0));
+    // Junk after the transactions: refused too.
+    let mut junk = b1.encode();
+    junk.extend_from_slice(&[0, 0, 0]);
+    assert!(db.store_blocks_only(segwit, &[junk]).unwrap_err().to_string().contains("after its transactions"));
+    // The block as mined is stored, byte for byte.
+    db.store_blocks_only(segwit, &[b1.encode(), b2.encode()]).unwrap();
+    assert_eq!(db.block_raw(c, &b2.hash()).unwrap(), Some(b2.encode()));
+}
+
+#[test]
+fn a_64_byte_transaction_is_refused_on_bitcoin_above_691719_only() {
+    use arcade_chain::params::{BITCOIN_MAIN, DOGECOIN_MAIN};
+    let g = block(Hash256::ZERO, vec![sw_coinbase(0, None, false)], 1);
+    let mut o = 1i32.to_le_bytes().to_vec();
+    write_varint(&mut o, 1);
+    o.extend_from_slice(&g.txs[0].txid.0);
+    o.extend_from_slice(&0u32.to_le_bytes());
+    write_varint(&mut o, 0);
+    o.extend_from_slice(&u32::MAX.to_le_bytes());
+    write_varint(&mut o, 1);
+    o.extend_from_slice(&1000u64.to_le_bytes());
+    write_varint(&mut o, 4);
+    o.extend_from_slice(&[0x51, 0x51, 0x87, 0x51]);
+    o.extend_from_slice(&0u32.to_le_bytes());
+    assert_eq!(o.len(), 64);
+    let t64 = Tx::parse(&o).unwrap();
+    let b = block(g.hash(), vec![sw_coinbase(1, None, false), t64.clone()], 2);
+    assert_eq!(no_64_byte_txs_above(&BITCOIN_MAIN), Some(691_719));
+    assert_eq!(tx_of_64_bytes(&BITCOIN_MAIN, 691_720, &b), Some(t64.txid));
+    assert_eq!(tx_of_64_bytes(&BITCOIN_MAIN, 691_719, &b), None);
+    assert_eq!(tx_of_64_bytes(&DOGECOIN_MAIN, 5_000_000, &b), None);
+}

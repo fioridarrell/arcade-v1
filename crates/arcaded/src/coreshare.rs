@@ -37,7 +37,7 @@ pub fn lent(node: &Node) -> Vec<&'static ChainParams> {
     // every mesh link).
     let runs: Vec<_> = node.extra.lock().unwrap().values().cloned().collect();
     for r in runs {
-        if r.mode == "full" && !node.far_behind(r.params) && r.peer_tip.load(std::sync::atomic::Ordering::Relaxed) <= node.chain.tip(r.params.chain_no).ok().flatten().map(|t| t.height + 10).unwrap_or(0) {
+        if r.mode == "full" && !node.chain.init_active(r.params.chain_no) && !node.far_behind(r.params) && r.peer_tip.load(std::sync::atomic::Ordering::Relaxed) <= node.chain.tip(r.params.chain_no).ok().flatten().map(|t| t.height + 10).unwrap_or(0) {
             v.push(r.params);
         }
     }

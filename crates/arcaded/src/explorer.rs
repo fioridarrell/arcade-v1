@@ -98,6 +98,11 @@ fn ctx<'a>(node: &'a Node, req: &Value) -> Result<Ctx<'a>, String> {
         Some(k) => crate::chains::find(k).ok_or_else(|| format!("unknown chain {k}"))?,
         None => node.params,
     };
+    // A chain in an init install answers nothing from here until it is built (crate::initsync):
+    // its blocks are stored but their rules and coins not checked yet.
+    if node.chain.init_active(p.chain_no) {
+        return Err(format!("{} is in an init install: the Explorer answers from it once it is built", p.name));
+    }
     let indexes = if p.chain_no == node.params.chain_no {
         crate::chains::home_indexes(node)
     } else if crate::arcsvc::runs(p) {

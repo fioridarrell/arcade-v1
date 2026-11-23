@@ -101,7 +101,7 @@ fn remember_passed(p: &ChainParams, tx: &Tx) {
 /// A passed-on transaction still remembered (and not yet in a block).
 fn passed_tx(node: &Node, p: &ChainParams, txid: &arcade_chain::Hash256) -> Option<Tx> {
     let raw = passed(|m| m.txs.get(&(p.chain_no, *txid)).map(|v| v.1.clone()))?;
-    if node.chain.tx_raw(p, txid).ok().flatten().is_some() {
+    if node.chain.tx_raw_tables(p, txid).ok().flatten().is_some() {
         passed(|m| m.forget(p, txid));
         return None;
     }
@@ -113,7 +113,7 @@ fn passed_tx(node: &Node, p: &ChainParams, txid: &arcade_chain::Hash256) -> Opti
 pub fn passed_pool(node: &Node, p: &ChainParams) -> Vec<(u64, Vec<u8>)> {
     let mut all: Vec<(arcade_chain::Hash256, u64, Vec<u8>)> =
         passed(|m| m.txs.iter().filter(|(k, _)| k.0 == p.chain_no).map(|(k, v)| (k.1, v.0, v.1.clone())).collect());
-    all.retain(|(id, ..)| node.chain.tx_raw(p, id).ok().flatten().is_none());
+    all.retain(|(id, ..)| node.chain.tx_raw_tables(p, id).ok().flatten().is_none());
     all.sort_by_key(|x| x.1);
     all.into_iter().map(|(_, seen, raw)| (seen, raw)).collect()
 }
@@ -297,7 +297,7 @@ pub fn sort(node: &Node, p: &ChainParams, tx: &Tx) -> Result<Option<(usize, arca
     if tx.raw.len() > MAX_TX {
         return Err(format!("larger than {MAX_TX} bytes"));
     }
-    if node.chain.mempool_tx(c, &tx.txid).map_err(|e| e.to_string())?.is_some() || node.chain.tx_raw(p, &tx.txid).map_err(|e| e.to_string())?.is_some() {
+    if node.chain.mempool_tx(c, &tx.txid).map_err(|e| e.to_string())?.is_some() || node.chain.tx_raw_tables(p, &tx.txid).map_err(|e| e.to_string())?.is_some() {
         return Err("known".into());
     }
     let (n, bytes) = node.chain.mempool_size(c).map_err(|e| e.to_string())?;

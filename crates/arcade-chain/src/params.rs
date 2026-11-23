@@ -184,6 +184,12 @@ pub struct ChainParams {
     pub coinbase_script_max: usize,
     /// The arcade's ledger index starts here (activation / index floor).
     pub index_start: u32,
+    /// Init installs (`arcade chain add <key> --init`): the headers phase is done only once the
+    /// best header chain has at least this much total work (big-endian hex, as Core prints
+    /// nMinimumChainWork; empty = no floor). A guard against a few sources feeding a made-up
+    /// low-work chain: they would have to out-work this. Set well below the real tip, so a new
+    /// release never waits for work the network hasn't done yet.
+    pub min_chain_work: &'static str,
 }
 
 impl ChainParams {
@@ -261,6 +267,39 @@ impl ChainParams {
     /// The checkpoint hash at `height`, if there is one.
     pub fn checkpoint_at(&self, height: u32) -> Option<Hash256> {
         self.checkpoints.iter().find(|(h, _)| *h == height).map(|(_, x)| Hash256::from_hex(x).expect("valid checkpoint hex"))
+    }
+
+    /// [`ChainParams::min_chain_work`] as a number (zero = no floor).
+    pub fn min_chain_work(&self) -> U256 {
+        let mut b = [0u8; 32];
+        match hex::decode(self.min_chain_work) {
+            Ok(v) if v.len() == 32 => b.copy_from_slice(&v),
+            _ => return U256::ZERO,
+        }
+        U256::from_be_bytes(&b)
+    }
+
+    /// The most bytes one block can take on the wire. On a SegWit chain without MWEB the weight
+    /// limit bounds a block's whole serialized size (weight = base x 3 + total), plus room for
+    /// an AuxPoW proof; elsewhere the protocol's message limit (blocks there may be bigger than
+    /// their rules say: Litecoin's MWEB part is not counted, other chains' limits are not all
+    /// known exactly).
+    pub fn max_block_bytes(&self) -> usize {
+        match self.block_rules {
+            Some(r) if self.format.segwit && !self.format.mweb => (r.max_block_weight.max(r.max_block_size) + (1 << 20)).min(crate::p2p::MAX_MESSAGE),
+            _ => crate::p2p::MAX_MESSAGE,
+        }
+    }
+
+    /// Scripts at or under this height are taken as valid unless ARCADE_VERIFY_ALL_SCRIPTS=1
+    /// (Core's "assume valid"): the newest checkpoint, since no fork may start under it.
+    /// Bitcoin's checkpoint is a fence against header spam only (init installs): its scripts are
+    /// all checked, as before it had one.
+    pub fn assume_valid(&self) -> Option<u32> {
+        if self.key == "btc" {
+            return None;
+        }
+        self.last_checkpoint(u32::MAX)
     }
 
     /// The highest checkpoint height at or below `height`: no fork may start under it.
@@ -924,6 +963,7 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 1_496_133,
+    min_chain_work: "",
 };
 
 pub static PEPECOIN_MAIN: ChainParams = ChainParams {
@@ -978,6 +1018,7 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 1_208_000,
+    min_chain_work: "",
 };
 
 pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
@@ -1021,6 +1062,7 @@ pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 24_450_000,
+    min_chain_work: "",
 };
 
 /// DigiByte testnet26 ("DigiDollar Reset"): DigiDollar active from height 600.
@@ -1060,6 +1102,7 @@ pub static DIGIBYTE_TEST: ChainParams = ChainParams {
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 595_000,
+    min_chain_work: "",
 };
 
 /// Kotia: Blackcoin-style PoS on Bitcoin 0.14. Scrypt PoW to block 1,000,000, then PoS.
@@ -1099,6 +1142,7 @@ pub static KOTIA_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 20,
     coinbase_script_max: 100,
     index_start: 1_530_000,
+    min_chain_work: "",
 };
 
 /// Flopcoin: a Dogecoin 1.14 fork. AuxPoW required from 110,000 (chain id 0xA3, strict).
@@ -1135,6 +1179,7 @@ pub static FLOPCOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 914_000,
+    min_chain_work: "",
 };
 
 /// Litecoin: scrypt, SegWit, Taproot, MWEB (extension block after the HogEx tx).
@@ -1172,6 +1217,7 @@ pub static LITECOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 3_197_300,
+    min_chain_work: "",
 };
 
 pub static LITECOIN_TEST: ChainParams = ChainParams {
@@ -1208,6 +1254,7 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 4_926_300,
+    min_chain_work: "",
 };
 
 /// Dogecoin: scrypt, merge-mined (AuxPoW chain id 0x62) from 371,337.
@@ -1254,6 +1301,7 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 6_415_000,
+    min_chain_work: "",
 };
 
 /// Bitcoin: sha256d, SegWit, Taproot; difficulty retargets every 2016 blocks (at most 4x).
@@ -1288,10 +1336,18 @@ pub static BITCOIN_MAIN: ChainParams = ChainParams {
         "seed.bitcoin.sprovoost.nl", "dnsseed.emzy.de", "seed.bitcoin.wiz.biz",
     ],
     fixed_peers: &[],
-    checkpoints: &[],
+    // Block 691,719: the block min_chain_work below ends at (Core 22.0's nMinimumChainWork and
+    // defaultAssumeValid; hash checked against two block explorers). No header fork may start
+    // under it, so a made-up branch can't spread over the low-difficulty years. Scripts are still
+    // checked everywhere (assume_valid).
+    checkpoints: &[(691_719, "00000000000000000008a89e854d57e5667df88f1cdef6fde2fbca1de5b639ad")],
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 970_000,
+    // Bitcoin Core 22.0's nMinimumChainWork: the total work up to block 691,719 (mid-2021,
+    // over 200,000 blocks under today's tip). Deliberately old: it only has to be far more work
+    // than anyone could make up, and an old value never holds back a real install.
+    min_chain_work: "00000000000000000000000000000000000000001fa4663bbbe19f82de910280",
 };
 
 /// Wojakcoin: a Bitcoin Core 0.21 fork with sha256d, 120 s blocks, no AuxPoW and no active
@@ -1337,6 +1393,7 @@ pub static WOJAKCOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 20,
     coinbase_script_max: 100,
     index_start: 228_000,
+    min_chain_work: "",
 };
 
 /// Shibacoin (SHIC): a Scrypt chain built from Dogecoin Core like Pepecoin, merge-mined with AuxPoW from block
@@ -1389,6 +1446,7 @@ pub static SHIBACOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 0,
+    min_chain_work: "",
 };
 
 /// Bellscoin (BEL), Bells 3: Scrypt, AuxPoW (chain id 16, strict) and SegWit both from block 144,000, bech32 "bel".
@@ -1442,6 +1500,7 @@ pub static BELLSCOIN_MAIN: ChainParams = ChainParams {
     // The original arcade's Bellscoin floor (config.py BEL_MAINNET_FLOOR).
     coinbase_script_max: 100,
     index_start: 1_289_000,
+    min_chain_work: "",
 };
 
 /// Luckycoin (LKY), Luckycoin Core 5.0.1 on Dogecoin 1.14's code: Scrypt, Digishield from 69,360, AuxPoW chain id 0x2013
@@ -1490,6 +1549,7 @@ pub static LUCKYCOIN_MAIN: ChainParams = ChainParams {
     // The original arcade's Luckycoin floor (config.py LKY_MAINNET_FLOOR).
     coinbase_script_max: 100,
     index_start: 1_153_000,
+    min_chain_work: "",
 };
 
 /// Junkcoin (JKC), Junkcoin Core 4.0.3.1 on Litecoin 0.21's code: Scrypt, AuxPoW chain id 0x2020 (strict) from block
@@ -1540,6 +1600,7 @@ pub static JUNKCOIN_MAIN: ChainParams = ChainParams {
     // No original-arcade floor: indexes start near the tip when it was added (2026-11-11, tip 1,215,059).
     coinbase_script_max: 110,
     index_start: 1_215_000,
+    min_chain_work: "",
 };
 
 /// Pepecoin regtest, for the consensus harness (tests/regtest): V1 and a real Pepecoin Core in
@@ -1581,6 +1642,7 @@ pub static PEPECOIN_REGTEST: ChainParams = ChainParams {
     coinbase_maturity: 60,
     coinbase_script_max: 100,
     index_start: 0,
+    min_chain_work: "",
 };
 
 /// Litecoin regtest, for the SegWit-era consensus harness (tests/regtest/ltcnet.py), as
@@ -1636,6 +1698,7 @@ pub static LITECOIN_REGTEST: ChainParams = ChainParams {
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 0,
+    min_chain_work: "",
 };
 
 /// The regtest chains of the consensus harnesses, by key.

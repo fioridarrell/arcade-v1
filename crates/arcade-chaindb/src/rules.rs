@@ -35,11 +35,11 @@ pub fn verify_all_scripts() -> bool {
 }
 
 /// The script flags to check a block at `height` with, or None when its scripts aren't checked:
-/// the chain has no block rules, or the block is under the newest checkpoint ("assume valid":
-/// V1 lets no fork start under it) and ARCADE_VERIFY_ALL_SCRIPTS is off.
+/// the chain has no block rules, or the block is under the chain's assume-valid height (its
+/// newest checkpoint, ChainParams::assume_valid) and ARCADE_VERIFY_ALL_SCRIPTS is off.
 pub fn script_flags(params: &ChainParams, height: u32, all: bool) -> Option<u32> {
     let br = params.block_rules.filter(|b| height > 0 && b.scripts)?;
-    (all || params.last_checkpoint(u32::MAX).is_none_or(|cp| height > cp)).then(|| (br.script_flags)(height))
+    (all || params.assume_valid().is_none_or(|cp| height > cp)).then(|| (br.script_flags)(height))
 }
 
 /// Size without witness data (Core's SERIALIZE_TRANSACTION_NO_WITNESS): the wire bytes,
@@ -416,7 +416,7 @@ const WATCH_FIRST: usize = 5;
 impl Watch {
     pub fn new(params: &ChainParams) -> Watch {
         let scripts_from = if params.block_rules.is_some_and(|b| b.scripts) {
-            if verify_all_scripts() { 1 } else { params.last_checkpoint(u32::MAX).map_or(1, |c| c + 1) }
+            if verify_all_scripts() { 1 } else { params.assume_valid().map_or(1, |c| c + 1) }
         } else {
             u32::MAX
         };
@@ -553,21 +553,36 @@ pub fn replay(db: &crate::ChainDb, params: &ChainParams, from: u32, to: u32, thr
     // Chunk starts handed out and not finished: done_to is just under the lowest.
     let open: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
     let last_seen = Mutex::new(std::time::Instant::now());
+    // The main chain's height of each block number, read once (a lookup per spent coin was a
+    // good part of a long replay's reads): u32::MAX where unknown (looked up then).
+    let mut b_height: Vec<u32> = Vec::new();
+    let _ = db.store(c).read(|r| {
+        r.for_each_prefix(crate::schema::HEIGHT, &crate::schema::k_chain(c), |k, v| {
+            let (h, b) = (arcade_store::key::be_u32(k, 2), arcade_store::key::be_u32(v, 32) as usize);
+            if h > to {
+                return Ok(false);
+            }
+            if b_height.len() <= b {
+                b_height.resize(b + 1, u32::MAX);
+            }
+            b_height[b] = h;
+            Ok(true)
+        })
+    });
+    let b_height = &b_height;
     std::thread::scope(|sc| {
         for _ in 0..threads.max(1) {
             sc.spawn(|| {
                 BLOCKS_IN_PARALLEL.set(threads > 1);
-                // Blocks read for their transactions, by block number (cleared when big).
-                let mut blocks: HashMap<u32, Option<Arc<Block>>> = HashMap::new();
-                let mut by_number = |b: u32| -> Option<Arc<Block>> {
-                    if blocks.len() > 4096 {
-                        blocks.clear();
+                // Transactions read for the coins they made, by (block number, position): one
+                // row each, not their whole block (a big chain's spends reach all over its
+                // history; cleared when big).
+                let mut txs_read: HashMap<(u32, u32), Option<Arc<arcade_chain::Tx>>> = HashMap::new();
+                let mut tx_at = |b: u32, pos: u32| -> Option<Arc<arcade_chain::Tx>> {
+                    if txs_read.len() > 200_000 {
+                        txs_read.clear();
                     }
-                    blocks.entry(b).or_insert_with(|| {
-                        let (h, _, _) = db.block_at(params, b).ok()??;
-                        let raw = db.block_raw(c, &params.block_id(&h)).ok()??;
-                        Block::parse_with(&raw, &params.format).ok().map(Arc::new)
-                    }).clone()
+                    txs_read.entry((b, pos)).or_insert_with(|| db.tx_at(params, b, pos).ok().flatten().map(Arc::new)).clone()
                 };
                 let mut heights: HashMap<u32, u32> = HashMap::new();
                 loop {
@@ -595,11 +610,10 @@ pub fn replay(db: &crate::ChainDb, params: &ChainParams, from: u32, to: u32, thr
                             if !tx.is_coinbase() {
                                 for inp in &tx.inputs {
                                     let Some((b, pos)) = db.tx_location(params, &inp.prevout.txid).ok().flatten() else { ok = false; break 'txs };
-                                    let Some(pb) = by_number(b) else { ok = false; break 'txs };
-                                    let Some(ptx) = pb.txs.get(pos as usize) else { ok = false; break 'txs };
+                                    let Some(ptx) = tx_at(b, pos) else { ok = false; break 'txs };
                                     let Some(o) = ptx.outputs.get(inp.prevout.vout as usize) else { ok = false; break 'txs };
-                                    let ph = match heights.get(&b) {
-                                        Some(x) => *x,
+                                    let ph = match b_height.get(b as usize).copied().filter(|h| *h != u32::MAX).or_else(|| heights.get(&b).copied()) {
+                                        Some(x) => x,
                                         None => {
                                             let Some((_, x, _)) = db.block_at(params, b).ok().flatten() else { ok = false; break 'txs };
                                             if heights.len() > 100_000 {

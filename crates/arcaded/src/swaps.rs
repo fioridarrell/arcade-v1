@@ -43,6 +43,10 @@ const KINDS: &[&str] = &["coin", "dd", "token20", "token", "ord"];
 /// not hold it longer, and a taker whose hold ran out waits as long again before that arcade may hold the order again
 /// (others get their turn).
 const HOLD_SECS: u32 = 30 * 60;
+/// After a taker lets go of its hold (its own lock step failed before anything was sent: "sletgo"), how long before
+/// its arcade may hold that order again. Others may hold it at once; the wait keeps a hold-and-let-go loop from
+/// keeping an order from everybody else (a let-go hold isn't the 30 minutes a hold that ran out waits).
+const LETGO_SECS: u32 = 2 * 60;
 /// Open orders here one asking arcade may hold at once, with every taker it carries (a website's visitors).
 const HOLDS_PER_PEER: usize = 3;
 
@@ -1257,6 +1261,10 @@ fn hold(node: &Node, o: &mut Value, peer: &str, who: &str) -> Result<(), String>
     } else if !held.is_empty() && peer_of(&held) == peer && t < until + HOLD_SECS {
         return Err(format!("your hold on that order ran out without a lock; it is open to others for {} more minutes", (until + HOLD_SECS - t).div_ceil(60)));
     }
+    let gone = o["let_go_until"].as_u64().unwrap_or(0) as u32;
+    if o["let_go_by"].as_str() == Some(peer) && t < gone {
+        return Err(format!("your arcade let go of that order just now; ask again in {} minutes", (gone - t).div_ceil(60).max(1)));
+    }
     let id = o["id"].as_str().unwrap_or("");
     let holding = list(node, "sorder").iter().filter(|x| x["id"] != id && x["status"] == "open" && x["held_until"].as_u64().unwrap_or(0) as u32 > t && x["held_by"].as_str().is_some_and(|h| peer_of(h) == peer)).count();
     if holding >= HOLDS_PER_PEER {
@@ -1285,6 +1293,24 @@ pub fn answer(node: &Node, peer: &str, q: &Value) -> Result<Value, String> {
             // "sized": this maker's lock takes only a 32-byte secret (an older taker doesn't know to look for it:
             // it never finds this side's lock, and both sides refund).
             Ok(json!({"order": public_order(&o), "maker_keys": keys_for(node, &[&o["give"], &o["get"]], Some(&o), &order_account(node, &o))?, "maker_secs": maker_secs(), "sized": sized_on(node, &o["give"])}))
+        }
+        // The taker it is held for lets go (its own lock step failed before anything was sent): open to others now,
+        // and to this arcade again after LETGO_SECS, not the HOLD_SECS wait of a hold that ran out.
+        "sletgo" => {
+            let who = q["taker"].as_str().unwrap_or("");
+            if who.is_empty() || peer_of(who) != peer {
+                return Err("a taker lets go of its own hold only".into());
+            }
+            let mut o = get(node, "sorder", q["order"].as_str().unwrap_or("")).filter(|o| o["status"] == "open").ok_or("that order is not open")?;
+            if o["held_by"].as_str() != Some(who) || o["held_until"].as_u64().unwrap_or(0) as u32 <= now() {
+                return Ok(json!({"held": false}));
+            }
+            o["held_by"] = json!("");
+            o["held_until"] = json!(0);
+            o["let_go_by"] = json!(peer);
+            o["let_go_until"] = json!(now() + LETGO_SECS);
+            put(node, "sorder", &o);
+            Ok(json!({"held": false, "let_go": true}))
         }
         "slocked" => {
             // A taker tells of its own lock only (or its own website's visitors').
@@ -1384,6 +1410,13 @@ fn ask(node: &Node, peer: &str, q: Value) -> Result<Value, String> {
 /// nothing is locked (a maker can't swap in other terms between the card and the Approve).
 pub fn take(node: &Node, maker: &str, order: &str, shown: Option<&Value>) -> Result<Value, String> {
     let quote = ask(node, maker, json!({"op": "squote", "chain": "dgbtest", "order": order, "taker": node.id_hex()}))?;
+    // Stopped before anything is locked: the hold is let go, so a retry (or another taker) needn't wait it out.
+    take_quoted(node, maker, shown, &quote).inspect_err(|_| {
+        let _ = ask(node, maker, json!({"op": "sletgo", "chain": "dgbtest", "order": order, "taker": node.id_hex()}));
+    })
+}
+
+fn take_quoted(node: &Node, maker: &str, shown: Option<&Value>, quote: &Value) -> Result<Value, String> {
     let o = quote["order"].clone();
     if let Some(sh) = shown {
         if !same_terms(&o, sh) {
@@ -1444,6 +1477,8 @@ pub fn outside(node: &Node, op: &str, req: &Value) -> Result<Value, String> {
             ask(node, maker, q)
         }
         "status" => ask(node, maker, json!({"op": "sstatus", "chain": "dgbtest", "hash": req["hash"]})),
+        // The visitor's lock step failed before anything was sent: let go of the hold (swaps::answer "sletgo").
+        "letgo" => ask(node, maker, json!({"op": "sletgo", "chain": "dgbtest", "order": req["order"], "taker": taker})),
         _ => Err("unknown outside-taker question".into()),
     }
 }
@@ -1977,6 +2012,32 @@ mod account_tests {
         // A taker tells of its own lock only.
         let told = answer(&t.node, "pc", &json!({"op": "slocked", "order": ids[0], "hash": "00", "taker": "pd"}));
         assert!(told.unwrap_err().contains("own lock"));
+    }
+
+    /// A taker whose lock step failed lets go of its hold: open to others at once, to its own arcade (a website's next
+    /// visitor too) after LETGO_SECS, never another taker's hold.
+    #[test]
+    fn a_taker_lets_go_of_its_hold() {
+        let t = crate::sitesvc::tests::setup();
+        two_accounts(&t);
+        let (give, get_leg) = legs(&t);
+        let id = place(&t.node, &give, &get_leg, &Value::Null).unwrap()["id"].as_str().unwrap().to_string();
+        let quote = |peer: &str, taker: &str| answer(&t.node, peer, &json!({"op": "squote", "order": id, "taker": taker}));
+        let letgo = |peer: &str, taker: &str| answer(&t.node, peer, &json!({"op": "sletgo", "order": id, "taker": taker}));
+        quote("pa", "pa:v1").unwrap();
+        assert!(letgo("pc", "pa:v1").is_err(), "only its own arcade lets go");
+        assert_eq!(letgo("pa", "pa:v2").unwrap()["let_go"], Value::Null, "another visitor's hold stays");
+        assert!(quote("pc", "pc").unwrap_err().contains("taking that order"));
+        assert_eq!(letgo("pa", "pa:v1").unwrap()["let_go"], true);
+        assert!(quote("pa", "pa:v2").unwrap_err().contains("let go of that order just now"));
+        quote("pc", "pc").unwrap();
+        // pc lets go too; once pa's short wait is over it holds it again.
+        letgo("pc", "pc").unwrap();
+        let mut o = get(&t.node, "sorder", &id).unwrap();
+        o["let_go_by"] = json!("pa");
+        o["let_go_until"] = json!(now() - 1);
+        put(&t.node, "sorder", &o);
+        quote("pa", "pa:v2").unwrap();
     }
 }
 

@@ -55,7 +55,7 @@ It has to be named because the entrance presents itself to arcaded as this compu
   the cookie's secret; the page keeps it in this browser and sends it with each call.
 - **This computer only**, for `/ui/` as for `/rpc`: a loopback peer asking for this port by a
   loopback name, with no proxy's headers, never with `--behind-proxy`. An SSH tunnel counts (it
-  arrives on loopback); `--http-bind 0.0.0.0` doesn't open the window to the network. Another
+  arrives on loopback); a non-loopback `--http-bind` is refused unless `--i-understand-remote-api` is also given, and even then the window stays on a loopback Host, so opening the port does not open the window to the network. Another
   website's page can't call `/rpc` (the Authorization header needs a preflight the arcade doesn't
   allow).
 - With the key, the window can do everything the app can (wallet included): treat the link like

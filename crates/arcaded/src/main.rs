@@ -135,6 +135,7 @@ mod walletproofs;
 mod turnsvc;
 mod v1copy;
 mod vxshare;
+mod drivepace;
 mod watchdog;
 mod v1import;
 mod shares;
@@ -695,6 +696,7 @@ fn main() {
     // Pepecoin testnet installed here, or borrowed until someone installs it (crate::homeinst).
     homeinst::init(&node);
     chains::start_saved(&node);
+    drivepace::start(node.clone());
     borrow::start(node.clone());
     swaps::start(node.clone());
     richlist::start(node.clone());

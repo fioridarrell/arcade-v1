@@ -293,6 +293,7 @@ impl ChainDb {
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
+            crate::pace::wait(c);
             self.store(c).read(|r| {
                 for &b in chunk {
                     for (k, raw) in r.scan_prefix(BLOCK_TX, &k_block(c, b))? {
@@ -906,6 +907,7 @@ impl Replay {
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
+            crate::pace::wait(c);
             let end = to.min(self.height + 1000);
             db.store(c).read(|r| {
                 for h in self.height + 1..=end {
@@ -996,6 +998,7 @@ impl DiskReplay {
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
+            crate::pace::wait(c);
             let end = to.min(self.height + 1000);
             db.store(c).read(|r| {
                 for h in self.height + 1..=end {

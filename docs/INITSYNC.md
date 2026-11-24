@@ -270,3 +270,17 @@ built.
 - `crates/arcaded/src/initsync.rs`: the phases in the chain thread, status rows.
 - `crates/arcaded/src/psync.rs`: `run_store` (store-only, any order).
 - `crates/arcade-chain/src/params.rs`: `ChainParams::min_chain_work`.
+
+## Sharing a drive
+
+An init install stores blocks and builds as fast as the drive allows. On a spinning disk that
+starves a chain on the same drive that was at its tip: each new block's reads wait behind the
+install (seen on node 2, 2026-11-23: Bitcoin stuck 8 blocks behind for 2 h while Dogecoin's
+init wrote ~50 MB/s to the same 8 TB disk). So bulk work yields (crate::drivepace): a monitor
+looks at every running chain every 5 s, and a chain that was at its tip in the last 6 h and is
+now more than 2 blocks behind marks its drive as starved. The init loops (each 16 MB stored,
+each 500 or 1,000 blocks of the tx index, coin set and rules replay) call
+`arcade_chaindb::pace::wait`, which waits while the drive is starved, at most 30 s at a time,
+so an install never stops for good. Chain status shows `drive_pace` while it yields; the event
+log says when it starts and stops. `ARCADE_DRIVE_PACE=0` turns it off.
+

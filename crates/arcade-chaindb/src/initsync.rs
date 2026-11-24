@@ -638,6 +638,7 @@ impl ChainDb {
                 out.stored += good.len();
                 good.clear();
                 good_bytes = 0;
+                crate::pace::wait(params.chain_no);
             }
         }
         if !good.is_empty() {

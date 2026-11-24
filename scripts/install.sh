@@ -1,5 +1,10 @@
 #!/usr/bin/env bash
-# Arcade V1.0 one-line installer for Linux and macOS:
+# Arcade V1.0 one-line installer for Linux and macOS.
+#
+# The install path the docs lead with is download, check the .sha256 (and the detached
+# minisign or GPG signature when the release has one), then:
+#   bash arcade-v1-linux-<arch>/scripts/install-linux.sh --prebuilt arcade-v1-linux-<arch>
+# This script is the advanced one-liner, for when you would rather not do those steps by hand:
 #
 #   curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.sh | bash
 #

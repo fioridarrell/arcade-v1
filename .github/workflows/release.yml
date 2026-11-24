@@ -5,10 +5,16 @@
 #   arcade-v1-linux-x86_64.tar.gz      (+ .sha256)   Ubuntu 22.04 (glibc 2.35: Ubuntu 22.04+, Mint 21+, Debian 12+)
 #   arcade-v1-linux-aarch64.tar.gz     (+ .sha256)
 #   arcade-v1-windows-x86_64.zip       (+ .sha256)   MSVC; Windows 10/11 x64
-#   arcade-v1-windows-x86_64-setup.exe (+ .sha256)   one-click installer around the zip's install.ps1
+#   arcade-v1-windows-x86_64-setup.exe (+ .sha256)   one-click installer; the payload zip's SHA-256 is inside it
+#   arcade-v1-windows-x86_64-binaries.sha256         arcaded.exe, arcade.exe, arcade-desktop.exe, Install.exe, setup.exe
+#   arcade-v1-windows-x86_64-payload.sha256          the zip the installer extracts, checked before it unpacks
 #   arcade-v1-macos-aarch64.tar.gz     (+ .sha256)   for now only when the macOS build succeeds (not required yet)
 #   arcade-v1-macos-x86_64.tar.gz      (+ .sha256)
-# Every archive carries COMMIT (the commit it was built from); the release job refuses to publish unless every
+# Windows binaries are Authenticode-signed when WINDOWS_CODESIGN_PFX is set (see scripts/windows/sign-authenticode.ps1).
+# With no certificate in that secret, signing is skipped and the log says so. Linux archives get a detached
+# minisign and/or GPG signature when those secrets are set (scripts/release/sign_linux.sh); the .sha256 is always published.
+# The release job refuses to publish if a hash does not match, or if a signature is missing when its secret is set.
+# Every archive carries COMMIT (the commit it was built from); the release job also refuses to publish unless every
 # archive's COMMIT is the tag's commit and every required platform (Linux x86_64 + aarch64, Windows x86_64) built.
 # No separate Windows releases (the old vX.Y.Z-windows pre-releases): a tag with a hyphen is refused.
 # install.sh downloads arcade-v1-linux-<arch>.tar.gz. install.ps1 downloads arcade-v1-windows-x86_64.zip. Arcades
@@ -162,17 +168,53 @@ jobs:
           git rev-parse HEAD | Set-Content "$name\COMMIT" -Encoding ascii -NoNewline
           # Zipped after the installer is built (next step), so the zip carries it as Install.exe.
 
+      - name: Sign programs (Authenticode)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
+        run: |
+          # Before the payload zip is hashed, so the signed programs are what the installer extracts.
+          # No certificate yet: the script exits 0 and names the secret Martin has to add.
+          $name = 'arcade-v1-${{ matrix.platform }}'
+          & .\scripts\windows\sign-authenticode.ps1 "$name\bin\arcaded.exe" "$name\bin\arcade.exe" "$name\bin\arcade-desktop.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed ($LASTEXITCODE)" }
+
       - name: One-click installer (Setup.exe)
         if: runner.os == 'Windows'
         shell: pwsh
+        env:
+          WINDOWS_CODESIGN_PFX: ${{ secrets.WINDOWS_CODESIGN_PFX }}
+          WINDOWS_CODESIGN_PASSWORD: ${{ secrets.WINDOWS_CODESIGN_PASSWORD }}
         run: |
-          # The packaged folder above, wrapped in an NSIS installer (scripts/windows/setup.nsi) that runs
-          # its install.ps1: double-click, no PowerShell, listed in Settings > Apps.
+          # The packaged folder above, as one zip the installer refuses to unpack until its SHA-256
+          # matches the hash compiled into the stub (scripts/windows/setup.nsi, Verify-Payload.ps1).
+          # Install.exe is a copy of the signed setup.exe, added after the payload zip is hashed,
+          # so the installer does not carry a copy of itself.
           $name = 'arcade-v1-${{ matrix.platform }}'
+          $payload = "$name-payload.zip"
+          if (Test-Path $payload) { Remove-Item $payload -Force }
+          Compress-Archive -Path $name -DestinationPath $payload
+          $payloadHash = (Get-FileHash $payload -Algorithm SHA256).Hash.ToLower()
+          [IO.File]::WriteAllText("$pwd\$name-payload.sha256", "$payloadHash  $name-payload`n")
           $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
           if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress | Out-Null }
-          & $nsis /NOCD /V2 "/DVERSION=$env:ARCADE_VERSION" "/DPKG=$name" "/DOUT=$name-setup.exe" scripts\windows\setup.nsi
+          $stub = "$name-setup-stub.exe"
+          & $nsis /NOCD /V2 "/DVERSION=$env:ARCADE_VERSION" "/DPKG=$name" "/DOUT=$stub" "/DPAYLOAD_SHA256=$payloadHash" scripts\windows\setup.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }
+          $python = "python"
+          if (-not (Get-Command python -ErrorAction SilentlyContinue)) {
+            if (Get-Command py -ErrorAction SilentlyContinue) { $python = "py" } else { throw "Python is required to append the installer payload" }
+          }
+          & $python scripts\release\payload_trailer.py append --stub $stub --payload $payload --out "$name-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "payload append failed ($LASTEXITCODE)" }
+          Remove-Item $stub, $payload -Force
+          & $python scripts\release\payload_trailer.py check --installer "$name-setup.exe" --expected $payloadHash
+          if ($LASTEXITCODE -ne 0) { throw "installer payload does not match the embedded SHA-256" }
+          # After the append, so the signature covers the payload. Install.exe is this file, copied below.
+          & .\scripts\windows\sign-authenticode.ps1 "$name-setup.exe"
+          if ($LASTEXITCODE -ne 0) { throw "Authenticode signing failed ($LASTEXITCODE)" }
           $hash = (Get-FileHash "$name-setup.exe" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("$pwd\$name-setup.exe.sha256", "$hash  $name-setup.exe`n")
           Get-ChildItem "$name-setup.exe*" | Format-Table Name,Length
@@ -181,23 +223,38 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
-          # The zip's folder opens on Install.exe (an installer at the top of the zip), beside
-          # Install-PowerShell.cmd. The installer was built from the folder before this copy, so it doesn't carry itself.
+          # The zip's folder opens on Install.exe (the signed setup.exe), beside Install-PowerShell.cmd.
           $name = 'arcade-v1-${{ matrix.platform }}'
           Copy-Item "$name-setup.exe" "$name\Install.exe"
           if (Test-Path "$name.zip") { Remove-Item "$name.zip" -Force }
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           $hash = (Get-FileHash "$name.zip" -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("$pwd\$name.zip.sha256", "$hash  $name.zip`n")
-          Get-ChildItem "$name.zip*" | Format-Table Name,Length
+          function Publish-Hash([string]$Path, [string]$Label) {
+            $h = (Get-FileHash -LiteralPath $Path -Algorithm SHA256).Hash.ToLower()
+            return "$h  $Label"
+          }
+          $lines = @(
+            (Publish-Hash "$name\bin\arcaded.exe" 'arcaded.exe'),
+            (Publish-Hash "$name\bin\arcade.exe" 'arcade.exe'),
+            (Publish-Hash "$name\bin\arcade-desktop.exe" 'arcade-desktop.exe'),
+            (Publish-Hash "$name\Install.exe" 'Install.exe'),
+            (Publish-Hash "$name-setup.exe" "$name-setup.exe")
+          )
+          [IO.File]::WriteAllText("$pwd\$name-binaries.sha256", (($lines -join "`n") + "`n"))
+          Get-ChildItem "$name.zip*", "$name-binaries.sha256", "$name-payload.sha256" | Format-Table Name,Length
 
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         if: runner.os == 'Windows'
         with:
           name: arcade-v1-${{ matrix.platform }}
           path: |
-            arcade-v1-${{ matrix.platform }}.zip*
-            arcade-v1-${{ matrix.platform }}-setup.exe*
+            arcade-v1-${{ matrix.platform }}.zip
+            arcade-v1-${{ matrix.platform }}.zip.sha256
+            arcade-v1-${{ matrix.platform }}-setup.exe
+            arcade-v1-${{ matrix.platform }}-setup.exe.sha256
+            arcade-v1-${{ matrix.platform }}-binaries.sha256
+            arcade-v1-${{ matrix.platform }}-payload.sha256
 
   # macOS: built from the same commit, not required yet (a failure here doesn't stop the release). The archive holds
   # the programs and scripts/install-macos.sh (launchd agent, a small app in ~/Applications); no signed .app/.dmg yet.
@@ -260,6 +317,11 @@ jobs:
     permissions:
       contents: write
     steps:
+      # Checkout before the artifacts. checkout's default clean would delete a download that landed first.
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
         with:
           pattern: arcade-v1-*
@@ -302,6 +364,25 @@ jobs:
               sys.exit("refusing to publish:\n  " + "\n  ".join(bad))
           PY
 
+      - name: Signature tools
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q osslsigncode minisign
+
+      - name: Sign Linux archives
+        env:
+          LINUX_MINISIGN_SECRET_KEY: ${{ secrets.LINUX_MINISIGN_SECRET_KEY }}
+          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
+          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
+        run: bash scripts/release/sign_linux.sh
+
+      - name: Check hashes and signatures
+        env:
+          WINDOWS_SIGNING_REQUIRED: ${{ secrets.WINDOWS_CODESIGN_PFX != '' }}
+          LINUX_MINISIGN_REQUIRED: ${{ secrets.LINUX_MINISIGN_SECRET_KEY != '' }}
+          LINUX_GPG_REQUIRED: ${{ secrets.LINUX_GPG_PRIVATE_KEY != '' }}
+        run: python3 scripts/release/check_release_assets.py
+
       - name: Publish
         env:
           GH_TOKEN: ${{ github.token }}
@@ -318,5 +399,5 @@ jobs:
           else
             gh release create "$TAG" "${files[@]}" -R "$GITHUB_REPOSITORY" --target "$GITHUB_SHA" \
               --title "Arcade V1.0 $TAG" \
-              --notes "**Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.** Read SECURITY.md (team@arcade-nodes.com) before you install. The Windows Setup.exe shows this warning and will not continue until you check the box.  Every download here is built from one commit, $GITHUB_SHA (each archive's COMMIT file says so).  **Windows 10/11 x64:** download **arcade-v1-windows-x86_64-setup.exe** and double-click it. Or download the zip, unpack it, and run **Install.exe** (or Install-PowerShell.cmd) from its folder.  **Linux** (x86_64, aarch64): curl -fsSL https://raw.githubusercontent.com/$GITHUB_REPOSITORY/main/scripts/install.sh | bash"
+              --notes "**Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.** Read SECURITY.md (team@arcade-nodes.com) before you install. The Windows Setup.exe shows this warning and will not continue until you check the box.  Every download here is built from one commit, $GITHUB_SHA (each archive's COMMIT file says so).  **Windows 10/11 x64:** download **arcade-v1-windows-x86_64-setup.exe**, check **arcade-v1-windows-x86_64-setup.exe.sha256**, and double-click it. The installer checks the payload against the SHA-256 inside it before it extracts anything. Or download the zip, check its .sha256, unpack it, and run **Install.exe**.  **Linux** (x86_64, aarch64): download **arcade-v1-linux-<arch>.tar.gz** and its **.sha256**, run sha256sum -c, and when the release has a **.minisig** or **.asc** check that too, then run scripts/install-linux.sh --prebuilt from the archive."
           fi

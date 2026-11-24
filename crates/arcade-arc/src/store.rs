@@ -64,6 +64,7 @@ pub fn chain_params(net: &Net, genesis: &Hash256) -> &'static ChainParams {
         coinbase_script_max: 100,
         index_start: 0,
         min_chain_work: "",
+        init_checkpoint: None,
     }))
 }
 

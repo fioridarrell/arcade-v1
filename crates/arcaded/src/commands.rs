@@ -327,13 +327,13 @@ cmds! {
     "chains.status" Public "key" "One chain's staged progress. `recovered_at_start` is `{from, to}` when this start wound the tip back (the last stop left without writing the coin caches, exit code 3), else null.";
     "chains.offers" Public "" "Chains other arcades offer over the mesh.";
     "chains.sizes" Admin "" "Measure this arcade's disk use per chain now.";
-    "chains.add" Admin "key, mode?, with?, drive?, init?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own; init = true: headers agreed by several sources first, then every block stored only, then built in bulk, for a big chain such as Bitcoin, docs/INITSYNC.md). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
+    "chains.add" Admin "key, mode?, with?, drive?, init?, core_dir?" "Install a chain (mode full, shared or chain; with = indexes; drive from chains.drives, else this arcade's own; init: headers agreed by several sources first, then every block stored only, then built in bulk, docs/INITSYNC.md; not given: init where the chain allows it, false: a plain install, true: init or a refusal; the answer says init_install and init_why_not; core_dir: the folder of a Core of this chain already on this computer, checked now and read in place when the install starts, instead of init). One install at a time: while another chain is still being installed it waits in a queue (queued, position).";
     "chains.queue" Public "" "Chains waiting in the queue, next first (position, key, name, mode, with; resume = a chain paused by chains.start_now that continues at its turn), the chain being installed now that they wait behind, the hidden chains, and plan_done (whether the startup chooser was answered).";
     "chains.unqueue" Admin "key" "Take a chain out of the install queue.";
     "chains.queue_first" Admin "key" "Move a queued chain to the front of the queue: it is next.";
     "chains.start_now" Admin "key" "Start a queued chain now: the chain being installed is paused and goes back into the queue right after it (a resume entry). Refused while Pepecoin testnet or the ARCADE chain is catching up.";
     "chains.hide" Admin "key, hidden?" "Leave a chain out of the Coins & chains list (hidden: true, the default) or show it again (false). Display only, any chain alike: an installed chain keeps running; nothing is removed or paused.";
-    "chains.plan" Admin "keys?, mode?, skip?" "The startup chooser: keys = the chains to use. Every other chain is hidden; the chosen ones not installed or queued yet are queued, smallest reported size for mode (full, shared or chain; default full) first, unknown sizes last, with no indexes. The ARCADE chain (arctest) is installed when it is among keys and syncs first; left out, it stays borrowed from arcades that keep it. Never removes a chain. skip: true only marks the chooser as answered.";
+    "chains.plan" Admin "keys?, mode?, skip?, core_dirs?" "The startup chooser: keys = the chains to use; core_dirs = {key: folder} for chains whose Core already runs on this computer (read in place at their turn instead of an init install; checked now). Every other chain is hidden; the chosen ones not installed or queued yet are queued, smallest reported size for mode (full, shared or chain; default full) first, unknown sizes last, with no indexes. The ARCADE chain (arctest) is installed when it is among keys and syncs first; left out, it stays borrowed from arcades that keep it. Never removes a chain. skip: true only marks the chooser as answered.";
     "chains.pause" Admin "key" "Pause a chain (by hand: the queue never resumes it).";
     "ui.link" Local "" "The link that opens the app's window in a browser (/ui/, with this start's key) and the SSH tunnel command for another computer (docs/WEBUI.md).";
     "chains.drives" Read "" "Drives a chain's file can go on: this arcade's own, and other mounted disks (free space, whether the arcade can write there).";
@@ -485,8 +485,10 @@ cmds! {
     "ring.send" Local "page, to, line?, link?" "Ring an address from this arcade's player, for the app whose page asks (arcade.realtime.ring): rung, and why not. It reaches them only if they have Notifications on for that app and the caller in their address book.";
     "ring.waiting" Local "" "What is ringing this arcade's player now; asking also says the app is open, so it can be rung here.";
     "ring.get" Local "id, page" "The ring an app was opened from (arcade.realtime.ringed), for that app only: from, tag, link, line, at.";
-    "inscribe" Wallet "data, encoding?, contenttype?, json?, client_ref?" "Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64).";
-    "inscribe.estimate" Public "data, encoding?, contenttype?, json?" "What inscribing that would cost: transactions, fee, value kept in its data outputs.";
+    "inscribe" Wallet "data, encoding?, contenttype?, json?, chain?, client_ref?" "Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64). chain: where it is written (default the chain sends use now). A long inscription is sent in batches that stay inside the mempool limit of 25 unconfirmed transactions in a row, counting ones the wallet already has waiting; what was sent is kept and the rest goes out on its own as earlier ones confirm (inscribe.resume, or the same call again). A piece already broadcast is never signed again.";
+    "inscribe.estimate" Public "data, encoding?, contenttype?, json?, chain?" "What inscribing that would cost on chain (default the chain sends use now): transactions, fee, value kept in its data outputs, and that chain's unit. Another chain is another quote.";
+    "inscribe.status" Read "id?" "An inscription being sent from here (id from inscribe, or one of its txids), or every unfinished one: how many transactions are sent, how many are waiting in a row, and that the rest continues on its own.";
+    "inscribe.resume" Wallet "id?" "Send more of an inscription that stopped because too many transactions were waiting in a row. With no id, every unfinished one. Pieces already broadcast are not signed again.";
     "wallet.requests" Read "page?" "Requests from pages to send, waiting for your answer.";
     "wallet.preview" Read "id" "A request's transaction as it would be built now: outputs and fee.";
     "wallet.approve" Local "id" "Approve a request: sign and send it.";
@@ -603,7 +605,9 @@ pub const PARAM_TYPES: &[(&str, &str, &str)] = &[
     ("here_only", "boolean", "Only what this arcade holds."),
     ("hex", "string", "Bytes as hex."),
     ("hidden", "boolean", "Hide (true) or show (false)."),
-    ("init", "boolean", "true: an init install (headers agreed by several sources, every block stored only, then built in bulk; docs/INITSYNC.md)."),
+    ("init", "boolean", "Not given: an init install where the chain allows it (headers agreed by several sources, every block stored only, then built in bulk; docs/INITSYNC.md). true: init or a refusal; false: a plain install."),
+    ("core_dir", "string", "The data folder of this chain's Core already on this computer (holding blocks/ and chainstate/): read in place when the install starts, instead of init. Stop that Core first."),
+    ("core_dirs", "object", "{chain key: Core data folder} for chosen chains whose Core already runs on this computer."),
     ("history", "boolean", "Include history rows."),
     ("history_limit", "integer", "History rows per page."),
     ("history_offset", "integer", "History rows to skip."),

@@ -323,14 +323,16 @@ fn busy_runs(node: &Node) -> Vec<&'static ChainParams> {
 /// Whether the home chain isn't caught up: no block yet, more than 10 behind the best height
 /// anyone tells us (headers, arcades on the mesh, lenders), or its address rows still building.
 /// The same test as an installed chain's (borrow::installed_ready).
+/// A home chain that is borrowed (not installed here: homeinst) has no blocks of its own and is
+/// never caught up; it holds nothing up.
 fn home_syncing(node: &Node) -> bool {
     let tip = node.chain.tip(node.params.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
     let (lag, addresses_ready) = crate::borrow::home_lag(node);
-    home_busy(tip, lag, addresses_ready)
+    home_busy(crate::homeinst::installed(), tip, lag, addresses_ready)
 }
 
-fn home_busy(tip: u32, lag: u32, addresses_ready: bool) -> bool {
-    tip == 0 || lag > 10 || !addresses_ready
+fn home_busy(installed: bool, tip: u32, lag: u32, addresses_ready: bool) -> bool {
+    installed && (tip == 0 || lag > 10 || !addresses_ready)
 }
 
 /// Whether a queue entry resumes a paused chain (rather than installing one).
@@ -658,7 +660,7 @@ pub fn hide(node: &Node, key: &str, hide: bool) -> Result<Value, String> {
 /// left out, it stays borrowed (and always shown). Chains already
 /// installed or queued keep their place: nothing is removed. `skip`: only remembers that the
 /// chooser was answered.
-pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result<Value, String> {
+pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool, core_dirs: &std::collections::BTreeMap<String, String>) -> Result<Value, String> {
     if skip {
         set_plan_done(node);
         return Ok(json!({"skipped": true}));
@@ -681,6 +683,19 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
     // Checked before anything changes, so a refusal changes nothing.
     for p in &chosen {
         check(p, mode, &[])?;
+    }
+    // Chains the operator already runs a Core for (the chooser asks): read from its folder instead
+    // of init. Each folder is checked now (crate::coreboot::check_dir), so a typo fails before anything changes.
+    let mut cores: std::collections::BTreeMap<&'static str, String> = std::collections::BTreeMap::new();
+    for (k, dir) in core_dirs.iter().filter(|(_, d)| !d.trim().is_empty()) {
+        let p = by_key(k).ok_or_else(|| format!("unknown chain {k}"))?;
+        if !chosen.iter().any(|c| c.key == p.key) {
+            continue;
+        }
+        if !matches!(mode, "full" | "chain") {
+            return Err("reading your Core's folder needs every block kept: Full or Blockchain only".into());
+        }
+        cores.insert(p.key, crate::coreboot::check_dir(p, dir).map_err(|e| format!("{}: {e}", p.name))?);
     }
     // The ARCADE chain, when ticked, first: queued chains wait until it has caught up. Unticked it stays borrowed from
     // the arcades that keep it (Martin 2026-11-18: every chain is borrowed until someone installs it).
@@ -715,6 +730,14 @@ pub fn plan(node: &Arc<Node>, keys: &[String], mode: &str, skip: bool) -> Result
         // Into the queue by size, with any chains already waiting (one install at a time, smallest first).
         for k in &order {
             insert_by_size(&mut q, json!({"key": k, "mode": mode, "with": [], "at": at, "bytes": bytes[k]}), |e| queued_bytes(node, e));
+            // The operator's Core folder, else init where the chain allows it, as chains.add does.
+            let core = cores.get(k.as_str()).cloned();
+            let asked = if core.is_some() { Some(false) } else { None };
+            let allowed = by_key(k).ok_or_else(|| format!("unknown chain {k}")).and_then(|p| crate::initsync::check(p, mode));
+            if let Ok((init, _)) = crate::initsync::choose(asked, true, allowed, crate::initsync::default_on()) {
+                crate::initsync::request(node, k, init);
+            }
+            crate::coreboot::remember_dir(node, k, core);
         }
         save_queue(node, &q);
         order
@@ -847,6 +870,13 @@ fn add_now(node: &Arc<Node>, key: &str, mode: &str, indexes: Vec<String>) -> Res
     launch(node, key, mode, indexes, arcade_app::now(), false, share)?;
     save(node);
     let _ = node.app.event("chains", &format!("installing {} ({mode}{})", p.name, if init { ", init: headers, then blocks stored only, then built in bulk" } else { "" }));
+    // The operator's own Core folder (chains.add core_dir): read in place now. When that fails
+    // (Core still running, folder gone), the install carries on from the network and says why.
+    if let Some(dir) = crate::coreboot::take_dir(node, key).filter(|_| !init) {
+        if let Err(e) = crate::coreboot::start_from_dir(node, key, &dir) {
+            let _ = node.app.event("chains", &format!("{}: not read from the Core folder {dir} ({e}); syncing from the network instead (arcade chain copy start {key} --from-dir <path> to try again)", p.name));
+        }
+    }
     status(node, key)
 }
 
@@ -1413,6 +1443,7 @@ pub fn status(node: &Node, key: &str) -> Result<Value, String> {
     let borrowed = crate::borrow::is_borrowed(p.key);
     Ok(json!({"key": key, "name": p.name, "installed": true, "home": home, "mode": mode, "indexes": indexes, "init": init.map(|x| x.as_str()),
               "init_timing": if init.is_some() { json!(node.chain.init_timing(c)) } else { Value::Null },
+              "drive_pace": if init.is_some() { crate::drivepace::note(c) } else { None },
               "state": state, "overall": overall, "stages": stages, "tip": tip, "copy": copy, "borrowed": borrowed, "watch": crate::watchdog::status(key),
               "borrow_state": if borrowed { crate::borrow::state_text(p.key) } else { None }}))
 }
@@ -1529,6 +1560,12 @@ pub fn confirms_row(p: &ChainParams) -> Value {
 
 /// `chains.list` rows from what is known without reading any chain: installed, borrowed or
 /// neither, with "loading" set until the first full pass is in.
+/// Whether a new full install of the chain would be an init install by default (chains.add with
+/// no init), for the installer's wording.
+fn init_by_default(node: &Node, p: &ChainParams, arcade: bool) -> bool {
+    !arcade && p.chain_no != node.params.chain_no && crate::initsync::default_on() && crate::initsync::check(p, "full").is_ok()
+}
+
 fn quick_list(node: &Node) -> Value {
     let installed: std::collections::BTreeSet<String> = node.extra.lock().unwrap().keys().cloned().collect();
     let row = |p: &ChainParams, arcade: bool| {
@@ -1537,7 +1574,7 @@ fn quick_list(node: &Node) -> Value {
                "borrowed": crate::borrow::is_borrowed(p.key), "state": "loading…", "loading": true, "sizes": null, "offers": node.offers_for(p.key).len(),
                "ord": !arcade && ord_start(p).is_some(), "tokens": if arcade { None } else { arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()) },
                "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "queued": queued_at(node, p.key),
-               "confirms": if arcade { Value::Null } else { confirms_row(p) }})
+               "confirms": if arcade { Value::Null } else { confirms_row(p) }, "init_install": init_by_default(node, p, arcade)})
     };
     let mut rows: Vec<Value> = ALL_CHAINS.iter().map(|p| row(p, false)).chain(crate::arcsvc::defined().map(|p| row(p, true))).collect();
     mark_rows(node, &mut rows, None);
@@ -1570,6 +1607,7 @@ pub fn list(node: &Node) -> Value {
                    "indexes": st["indexes"], "overall": st["overall"], "state": st["state"],
                    "ord": ord_start(p).is_some(), "tokens": arcade_ledger::tokens::protocol(p).map(|x| x.0.to_uppercase()),
                    "dunes": p.key == "doge", "dogefeed": p.key == "doge", "runes": p.key == "btc", "sizes": crate::sizes::for_chain(node, p.key),
+                   "init_install": init_by_default(node, p, false),
                    "offers": node.offers_for(p.key).len(), "confirms": confirms_row(p),
                    "borrowed": st["borrowed"] == true, "lenders": st["lenders"], "tip": st["tip"], "floor": st["floor"], "mismatch": st["mismatch"],
                    "queued": q.iter().position(|e| e["key"] == p.key).map(|i| i + 1),
@@ -2150,11 +2188,13 @@ mod home_queue_tests {
 
     #[test]
     fn installs_wait_while_the_home_chain_syncs() {
-        assert!(home_busy(0, 0, true), "no home block yet");
-        assert!(home_busy(1_000, 50_000, true), "far behind");
-        assert!(home_busy(1_000, 11, true), "just past the margin");
-        assert!(home_busy(1_000, 0, false), "address rows still building");
-        assert!(!home_busy(1_000, 10, true), "caught up: installs go ahead");
+        assert!(home_busy(true, 0, 0, true), "no home block yet");
+        assert!(home_busy(true, 1_000, 50_000, true), "far behind");
+        assert!(home_busy(true, 1_000, 11, true), "just past the margin");
+        assert!(home_busy(true, 1_000, 0, false), "address rows still building");
+        assert!(!home_busy(true, 1_000, 10, true), "caught up: installs go ahead");
+        // Borrowed (a new arcade's home chain until it is installed): never holds the queue.
+        assert!(!home_busy(false, 0, 0, true), "borrowed home, no blocks of its own");
     }
 
     fn with(ix: &[&str]) -> Vec<String> {

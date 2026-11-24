@@ -316,18 +316,19 @@
     const rows = r.rows.map((x) => ({
       go: x.address ? () => go("address", x.address) : null,
       cells: [[fmt(x.rank), 1], [x.address ? addrLink(x.address, x.tag) : h("span", { class: "faint" }, "a script no address names")], [amt(x.balance), 1],
-        [h("span", {}, h("span", { class: "x-meter", title: pct(x.share), style: "display:inline-block;width:4em;vertical-align:middle;margin-right:6px" }, h("i", { style: `width:${Math.max(1, Math.min(100, x.share * 100))}%` })), pct(x.share)), 1], [fmt(x.coins), 1]],
+        [h("span", {}, h("span", { class: "x-meter", title: pct(x.share), style: "display:inline-block;width:4em;vertical-align:middle;margin-right:6px" }, h("i", { style: `width:${Math.max(1, Math.min(100, x.share * 100))}%` })), pct(x.share)), 1], [fmt(x.utxos ?? x.coins), 1]],
     }));
     const listed = r.listed || r.rows.length;
     const facts = [
-      r.holders != null && `${fmt(r.holders)} addresses hold ${chain.name}`,
+      r.holders != null && `${fmt(r.holders)} addresses and scripts hold ${chain.name}`,
+      r.unnamed?.rows > 0 && `${fmt(r.unnamed.rows)} scripts no address names (${amt(r.unnamed.balance)} in ${fmt(r.unnamed.utxos)} UTXOs, mostly data outputs) are left out of the ranks`,
       r.total != null && `${amt(r.total)} in unspent coins`,
       r.height != null && `as of block ${fmt(r.height)}${r.at ? ` (${ago(r.at)})` : ""}`,
       r.building && "a newer list is being made",
     ].filter(Boolean).join(" · ");
     return h("div", {}, sect(`Rich list · top ${fmt(listed)}`, null, h("div", {},
       pager(listed, size, page, "rich"),
-      table([["#", 1], ["Address"], ["Balance", 1], ["Share", 1], ["Coins", 1]], rows),
+      table([["#", 1], ["Address"], ["Balance", 1], ["Share", 1], [h("span", { title: "Separate unspent outputs that make up this balance, not an amount of coins" }, "UTXOs"), 1]], rows),
       pager(listed, size, page, "rich"))),
       h("p", { class: "x-note" }, facts),
       h("p", { class: "x-note" }, "Balances add up each address's unspent coins on this chain, the same way its address page counts them. An exchange or a pool often shows as one big address."));

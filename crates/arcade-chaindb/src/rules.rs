@@ -590,6 +590,7 @@ pub fn replay(db: &crate::ChainDb, params: &ChainParams, from: u32, to: u32, thr
                         break;
                     }
                     crate::cpushare::pace();
+                    crate::pace::wait(c);
                     let start = next.fetch_add(CHUNK, Relaxed);
                     if start > to {
                         break;

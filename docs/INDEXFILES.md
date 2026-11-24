@@ -8,14 +8,27 @@ Code: `crates/arcade-chaindb/src/ixfile.rs` (format), `ixset.rs` (a chain's file
 
 The address tables (`core.v2.script_hist`, `core.v2.spends`) and the tx index (`core.v1.txs`) are almost entirely history that never changes, kept uncompressed in B-trees built for random inserts. On Bitcoin they are an estimated 0.7–0.95 TB. The same rows, sorted, cut into blocks and compressed by column, take roughly a sixth of that (§6), and a file of them is the same bytes on every arcade, so it can later be shared and checked by a hash.
 
-## 2. The format (version 2)
+## 2. The format (version 3)
 
-One file holds the rows of one **kind** for one span of heights: a **range** (10,000 heights) or an **era** (100,000 heights, ten ranges merged). A file is written once and never changed.
+One file holds the rows of one **kind** for one span of heights: a **range** or an **era** (ten ranges merged). A file is written once and never changed.
 
-    header   64 bytes
-             magic "ARCIXF\r\n" (8) | format u16 | kind u8 | 0 | chain number u16 |
-             row size u16 | key size u16 | 0 0 | rows per block u32 |
-             first height u32 | last height u32 | hash of the block at the last height (32)
+**Layout per chain** (`ixconv::Layout::for_chain`): a range is about the same stretch of time on every chain (about ten weeks, 10,000 Bitcoin blocks), so a lookup opens about as many files whatever the block interval:
+
+| Chains | Block interval | Range | Era | Eras at late-2026 heights |
+|---|---|---|---|---|
+| btc (and any chain not listed) | 10 min | 10,000 | 100,000 | 9 |
+| wjk | 2 min | 50,000 | 500,000 | |
+| ltc, ltctest | 2.5 min | 40,000 | 400,000 | 8 |
+| doge, pep, peptest, lky, flop, shic, bel, jkc, kot | 1 min | 100,000 | 1,000,000 | doge 6, pep 1 |
+| dgb, dgbtest | 15 s | 400,000 | 4,000,000 | dgb 6 (not 245 at Bitcoin's layout) |
+
+The layout is pinned in every file's header, so files cut another way never share an id, and a reader refuses files not cut by the chain's own layout, or not a whole range or era on its own boundary. Changing a chain's layout cuts other files: a new format version.
+
+    header   80 bytes
+             magic "ARCIXF\r\n" (8) | format u16 (3) | kind u8 | 0 | chain number u16 |
+             row size u16 | key size u16 | rules version u16 | rows per block u32 |
+             first height u32 | last height u32 | hash of the block at the last height (32) |
+             range length u32 | ranges per era u32 | 0 (8)
     blocks   a fixed number of rows each, the last one shorter
              filter: 10 bits a row (fixed per kind), uncompressed
              per column: raw length u32 | stored length u32 | one zstd frame
@@ -26,6 +39,8 @@ One file holds the rows of one **kind** for one span of heights: a **range** (10
 
 All integers are big-endian. File name: `<kind>-<first height, 8 digits>-<last height, 8 digits>.ixf` in `<chain directory>/index/`.
 
+- **Rules version** (`ixfile::RULES`, 1): what the rows mean beyond their byte layout (which outputs and inputs count as an address's, the script id, what is unspendable, what a position counts). Changing that changes the rows, so it is a new rules version even when the format stays; a reader refuses another version's files. Format 3 = format 2 plus the layout and the rules version in a longer header (version 2 files are refused: convert again).
+- **Amounts** (H): one transaction's received or spent for one address, so never above the chain's `MAX_MONEY`, which consensus caps a transaction's outputs and inputs at. Dogecoin's supply (~150 B DOGE, 1.5·10¹⁹ koinu) nears `u64::MAX` (1.8·10¹⁹), but its `MAX_MONEY` is 10¹⁸; every chain's is under `u64::MAX`/8 (DigiByte's 2.1·10¹⁸ is the largest) except Kotia's, which is `i64::MAX` (no cap, as Blackcoin) and still fits (tested), and the columns carry the whole u64 range anyway.
 - **Canonical rows** are fixed-size and big-endian, so their bytes sort as their keys do. They name a block by **height** and a transaction by its **position in the block**, never by the local block number, so every arcade on the same chain has the same rows.
 - **Rows per block are fixed per kind**, not a size target, so every arcade cuts the same blocks.
 - **Hashes are over canonical rows**, not compressed bytes. The **file id** is sha256(header | row count | every block's first key and row hash): it does not depend on the zstd version or level. The first keys are in it because the readers search them: a file with the right id cannot steer a lookup to another block (version 2; version 1 left them out). With the same zstd version and level (19; the version is pinned by `Cargo.lock`) the whole file is byte-identical, which the tests check across builders, thread counts, interrupted writes and merged-versus-direct eras.
@@ -56,9 +71,9 @@ Each block is turned into columns, and each column is compressed on its own (its
 
 ## 3. Conversion from the tables
 
-`ChainDb::convert_to_index_files(params, options, stop, note)`; by hand, with the arcade stopped: `cargo run --release -p arcade-chaindb --example ixfiles -- convert <chain.mdbx> <chain key>` (Ctrl-C saves a checkpoint and stops; a second Ctrl-C quits at once). Only the standard layout (ranges of 10,000, eras of ten) is accepted outside the tests.
+`ChainDb::convert_to_index_files(params, options, stop, note)`; by hand, with the arcade stopped: `cargo run --release -p arcade-chaindb --example ixfiles -- convert <chain.mdbx> <chain key>` (Ctrl-C saves a checkpoint and stops; a second Ctrl-C quits at once). Only the chain's own layout is accepted outside the tests.
 
-- **What is settled.** The sealed height is the end of the last whole range that lies at least 1,000 blocks (`UNDO_DEPTH`) below both the tip and the height the coins are complete at. With a tip at 20,999, heights 0..=19,999 are sealed. Only settled rows are converted.
+- **What is settled.** The sealed height is the end of the last whole range that lies at least 1,000 blocks (`UNDO_DEPTH`) below both the tip and the height the coins are complete at. On Bitcoin, with a tip at 20,999, heights 0..=19,999 are sealed. The boundaries depend only on the chain's layout, never on where a pass started, and rows name blocks by height and position: an arcade whose blocks got other local numbers writes the same files (tested). Only settled rows are converted.
 - **One scan per kind**, in key order, in short read transactions (200,000 rows each), so the database can recycle pages while the chain keeps syncing. Each row goes to the writer of its height's span: an era file where a whole era is settled, range files above it. Order: tx index, spends, history. Spends and history only while the Addresses index is on.
   - `txs`: a row's block number becomes its height; rows sharing 8 prefix bytes are sorted by height and position.
   - `spends`: block numbers become heights, and the row goes to the spender's span. This relies on block numbers rising with height on the main chain (true by construction: a block gets its number when it is first connected); it is checked first, and a chain where it does not hold is refused.
@@ -113,6 +128,16 @@ Measured 2026-11-20 by `ixfiles bench` on real Bitcoin address run files from a 
 **History is about twice the design's estimate, spends about 1.4 times; the tx index is as hoped.** The earlier figures compressed each column over a whole run file at once, where zstd finds repeats far apart (an amount received in one row and spent in another, for one). Cut into blocks of 8,192 rows sorted by address, most of that is out of reach, and script ids (hashes, about 21 bytes per new address) do not compress at all. Whole-chain estimates at these rates: history ~90–110 GB, spends ~10–13 GB, tx index ~10–12 GB: roughly 110–135 GB where the design said 75–100, against 0.7–0.95 TB of tables. History should gain from era files (longer runs per address), and has clear room left (bigger blocks, coding amounts against the address's earlier rows, a per-file dictionary); any of that is a new format version and must be settled before files are shared.
 
 Notes: run files hold one history row per output or input; a file row is one per (address, transaction), as in the table. The run files carry no tx position, so the benchmark uses the rank of a row's txid among its block's as the position (same range and spread). That machine's T run files only hold transactions whose outputs were all spent before a cache flush, which does not change their randomness.
+
+### Other chains (format 3, 2026-11-22, init installs on the mini)
+
+| Chain | Sealed to | H history | P spends | T tx index | Conversion | `ixfiles check` |
+|---|---|---|---|---|---|---|
+| pep | 1,299,999 (era 0–999,999 + 3 ranges) | 67.2 M rows, 5.76 B/row | 35.3 M, 3.25 B/row | 28.3 M, 10.10 B/row | 161–187 s, 9.3 GB peak | every 400th: 20,148 addresses, 70,789 txs, 88,234 spends, 0 differ |
+| lky | 1,099,999 (era + 1 range) | 4.1 M, 6.74 B/row | 2.6 M, 3.90 B/row | 1.5 M, 9.82 B/row | 8 s | every 25th: 9,368 addresses, 60,120 txs, 105,185 spends, 0 differ |
+| flop (tx index only) | 899,999 (9 ranges: the first era isn't whole yet) | | | 1.1 M, 9.79 B/row | seconds | every 10th: 109,792 txs, 0 differ |
+
+Converted twice each (pep, lky): the same rows and bytes both times. All 27 files pass `ixfiles verify`.
 
 ## 7. Not in this part
 

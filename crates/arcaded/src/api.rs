@@ -779,12 +779,15 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             let bytes = if req["encoding"] == "base64" { base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| format!("data: {e}"))? } else { data.as_bytes().to_vec() };
             let ctype = s("contenttype").unwrap_or_else(|| "text/plain".into());
             let json = match &req["json"] { Value::Null => None, Value::String(j) => Some(j.clone()), other => Some(other.to_string()) };
+            let chain = s("chain").filter(|c| !c.is_empty());
             if req["cmd"] == "inscribe.estimate" {
-                Ok(crate::walletsvc::inscribe_estimate(bytes.len(), &ctype, json.as_ref().map(|j| j.len()).unwrap_or(0)))
+                crate::walletsvc::inscribe_estimate(node, chain.as_deref(), bytes.len(), &ctype, json.as_ref().map(|j| j.len()).unwrap_or(0))
             } else {
-                crate::walletsvc::inscribe(node, &bytes, &ctype, json.as_deref())
+                crate::inscqueue::inscribe(node, &bytes, &ctype, json.as_deref(), chain.as_deref())
             }
         }
+        "inscribe.status" => crate::inscqueue::status(node, s("id").as_deref()),
+        "inscribe.resume" => crate::inscqueue::resume_req(node, req),
         "wallet.requests" => Ok(crate::walletsvc::requests(node, s("page").as_deref())),
         "wallet.preview" => crate::walletsvc::preview(node, &s("id").ok_or("id required")?),
         "wallet.approve" => crate::walletsvc::approve(node, &s("id").ok_or("id required")?),
@@ -1418,26 +1421,62 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             let key = s("key").ok_or("key required")?;
             let mode = s("mode").unwrap_or_else(|| "full".into());
             // init: headers agreed by several sources, blocks stored only, then built in bulk
-            // (crate::initsync, docs/INITSYNC.md). Remembered until the install starts.
-            let init = req["init"] == true;
+            // (crate::initsync, docs/INITSYNC.md). Remembered until the install starts. Not said:
+            // init wherever the chain allows it (crate::initsync::choose); false: a plain install.
+            // core_dir: the operator already runs this chain's Core on this computer; its folder
+            // is read in place when the install starts (crate::coreboot::request_dir), not init.
+            let core_dir = s("core_dir").filter(|d| !d.trim().is_empty());
+            if core_dir.is_some() && req["init"] == true {
+                return Err("init or your own Core's folder, not both".into());
+            }
+            if core_dir.is_some() && !matches!(mode.as_str(), "full" | "chain") {
+                return Err("reading your Core's folder needs every block kept: mode full or chain".into());
+            }
+            let asked = if core_dir.is_some() { Some(false) } else { req["init"].as_bool() };
             let canon = arcade_chain::params::by_key(&key).map(|p| p.key.to_string()).unwrap_or_else(|| key.clone());
-            if init {
-                let p = arcade_chain::params::by_key(&canon).ok_or_else(|| format!("{key}: no such chain"))?;
-                crate::initsync::check(p, &mode)?;
-                if node.chain_params(&canon).is_some() {
-                    return Err(format!("{canon} is installed already; an init install starts from nothing"));
-                }
-                crate::initsync::request(node, &canon, true);
-            } else if node.chain_params(&canon).is_none() {
-                // A plain add of a chain queued earlier with init: it is a plain install now.
-                crate::initsync::request(node, &canon, false);
+            let param = arcade_chain::params::by_key(&canon);
+            // The ARCADE chain and the home chain have installs of their own (crate::chains::add).
+            let own_install = crate::arcsvc::defines(&canon) || param.is_some_and(|p| p.chain_no == node.params.chain_no);
+            let fresh = node.chain_params(&canon).is_none();
+            let allowed = match param {
+                Some(_) if own_install => Err("this chain installs its own way".to_string()),
+                Some(p) => crate::initsync::check(p, &mode),
+                None => Err(format!("{key}: no such chain")),
+            };
+            if asked == Some(true) && param.is_none() {
+                return Err(format!("{key}: no such chain"));
+            }
+            let (init, why_not) = crate::initsync::choose(asked, fresh, allowed, crate::initsync::default_on()).map_err(|e| format!("{canon}: {e}"))?;
+            if fresh && !own_install {
+                // Also turns off init (or a Core folder) asked for earlier, when this add says otherwise.
+                crate::coreboot::request_dir(node, &canon, core_dir.as_deref())?;
+                crate::initsync::request(node, &canon, init);
+            } else if core_dir.is_some() && own_install {
+                return Err(format!("{canon} installs its own way, not from a Core folder"));
+            } else if core_dir.is_some() {
+                return Err(format!("{canon} is installed already; read a Core folder into it with: arcade chain copy start {canon} --from-dir <path>"));
             }
             // The drive chosen for it, else this arcade's own (crate::chaindrive): its file starts there.
             let r = crate::chaindrive::add(node, &key, &s("drive").unwrap_or_default(), || crate::chains::add(&node.self_arc(), &key, &mode, with));
-            if init && r.is_err() {
+            if r.is_err() && fresh && !own_install {
                 crate::initsync::request(node, &canon, false);
+                let _ = crate::coreboot::request_dir(node, &canon, None);
             }
-            r
+            r.map(|mut v| {
+                if fresh && !own_install {
+                    if let Some(o) = v.as_object_mut() {
+                        o.insert("init_install".into(), json!(init));
+                        if let Some(d) = &core_dir {
+                            o.insert("core_dir".into(), json!(d));
+                        }
+                        if let Some(w) = why_not {
+                            let w = w.replace(" (install it without --init)", "").replace(": install it without --init", "");
+                            o.insert("init_why_not".into(), json!(w));
+                        }
+                    }
+                }
+                v
+            })
         }
         "chains.queue" => Ok(crate::chains::queue_list(node)),
         "chains.unqueue" => crate::chains::unqueue(node, &s("key").ok_or("key required")?),
@@ -1446,7 +1485,10 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
         "chains.hide" => crate::chains::hide(node, &s("key").ok_or("key required")?, req["hidden"].as_bool().unwrap_or(true)),
         "chains.plan" => {
             let keys: Vec<String> = req["keys"].as_array().map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect()).unwrap_or_default();
-            crate::chains::plan(&node.self_arc(), &keys, &s("mode").unwrap_or_else(|| "full".into()), req["skip"] == true)
+            // core_dirs: {key: folder} for chains the operator already runs a Core for (the chooser asks).
+            let cores: std::collections::BTreeMap<String, String> =
+                req["core_dirs"].as_object().map(|o| o.iter().filter_map(|(k, v)| v.as_str().map(|d| (k.clone(), d.to_string()))).collect()).unwrap_or_default();
+            crate::chains::plan(&node.self_arc(), &keys, &s("mode").unwrap_or_else(|| "full".into()), req["skip"] == true, &cores)
         }
         // By hand: a resume entry in the queue for the chain is dropped (chains::pause_by_hand).
         "chains.pause" => crate::chains::pause_by_hand(node, &s("key").ok_or("key required")?, true),

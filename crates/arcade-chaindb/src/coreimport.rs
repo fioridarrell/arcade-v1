@@ -288,11 +288,19 @@ impl ChainDb {
     pub fn write_txs_for(&self, params: &ChainParams, bs: &[u32], tmp: &Path, stop: &AtomicBool, note: Note) -> Result<u64> {
         let c = params.chain_no;
         let mut s = Sorter::new(tmp, &format!("txs-{c}"))?;
+        // Read in block-number order, not height order: an init install stores blocks in the
+        // order they arrive, so height order jumps all over the file (one seek per block on a
+        // spinning disk, ~100 blocks/s), while block-number order follows the file. The rows go
+        // through the sorter and TXS keeps every value of a key (dup), so the order changes nothing.
+        let mut order: Vec<u32> = bs.to_vec();
+        order.sort_unstable();
+        let bs = &order[..];
         for (i, chunk) in bs.chunks(500).enumerate() {
             crate::cpushare::pace();
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
+            crate::pace::wait(c);
             self.store(c).read(|r| {
                 for &b in chunk {
                     for (k, raw) in r.scan_prefix(BLOCK_TX, &k_block(c, b))? {
@@ -781,18 +789,16 @@ pub(crate) fn check_stored_block(db: &ChainDb, params: &ChainParams, raw: &[u8])
     // The block's own AuxPoW is what is kept (block_meta) and served with its header: it must
     // prove the work itself, as the header check does (sync.rs), not only the one the headers
     // round saw.
-    if let Some(a) = &b.auxpow {
-        let hash = params.block_id(&b.header);
-        let chain_id = params.auxpow_chain_id.unwrap_or(b.header.chain_id());
-        a.check(hash, chain_id, params.auxpow_strict_chain_id).map_err(|e| err(format!("block {hash}: AuxPoW: {e}")))?;
-        let ph = arcade_chain::pow::pow_hash(arcade_chain::pow::PowAlgo::Scrypt, &a.parent.encode());
-        if !arcade_chain::pow::meets_target(&ph, b.header.bits) {
-            return Err(err(format!("block {hash}: AuxPoW parent misses target")));
-        }
-    }
     // Its height on our header chain. A block whose header we don't hold can't be stored, and is
     // never checked as if at height 0 (where SegWit is off, so a stripped copy would pass).
-    let height = db.header(params.chain_no, &b.hash())?.map(|r| r.height).ok_or_else(|| err(format!("block {}: its header is not in our header chain", b.hash())))?;
+    let known = db.header(params.chain_no, &b.hash())?.map(|r| r.height);
+    // The block's own AuxPoW is checked first, at its height (the parent's algorithm is the
+    // chain's there; a block of no known height is refused just below in any case).
+    if let Some(a) = &b.auxpow {
+        let hash = params.block_id(&b.header);
+        arcade_chain::params::check_auxpow_proof(params, &b.header, hash, a, known.unwrap_or(u32::MAX)).map_err(|e| err(format!("block {hash}: AuxPoW: {e}")))?;
+    }
+    let height = known.ok_or_else(|| err(format!("block {}: its header is not in our header chain", b.hash())))?;
     if let Some(br) = params.block_rules {
         if (br.script_flags)(height) & arcade_chain::params::SCRIPT_WITNESS != 0 {
             b.check_witness_commitment().map_err(|e| err(format!("block {}: {e}", b.hash())))?;
@@ -908,6 +914,7 @@ impl Replay {
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
+            crate::pace::wait(c);
             let end = to.min(self.height + 1000);
             db.store(c).read(|r| {
                 for h in self.height + 1..=end {
@@ -998,6 +1005,7 @@ impl DiskReplay {
             if stop.load(Ordering::Relaxed) {
                 return Err(err("stopped"));
             }
+            crate::pace::wait(c);
             let end = to.min(self.height + 1000);
             db.store(c).read(|r| {
                 for h in self.height + 1..=end {

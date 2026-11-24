@@ -133,6 +133,25 @@ pub const MIN_AGREE: usize = 3;
 /// much work at each height, and overtakes).
 pub const SIDE_BUDGET: u32 = if cfg!(test) { 50 } else { 20_000 };
 
+/// low_work_branch keeps the best header chain's header at every WORK_STEP-th height.
+const WORK_STEP: u32 = if cfg!(test) { 4 } else { 1_000 };
+
+/// Header bytes a source may send in one headers round, on average, for each new header of
+/// ours it brings (header, AuxPoW proof and count byte as they arrive), on top of
+/// [`HEADER_BYTES_SLACK`]. A plain header is 81 bytes. An AuxPoW one carries its parent's
+/// coinbase and two merkle branches: a few hundred bytes on the Litecoin-mined chains, rarely
+/// more than 2 KiB. A source that sends far more than that (huge proofs, or the same headers
+/// over and over) is left out of the round instead of being read on.
+pub const HEADER_BYTES_EACH: u64 = if cfg!(test) { 1_000 } else { 16 * 1024 };
+/// Header bytes a source may send in a round beyond [`HEADER_BYTES_EACH`] per new header: one
+/// full headers message (2,000 headers) of large proofs.
+pub const HEADER_BYTES_SLACK: u64 = if cfg!(test) { 4_000 } else { 2_000 * 16 * 1024 };
+
+/// The bytes a headers entry took on the wire (header, its AuxPoW, the count byte).
+fn entry_bytes(e: &HeaderEntry) -> u64 {
+    81 + e.auxpow.as_ref().map_or(0, |a| a.raw.len() as u64)
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Headers,
@@ -179,20 +198,24 @@ pub struct Agreement {
     pub differ: Vec<String>,
     /// The best header's total work reaches the chain's `min_chain_work`.
     pub work_ok: bool,
+    /// The best header chain runs through the release's init checkpoint (ChainParams::
+    /// init_checkpoint). False on a chain without one (init installs are refused there).
+    pub floor_ok: bool,
 }
 
 impl Agreement {
     /// Enough sources agree and the work is there: the headers phase is done.
     pub fn done(&self) -> bool {
-        self.agree.len() >= MIN_AGREE && self.work_ok
+        self.agree.len() >= MIN_AGREE && self.work_ok && self.floor_ok
     }
 
     pub fn text(&self) -> String {
         format!(
-            "best header {} at {} · {} of {} sources agree{} · work {}{}",
+            "best header {} at {} · {} of {} sources agree{} · work {}{}{}",
             short(&self.best), self.height, self.agree.len(), MIN_AGREE,
             if self.differ.is_empty() { String::new() } else { format!(" ({} don't: {})", self.differ.len(), self.differ.iter().take(4).cloned().collect::<Vec<_>>().join("; ")) },
             if self.work_ok { "enough" } else { "below the chain's minimum" },
+            if self.floor_ok { "" } else { " · not through the release checkpoint yet" },
             if self.new_headers > 0 { format!(" · {} new headers", self.new_headers) } else { String::new() }
         )
     }
@@ -222,6 +245,8 @@ struct Located<'a, 'b> {
     p: &'a ChainParams,
     /// The last header of the source's last answer (whose branch it feeds).
     last: Option<Hash256>,
+    /// Header bytes this source sent this round.
+    bytes: u64,
 }
 
 impl BlockSource for Located<'_, '_> {
@@ -230,6 +255,7 @@ impl BlockSource for Located<'_, '_> {
         let mut loc: Vec<Hash256> = best.into_iter().collect();
         loc.extend(self.back.iter().filter(|h| best.as_ref() != Some(h)));
         let reply = self.inner.get_headers(&loc)?;
+        self.bytes += reply.iter().map(entry_bytes).sum::<u64>();
         self.last = reply.last().map(|e| self.p.block_id(&e.header));
         Ok(reply)
     }
@@ -452,11 +478,12 @@ impl ChainDb {
         let mut a = Agreement::default();
         let back = self.init_locator(c)?;
         let mut failed: HashMap<String, String> = HashMap::new();
-        // The best header chain's work by height, for the best header it was taken at.
-        let mut works: Option<(Hash256, Vec<arcade_chain::pow::U256>)> = None;
+        // The best header chain's headers at sampled heights, for the best header they were taken at.
+        let mut works: Option<(Hash256, Vec<Hash256>)> = None;
         for (key, src) in sources.iter_mut() {
-            let mut loc = Located { inner: &mut **src, db: self, c, back: &back, p, last: None };
+            let mut loc = Located { inner: &mut **src, db: self, c, back: &back, p, last: None, bytes: 0 };
             let mut side = 0u32;
+            let mut brought = 0u64;
             loop {
                 if stop.load(Ordering::Relaxed) {
                     return Err(err("stopped"));
@@ -465,6 +492,11 @@ impl ChainDb {
                     Ok(0) => break,
                     Ok(n) => {
                         a.new_headers += n;
+                        brought += u64::from(n);
+                        if loc.bytes > HEADER_BYTES_SLACK + brought * HEADER_BYTES_EACH {
+                            failed.insert(key.clone(), format!("sent {} KiB of headers for {brought} new ones; left out", loc.bytes / 1024));
+                            break;
+                        }
                         // Headers that went to a low-work branch count against the source.
                         if let Some(last) = loc.last.take() {
                             if self.low_work_branch(c, &last, &mut works)? {
@@ -488,6 +520,7 @@ impl ChainDb {
         a.best = best;
         a.height = rec.height;
         a.work_ok = rec.work >= p.min_chain_work();
+        a.floor_ok = self.through_floor(p, rec.height)?;
         // Asked from best's parent, an agreeing source must send best itself.
         let ask = if rec.height > 0 { rec.header.prev } else { best };
         let mut agree: Vec<String> = Vec::new();
@@ -512,10 +545,21 @@ impl ChainDb {
         Ok(a)
     }
 
+    /// Whether a best header at `height` lies on the chain through the release's init checkpoint.
+    /// The checkpoint's block must be stored and the best header at or above its height: every
+    /// header at that height was checked against the checkpoint (check_header), and a header is
+    /// only stored after its parent, so every stored header above it descends from that block.
+    fn through_floor(&self, p: &ChainParams, height: u32) -> Result<bool> {
+        let Some((h, hash)) = p.init_floor() else { return Ok(false) };
+        Ok(height >= h && self.header(p.chain_no, &hash)?.is_some_and(|r| r.height == h))
+    }
+
     /// Whether `last` (a stored header) is on a branch with less work than the best header chain
-    /// at its height (or, past the best header, less work than it). `works` caches the best
-    /// chain's work by height for the best header it was taken at.
-    fn low_work_branch(&self, c: u16, last: &Hash256, works: &mut Option<(Hash256, Vec<arcade_chain::pow::U256>)>) -> Result<bool> {
+    /// at its height (or, past the best header, less work than it). `works` caches, for the
+    /// best header it was taken at, the best chain's header at every [`WORK_STEP`]th height: a
+    /// height's work is read by walking down at most that many headers from the next sample.
+    /// (Holding every height's work took 32 bytes a height: ~0.8 GB on DigiByte's 24.5 M.)
+    fn low_work_branch(&self, c: u16, last: &Hash256, works: &mut Option<(Hash256, Vec<Hash256>)>) -> Result<bool> {
         let Some(best) = self.best_header(c)? else { return Ok(false) };
         if best == *last {
             return Ok(false);
@@ -525,21 +569,37 @@ impl ChainDb {
             return Ok(rec.work < brec.work);
         }
         if works.as_ref().is_none_or(|(b, _)| *b != best) {
-            let mut v = vec![arcade_chain::pow::U256::ZERO; brec.height as usize + 1];
+            let mut v = vec![Hash256::ZERO; (brec.height / WORK_STEP) as usize + 1];
             self.store(c).read(|r| {
-                let mut x = brec.clone();
+                let (mut h, mut x) = (best, brec.clone());
                 loop {
-                    v[x.height as usize] = x.work;
+                    if x.height % WORK_STEP == 0 {
+                        v[(x.height / WORK_STEP) as usize] = h;
+                    }
                     if x.height == 0 {
                         break;
                     }
-                    x = header_rec(r, c, &x.header.prev)?.ok_or_else(|| err("a header's parent is missing"))?;
+                    h = x.header.prev;
+                    x = header_rec(r, c, &h)?.ok_or_else(|| err("a header's parent is missing"))?;
                 }
                 Ok(())
             })?;
             *works = Some((best, v));
         }
-        Ok(works.as_ref().is_some_and(|(_, v)| rec.work < v[rec.height as usize]))
+        let samples = &works.as_ref().expect("set above").1;
+        // The sample at or above rec's height (the best header itself above the last sample).
+        let i = rec.height.div_ceil(WORK_STEP) as usize;
+        let mut x = match samples.get(i) {
+            Some(s) if i as u32 * WORK_STEP <= brec.height => self.header(c, s)?.ok_or_else(|| err("a sampled header is missing"))?,
+            _ => brec,
+        };
+        self.store(c).read(|r| {
+            while x.height > rec.height {
+                x = header_rec(r, c, &x.header.prev)?.ok_or_else(|| err("a header's parent is missing"))?;
+            }
+            Ok(())
+        })?;
+        Ok(rec.work < x.work)
     }
 
     /// Store a batch a source sent for `wanted` (store-only, any order): each block must be one
@@ -578,6 +638,7 @@ impl ChainDb {
                 out.stored += good.len();
                 good.clear();
                 good_bytes = 0;
+                crate::pace::wait(params.chain_no);
             }
         }
         if !good.is_empty() {

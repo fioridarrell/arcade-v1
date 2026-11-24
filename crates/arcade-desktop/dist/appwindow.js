@@ -1066,8 +1066,10 @@
         const c = document.createElement("div"); c.className = "caution " + pv.caution.level; c.setAttribute("role", "alert"); c.textContent = pv.caution.note;
         lines.push(c);
       }
-      const yes = await card("Approve this send?", lines, "Approve and send", "Refuse");
-      await api(yes ? "wallet.approve" : "wallet.deny", { id: r.id });
+        const yes = await card("Approve this send?", lines, "Approve and send", "Refuse");
+        // kind, to, units, fee and the outputs are the card the user just saw. The desktop
+        // approves that exact transaction on the signer; a different one is refused.
+        await api(yes ? "wallet.approve" : "wallet.deny", yes ? { id: r.id, kind: pv.kind, to: pv.to, units: pv.units, fee: pv.fee, outputs: pv.outputs } : { id: r.id });
     } catch (_) { /* answered elsewhere */ }
     finally { showing = null; }
   }, 1500);

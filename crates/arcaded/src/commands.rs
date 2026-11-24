@@ -485,8 +485,10 @@ cmds! {
     "ring.send" Local "page, to, line?, link?" "Ring an address from this arcade's player, for the app whose page asks (arcade.realtime.ring): rung, and why not. It reaches them only if they have Notifications on for that app and the caller in their address book.";
     "ring.waiting" Local "" "What is ringing this arcade's player now; asking also says the app is open, so it can be rung here.";
     "ring.get" Local "id, page" "The ring an app was opened from (arcade.realtime.ringed), for that app only: from, tag, link, line, at.";
-    "inscribe" Wallet "data, encoding?, contenttype?, json?, client_ref?" "Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64).";
-    "inscribe.estimate" Public "data, encoding?, contenttype?, json?" "What inscribing that would cost: transactions, fee, value kept in its data outputs.";
+    "inscribe" Wallet "data, encoding?, contenttype?, json?, chain?, client_ref?" "Inscribe content as this wallet's (arcade INSC; data as text or base64 with encoding: base64). chain: where it is written (default the chain sends use now). A long inscription is sent in batches that stay inside the mempool limit of 25 unconfirmed transactions in a row, counting ones the wallet already has waiting; what was sent is kept and the rest goes out on its own as earlier ones confirm (inscribe.resume, or the same call again). A piece already broadcast is never signed again.";
+    "inscribe.estimate" Public "data, encoding?, contenttype?, json?, chain?" "What inscribing that would cost on chain (default the chain sends use now): transactions, fee, value kept in its data outputs, and that chain's unit. Another chain is another quote.";
+    "inscribe.status" Read "id?" "An inscription being sent from here (id from inscribe, or one of its txids), or every unfinished one: how many transactions are sent, how many are waiting in a row, and that the rest continues on its own.";
+    "inscribe.resume" Wallet "id?" "Send more of an inscription that stopped because too many transactions were waiting in a row. With no id, every unfinished one. Pieces already broadcast are not signed again.";
     "wallet.requests" Read "page?" "Requests from pages to send, waiting for your answer.";
     "wallet.preview" Read "id" "A request's transaction as it would be built now: outputs and fee.";
     "wallet.approve" Local "id" "Approve a request: sign and send it.";

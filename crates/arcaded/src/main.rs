@@ -94,6 +94,8 @@ mod richlist;
 mod tokensend;
 mod meshview;
 mod mempoolshare;
+mod chainlimit;
+mod inscqueue;
 mod msgsvc;
 mod namesites;
 mod ordtypes;
@@ -802,6 +804,11 @@ fn main() {
         // Large blobs being published from here: parts over successive blocks, resumed after a restart (largeblob.rs).
         let n = node.clone();
         std::thread::Builder::new().name("large blobs".into()).spawn(move || largeblob::run(n)).unwrap();
+    }
+    {
+        // Inscriptions longer than a mempool chain: the rest goes out as earlier pieces confirm, including after a restart.
+        let n = node.clone();
+        std::thread::Builder::new().name("inscriptions".into()).spawn(move || inscqueue::run(n)).unwrap();
     }
     {
         // "cb" Core-data copies: asking, fetching, taking in, re-checking.

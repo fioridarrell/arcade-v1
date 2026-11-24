@@ -2826,6 +2826,12 @@ pub fn pooled(txid: &Hash256) -> bool {
     svc().is_some_and(|s| s.st.lock().unwrap().pool.iter().any(|w| w.tx.txid == *txid))
 }
 
+/// The row a waiting transaction stands in on this arcade's own ARCADE pool (counting itself).
+/// None when the pool isn't here or the transaction isn't waiting in it.
+pub fn pool_row(id: &Hash256) -> Option<usize> {
+    svc()?.st.lock().unwrap().pool.row_of(id)
+}
+
 /// Whether the chain runs here and is as far as the arcades it is linked to (its pool takes what it should).
 pub fn ready() -> bool {
     svc().is_some_and(|s| s.caught_up())

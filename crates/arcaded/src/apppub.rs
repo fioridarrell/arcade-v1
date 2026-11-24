@@ -548,7 +548,15 @@ fn run(node: &Node, p: &'static ChainParams, sk: &SecretKey, pk: &PublicKey, j: 
                 let coins = wallet_coins(node, p, pk);
                 let (ins, o) = arcade_wallet::tx::plan_spend(p, outs[0].clone(), pk, &coins, rate, dust).map_err(what)?;
                 let tx = sign(p, sk, &ins, &o)?;
-                send_noted(node, p, j, "single", &tx, fee_of(&tx, &ins))?
+                let row = crate::msgsvc::projected_row(node, p, &tx);
+                if !crate::chainlimit::fits(row) {
+                    return waiting_for_chain(node, ask, 0, 1, row.saturating_sub(1), j["fee"].as_u64().unwrap_or(0), vec![]);
+                }
+                match send_noted(node, p, j, "single", &tx, fee_of(&tx, &ins)) {
+                    Ok(t) => t,
+                    Err(e) if crate::chainlimit::is_refusal(&e) => return waiting_for_chain(node, ask, 0, 1, crate::chainlimit::LIMIT, j["fee"].as_u64().unwrap_or(0), vec![]),
+                    Err(e) => return Err(e),
+                }
             }
         };
         return finish(node, j, vec![txid]);
@@ -562,9 +570,17 @@ fn run(node: &Node, p: &'static ChainParams, sk: &SecretKey, pk: &PublicKey, j: 
             let o = vec![TxOutSpec { value: piece_value, script: script.clone() }; pieces.len()];
             let (ins, o) = arcade_wallet::tx::plan_spend(p, o, pk, &coins, rate, dust).map_err(what)?;
             let tx = sign(p, sk, &ins, &o)?;
+            let row = crate::msgsvc::projected_row(node, p, &tx);
+            if !crate::chainlimit::fits(row) {
+                return waiting_for_chain(node, ask, 0, pieces.len() + 1, row.saturating_sub(1), j["fee"].as_u64().unwrap_or(0), vec![]);
+            }
             j["piece"] = json!(piece_value);
             j["pieces"] = json!({});
-            let txid = send_noted(node, p, j, "split", &tx, fee_of(&tx, &ins))?;
+            let txid = match send_noted(node, p, j, "split", &tx, fee_of(&tx, &ins)) {
+                Ok(t) => t,
+                Err(e) if crate::chainlimit::is_refusal(&e) => return waiting_for_chain(node, ask, 0, pieces.len() + 1, crate::chainlimit::LIMIT, j["fee"].as_u64().unwrap_or(0), vec![]),
+                Err(e) => return Err(e),
+            };
             j["split"] = json!(txid);
             jput(node, j)?;
             txid
@@ -592,8 +608,13 @@ fn run(node: &Node, p: &'static ChainParams, sk: &SecretKey, pk: &PublicKey, j: 
                 let coin = Utxo { outpoint: OutPoint { txid: split_h, vout: n as u32 }, value: piece_value, script: script.clone() };
                 let (ins, o2) = arcade_wallet::tx::plan_spend(p, o.clone(), pk, std::slice::from_ref(&coin), rate, dust).map_err(what)?;
                 let tx = sign(p, sk, &ins, &o2)?;
+                let row = crate::msgsvc::projected_row(node, p, &tx);
+                if !crate::chainlimit::fits(row) {
+                    return waiting_for_chain(node, ask, txids.len(), outs.len(), row.saturating_sub(1), j["fee"].as_u64().unwrap_or(0), txids);
+                }
                 match send_noted(node, p, j, &slot, &tx, fee_of(&tx, &ins)) {
                     Ok(t) => t,
+                    Err(e) if crate::chainlimit::is_refusal(&e) => return waiting_for_chain(node, ask, txids.len(), outs.len(), crate::chainlimit::LIMIT, j["fee"].as_u64().unwrap_or(0), txids),
                     Err(e) => {
                         // Refused: its coin is spent by another sender (the tool's case of 2026-10-19). Paid from
                         // the wallet's other coins instead, never the split's.
@@ -614,8 +635,25 @@ fn run(node: &Node, p: &'static ChainParams, sk: &SecretKey, pk: &PublicKey, j: 
     finish(node, j, txids)
 }
 
-/// A publication whose split waits for a block (a coin chain): once it has one, the pieces go out from here.
-/// Publications waiting so (journal keys), one thread each.
+/// The mempool row is full: keep what was sent and let the background pass try again.
+fn waiting_for_chain(node: &Node, ask: &Ask, sent: usize, total: usize, waiting: usize, fee: u64, txids: Vec<String>) -> Result<Value, String> {
+    wait_in_background(node, ask, crate::arcledger::sign_as());
+    Ok(json!({
+        "id": txids.first().cloned().unwrap_or_default(),
+        "txid": txids.first().cloned().unwrap_or_default(),
+        "txids": txids,
+        "fee": fee,
+        "state": "waiting",
+        "sent": sent > 0,
+        "sent_count": sent,
+        "total": total,
+        "waiting": waiting,
+        "note": crate::chainlimit::note(sent, total, waiting),
+    }))
+}
+
+/// A publication whose split waits for a block (a coin chain), or whose next piece would make the mempool row too
+/// long: once there is room, the pieces go out from here. Publications waiting so (journal keys), one thread each.
 static WAITING: Mutex<BTreeSet<String>> = Mutex::new(BTreeSet::new());
 
 fn wait_in_background(node: &Node, ask: &Ask, as_tag: Option<String>) {

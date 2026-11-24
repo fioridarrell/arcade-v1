@@ -15,7 +15,8 @@ fn repo(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join(rel);
-    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
+    // A Windows checkout has CRLF line ends (git's autocrlf); the checks below match on "\n".
+    std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display())).replace("\r\n", "\n")
 }
 
 fn has_notice(text: &str) -> bool {

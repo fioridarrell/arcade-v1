@@ -198,8 +198,22 @@ jobs:
           Compress-Archive -Path $name -DestinationPath $payload
           $payloadHash = (Get-FileHash $payload -Algorithm SHA256).Hash.ToLower()
           [IO.File]::WriteAllText("$pwd\$name-payload.sha256", "$payloadHash  $name-payload`n")
-          $nsis = Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'
-          if (-not (Test-Path $nsis)) { choco install nsis -y --no-progress | Out-Null }
+          # NSIS isn't on every runner image: install it when missing, then find makensis wherever it landed.
+          function Find-Makensis {
+            $c = @((Join-Path ${env:ProgramFiles(x86)} 'NSIS\makensis.exe'), (Join-Path $env:ProgramFiles 'NSIS\makensis.exe'),
+                   (Join-Path $env:ProgramFiles 'NSIS\Bin\makensis.exe'), (Join-Path ${env:ProgramFiles(x86)} 'NSIS\Bin\makensis.exe'))
+            $hit = $c | Where-Object { Test-Path $_ } | Select-Object -First 1
+            if (-not $hit) { $hit = (Get-Command makensis -ErrorAction SilentlyContinue).Source }
+            $hit
+          }
+          $nsis = Find-Makensis
+          if (-not $nsis) {
+            choco install nsis -y --no-progress
+            if ($LASTEXITCODE -ne 0) { throw "choco install nsis failed ($LASTEXITCODE)" }
+            $nsis = Find-Makensis
+          }
+          if (-not $nsis) { throw "makensis.exe not found after installing NSIS" }
+          Write-Host "makensis: $nsis"
           $stub = "$name-setup-stub.exe"
           & $nsis /NOCD /V2 "/DVERSION=$env:ARCADE_VERSION" "/DPKG=$name" "/DOUT=$stub" "/DPAYLOAD_SHA256=$payloadHash" scripts\windows\setup.nsi
           if ($LASTEXITCODE -ne 0) { throw "makensis failed ($LASTEXITCODE)" }

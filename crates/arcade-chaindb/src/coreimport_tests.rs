@@ -630,3 +630,36 @@ fn a_64_byte_transaction_is_refused_on_bitcoin_above_691719_only() {
     assert_eq!(tx_of_64_bytes(&BITCOIN_MAIN, 691_719, &b), None);
     assert_eq!(tx_of_64_bytes(&DOGECOIN_MAIN, 5_000_000, &b), None);
 }
+
+/// write_txs_for reads stored blocks in block-number order (an init install's file order), not
+/// in the order given: the tx index comes out the same whatever order the blocks are listed in.
+#[test]
+fn the_tx_index_is_the_same_in_any_reading_order() {
+    let e = env(40);
+    let c = e.p.chain_no;
+    let index = |listed: &dyn Fn(Vec<u32>) -> Vec<u32>| {
+        let d = tempfile::tempdir().unwrap();
+        let db = partial(&e, d.path(), 0);
+        let tip = db.tip(c).unwrap().unwrap();
+        let path = db.header_path(c, tip.height + 1, 40).unwrap();
+        // Stored out of height order, as many sources deliver them.
+        let mut raws: Vec<Vec<u8>> = path.iter().map(|x| e.blocks.iter().find(|b| b.hash() == *x).unwrap().encode()).collect();
+        raws.reverse();
+        raws.rotate_left(13);
+        for ch in raws.chunks(7) {
+            db.store_blocks_only(e.p, ch).unwrap();
+        }
+        let bs: Vec<u32> = path.iter().map(|x| db.stored_b(c, x).unwrap().unwrap()).collect();
+        let n = db.write_txs_for(e.p, &listed(bs), &d.path().join("t"), &AtomicBool::new(false), &mut |_| {}).unwrap();
+        (n, table(&db, TXS))
+    };
+    let by_height = index(&|bs| bs);
+    let reversed = index(&|mut bs| {
+        bs.reverse();
+        bs
+    });
+    assert!(by_height.0 > 40, "{}", by_height.0);
+    assert_eq!(by_height, reversed);
+    // One row per transaction, as many as the reference chain has.
+    assert_eq!(by_height.1.len(), table(&e.reference, TXS).len());
+}

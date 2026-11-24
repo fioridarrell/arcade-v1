@@ -288,6 +288,13 @@ impl ChainDb {
     pub fn write_txs_for(&self, params: &ChainParams, bs: &[u32], tmp: &Path, stop: &AtomicBool, note: Note) -> Result<u64> {
         let c = params.chain_no;
         let mut s = Sorter::new(tmp, &format!("txs-{c}"))?;
+        // Read in block-number order, not height order: an init install stores blocks in the
+        // order they arrive, so height order jumps all over the file (one seek per block on a
+        // spinning disk, ~100 blocks/s), while block-number order follows the file. The rows go
+        // through the sorter and TXS keeps every value of a key (dup), so the order changes nothing.
+        let mut order: Vec<u32> = bs.to_vec();
+        order.sort_unstable();
+        let bs = &order[..];
         for (i, chunk) in bs.chunks(500).enumerate() {
             crate::cpushare::pace();
             if stop.load(Ordering::Relaxed) {

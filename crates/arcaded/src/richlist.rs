@@ -66,21 +66,36 @@ fn address_of(node: &Node, p: &'static ChainParams, row: &arcade_chaindb::RichRo
     }
 }
 
-/// Make `p`'s list now (the background thread; slow on a big chain: a walk through every unspent coin).
+/// Rows read from the address index per list, before rows with no address are left out: unspent data outputs (a
+/// script no address names, often 0.01 each) can fill most of the biggest KEEP, so more are read to keep KEEP holders.
+const SCAN: usize = KEEP * 4;
+
+/// Make `p`'s list now (the background thread; slow on a big chain: a walk through every unspent coin). Only rows with
+/// an address are ranked; the scripts no address names among the SCAN biggest are added up once, as `unnamed`.
 fn make(node: &Node, p: &'static ChainParams) -> Result<Value, String> {
     let height = node.chain.tip(p.chain_no).ok().flatten().map(|t| t.height).unwrap_or(0);
     let began = Instant::now();
-    let r = node.chain.rich_list(p.chain_no, KEEP, arcade_chaindb::cpushare::pace).map_err(|e| e.to_string())?;
-    let rows: Vec<Value> = r
-        .top
-        .iter()
-        .map(|x| {
-            let a = address_of(node, p, x);
-            json!({"address": a, "balance": x.balance, "coins": x.coins, "kind": if a.is_none() { Some("script") } else { None }})
-        })
-        .collect();
+    let r = node.chain.rich_list(p.chain_no, SCAN, arcade_chaindb::cpushare::pace).map_err(|e| e.to_string())?;
+    let (rows, unnamed) = ranked(r.top.iter().map(|x| (address_of(node, p, x), x)));
     Ok(json!({"chain": p.key, "height": height, "at": arcade_app::now(), "holders": r.holders, "coins": r.coins, "total": r.total,
-              "rows": rows, "secs": began.elapsed().as_secs()}))
+              "rows": rows, "unnamed": unnamed, "secs": began.elapsed().as_secs()}))
+}
+
+/// The biggest KEEP rows that name an address, and the rows that don't, added up: {rows, balance, utxos}.
+fn ranked<'a>(rows: impl Iterator<Item = (Option<String>, &'a arcade_chaindb::RichRow)>) -> (Vec<Value>, Value) {
+    let (mut out, mut n, mut bal, mut utxos) = (Vec::new(), 0u64, 0u64, 0u64);
+    for (a, x) in rows {
+        match a {
+            Some(a) if out.len() < KEEP => out.push(json!({"address": a, "balance": x.balance, "coins": x.coins, "utxos": x.coins})),
+            Some(_) => {}
+            None => {
+                n += 1;
+                bal += x.balance;
+                utxos += x.coins;
+            }
+        }
+    }
+    (out, json!({"rows": n, "balance": bal, "utxos": utxos}))
 }
 
 fn refresh_of(p: &ChainParams) -> Duration {
@@ -176,7 +191,7 @@ pub fn read(node: &Node, p: &'static ChainParams, req: &Value) -> Result<Value, 
         .unwrap_or_default();
     let listed = v["rows"].as_array().map_or(0, |a| a.len());
     Ok(json!({"chain": p.key, "unit": unit, "height": v["height"], "at": v["at"], "holders": v["holders"], "coins": v["coins"],
-              "total": v["total"], "rows": rows, "offset": offset, "limit": limit, "listed": listed, "kept": KEEP,
+              "total": v["total"], "unnamed": v["unnamed"], "rows": rows, "offset": offset, "limit": limit, "listed": listed, "kept": KEEP,
               "next": (offset + limit < listed).then_some(offset + limit), "building": building,
               "refresh_secs": refresh_of(p).as_secs()}))
 }
@@ -199,6 +214,21 @@ mod tests {
         assert_eq!(address_of(&t.node, p, &row(sid)), Some(arcade_ledger::address::base58check(p.p2sh_version, &h)));
         sid[0] = 2;
         assert_eq!(address_of(&t.node, p, &row(sid)), None);
+    }
+
+    #[test]
+    fn rows_no_address_names_are_left_out_of_the_ranks_and_added_up() {
+        let row = |balance, coins| arcade_chaindb::RichRow { sid: [0u8; 21], balance, coins, first: (0, 0, 0) };
+        let (a, b, c) = (row(900, 3), row(4, 1), row(2, 2));
+        let (rows, unnamed) = ranked([(Some("a1".to_string()), &a), (None, &b), (None, &c)].into_iter());
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["address"], "a1");
+        assert_eq!(rows[0]["utxos"], 3);
+        assert_eq!(unnamed, json!({"rows": 2, "balance": 6, "utxos": 3}));
+        let many: Vec<_> = (0..KEEP + 5).map(|i| row(1000 - i as u64, 1)).collect();
+        let (rows, unnamed) = ranked(many.iter().map(|x| (Some(format!("a{}", x.balance)), x)));
+        assert_eq!(rows.len(), KEEP);
+        assert_eq!(unnamed["rows"], 0);
     }
 
     #[test]

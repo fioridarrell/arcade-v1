@@ -166,6 +166,41 @@ impl BlockSource for Src {
     }
 }
 
+/// A test's directory, holding the lock that lets one of these tests run at a time: each chain file reserves 4 TiB
+/// of address space (CHAIN_SCHEMA.max_size), and many of them open at once on a many-core machine ran out of it
+/// (Mdbx(OutOfMemory) at open). A second directory in the same test doesn't wait on its own lock.
+struct TestDir {
+    dir: tempfile::TempDir,
+    _turn: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl std::ops::Deref for TestDir {
+    type Target = tempfile::TempDir;
+    fn deref(&self) -> &tempfile::TempDir {
+        &self.dir
+    }
+}
+
+impl Drop for TestDir {
+    fn drop(&mut self) {
+        if self._turn.is_some() {
+            HELD.with(|h| h.set(false));
+        }
+    }
+}
+
+static TURN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+thread_local!(static HELD: std::cell::Cell<bool> = const { std::cell::Cell::new(false) });
+
+fn tmpdir() -> TestDir {
+    let turn = (!HELD.with(|h| h.get())).then(|| {
+        let g = TURN.lock().unwrap_or_else(|e| e.into_inner());
+        HELD.with(|h| h.set(true));
+        g
+    });
+    TestDir { dir: tempfile::tempdir().unwrap(), _turn: turn }
+}
+
 fn open(dir: &Path) -> ChainDb {
     ChainDb::open(dir.join("chain.mdbx")).unwrap()
 }
@@ -218,7 +253,7 @@ fn an_init_install_ends_as_a_normal_sync() {
     let blocks = chain(40);
     let p = params(&blocks[0], |_| {});
     let c = p.chain_no;
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let r = reference(d.path(), p, &blocks);
     let db = open(d.path());
     let (mut a, mut b, mut x) = (Src::new(&blocks), Src::new(&blocks), Src::new(&blocks));
@@ -255,7 +290,7 @@ fn blocks_stored_in_any_order_give_the_same_coins() {
     let blocks = chain(30);
     let p = params(&blocks[0], |_| {});
     let c = p.chain_no;
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let r = reference(d.path(), p, &blocks);
     let db = open(d.path());
     let mut a = Src::new(&blocks);
@@ -292,7 +327,7 @@ fn blocks_stored_in_any_order_give_the_same_coins() {
 fn agreement_needs_three_independent_sources_on_one_tip() {
     let blocks = chain(20);
     let p = params(&blocks[0], |_| {});
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     // A shorter branch from 17: its source has another tip.
     let mut fork = blocks[..=17].to_vec();
@@ -328,7 +363,7 @@ fn agreement_needs_three_independent_sources_on_one_tip() {
     assert!(!ag.done(), "{}", ag.text());
     // Total work below the chain's minimum: not done however many agree.
     let p2 = params(&blocks[0], |p| p.min_chain_work = "00000000000000000000000000000000000000000000000000000000ffffffff");
-    let d2 = tempfile::tempdir().unwrap();
+    let d2 = tmpdir();
     let db2 = open(d2.path());
     begin(&db2, p2, &mut a);
     let ag = round(&db2, p2, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
@@ -341,7 +376,7 @@ fn bad_blocks_are_refused_and_fetched_again() {
     let blocks = chain(12);
     let p = params(&blocks[0], |_| {});
     let c = p.chain_no;
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let mut good = Src::new(&blocks);
     begin(&db, p, &mut good);
@@ -394,7 +429,7 @@ fn a_block_with_its_witnesses_stripped_is_refused() {
     let witness_rules = BlockRules { script_flags: |_| SCRIPT_WITNESS, ..BITCOIN_BLOCK_RULES };
     let p = params(&g, |p| p.block_rules = Some(witness_rules));
     let c = p.chain_no;
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let mut good = Src::new(&blocks);
     begin(&db, p, &mut good);
@@ -416,7 +451,7 @@ fn an_init_install_resumes_in_each_phase() {
     let blocks = chain(40);
     let p = params(&blocks[0], |_| {});
     let c = p.chain_no;
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let r = reference(d.path(), p, &blocks);
     let tmp = d.path().join("tmp");
     let (mut a, mut b, mut x) = (Src::new(&blocks), Src::new(&blocks), Src::new(&blocks));
@@ -486,7 +521,7 @@ fn the_build_checks_the_rules_and_ends_as_a_normal_sync() {
     let blocks = chain(40);
     let p = ruled(&blocks[0], |_, _| 1_000_000);
     let c = p.chain_no;
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let r = reference(d.path(), p, &blocks);
     let db = open(d.path());
     stored_all(&db, p, &blocks);
@@ -511,7 +546,7 @@ fn a_block_the_rules_refuse_is_fetched_again_once_then_the_build_stops() {
     // Block 7's coinbase pays more than its subsidy.
     let p = ruled(&blocks[0], |h, _| if h == 7 { 1 } else { 1_000_000 });
     let c = p.chain_no;
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let tmp = d.path().join("tmp");
     let db = open(d.path());
     stored_all(&db, p, &blocks);
@@ -542,7 +577,7 @@ fn a_block_the_rules_refuse_is_fetched_again_once_then_the_build_stops() {
 fn the_coin_set_derived_on_disk_ends_as_a_normal_sync() {
     let blocks = chain(40);
     let p = params(&blocks[0], |_| {});
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let r = reference(d.path(), p, &blocks);
     let db = open(d.path());
     stored_all(&db, p, &blocks);
@@ -564,7 +599,7 @@ fn a_spend_of_an_output_made_later_in_its_block_is_refused_in_memory_and_on_disk
         let b2 = mine(b1.hash(), &txs, 2);
         let blocks = vec![g.clone(), b1.clone(), b2];
         let p = params(&g, |_| {});
-        let d = tempfile::tempdir().unwrap();
+        let d = tmpdir();
         let db = open(d.path());
         stored_all(&db, p, &blocks);
         let r = build_with(&db, p, &d.path().join("tmp"), 0, budget);
@@ -585,7 +620,7 @@ fn a_spend_of_an_output_made_later_in_its_block_is_refused_in_memory_and_on_disk
 fn junk_after_the_transactions_or_a_bad_auxpow_is_refused() {
     let blocks = chain(3);
     let p = params(&blocks[0], |_| {});
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let mut a = Src::new(&blocks);
     begin(&db, p, &mut a);
@@ -629,7 +664,7 @@ fn block_numbers_follow_heights_even_when_the_best_chain_moves() {
         let prev = fork.last().unwrap().hash();
         fork.push(mine(prev, &[coinbase(900 + h, None, false)], h));
     }
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let r = reference(d.path(), p, &fork);
     let db = open(d.path());
     let mut a = Src::new(&blocks);
@@ -697,7 +732,7 @@ fn a_source_feeding_a_low_work_branch_is_left_out_of_the_headers_round() {
         low.push(mine_bits(prev, &[coinbase(5000 + h, None, false)], h, EASY));
     }
     // Ours first: the low branch is spam and its source is left out.
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let (mut a, mut l) = (Src::new(&good), Src::new(&low));
     begin(&db, p, &mut a);
@@ -706,7 +741,7 @@ fn a_source_feeding_a_low_work_branch_is_left_out_of_the_headers_round() {
     assert!(ag.differ.iter().any(|x| x.starts_with("l: sent") && x.contains("less work")), "{:?}", ag.differ);
     assert!(!ag.differ.iter().any(|x| x.starts_with("a:")), "{:?}", ag.differ);
     // The low branch sent first: our chain still wins and its source is never counted against.
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let (mut a, mut l) = (Src::new(&good), Src::new(&low));
     begin(&db, p, &mut l);
@@ -722,7 +757,7 @@ fn headers_are_done_only_through_the_init_checkpoint() {
     // Checkpoint at 12 on this chain: done.
     let at12 = leak(&blocks[12]);
     let p = params(&blocks[0], |p| p.init_checkpoint = Some((12, at12)));
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let (mut a, mut b, mut e) = (Src::new(&blocks), Src::new(&blocks), Src::new(&blocks));
     begin(&db, p, &mut a);
@@ -730,7 +765,7 @@ fn headers_are_done_only_through_the_init_checkpoint() {
     assert!(ag.floor_ok && ag.done(), "{}", ag.text());
     // Checkpoint above every source's tip: not done, however many agree.
     let p2 = params(&blocks[0], |p| p.init_checkpoint = Some((40, at12)));
-    let d2 = tempfile::tempdir().unwrap();
+    let d2 = tmpdir();
     let db2 = open(d2.path());
     begin(&db2, p2, &mut a);
     let ag = round(&db2, p2, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
@@ -740,14 +775,14 @@ fn headers_are_done_only_through_the_init_checkpoint() {
     // Another block named at 12: the sources' chain is refused at 12 and never gets through.
     let other = leak(&blocks[13]);
     let p3 = params(&blocks[0], |p| p.init_checkpoint = Some((12, other)));
-    let d3 = tempfile::tempdir().unwrap();
+    let d3 = tmpdir();
     let db3 = open(d3.path());
     begin(&db3, p3, &mut a);
     let ag = round(&db3, p3, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
     assert!(ag.height < 12 && !ag.floor_ok && !ag.done(), "{}", ag.text());
     // No init checkpoint at all: never done.
     let p4 = params(&blocks[0], |p| p.init_checkpoint = None);
-    let d4 = tempfile::tempdir().unwrap();
+    let d4 = tmpdir();
     let db4 = open(d4.path());
     begin(&db4, p4, &mut a);
     let ag = round(&db4, p4, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
@@ -758,7 +793,7 @@ fn headers_are_done_only_through_the_init_checkpoint() {
 fn a_source_sending_far_more_header_bytes_than_it_brings_is_left_out() {
     let blocks = chain(30);
     let p = params(&blocks[0], |_| {});
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let (mut a, mut b) = (Src::new(&blocks), Src::new(&blocks));
     // 81 bytes a header, each sent 40 times: 3,240 bytes per new header, over the test's 1,000.
@@ -769,7 +804,7 @@ fn a_source_sending_far_more_header_bytes_than_it_brings_is_left_out() {
     assert!(ag.differ.iter().any(|x| x.starts_with("w:") && x.contains("KiB of headers")), "{:?}", ag.differ);
     assert_eq!(ag.agree, vec!["a".to_string(), "b".to_string()]);
     // Sent a few times over, within the allowance: heard as usual.
-    let d2 = tempfile::tempdir().unwrap();
+    let d2 = tmpdir();
     let db2 = open(d2.path());
     let mut twice = Src::new(&blocks);
     twice.repeat = 2;
@@ -806,7 +841,7 @@ fn bitcoin_has_a_checkpoint_at_its_minimum_chain_work_block() {
 fn a_stored_block_whose_header_we_lack_is_refused_not_checked_at_height_0() {
     let blocks = chain(3);
     let p = params(&blocks[0], |p| p.block_rules = Some(BlockRules { script_flags: |_| SCRIPT_WITNESS, ..BITCOIN_BLOCK_RULES }));
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let db = open(d.path());
     let mut a = Src::new(&blocks[..2]);
     begin(&db, p, &mut a);
@@ -827,7 +862,7 @@ fn a_build_target_the_best_chain_left_is_given_up_and_its_join_undone() {
         let prev = fork.last().unwrap().hash();
         fork.push(mine(prev, &[coinbase(900 + h, None, false)], h));
     }
-    let d = tempfile::tempdir().unwrap();
+    let d = tmpdir();
     let r = reference(d.path(), p, &fork);
     let db = open(d.path());
     stored_all(&db, p, &blocks);

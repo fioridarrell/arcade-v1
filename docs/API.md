@@ -11,13 +11,21 @@ Everything the desktop app does goes through one set of commands. Programs reach
 **Only this computer.** `/rpc` and `/api/v1` answer only requests from this computer, addressed to
 `127.0.0.1`, `localhost` or `[::1]` with the arcade's port (the `Host` header), that didn't come
 through a proxy (requests carrying a proxy's headers, such as `X-Forwarded-*`, `Forwarded`, `Via`,
-`X-Real-IP`, `CF-Connecting-IP` or `True-Client-IP`, are refused). A reverse proxy or tunnel that
-adds none of those (a plain `proxy_pass`, `ssh -L`, `socat`) would make
+`X-Real-IP`, `CF-Connecting-IP` or `True-Client-IP`, are refused). A name that merely resolves to
+127.0.0.1 (a DNS-rebinding page) is refused, because its `Host` header is not one of those. A reverse
+proxy or tunnel that adds none of those headers (a plain `proxy_pass`, `ssh -L`, `socat`) would make
 its visitors look like this computer: run arcaded with `--behind-proxy` there, and nothing over the
 web port counts as this computer (programs then use the socket). Answers carry no CORS headers. The
-operator can open the HTTP port (`arcaded --http-bind 0.0.0.0`) and serve a website from it
-(`--site DIR`): visitors then get the site's pages and inscription content (`/content/<id>`,
-`/inscription/<id>`), never the API. A public website calls the API from its own server code.
+web port listens on 127.0.0.1. A non-loopback `--http-bind` is refused unless `--i-understand-remote-api`
+is also given, and startup then prints a warning. With that flag the operator can serve a website
+(`--site DIR`): visitors get the site's pages and inscription content (`/content/<id>`,
+`/inscription/<id>`), never the API, which still requires a loopback `Host`. A public website calls
+the API from its own server code.
+
+**The other ports stay open, and they are not this API.** Mesh (TCP 8421) carries blocks and signed
+records between arcades: welcome records, code releases, ledger items. STUN (UDP 3478) answers binding
+requests so a peer can learn its public address, and carries call media when the relay is on. Neither
+serves the wallet or this HTTP API.
 
 ## JSON-RPC
 

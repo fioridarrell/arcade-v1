@@ -63,6 +63,50 @@ pub struct Opts {
     pub behind_proxy: bool,
 }
 
+/// Where the web port may listen. Loopback is the default. A non-loopback address is refused
+/// unless the operator also passed `--i-understand-remote-api` (`remote` is then true, and startup
+/// prints [`remote_api_warning`]).
+#[derive(Debug)]
+pub struct HttpBind {
+    pub addr: String,
+    pub remote: bool,
+}
+
+/// `asked` is `--http-bind`, or None for the default. `understand` is `--i-understand-remote-api`.
+pub fn resolve_http_bind(asked: Option<&str>, understand: bool) -> Result<HttpBind, String> {
+    let raw = asked.map(str::trim).filter(|s| !s.is_empty()).unwrap_or("127.0.0.1");
+    if bind_is_loopback(raw) {
+        return Ok(HttpBind { addr: raw.to_string(), remote: false });
+    }
+    if !understand {
+        return Err(format!(
+            "--http-bind {raw} is not a loopback address. The web port stays on this computer unless you also pass --i-understand-remote-api"
+        ));
+    }
+    Ok(HttpBind { addr: raw.to_string(), remote: true })
+}
+
+/// An address this computer is: 127.0.0.0/8, ::1, or the name localhost. A public address, 0.0.0.0 and :: are not.
+fn bind_is_loopback(raw: &str) -> bool {
+    let s = raw.trim();
+    let bare = s.strip_prefix('[').and_then(|r| r.strip_suffix(']')).unwrap_or(s);
+    if bare.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    match bare.parse::<IpAddr>() {
+        Ok(IpAddr::V4(v)) => v.is_loopback(),
+        Ok(IpAddr::V6(v)) => v.is_loopback() || v.to_ipv4_mapped().is_some_and(|m| m.is_loopback()),
+        Err(_) => false,
+    }
+}
+
+/// Printed at startup when the web port is deliberately not only on loopback.
+pub fn remote_api_warning(addr: &str) -> String {
+    format!(
+        "warning: the web port is open on {addr} because --i-understand-remote-api was set. The API still answers only a loopback Host header, so a page on another name cannot drive it. Anyone who can reach {addr} can still request the site and inscription pages."
+    )
+}
+
 /// What each connection needs from the options.
 struct Conf {
     site: Option<PathBuf>,
@@ -1545,6 +1589,54 @@ pub(crate) mod tests {
 
     fn status(answer: &str) -> &str {
         answer.split(' ').nth(1).unwrap_or("")
+    }
+
+    #[test]
+    fn default_bind_listens_only_on_loopback() {
+        let b = resolve_http_bind(None, false).unwrap();
+        assert_eq!(b.addr, "127.0.0.1");
+        assert!(!b.remote);
+        let l = TcpListener::bind((b.addr.as_str(), 0)).unwrap();
+        let ip = l.local_addr().unwrap().ip();
+        assert!(ip.is_loopback(), "{ip}");
+        for a in ["127.0.0.2", "::1", "[::1]", "localhost", "LOCALHOST"] {
+            let b = resolve_http_bind(Some(a), false).unwrap();
+            assert!(!b.remote, "{a}");
+            assert!(bind_is_loopback(&b.addr), "{a}");
+        }
+    }
+
+    #[test]
+    fn a_public_bind_is_refused_without_the_flag() {
+        for a in ["0.0.0.0", "::", "[::]", "192.168.1.5", "8.8.8.8", "example.com", "127.0.0.1.evil.example"] {
+            let err = resolve_http_bind(Some(a), false).expect_err(a);
+            assert!(err.contains("--i-understand-remote-api"), "{a}: {err}");
+            assert!(err.contains(a), "{err}");
+        }
+        let b = resolve_http_bind(Some("0.0.0.0"), true).unwrap();
+        assert!(b.remote && b.addr == "0.0.0.0");
+        let warn = remote_api_warning(&b.addr);
+        assert!(warn.contains("0.0.0.0") && warn.contains("--i-understand-remote-api"));
+        // The flag is not required for loopback, and it does not mark a loopback bind as remote.
+        assert!(!resolve_http_bind(Some("127.0.0.1"), true).unwrap().remote);
+    }
+
+    #[test]
+    fn a_dns_rebinding_host_cannot_drive_the_api() {
+        let (_one, t) = crate::http::tests::node();
+        // A page whose name was pointed at 127.0.0.1 asks with that name, not with a loopback Host.
+        for raw in [
+            "GET /api/v1/routes HTTP/1.1\r\nHost: rebind.example:8420\r\n\r\n",
+            "GET /api/v1/routes HTTP/1.1\r\nHost: 127.0.0.1.evil.example:8420\r\n\r\n",
+            "GET /api/v1/routes HTTP/1.1\r\nHost: 8.8.8.8:8420\r\n\r\n",
+            "GET /api/v1/routes HTTP/1.1\r\n\r\n",
+            "POST /rpc HTTP/1.1\r\nHost: rebind.example:8420\r\nContent-Length: 0\r\n\r\n",
+        ] {
+            let a = ask(&t.node, &conf(), raw.as_bytes());
+            assert_eq!(status(&a), "403", "{raw} -> {a}");
+        }
+        let a = ask(&t.node, &conf(), &get("/api/v1/routes", ""));
+        assert_eq!(status(&a), "200", "{a}");
     }
 
     #[test]

@@ -163,6 +163,7 @@
  "Audits this period": "chains.js:487",
  "Author": "explorer.js:760",
  "Authorization": "common.js:42",
+ "Automatic updates are off until you turn this on: this arcade then installs a newer signed release from the network, and only after its signature, file hashes and version all check.": "index.html:480",
  "Automatic welcomes off: Home still shows new arcades with the button.": "options.js:286",
  "Back to the overview": "explorer.js:845",
  "Back to the page you were on (Alt+←)": "explorer.js:874",

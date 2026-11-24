@@ -33,7 +33,7 @@ That's all. It downloads the newest ready-made release for your PC (Intel/AMD or
 - **arcade**, the command line (`arcade status`, `arcade setup`, ...);
 - **Arcade V1.0**, the desktop app, with its icon and a launcher in your app menu.
 
-Everything goes in your home folder: programs in `~/.local/bin`, data in `~/.local/share/arcade`. Run the same command again to update.
+Everything goes in your home folder: programs in `~/.local/bin`, data in `~/.local/share/arcade`. Run the same command again to update by hand. With automatic updates on in Options (off until you turn them on), the arcade also installs a newer signed release from the mesh; see [docs/RELEASE-KEY.md](docs/RELEASE-KEY.md).
 
 ### Requirements
 
@@ -79,6 +79,8 @@ curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scr
 | `--no-desktop` | Don't build the desktop app. |
 | `--home DIR` | Data folder (default `~/.local/share/arcade`). |
 | `--http-port N`, `--mesh-port N`, `--stun-port N` | Ports. The defaults are 8420, 8421 and 3478. A port that's already taken (for example, by another arcade on the same PC) moves to the next free one. STUN turns off (`0`) if its port is taken. |
+
+The web port (8420) is this computer's HTTP API and the app window. It listens on 127.0.0.1 unless you pass both `--http-bind` and `--i-understand-remote-api`. The mesh port (8421) is how arcades exchange blocks and signed records (welcome records, code releases, ledger items). The STUN port (3478, UDP) answers binding requests so a peer can learn its public address, and carries call media when the relay is on. Neither the mesh port nor the STUN port serves the wallet or the HTTP API.
 
 If the web port is reached through a reverse proxy or a tunnel, put `ARCADED_OPTS=--behind-proxy` in `~/.config/arcade/arcaded.env` and restart the service (`systemctl --user restart arcaded`): then nothing that arrives over the web port counts as this computer, so the API and the wallet's page API answer only the local socket. That file is yours: installs and updates rewrite the service, never it. Don't edit the service's `ExecStart` line, which the next update replaces.
 
@@ -126,11 +128,13 @@ That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release 
 - **arcade**, the command line (`arcade status`, `arcade setup`, ...);
 - **Arcade V1.0**, the desktop app, in the Start menu. The window uses Microsoft Edge WebView2, which Windows 11 already has. If yours doesn't, the installer adds the WebView2 runtime.
 
-Programs go in `%LOCALAPPDATA%\Programs\Arcade`. Data goes in `%LOCALAPPDATA%\arcade` (not `~/.local/share/arcade`). The ports are the same as on Linux: **8420** (http), **8421** (mesh) and **3478** (STUN). A port that's already taken moves to the next free one; STUN turns off (`0`) if 3478 is taken. Each database file can grow to 512 GiB on Windows (the library reserves that address space up front; on Linux the ceiling stays 4 TiB and is not reserved).
+Programs go in `%LOCALAPPDATA%\Programs\Arcade`. Data goes in `%LOCALAPPDATA%\arcade` (not `~/.local/share/arcade`). The ports are the same as on Linux: **8420** (http, this computer only), **8421** (mesh: blocks and signed records) and **3478** (STUN: binding requests and call media). Neither 8421 nor 3478 serves the wallet or the HTTP API. A port that's already taken moves to the next free one; STUN turns off (`0`) if 3478 is taken. Each database file can grow to 512 GiB on Windows (the library reserves that address space up front; on Linux the ceiling stays 4 TiB and is not reserved).
 
 Open **Arcade V1.0** from the Start menu, or run `arcade setup` in a new terminal. Either way you then make a new wallet, or restore one from its 12 words, and claim your @handle. The service connects to the mesh and syncs Pepecoin testnet by itself.
 
-Run the same command again to update. Your wallet, its 12 words, your @handle, messages and chains are kept. The service is asked to finish what it was writing (that can take a few minutes while a chain is catching up) and is then started on the new programs. If the app was open, close it and open it again.
+Windows builds update themselves over the mesh the same way Linux does, when automatic updates are on in Options. That switch is off until you turn it on. A release is installed only when it is signed by the release key, the archive hash matches that signed record, and the new program reports that version. An older version is never installed, and nothing skips the signature check. See [docs/RELEASE-KEY.md](docs/RELEASE-KEY.md).
+
+Run the same command again to update by hand. Your wallet, its 12 words, your @handle, messages and chains are kept. The service is asked to finish what it was writing (that can take a few minutes while a chain is catching up) and is then started on the new programs. If the app was open, close it and open it again.
 
 ### Options
 

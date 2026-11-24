@@ -48,7 +48,8 @@ fn sha_hex(b: &[u8]) -> String {
     hex::encode(Sha256::digest(b))
 }
 
-fn message(id: &str) -> Vec<u8> {
+/// The bytes a release key signs: the tag, then the record's id (SHA-256 of the record's own bytes).
+pub(crate) fn release_message(id: &str) -> Vec<u8> {
     [&b"ARCADE code release\0"[..], id.as_bytes()].concat()
 }
 
@@ -67,32 +68,68 @@ pub struct Release {
     pub files: BTreeMap<String, (String, u64)>,
 }
 
+/// Why a release signature was not accepted. A record is never taken on a failure.
+#[derive(Debug, PartialEq, Eq)]
+pub enum VerifyFail {
+    /// No signature, or not 64 bytes of hex. There is no path that skips this.
+    Unsigned,
+    /// A 64-byte signature that none of the given keys accepts, including when no key is trusted.
+    WrongKey,
+    /// The signature checks, and the record's fields do not.
+    Record(String),
+}
+
+fn decode_release_key(hex_key: &str) -> Option<VerifyingKey> {
+    let b: [u8; 32] = hex::decode(hex_key.trim()).ok()?.try_into().ok()?;
+    VerifyingKey::from_bytes(&b).ok()
+}
+
+/// The release keys a check uses: the ones [`start`] pinned (the built-in keys, plus `--code-key` on a closed
+/// test network), or just the built-in keys before start. Never a set that skips the signature.
+pub fn trusted_keys() -> Vec<VerifyingKey> {
+    if let Some(k) = KEYS.get() {
+        return k.clone();
+    }
+    RELEASE_KEYS.iter().filter_map(|k| decode_release_key(k)).collect()
+}
+
 impl Release {
-    /// A record and its signature, checked: its fields, and a signature by a trusted release key.
-    pub fn check(record: &str, sig: &str) -> Result<Release, String> {
-        let v: Value = serde_json::from_str(record).map_err(|_| "a release record must be JSON")?;
+    /// A record and its signature, checked against `keys`: the signature first, then the fields.
+    /// An empty `keys` refuses every record. Nothing here turns the signature check off.
+    pub fn verify(record: &str, sig: &str, keys: &[VerifyingKey]) -> Result<Release, VerifyFail> {
+        let sig = sig.trim().to_lowercase();
+        let Ok(raw) = hex::decode(&sig) else { return Err(VerifyFail::Unsigned) };
+        let Ok(s) = <[u8; 64]>::try_from(raw) else { return Err(VerifyFail::Unsigned) };
         let id = sha_hex(record.as_bytes());
-        let sig = sig.to_lowercase();
-        let s: [u8; 64] = hex::decode(&sig).ok().and_then(|b| b.try_into().ok()).ok_or("a release signature is 64 bytes")?;
-        let keys = KEYS.get().map(Vec::as_slice).unwrap_or(&[]);
-        if !keys.iter().any(|k| k.verify(&message(&id), &Signature::from_bytes(&s)).is_ok()) {
-            return Err("not signed by a release key this arcade trusts".into());
+        if !keys.iter().any(|k| k.verify(release_message(&id).as_slice(), &Signature::from_bytes(&s)).is_ok()) {
+            return Err(VerifyFail::WrongKey);
         }
-        let txt = |k: &str| v[k].as_str().map(String::from).ok_or(format!("a release record needs {k}"));
+        let v: Value = serde_json::from_str(record).map_err(|_| VerifyFail::Record("a release record must be JSON".into()))?;
+        let txt = |k: &str| v[k].as_str().map(String::from).ok_or_else(|| VerifyFail::Record(format!("a release record needs {k}")));
         let mut files = BTreeMap::new();
-        for (name, f) in v["files"].as_object().ok_or("a release record needs files")? {
-            let sha = f["sha256"].as_str().filter(|s| s.len() == 64 && hex::decode(s).is_ok()).ok_or("a file needs its sha256")?;
-            let bytes = f["bytes"].as_u64().filter(|b| *b <= MAX_FILE).ok_or("a file needs its size (at most 1 GiB)")?;
+        for (name, f) in v["files"].as_object().ok_or_else(|| VerifyFail::Record("a release record needs files".into()))? {
+            let sha = f["sha256"].as_str().filter(|s| s.len() == 64 && hex::decode(s).is_ok()).ok_or_else(|| VerifyFail::Record("a file needs its sha256".into()))?;
+            let bytes = f["bytes"].as_u64().filter(|b| *b <= MAX_FILE).ok_or_else(|| VerifyFail::Record("a file needs its size (at most 1 GiB)".into()))?;
             if name.contains('/') || name.contains("..") || name.is_empty() {
-                return Err("a file name is a plain name".into());
+                return Err(VerifyFail::Record("a file name is a plain name".into()));
             }
             files.insert(name.clone(), (sha.to_lowercase(), bytes));
         }
         let commit = txt("commit")?;
         if commit.len() != 40 || hex::decode(&commit).is_err() {
-            return Err("commit is a git commit id".into());
+            return Err(VerifyFail::Record("commit is a git commit id".into()));
         }
         Ok(Release { id, record: record.to_string(), sig, name: txt("name")?, version: txt("version")?, commit, time: v["time"].as_u64().unwrap_or(0), files })
+    }
+
+    /// A record and its signature, checked against the keys this arcade trusts.
+    pub fn check(record: &str, sig: &str) -> Result<Release, String> {
+        match Self::verify(record, sig, KEYS.get().map(Vec::as_slice).unwrap_or(&[])) {
+            Ok(r) => Ok(r),
+            Err(VerifyFail::Unsigned) => Err("a release signature is 64 bytes".into()),
+            Err(VerifyFail::WrongKey) => Err("not signed by a release key this arcade trusts".into()),
+            Err(VerifyFail::Record(e)) => Err(e),
+        }
     }
 
     pub fn is_program(name: &str) -> bool {
@@ -325,9 +362,11 @@ fn keep_file(sha: &str, src: &Path) -> Result<(), String> {
 
 /// Start: the trusted keys, the releases and files kept here, and the fetcher.
 pub fn start(node: &Arc<Node>, test_key: Option<String>) {
-    let mut keys: Vec<VerifyingKey> = RELEASE_KEYS.iter().filter_map(|k| hex::decode(k).ok()?.try_into().ok()).filter_map(|b: [u8; 32]| VerifyingKey::from_bytes(&b).ok()).collect();
-    if let Some(k) = test_key.and_then(|k| hex::decode(k).ok()).and_then(|b| <[u8; 32]>::try_from(b).ok()).and_then(|b| VerifyingKey::from_bytes(&b).ok()) {
-        keys.push(k);
+    let mut keys = trusted_keys();
+    if let Some(k) = test_key.as_deref().and_then(decode_release_key) {
+        if !keys.iter().any(|h| h.as_bytes() == k.as_bytes()) {
+            keys.push(k);
+        }
     }
     let _ = KEYS.set(keys);
     let _ = HOME.set(node.home.clone());
@@ -523,22 +562,8 @@ pub fn on_frame(link: &mut Link, f: &Frame) -> Result<(), LinkError> {
 /// The name the arcade's own releases go by.
 pub const ARCADE_V1: &str = "@arcade/arcade-v1";
 
-/// For the updater: every release of `name` whose `file` is held here, as (version, path to the file, its sha256).
-/// Each was signed by a trusted release key and its file checked against the record when it was kept.
-pub fn held_programs(name: &str, file: &str) -> Vec<(String, PathBuf, String)> {
-    let s = st();
-    s.releases
-        .values()
-        .filter(|r| r.name == name)
-        .filter_map(|r| {
-            let (sha, _) = r.files.get(file)?;
-            s.have.contains(sha).then(|| (r.version.clone(), file_path(sha), sha.clone()))
-        })
-        .collect()
-}
-
-/// Every release of `name` with its `file` held here, newest first: (release, the file's path). For crate::relrepo,
-/// which shows the newest bundle as a repository.
+/// Every release of `name` with its `file` held here, newest first: (release, the file's path). The updater
+/// re-checks the signature from here before it installs. `relrepo` shows the newest bundle as a repository.
 pub fn held_files(name: &str, file: &str) -> Vec<(Release, PathBuf)> {
     let s = st();
     let mut v: Vec<(Release, PathBuf)> = s

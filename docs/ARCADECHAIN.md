@@ -924,10 +924,16 @@ history, the vendored dependencies so it rebuilds with no internet, and the preb
 - **Sizes (v0.1.66, 2026-11-14):** bundle 8.8 MB (577 commits), dependencies 58.6 MB (537 crates, 763 MB unpacked),
   ARM Linux programs 13.8 MB.
 - **Updates come from the network** (Martin 2026-11-14: "Arcade V1 should be where arcade V1 is pulling all future
-  updates"): `updater.rs` takes the newest `@arcade/arcade-v1` release whose `program-linux-<arch>` archive is held
-  here (looking every 10 minutes is a read of the code store), checks it again, and installs it as before (`.prev`
-  kept, clean restart). GitHub is no longer asked. Tested: an arcade on v0.1.90 behind no open port fetched v0.1.91
-  from another arcade, installed it and restarted into it in about 20 s.
+  updates"): `updater.rs` takes the newest `@arcade/arcade-v1` release whose program archive for this machine is held
+  here (`program-linux-<arch>`, `program-windows-x86_64`, or `program-macos-<arch>`). Windows builds do update
+  themselves over the mesh, with the same checks as Linux; a Windows version `vX.Y.Z-windows` is the release
+  `vX.Y.Z`. Looking every 10 minutes is a read of the code store. Automatic updates are off until the operator turns
+  them on (Options, or `update.set`). A release is installed only when its signature is by a trusted release key,
+  the archive hash matches that signed record, and the new program reports that version. An older version is never
+  installed. Nothing skips the signature check. The old programs are kept as `.prev`, then a clean restart. A refusal
+  is logged and the installed programs are left as they are. GitHub is no longer asked. The release key, who can
+  sign, and how a key is rotated or dropped are in [RELEASE-KEY.md](RELEASE-KEY.md). Tested: an arcade on v0.1.90
+  behind no open port fetched v0.1.91 from another arcade, installed it and restarted into it in about 20 s.
 - **Still to do:** mainnet block 0 naming the first release's id; repos for everyone under @tags (`@tag/name`, push = signed ref update) once the ledger runs on ARCADE.
 
 ### 14.26 The writer's share (Martin 2026-11-14, rules version 2)

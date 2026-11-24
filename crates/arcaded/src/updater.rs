@@ -11,6 +11,15 @@
 //!
 //! "Check now" and "Update now" do the same by hand. A local build (no release version) never updates itself.
 //!
+//! A release is installed only when it passes every check below, and nothing is put in place when one fails.
+//! The signature is always required: there is no setting, environment variable, or flag that skips it.
+//! `--code-key` adds a key on a closed test network; it does not turn the check off.
+//!   - signed by a release key this arcade trusts (an unsigned record, or a signature by any other key, is refused);
+//!   - the program archive's SHA-256 is the one in that signed record;
+//!   - the new arcaded reports that release's version;
+//!   - the version is not older than the one running (a Windows `vX.Y.Z-windows` counts as `vX.Y.Z`).
+//! Each refusal is written to the arcade's log and shown under Options. The programs already installed are left as they are.
+//!
 //! **Windows** (the windows branch): the same signed releases, the same checks. Its program archive is
 //! `program-windows-x86_64` (the release's `arcade-v1-windows-x86_64.zip`), carried either by the release itself
 //! (`vX.Y.Z`) or by a Windows release of its own (`vX.Y.Z-windows`, the windows branch's commit); a Windows build's
@@ -62,6 +71,79 @@ fn release_version(v: &str, windows: bool) -> Option<(u64, u64, u64)> {
 
 fn rel(v: &str) -> Option<(u64, u64, u64)> {
     release_version(v, cfg!(windows))
+}
+
+/// Why a release was not installed. Nothing is written into the install folder on any of these.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Reject {
+    /// No signature, or not 64 bytes of hex.
+    Unsigned,
+    /// A signature no trusted release key accepts.
+    WrongKey,
+    /// The archive's SHA-256 is not the one in the signed record (or the record names no such file).
+    HashMismatch,
+    /// The new arcaded does not report the signed release's version.
+    VersionMismatch,
+    /// The signed version is older than the one running, or this build has no version to compare.
+    Rollback,
+}
+
+impl std::fmt::Display for Reject {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Reject::Unsigned => "unsigned release",
+            Reject::WrongKey => "signed by a key this arcade does not trust",
+            Reject::HashMismatch => "archive hash does not match the signed record",
+            Reject::VersionMismatch => "the new program does not report this release's version",
+            Reject::Rollback => "older than the version running",
+        })
+    }
+}
+
+/// The signature, the archive hash and the rollback check, before the archive is unpacked.
+/// `running` is this build's version; None refuses (a build with no version cannot show it is not a downgrade).
+fn vet_record(record: &str, sig: &str, keys: &[ed25519_dalek::VerifyingKey], program_file: &str, archive_sha256: &str, running: Option<(u64, u64, u64)>, windows: bool) -> Result<crate::arccode::Release, Reject> {
+    let release = match crate::arccode::Release::verify(record, sig, keys) {
+        Ok(r) => r,
+        Err(crate::arccode::VerifyFail::Unsigned) => return Err(Reject::Unsigned),
+        Err(crate::arccode::VerifyFail::WrongKey) => return Err(Reject::WrongKey),
+        // A signature we trust over bytes that are not a release is not something we install.
+        Err(crate::arccode::VerifyFail::Record(_)) => return Err(Reject::HashMismatch),
+    };
+    let Some(candidate) = release_version(&release.version, windows) else {
+        return Err(Reject::VersionMismatch);
+    };
+    let Some(cur) = running else { return Err(Reject::Rollback) };
+    if candidate < cur {
+        return Err(Reject::Rollback);
+    }
+    match release.files.get(program_file) {
+        Some((want, _)) if want.eq_ignore_ascii_case(archive_sha256) => Ok(release),
+        _ => Err(Reject::HashMismatch),
+    }
+}
+
+/// The unpacked arcaded reports the release it was signed as.
+fn vet_binary(said: &str, tag: &str, windows: bool) -> Result<(), Reject> {
+    if says_version(said, tag, windows) { Ok(()) } else { Err(Reject::VersionMismatch) }
+}
+
+/// Every check that must pass before the new programs replace the ones installed.
+/// There is no argument that skips the signature. A refusal means the caller writes nothing.
+fn release_may_stage(record: &str, sig: &str, keys: &[ed25519_dalek::VerifyingKey], program_file: &str, archive_sha256: &str, said: &str, running: Option<(u64, u64, u64)>, windows: bool) -> Result<(), Reject> {
+    let release = vet_record(record, sig, keys, program_file, archive_sha256, running, windows)?;
+    vet_binary(said, &release.version, windows)
+}
+
+/// What the log and Options show when a release is refused.
+fn refusal_line(tag: &str, why: &Reject) -> String {
+    format!("update to {tag} refused: {why}")
+}
+
+/// Stored automatic-update choice. Absent, unreadable, or anything but `{"on": true}` is off,
+/// so a fresh install stays off and an install that already opted in stays on.
+fn opted_in(raw: Option<&[u8]>) -> bool {
+    raw.and_then(|v| serde_json::from_slice::<Value>(v).ok()).is_some_and(|v| v["on"] == true)
 }
 
 /// Whether `arcaded --version`'s output names release `tag` (on Windows, `vX.Y.Z` and `vX.Y.Z-windows` name the same
@@ -120,8 +202,8 @@ fn st() -> &'static Mutex<State> {
 static SELF: OnceLock<(PathBuf, Vec<std::ffi::OsString>)> = OnceLock::new();
 
 pub fn on(node: &Node) -> bool {
-    node.app.store.read(|r| r.get(arcade_app::META, SETTING)).ok().flatten()
-        .and_then(|v| serde_json::from_slice::<Value>(&v).ok()).is_some_and(|v| v["on"] == true)
+    let raw = node.app.store.read(|r| r.get(arcade_app::META, SETTING)).ok().flatten();
+    opted_in(raw.as_deref())
 }
 
 pub fn set(node: &Node, on: bool) -> Result<Value, String> {
@@ -165,18 +247,24 @@ pub fn status(node: &Node) -> Value {
     })
 }
 
-/// The newest release of the arcade's own code whose archive for this machine is held here: (tag, archive, sha256).
-fn newest_release() -> Result<Option<(String, String, String)>, String> {
+/// A release this arcade holds and could install, still to be checked again before anything is put in place.
+struct Candidate {
+    tag: String,
+    archive: String,
+    record: String,
+    sig: String,
+}
+
+/// The newest release of the arcade's own code whose archive for this machine is held here.
+fn newest_release() -> Result<Option<Candidate>, String> {
     let file = program_file().ok_or("no release build for this system")?;
-    let best = crate::arccode::held_programs(crate::arccode::ARCADE_V1, &file)
-        .into_iter()
-        .filter_map(|(v, path, sha)| Some((rel(&v)?, v, path, sha)))
-        .max_by(|a, b| a.0.cmp(&b.0));
-    Ok(best.map(|(_, v, path, sha)| (v, path.to_string_lossy().into_owned(), sha)))
+    // held_files is newest first. The signature was checked when the record was kept; install checks it again.
+    let best = crate::arccode::held_files(crate::arccode::ARCADE_V1, &file).into_iter().find(|(r, _)| rel(&r.version).is_some());
+    Ok(best.map(|(r, path)| Candidate { tag: r.version, archive: path.to_string_lossy().into_owned(), record: r.record, sig: r.sig }))
 }
 
 /// Look for a release (status updated); Some(the release) when it is newer than this build.
-pub fn check() -> Result<Option<(String, String, String)>, String> {
+fn look() -> Result<Option<Candidate>, String> {
     st().lock().unwrap().doing = "checking";
     let r = newest_release();
     let mut s = st().lock().unwrap();
@@ -185,9 +273,9 @@ pub fn check() -> Result<Option<(String, String, String)>, String> {
     match r {
         Ok(rel) => {
             s.error = None;
-            s.newest = rel.as_ref().map(|r| r.0.clone());
+            s.newest = rel.as_ref().map(|r| r.tag.clone());
             let cur = version().and_then(self::rel);
-            Ok(rel.filter(|r| matches!((self::rel(&r.0), cur), (Some(n), Some(c)) if n > c)))
+            Ok(rel.filter(|r| matches!((self::rel(&r.tag), cur), (Some(n), Some(c)) if n > c)))
         }
         Err(e) => {
             s.error = Some(format!("couldn't look for a release: {e}"));
@@ -212,32 +300,40 @@ fn work_dir(home: &std::path::Path) -> Result<std::path::PathBuf, String> {
     Ok(work)
 }
 
-/// Check and put in place release `tag` (its archive at `archive`, which must hash to `want`); then restart into it.
-fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), String> {
+/// Check release `c` again (signature, hash, version, not a downgrade) and put it in place; then restart into it.
+/// A refusal is logged and leaves the installed programs untouched.
+fn install(node: &Node, c: &Candidate) -> Result<(), String> {
     if let Some(why) = unsupported() {
         return Err(why);
     }
+    let tag = &c.tag;
     let (exe, _) = SELF.get().ok_or("arcaded's own path unknown")?;
     let dir = exe.parent().ok_or("arcaded's folder unknown")?.to_path_buf();
     let work = work_dir(&node.home)?;
     let result = (|| -> Result<(), String> {
         st().lock().unwrap().doing = "checking the release";
+        let program = program_file().ok_or("no release build for this system")?;
+        let bytes = std::fs::read(&c.archive).map_err(|e| format!("the release archive: {e}"))?;
+        let got = hex::encode(Sha256::digest(&bytes));
+        // Signature, key, hash and rollback before the archive is unpacked or anything is put in place.
+        let release = match vet_record(&c.record, &c.sig, &crate::arccode::trusted_keys(), &program, &got, version().and_then(rel), cfg!(windows)) {
+            Ok(r) => r,
+            Err(why) => return Err(format!("refused: {why}")),
+        };
+        if release.version != c.tag {
+            return Err(format!("refused: {}", Reject::VersionMismatch));
+        }
         // (named as its kind: Expand-Archive, the Windows fallback, takes only a .zip)
         let tarball = work.join(if cfg!(windows) { "release.zip" } else { "release.tar.gz" });
-        std::fs::copy(archive, &tarball).map_err(|e| format!("the release archive: {e}"))?;
-        // Checked when it was kept; once more, as it is what runs next.
-        let got = hex::encode(Sha256::digest(std::fs::read(&tarball).map_err(|e| e.to_string())?));
-        if got != want {
-            return Err(format!("the release archive doesn't match its record ({got} is not {want})"));
-        }
+        std::fs::write(&tarball, &bytes).map_err(|e| format!("the release archive: {e}"))?;
         st().lock().unwrap().doing = "installing";
         unpack(&tarball, &work)?;
         let bin = work.join(archive_folder(&asset_name().unwrap())).join("bin");
-        // The new arcaded must run here and be the release it says it is.
+        // The new arcaded must run here and be the release it says it is. A mismatch is not swapped in.
         let v = quiet(std::process::Command::new(bin.join(format!("arcaded{}", std::env::consts::EXE_SUFFIX))).arg("--version")).output().map_err(|e| format!("the new arcaded doesn't run here: {e}"))?;
         let said = String::from_utf8_lossy(&v.stdout);
-        if !says_version(&said, tag, cfg!(windows)) {
-            return Err(format!("the new arcaded says it is {:?}, not {tag}", said.trim()));
+        if let Err(why) = vet_binary(&said, &release.version, cfg!(windows)) {
+            return Err(format!("refused: {why}"));
         }
         #[cfg(windows)]
         return swap_windows(&bin, &dir);
@@ -301,12 +397,16 @@ fn install(node: &Node, tag: &str, archive: &str, want: &str) -> Result<(), Stri
             Ok(())
         }
         Err(e) => {
+            let line = match e.strip_prefix("refused: ") {
+                Some(why) => format!("update to {tag} refused: {why}"),
+                None => format!("update to {tag} failed: {e}"),
+            };
             let mut s = st().lock().unwrap();
             s.doing = "idle";
-            s.error = Some(format!("update to {tag} failed: {e}"));
+            s.error = Some(line.clone());
             drop(s);
-            let _ = node.app.event("update", &format!("update to {tag} failed: {e}"));
-            Err(e)
+            let _ = node.app.event("update", &line);
+            Err(line)
         }
     }
 }
@@ -443,6 +543,11 @@ fn clean_aside(dir: &std::path::Path) {
     }
 }
 
+/// Look now, installing nothing. The result is in [`status`].
+pub fn check() -> Result<(), String> {
+    look().map(|_| ())
+}
+
 /// "Update now": install the newest release if it is newer (in the background).
 pub fn update_now(node: Arc<Node>) -> Result<Value, String> {
     if let Some(why) = unsupported() {
@@ -451,12 +556,12 @@ pub fn update_now(node: Arc<Node>) -> Result<Value, String> {
     if st().lock().unwrap().doing != "idle" {
         return Err("an update is already under way".into());
     }
-    let Some((tag, tar, sum)) = check()? else {
+    let Some(c) = look()? else {
         return Err(format!("{} is the newest release", version().unwrap_or("this")));
     };
     let n = node.clone();
     std::thread::Builder::new().name("update".into()).spawn(move || {
-        let _ = install(&n, &tag, &tar, &sum);
+        let _ = install(&n, &c);
     }).map_err(|e| e.to_string())?;
     Ok(status(&node))
 }
@@ -481,8 +586,8 @@ pub fn start(node: Arc<Node>) {
             if !on(&node) || unsupported().is_some() || st().lock().unwrap().doing != "idle" {
                 continue;
             }
-            if let Ok(Some((tag, tar, sum))) = check() {
-                if install(&node, &tag, &tar, &sum).is_ok() {
+            if let Ok(Some(c)) = look() {
+                if install(&node, &c).is_ok() {
                     return;
                 }
             }
@@ -612,5 +717,140 @@ mod tests {
         assert_eq!(program_file_for("arcade-v1-windows-x86_64.zip"), "program-windows-x86_64");
         assert_eq!(archive_folder("arcade-v1-windows-x86_64.zip"), "arcade-v1-windows-x86_64");
         assert_eq!(archive_folder("arcade-v1-linux-x86_64.tar.gz"), "arcade-v1-linux-x86_64");
+    }
+
+    use ed25519_dalek::{Signer, SigningKey};
+    use sha2::{Digest, Sha256};
+
+    const FILE: &str = "program-linux-x86_64";
+    const SHA: &str = "abababababababababababababababababababababababababababababababab";
+
+    fn key(b: u8) -> SigningKey {
+        SigningKey::from_bytes(&[b; 32])
+    }
+
+    fn record(version: &str, sha: &str) -> String {
+        format!(
+            r#"{{"commit":"0123456789abcdef0123456789abcdef01234567","files":{{"{FILE}":{{"bytes":4,"sha256":"{sha}"}}}},"name":"@arcade/arcade-v1","time":1,"version":"{version}"}}"#
+        )
+    }
+
+    fn sign(sk: &SigningKey, record: &str) -> String {
+        let id = hex::encode(Sha256::digest(record.as_bytes()));
+        hex::encode(sk.sign(&crate::arccode::release_message(&id)).to_bytes())
+    }
+
+    /// The install puts a program in `dir` only after every check has passed.
+    fn stage(dir: &std::path::Path, verdict: Result<(), Reject>) -> Result<(), Reject> {
+        verdict?;
+        std::fs::write(dir.join("arcaded"), b"staged").unwrap();
+        Ok(())
+    }
+
+    fn fresh_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("arcade-reject-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn assert_refused(name: &str, verdict: Result<(), Reject>, why: Reject) {
+        let dir = fresh_dir(name);
+        assert_eq!(verdict.as_ref().err(), Some(&why), "{name}");
+        assert!(stage(&dir, verdict).is_err(), "{name}");
+        assert!(!dir.join("arcaded").exists(), "{name} was staged");
+        let line = refusal_line("v0.2.0", &why);
+        assert!(line.contains("refused") && line.contains(&why.to_string()), "{line}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn admit(record: &str, sig: &str, keys: &[ed25519_dalek::VerifyingKey], sha: &str, said: &str, running: Option<(u64, u64, u64)>, windows: bool) -> Result<(), Reject> {
+        release_may_stage(record, sig, keys, FILE, sha, said, running, windows)
+    }
+
+    #[test]
+    fn automatic_updates_are_off_until_opted_in() {
+        assert!(!opted_in(None), "a fresh install has no setting");
+        assert!(!opted_in(Some(br#"{"on":false}"#)));
+        assert!(!opted_in(Some(br#"{"on":1}"#)));
+        assert!(!opted_in(Some(b"not json")));
+        assert!(opted_in(Some(br#"{"on":true}"#)), "an install that already opted in keeps it");
+    }
+
+    #[test]
+    fn an_unsigned_release_is_refused_and_not_staged() {
+        let sk = key(1);
+        let rec = record("v0.2.0", SHA);
+        let vk = sk.verifying_key();
+        // No signature, a short one, and one that is not hex. None of these is a way past the check.
+        for sig in ["", "abcd", "zz", &"ab".repeat(10)] {
+            assert_refused(sig, admit(&rec, sig, &[vk], SHA, "arcaded v0.2.0\n", Some((0, 1, 0)), false), Reject::Unsigned);
+        }
+    }
+
+    #[test]
+    fn a_wrong_key_is_refused_and_not_staged() {
+        let trusted = key(1);
+        let other = key(2);
+        let rec = record("v0.2.0", SHA);
+        let sig = sign(&other, &rec);
+        assert_refused("wrong-key", admit(&rec, &sig, &[trusted.verifying_key()], SHA, "arcaded v0.2.0\n", Some((0, 1, 0)), false), Reject::WrongKey);
+        // A signature that is 64 bytes and still not ours, and a release key list with nobody on it.
+        let zeros = "00".repeat(64);
+        assert_refused("zeros", admit(&rec, &zeros, &[trusted.verifying_key()], SHA, "arcaded v0.2.0\n", Some((0, 1, 0)), false), Reject::WrongKey);
+        assert_refused("no-keys", admit(&rec, &sign(&trusted, &rec), &[], SHA, "arcaded v0.2.0\n", Some((0, 1, 0)), false), Reject::WrongKey);
+    }
+
+    #[test]
+    fn a_hash_mismatch_is_refused_and_not_staged() {
+        let sk = key(1);
+        let rec = record("v0.2.0", SHA);
+        let other = "cd".repeat(32);
+        assert_ne!(other, SHA);
+        assert_refused("hash", admit(&rec, &sign(&sk, &rec), &[sk.verifying_key()], &other, "arcaded v0.2.0\n", Some((0, 1, 0)), false), Reject::HashMismatch);
+    }
+
+    #[test]
+    fn a_version_mismatch_is_refused_and_not_staged() {
+        let sk = key(1);
+        let rec = record("v0.2.0", SHA);
+        assert_refused(
+            "version",
+            admit(&rec, &sign(&sk, &rec), &[sk.verifying_key()], SHA, "arcaded v0.1.0\n", Some((0, 1, 0)), false),
+            Reject::VersionMismatch,
+        );
+        // Windows reports its own tag; a different release is still refused.
+        let win = record("v0.2.0-windows", SHA);
+        assert_refused(
+            "version-windows",
+            admit(&win, &sign(&sk, &win), &[sk.verifying_key()], SHA, "arcaded v0.1.9-windows\r\n", Some((0, 1, 0)), true),
+            Reject::VersionMismatch,
+        );
+    }
+
+    #[test]
+    fn an_older_version_is_never_installed() {
+        let sk = key(1);
+        let rec = record("v0.1.0", SHA);
+        let said = "arcaded v0.1.0\n";
+        assert_refused("rollback", admit(&rec, &sign(&sk, &rec), &[sk.verifying_key()], SHA, said, Some((0, 2, 0)), false), Reject::Rollback);
+        // The same numbers with the Windows suffix are the same release, and still older.
+        let win = record("v0.1.2-windows", SHA);
+        assert_refused(
+            "rollback-windows",
+            admit(&win, &sign(&sk, &win), &[sk.verifying_key()], SHA, "arcaded v0.1.2-windows\r\n", Some((0, 1, 5)), true),
+            Reject::Rollback,
+        );
+        // No running version means we cannot show this is not a downgrade.
+        assert_refused("no-running", admit(&rec, &sign(&sk, &rec), &[sk.verifying_key()], SHA, said, None, false), Reject::Rollback);
+        // The same version is not a downgrade. A newer one may be staged.
+        let same = record("v0.2.0", SHA);
+        let dir = fresh_dir("newer");
+        let verdict = admit(&same, &sign(&sk, &same), &[sk.verifying_key()], SHA, "arcaded v0.2.0\n", Some((0, 2, 0)), false);
+        assert!(verdict.is_ok(), "{verdict:?}");
+        assert!(!dir.join("arcaded").exists());
+        stage(&dir, admit(&same, &sign(&sk, &same), &[sk.verifying_key()], SHA, "arcaded v0.2.0\n", Some((0, 1, 9)), false)).unwrap();
+        assert!(dir.join("arcaded").exists(), "a newer signed release may be staged");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

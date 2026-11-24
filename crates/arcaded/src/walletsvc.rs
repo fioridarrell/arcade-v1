@@ -1079,12 +1079,29 @@ fn finish_card(
             Ok((String::new(), fee, outs, caution))
         }
         SignPath::Signer => {
+            let amount = r["units"].as_u64().unwrap_or(0);
+            let card = arcade_signer::Card {
+                to: to.to_string(),
+                amount,
+                fee,
+                outputs: spec
+                    .iter()
+                    .map(|o| arcade_signer::ShownOutput {
+                        address: arcade_ledger::address::address_of(&o.script, p),
+                        value: o.value,
+                        script: Some(hex::encode(&o.script)),
+                    })
+                    .collect(),
+            };
+            // Shown in the signer window. Proposing does not approve: the desktop program, or the
+            // browser session, still has to.
+            crate::signer::propose(&node.home, &card)?;
             let job = arcade_signer::SignJob {
                 chain: p.key.into(),
                 index,
                 kind: r["kind"].as_str().unwrap_or("coins").into(),
                 to: to.to_string(),
-                amount: r["units"].as_u64().unwrap_or(0),
+                amount,
                 fee,
                 time,
                 inputs: chosen
@@ -1141,9 +1158,57 @@ fn page_card(node: &Node, page: &str) -> Value {
 static APPROVING: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 pub fn approve(node: &Node, id: &str) -> Result<Value, String> {
-    // Coin, token and inscription cards are signed by arcade-signer, and only when the desktop
-    // has approved that exact card. Storage, market and repository cards are not those transactions.
+    // Coin, token and inscription cards are signed by arcade-signer, and only when that exact
+    // card was approved (the desktop program, or the browser session). Storage, market and
+    // repository cards are not those transactions.
+    let kind = get_req(node, id).and_then(|r| r["kind"].as_str().map(str::to_string));
+    if matches!(kind.as_deref(), Some("coins" | "token" | "inscription")) {
+        return approve_page_card(node, id);
+    }
     approve_with(node, id, |r| card_build(node, r, SignPath::Signer).map(|(t, f, o, _)| (t, f, o)))
+}
+
+/// A page's send. While the signer is locked the request stays pending and the window is told
+/// where to confirm it. arcaded cannot approve the card itself.
+fn approve_page_card(node: &Node, id: &str) -> Result<Value, String> {
+    let _one = APPROVING.lock().unwrap_or_else(|e| e.into_inner());
+    let mut r = get_req(node, id).ok_or("no such request")?;
+    if r["status"] != "pending" {
+        return Err(format!("that request is {}", r["status"].as_str().unwrap_or("closed")));
+    }
+    match card_build(node, &r, SignPath::Signer) {
+        Ok((txid, fee, _, _)) => {
+            if let Some(now) = get_req(node, id) {
+                r = now;
+            }
+            r["status"] = json!("sent");
+            r["txid"] = json!(txid);
+            r["fee"] = json!(fee);
+            r["answered"] = json!(arcade_app::now());
+            let _ = node.app.event("wallet", &format!("sent {} (approved) in {txid}", r["what"].as_str().unwrap_or("")));
+            put_req(node, &r);
+            Ok(r)
+        }
+        Err(e) if e.contains("the signer is locked") => {
+            let url = crate::signer::confirm_url(&node.home).unwrap_or_default();
+            Ok(json!({
+                "status": "confirm",
+                "id": r["id"],
+                "confirm_url": url,
+                "error": "Confirm this send in the signer window. It is not sent until you approve it there.",
+            }))
+        }
+        Err(e) => {
+            if let Some(now) = get_req(node, id) {
+                r = now;
+            }
+            r["status"] = json!("failed");
+            r["error"] = json!(e);
+            r["answered"] = json!(arcade_app::now());
+            put_req(node, &r);
+            Ok(r)
+        }
+    }
 }
 
 /// Approve with `send` building and broadcasting the transaction: (txid, fee, outputs).

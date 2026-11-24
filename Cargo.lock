@@ -181,6 +181,7 @@ name = "arcade-cli"
 version = "0.1.0"
 dependencies = [
  "arcade-local",
+ "arcade-signer",
  "serde_json",
 ]
 
@@ -297,6 +298,7 @@ dependencies = [
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.11.1",
  "tempfile",
  "zeroize",
 ]

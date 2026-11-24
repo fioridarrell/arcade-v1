@@ -35,8 +35,24 @@ impl Client {
     }
 
     /// Record the card the user just approved. This unlocks signing for that card only.
+    /// Refused when the caller is not the desktop program.
     pub fn approve(&mut self, card: &Card) -> Result<(), String> {
         self.roundtrip(&json!({"op": "approve", "card": card})).map(|_| ())
+    }
+
+    /// The card the signer window should show. This does not approve it.
+    pub fn propose(&mut self, card: &Card) -> Result<(), String> {
+        self.roundtrip(&json!({"op": "propose", "card": card})).map(|_| ())
+    }
+
+    /// Register the hash of a browser session the caller already holds. The token is not sent.
+    pub fn bind_grant(&mut self, hash_hex: &str) -> Result<(), String> {
+        self.roundtrip(&json!({"op": "browser_bind", "hash": hash_hex})).map(|_| ())
+    }
+
+    /// Ask the signer to exit. Used when its version is not the service's.
+    pub fn shutdown(&mut self) -> Result<(), String> {
+        self.roundtrip(&json!({"op": "shutdown"})).map(|_| ())
     }
 
     /// Sign `job` when it is the approved card. Returns the raw signed transaction.

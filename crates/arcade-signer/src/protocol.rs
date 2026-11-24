@@ -1,5 +1,6 @@
 //! One request and one answer on a connection: a 4-byte little-endian length, then JSON.
-//! The desktop sends `approve`. arcaded sends `sign`. Neither message is accepted on HTTP.
+//! The desktop program sends `approve`. arcaded sends `sign` and `propose`. The browser session
+//! is not on this socket: the signer window takes it over loopback HTTP. None of this is the mesh.
 
 use serde::{Deserialize, Serialize};
 

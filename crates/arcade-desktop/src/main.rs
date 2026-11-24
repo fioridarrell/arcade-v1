@@ -67,6 +67,10 @@ fn answer_limit(cmd: &str, req: &Value) -> std::time::Duration {
 
 /// Tell the signer which card the user just approved. Storage, market and repository cards are
 /// not transactions the signer holds, and a refusal never unlocks it.
+///
+/// The socket accepts this only from this program. On Windows a unix socket does not say which
+/// program connected, so the same card is posted to the signer's loopback window, which checks
+/// the program there.
 fn approve_on_signer(req: &Value) -> Result<(), String> {
     let kind = req["kind"].as_str().unwrap_or("");
     if !matches!(kind, "coins" | "token" | "inscription") {
@@ -86,7 +90,31 @@ fn approve_on_signer(req: &Value) -> Result<(), String> {
             })
             .collect(),
     };
-    arcade_signer::Client::connect(&home())?.approve(&card)
+    if arcade_signer::Client::connect(&home()).and_then(|mut c| c.approve(&card)).is_ok() {
+        return Ok(());
+    }
+    desktop_approve_http(&card)
+}
+
+fn desktop_approve_http(card: &arcade_signer::Card) -> Result<(), String> {
+    use std::io::{Read, Write};
+    let mut client = arcade_signer::Client::connect(&home())?;
+    let port = client.status()?["confirm_port"].as_u64().ok_or("the signer has no confirmation window")? as u16;
+    let body = serde_json::to_vec(&json!({"card": card})).map_err(|e| e.to_string())?;
+    let mut s = std::net::TcpStream::connect(("127.0.0.1", port)).map_err(|e| format!("the signer window: {e}"))?;
+    let head = format!("POST /desktop-approve HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body.len());
+    s.write_all(head.as_bytes()).map_err(|e| e.to_string())?;
+    s.write_all(&body).map_err(|e| e.to_string())?;
+    let mut buf = Vec::new();
+    s.read_to_end(&mut buf).map_err(|e| e.to_string())?;
+    let text = String::from_utf8_lossy(&buf);
+    let json = text.split("\r\n\r\n").nth(1).unwrap_or("");
+    let v: Value = serde_json::from_str(json).unwrap_or(json!({"ok": false, "error": "bad reply from the signer"}));
+    if v["ok"] == true {
+        Ok(())
+    } else {
+        Err(v["error"].as_str().unwrap_or("the signer refused").to_string())
+    }
 }
 
 /// Forward one request to arcaded and return its answer. Only what the asking window may send (window_may).

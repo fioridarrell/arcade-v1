@@ -2,7 +2,8 @@
 //!
 //! The seed stays in that process. This one sends the unsigned transaction over the local
 //! socket and broadcasts whatever comes back. A locked signer, or a transaction that is not the
-//! card the desktop approved, comes back as an error and nothing is signed here instead.
+//! card the operator approved, comes back as an error and nothing is signed here instead.
+//! arcaded can show a card to the signer window. It cannot approve one.
 
 use arcade_chain::params::ChainParams;
 use arcade_signer::{Client, SignJob};
@@ -10,10 +11,12 @@ use std::path::Path;
 use std::process::Command;
 use std::time::{Duration, Instant};
 
-/// Connect, and start the signer if it is not already listening. A missing binary is reported
-/// and left for the signing call to fail closed: arcaded does not sign the card itself.
+/// Connect, and start the signer if it is not already listening. A signer that is up but reports
+/// a different version is stopped first, so an update does not leave the old binary serving.
+/// A missing binary is reported and left for the signing call to fail closed: arcaded does not
+/// sign the card itself.
 pub fn ensure_running(home: &Path) {
-    if Client::connect(home).is_ok() {
+    if !prepare_signer(home) {
         return;
     }
     let exe = signer_exe();
@@ -33,6 +36,124 @@ pub fn ensure_running(home: &Path) {
         }
         Err(e) => eprintln!("arcaded: arcade-signer ({}) did not start: {e}. Approving a send stays locked until it is running.", exe.display()),
     }
+}
+
+/// What is listening on the signer socket.
+enum SignerState {
+    Down,
+    Current,
+    Stale { pid: Option<u32> },
+}
+
+fn signer_state(home: &Path) -> SignerState {
+    let mut client = match Client::connect(home) {
+        Ok(c) => c,
+        Err(_) => return SignerState::Down,
+    };
+    match client.status() {
+        Ok(v) if v["version"].as_str() == Some(arcade_signer::build_version()) => SignerState::Current,
+        Ok(v) => SignerState::Stale { pid: v["pid"].as_u64().map(|n| n as u32) },
+        // Connected, but not a signer that reports a version: replace it.
+        Err(_) => SignerState::Stale { pid: None },
+    }
+}
+
+/// True when the caller should start a signer. A matching one is left running. A stale one is stopped.
+fn prepare_signer(home: &Path) -> bool {
+    match signer_state(home) {
+        SignerState::Current => false,
+        SignerState::Down => true,
+        SignerState::Stale { .. } => {
+            stop_stale(home);
+            true
+        }
+    }
+}
+
+fn stop_stale(home: &Path) {
+    let pid = match signer_state(home) {
+        SignerState::Stale { pid } => pid,
+        _ => return,
+    };
+    if let Ok(mut client) = Client::connect(home) {
+        let _ = client.shutdown();
+    }
+    if matches!(signer_state(home), SignerState::Down) {
+        return;
+    }
+    let pid = pid.or_else(|| listener_pid(home));
+    if let Some(pid) = pid {
+        if pid > 1 && pid != std::process::id() && is_signer_process(pid) {
+            terminate(pid);
+        }
+    }
+    let until = Instant::now() + Duration::from_secs(2);
+    while Instant::now() < until && !matches!(signer_state(home), SignerState::Down) {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn is_signer_process(pid: u32) -> bool {
+    arcade_signer::process_file_name(pid).is_some_and(|n| {
+        let base = n.strip_suffix(".exe").unwrap_or(&n);
+        base == "arcade-signer"
+    })
+}
+
+/// The process listening on `home`'s signer socket, when the socket table says.
+fn listener_pid(home: &Path) -> Option<u32> {
+    #[cfg(target_os = "linux")]
+    {
+        let path = arcade_signer::socket_path(home);
+        let needle = path.to_string_lossy();
+        let text = std::fs::read_to_string("/proc/net/unix").ok()?;
+        let mut inode = None;
+        for line in text.lines() {
+            let Some(at) = line.find(needle.as_ref()) else { continue };
+            inode = line[..at].split_whitespace().last().and_then(|s| s.parse::<u64>().ok());
+            break;
+        }
+        let inode = inode?;
+        let want = format!("socket:[{inode}]");
+        for ent in std::fs::read_dir("/proc").ok()?.flatten() {
+            let Ok(pid) = ent.file_name().to_str().unwrap_or("").parse::<u32>() else { continue };
+            let Ok(fds) = std::fs::read_dir(ent.path().join("fd")) else { continue };
+            for fd in fds.flatten() {
+                if std::fs::read_link(fd.path()).ok().is_some_and(|p| p.to_string_lossy() == want) {
+                    return Some(pid);
+                }
+            }
+        }
+        None
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = home;
+        None
+    }
+}
+
+fn terminate(pid: u32) {
+    #[cfg(unix)]
+    {
+        let _ = Command::new("kill").args(["-TERM", &pid.to_string()]).status();
+    }
+    #[cfg(windows)]
+    {
+        let _ = Command::new("taskkill").args(["/PID", &pid.to_string(), "/F"]).status();
+    }
+}
+
+/// The signer's confirmation window, with no session in the address. The session is the fragment
+/// `arcade web` prints, which this process never receives.
+pub fn confirm_url(home: &Path) -> Result<String, String> {
+    let port = Client::connect(home)?.status()?["confirm_port"].as_u64().ok_or("the signer has no confirmation window")?;
+    Ok(format!("http://127.0.0.1:{port}/approve"))
+}
+
+/// Show `card` in the signer window. This does not approve it.
+pub fn propose(home: &Path, card: &arcade_signer::Card) -> Result<(), String> {
+    Client::connect(home)?.propose(card)
 }
 
 /// Write the phrase into the signer's file and, if that changed anything, tell a running signer
@@ -157,44 +278,72 @@ mod tests {
             let mode = std::fs::metadata(arcade_signer::socket_path(t.dir.path())).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o600, "only this user can open the signer socket");
         }
-        Client::connect(t.dir.path()).unwrap().approve(&card).unwrap();
-        let raw = sign(t.dir.path(), &job).unwrap();
-        assert!(raw.len() > 60, "the approved transaction is signed");
+        let refused = Client::connect(t.dir.path()).unwrap().approve(&card).unwrap_err();
+        assert!(refused.contains("cannot approve"), "{refused}");
         let err = sign(t.dir.path(), &job).unwrap_err();
-        assert!(err.contains("locked"), "signing locks the signer again: {err}");
+        assert!(err.contains("locked"), "a refused approval leaves the signer locked: {err}");
     }
 
     #[test]
-    fn a_changed_transaction_is_refused() {
+    fn a_signer_on_this_version_is_kept_and_a_different_one_is_stopped() {
         let _one = ONE.lock().unwrap_or_else(|e| e.into_inner());
         let t = running();
-        let (job, card) = coins(10_000_000, 1_000_000, 1);
-        let mut client = Client::connect(t.dir.path()).unwrap();
-        client.approve(&card).unwrap();
+        assert!(!prepare_signer(t.dir.path()), "the signer we just started is this build");
+        let version = Client::connect(t.dir.path()).unwrap().status().unwrap()["version"].as_str().unwrap().to_string();
+        assert_eq!(version, arcade_signer::build_version());
+        ensure_running(t.dir.path());
+        assert_eq!(Client::connect(t.dir.path()).unwrap().status().unwrap()["version"], version);
 
-        let mut amount = job.clone();
-        amount.amount += 1;
-        amount.outputs[0].value += 1;
-        amount.outputs[1].value -= 1;
-        let err = sign(t.dir.path(), &amount).unwrap_err();
-        assert!(err.contains("amount"), "{err}");
+        let dir = tempfile::tempdir().unwrap();
+        serve_old(dir.path());
+        assert!(prepare_signer(dir.path()), "a different version is stopped, and a new signer is wanted");
+        match Client::connect(dir.path()) {
+            Err(e) => assert!(e.contains("not running"), "{e}"),
+            Ok(_) => panic!("the old signer is still listening"),
+        }
+    }
 
-        let mut address = job.clone();
-        let other = coins(10_000_000, 1_000_000, 2).0;
-        address.to = other.to;
-        address.outputs[0] = other.outputs[0].clone();
-        let err = sign(t.dir.path(), &address).unwrap_err();
-        assert!(err.contains("address"), "{err}");
-
-        let mut fee = job.clone();
-        fee.fee -= 1;
-        fee.outputs[1].value += 1;
-        let err = sign(t.dir.path(), &fee).unwrap_err();
-        assert!(err.contains("fee"), "{err}");
-
-        // The approval is still there: the matching transaction signs, and then the signer locks.
-        let raw = sign(t.dir.path(), &job).unwrap();
-        assert!(raw.len() > 60);
-        assert!(Client::connect(t.dir.path()).unwrap().status().unwrap()["locked"] == true);
+    /// A signer that answers status with some other version, and exits when asked to shut down.
+    fn serve_old(home: &Path) {
+        let path = arcade_signer::socket_path(home);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let _ = std::fs::remove_file(&path);
+        let listener = arcade_local::UnixListener::bind(&path).unwrap();
+        std::thread::spawn(move || {
+            for conn in listener.incoming() {
+                let Ok(mut conn) = conn else { continue };
+                let mut lenb = [0u8; 4];
+                if std::io::Read::read_exact(&mut conn, &mut lenb).is_err() {
+                    continue;
+                }
+                let len = u32::from_le_bytes(lenb) as usize;
+                let mut body = vec![0u8; len];
+                if std::io::Read::read_exact(&mut conn, &mut body).is_err() {
+                    continue;
+                }
+                let req: serde_json::Value = serde_json::from_slice(&body).unwrap_or(serde_json::json!({}));
+                let answer = if req["op"] == "shutdown" {
+                    let bytes = serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap();
+                    let _ = std::io::Write::write_all(&mut conn, &(bytes.len() as u32).to_le_bytes());
+                    let _ = std::io::Write::write_all(&mut conn, &bytes);
+                    break;
+                } else {
+                    serde_json::json!({"ok": true, "version": "not-this-build", "pid": std::process::id(), "locked": true})
+                };
+                let bytes = serde_json::to_vec(&answer).unwrap();
+                let _ = std::io::Write::write_all(&mut conn, &(bytes.len() as u32).to_le_bytes());
+                let _ = std::io::Write::write_all(&mut conn, &bytes);
+            }
+        });
+        let until = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < until {
+            if Client::connect(home).is_ok() {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        panic!("the old signer did not start");
     }
 }

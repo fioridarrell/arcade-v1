@@ -285,7 +285,10 @@
     const FLAGS = [["multiplayer", "Multiplayer"], ["wallet", "Uses the wallet"], ["contacts", "Reads contacts"], ["groups", "Group chats"], ["feed", "Posts on the feed"], ["media", "Camera & microphone"], ["pictures", "Draws pictures"], ["notify", "Rings while closed"]];
     const boxes = FLAGS.map(([k, l]) => h("label", { class: "ap-perm" }, h("input", { type: "checkbox", value: k }), " ", l));
     const page = h("input", { type: "file", accept: ".html,.htm,text/html" }), cov = h("input", { type: "file", accept: "image/*" });
+    const chain = h("select", { title: "Which chain this app is published on" });
     const est = h("div", { class: "s" });
+    const resume = h("button", {}, "Resume");
+    resume.hidden = true;
     // Category: a known one, or a new one typed in (it shows in the App Store once used).
     const catSel = h("select", {}, h("option", { value: "" }, "Category: Apps"));
     const catNew = f("or a new category", { maxlength: "24", style: "max-width:14em" });
@@ -299,36 +302,106 @@
       if (cg) c.category = cg;
       return c;
     };
+    // A quote computed for the previous chain must not overwrite the one for the chain just chosen.
+    let estSeq = 0;
+    const money = (sats, unit) => coinNum(sats) + " " + (unit || (chain.selectedOptions[0] && chain.selectedOptions[0].dataset.unit) || homeTicker());
+    const chainArg = () => chain.value || undefined;
+    const showWait = (r) => {
+      const sent = Number(r.sent) || 0, total = Number(r.total || r.transactions) || 0;
+      resume.hidden = false;
+      resume.dataset.id = r.id || "";
+      est.textContent = `${sent} of ${total} sent, waiting for confirmations. The rest continues automatically.`;
+      note(r.note || est.textContent, false);
+    };
     const estimate = async () => {
+      const seq = ++estSeq;
+      const picked = chainArg();
       const pg = await read(page), cv = await read(cov);
-      if (!pg) { est.textContent = ""; return; }
-      const a = await api("inscribe.estimate", { data: pg.data, encoding: "base64", contenttype: "text/html", json: JSON.stringify({ app: cardOf() }) });
-      const b = cv ? await api("inscribe.estimate", { data: cv.data, encoding: "base64", contenttype: cv.type || "image/png" }) : { fee: 0, locked: 0, transactions: 0 };
-      est.textContent = `${a.transactions + b.transactions} transaction${a.transactions + b.transactions === 1 ? "" : "s"} · network fee about ${PEP(a.fee + b.fee)} · ${PEP(a.locked + b.locked)} kept in data outputs (yours, spendable later)`;
+      if (seq !== estSeq) return;
+      if (!pg) { if (resume.hidden) est.textContent = ""; return; }
+      const card = JSON.stringify({ app: cardOf() });
+      const a = await api("inscribe.estimate", { data: pg.data, encoding: "base64", contenttype: "text/html", json: card, chain: picked });
+      const b = cv ? await api("inscribe.estimate", { data: cv.data, encoding: "base64", contenttype: cv.type || "image/png", chain: picked }) : { fee: 0, locked: 0, transactions: 0, unit: a.unit };
+      if (seq !== estSeq) return;
+      const n = a.transactions + b.transactions;
+      const unit = a.unit || b.unit;
+      est.textContent = `${n} transaction${n === 1 ? "" : "s"} · network fee about ${money(a.fee + b.fee, unit)} · ${money(a.locked + b.locked, unit)} kept in data outputs (yours, spendable later)`;
     };
     page.onchange = estimate; cov.onchange = estimate;
+    chain.onchange = () => { estimate(); };
+    chainPicker(chain).then(() => estimate());
     const go = h("button", { class: "primary" }, "Publish");
+    // While this view is open, nudge an unfinished inscription and keep the line up to date. The arcade also
+    // continues it with the window closed, and after a restart.
+    const watch = (id, after) => {
+      clearInterval(window.__inscWatch);
+      const tick = async () => {
+        try {
+          const s = await api("inscribe.resume", { id: id || undefined });
+          const job = s.jobs ? (s.jobs.find((j) => j.state !== "sent") || s.jobs[0]) : s;
+          if (!job) return;
+          if (job.state === "sent") {
+            clearInterval(window.__inscWatch);
+            resume.hidden = true;
+            if (after) after(job); else note(job.note || "Inscribed.");
+          } else showWait(job);
+        } catch (e) { clearInterval(window.__inscWatch); note(e.message, true); go.disabled = false; }
+      };
+      window.__inscWatch = setInterval(tick, 15000);
+    };
+    resume.onclick = async () => {
+      resume.disabled = true;
+      try {
+        const s = await api("inscribe.resume", { id: resume.dataset.id || undefined });
+        const job = s.jobs ? (s.jobs.find((j) => j.state !== "sent") || s.jobs[0]) : s;
+        if (!job || job.state === "sent") { resume.hidden = true; note((job && job.note) || "Inscribed."); }
+        else { showWait(job); watch(job.id); }
+      } catch (e) { note(e.message, true); }
+      resume.disabled = false;
+    };
+    const published = (name, txid) => note(`Published ${name}: card ${String(txid || "").slice(0, 12)}… It shows in the App Store once its transactions are in blocks.`);
     go.onclick = async () => {
       const c = cardOf();
       if (!c.name) return note("Give the app a name.", true);
       const pg = await read(page);
       if (!pg) return note("Pick the app's HTML file.", true);
       go.disabled = true;
+      clearInterval(window.__inscWatch);
       try {
         const cv = await read(cov);
         if (cv) {
-          const r = await api("inscribe", { data: cv.data, encoding: "base64", contenttype: cv.type || "image/png" });
-          c.cover = r.txid;
+          const cover = await api("inscribe", { data: cv.data, encoding: "base64", contenttype: cv.type || "image/png", chain: chainArg() });
+          if (cover.state === "waiting") {
+            showWait(cover);
+            watch(cover.id, async (done) => {
+              try {
+                c.cover = (done && done.txid) || cover.txid;
+                const pageNow = await read(page);
+                if (!pageNow) return;
+                const r = await api("inscribe", { data: pageNow.data, encoding: "base64", contenttype: "text/html", json: JSON.stringify({ app: c }), chain: chainArg() });
+                if (r.state === "waiting") { showWait(r); watch(r.id, (fin) => published(c.name, (fin && fin.txid) || r.txid)); }
+                else published(c.name, r.txid);
+              } catch (e) { note(e.message, true); }
+              go.disabled = false;
+            });
+            return;
+          }
+          c.cover = cover.txid;
         }
-        const r = await api("inscribe", { data: pg.data, encoding: "base64", contenttype: "text/html", json: JSON.stringify({ app: c }) });
-        note(`Published ${c.name}: card ${r.txid.slice(0, 12)}… It shows in the App Store once its transactions are in blocks.`);
+        const r = await api("inscribe", { data: pg.data, encoding: "base64", contenttype: "text/html", json: JSON.stringify({ app: c }), chain: chainArg() });
+        if (r.state === "waiting") { showWait(r); watch(r.id, (fin) => published(c.name, (fin && fin.txid) || r.txid)); }
+        else published(c.name, r.txid);
       } catch (e) { note(e.message, true); }
       go.disabled = false;
     };
+    api("inscribe.status").then((s) => {
+      const j = (s.jobs || []).find((x) => x.state !== "sent");
+      if (j) { showWait(j); watch(j.id); }
+    }).catch(() => {});
     put(h("div", { class: "card ap-pub" },
       h("p", { class: "s" }, "An app is an HTML page inscribed with its card. Publishing again under the same name replaces your earlier version; the old one still plays at its own link."),
       name, h("div", { class: "row" }, version, players, genre), h("div", { class: "row" }, catSel, catNew), family, desc, h("div", { class: "ap-flags" }, ...boxes),
-      h("label", {}, "App page (HTML) ", page), h("label", {}, "Cover image ", cov), est, h("div", { class: "row" }, go)));
+      h("label", {}, "App page (HTML) ", page), h("label", {}, "Cover image ", cov), h("label", {}, "Chain ", chain), est, h("div", { class: "row" }, go, resume)));
   }
 
   document.querySelectorAll("#ap2-views button").forEach((b) => b.onclick = () => { view = b.dataset.v; detail = null; draw(); });

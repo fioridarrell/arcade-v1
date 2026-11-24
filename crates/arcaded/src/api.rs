@@ -779,12 +779,15 @@ fn dispatch_cmd(node: &Node, req: &Value) -> Result<Value, String> {
             let bytes = if req["encoding"] == "base64" { base64::engine::general_purpose::STANDARD.decode(data.trim()).map_err(|e| format!("data: {e}"))? } else { data.as_bytes().to_vec() };
             let ctype = s("contenttype").unwrap_or_else(|| "text/plain".into());
             let json = match &req["json"] { Value::Null => None, Value::String(j) => Some(j.clone()), other => Some(other.to_string()) };
+            let chain = s("chain").filter(|c| !c.is_empty());
             if req["cmd"] == "inscribe.estimate" {
-                Ok(crate::walletsvc::inscribe_estimate(bytes.len(), &ctype, json.as_ref().map(|j| j.len()).unwrap_or(0)))
+                crate::walletsvc::inscribe_estimate(node, chain.as_deref(), bytes.len(), &ctype, json.as_ref().map(|j| j.len()).unwrap_or(0))
             } else {
-                crate::walletsvc::inscribe(node, &bytes, &ctype, json.as_deref())
+                crate::inscqueue::inscribe(node, &bytes, &ctype, json.as_deref(), chain.as_deref())
             }
         }
+        "inscribe.status" => crate::inscqueue::status(node, s("id").as_deref()),
+        "inscribe.resume" => crate::inscqueue::resume_req(node, req),
         "wallet.requests" => Ok(crate::walletsvc::requests(node, s("page").as_deref())),
         "wallet.preview" => crate::walletsvc::preview(node, &s("id").ok_or("id required")?),
         "wallet.approve" => crate::walletsvc::approve(node, &s("id").ok_or("id required")?),

@@ -76,8 +76,11 @@ pub fn lag_of(tip: u32, best_header: u32) -> u32 {
     best_header.saturating_sub(tip)
 }
 
+/// One running chain as the monitor sees it: number, key, device, in init, paused, blocks behind.
+type Seen<'a> = (u16, &'a str, Option<u64>, bool, bool, u32);
+
 /// The starved drives, from each chain's device, init state, pause and lag. Pure, for tests.
-pub fn starved_devs(chains: &[(u16, &str, Option<u64>, bool, bool, u32)], at_tip: &mut HashMap<u16, Instant>, now: Instant) -> HashMap<u64, String> {
+pub fn starved_devs(chains: &[Seen<'_>], at_tip: &mut HashMap<u16, Instant>, now: Instant) -> HashMap<u64, String> {
     let mut out: HashMap<u64, String> = HashMap::new();
     for &(c, key, dev, init, paused, lag) in chains {
         if init || paused {

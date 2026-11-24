@@ -1,19 +1,81 @@
 # Init installs: store first, build in bulk
 
-Status: **built on `team/init-sync`, opt-in, not yet run against Bitcoin mainnet.** 2026-11-20.
+Status: **built on `team/init-sync`, every chain with a checkpoint on `team/all-chains`; the default where the chain allows it on `team/init-default` (2026-11-23). Not yet run to the end against Bitcoin or Dogecoin mainnet.** 2026-11-22.
 
 ```
-arcade chain add btc --init            # CLI
-{"cmd": "chains.add", "key": "btc", "init": true}   # API
+arcade chain add btc                   # init where the chain allows it (the default)
+arcade chain add btc --init            # init or a refusal with the reason
+arcade chain add btc --no-init         # a plain install: blocks connected one after the other
+{"cmd": "chains.add", "key": "btc"}                 # API: init where allowed
+{"cmd": "chains.add", "key": "btc", "init": true}   # API: init or refuse
+{"cmd": "chains.add", "key": "btc", "init": false}  # API: plain
 ```
 
-Without `--init` nothing changes: blocks are connected one after the other as before.
+**The default.** A new install that doesn't say (chains.add with no `init`, the app's Install
+button, the startup chooser's queue) is an init install when `check` allows the chain and mode
+(the table below; mode full or chain), and a plain one otherwise. chains.add's answer says which:
+`init_install` true or false, and `init_why_not` with the reason when the default couldn't use it.
+An installed chain, the home chain and the ARCADE chain keep their own installs. An operator turns
+the default off with `ARCADE_INIT_DEFAULT=0` in arcaded's environment.
 
-**Which chains:** only those with a `min_chain_work` (Bitcoin, for now) and no proof of stake.
-`chains.add` with init refuses the others with the reason: a proof-of-stake chain's stake is
-checked only when a block is connected, which an init install never does for the blocks it builds;
-and without a work floor the few sources that agree on the headers could be one party feeding a
-made-up chain. A chain gets init installs once its Core's `nMinimumChainWork` is set in its params.
+**An operator who already runs the coin's Core** is asked in the app's installer ("Do you already
+run Dogecoin Core on this computer?"). Yes, with its data folder: `chains.add` gets `core_dir`
+(CLI `--core <datadir>`), the folder is checked at once (a Core datadir of this chain, not pruned)
+and read in place when the install starts (`chains.copy_from_dir`, crate::localcopy), which is
+faster than any download. That Core must be stopped by then; if it isn't, the install carries on
+from the network and the event log says why. `chains.list` says per chain whether a new install
+would be an init install (`init_install`), for the installer's wording.
+
+**Which chains:** those with an **init checkpoint** in the release (`ChainParams::init_checkpoint`),
+no proof of stake and no MWEB. `chains.add` with init refuses the others with the reason (by default they install plain):
+
+| Chain | Init | Checkpoint (height) | Sources | `min_chain_work` |
+|---|---|---|---|---|
+| btc | yes | 691,719 | Core 22.0 `defaultAssumeValid`, two explorers | Core 22.0 |
+| pep | yes | 1,300,000 | pepecoind on node 2 and node 3; pepeblocks.com, pepeplorer.com | Pepecoin Core (block 327,239) |
+| peptest | yes | 1,570,000 | node 2's arcade; pepecoind testnet on node 2 and node 3; testnet.pepeblocks.com | Pepecoin Core testnet (87,222) |
+| doge | yes | 4,800,000 | node 2's arcade (Dogecoin headers); blockchair.com, blockcypher.com | Dogecoin Core (5,050,000) |
+| lky | yes | 1,180,000 | luckycoind on node 2; luckyscan.org | Luckycoin Core (620,035) |
+| flop | yes | 930,000 | flopcoind on node 3; explorer.flopcoin.net | Flopcoin Core (111,006) |
+| dgb | no | — | two explorers agree (24,580,000), but none of our reachable nodes holds DigiByte mainnet | Core has none (0) |
+| dgbtest | no | — | only node 2's arcade; no public explorer or Core checkpoint for testnet26 | Core has none |
+| ltc, ltctest, jkc | no | — | MWEB: the extension block can't be checked yet (below) | |
+| kot | no | — | proof of stake after 1,000,000 (below) | |
+| shic, bel, wjk | no | — | no chain data of ours to check a recent hash against (Bells' node is stopped) | |
+
+The checkpoint is the **trust floor**. `min_chain_work` alone is weak on the small merge-mined
+chains: a big Scrypt pool makes their work cheaply, so a few sources could feed a made-up chain
+with enough of it. A made-up chain can't run through a block the release names. Headers at the
+checkpoint's height must be that block (as with any checkpoint), no branch may start under it,
+and the headers phase is done only once the best header chain runs through it. Unlike the older
+`checkpoints`, it is **not** an assume-valid point: scripts under it are still checked
+(`ChainParams::assume_valid` reads only `checkpoints`). Each hash comes from at least two
+independent sources: our own nodes' chain data (read only) plus the coin's Core source or a
+public explorer. A chain where that can't be done stays refused, with the reason given. Where the
+coin's Core has an `nMinimumChainWork`, it is set too.
+
+A proof-of-stake chain (Kotia after block 1,000,000) stays refused: its stake (kernel hash,
+coin age, block signature) is checked only when a block is connected, which an init install never
+does for the blocks it builds, and those checks are not small enough to add to the stored-block
+checks. MWEB chains (Litecoin, its testnet, Junkcoin) stay refused: the bytes after a block's
+transactions are stored and served as part of the block, but nothing checks them. Their header
+could be checked against the HogEx output, but not their body: its roots are MMR roots over every
+MWEB output and kernel ever made, which needs the whole MWEB state.
+
+**AuxPoW chains** (doge, pep, peptest, flop, shic, bel, lky, jkc): the parent's proof of work is
+hashed with the chain's own algorithm from its params (`params::auxpow_parent_algo`), in one
+check shared by the header sync, the stored-block checks and borrowing (`check_auxpow_proof`).
+AuxPoW headers are large (the parent's coinbase and two merkle branches), so a source may send at
+most 16 KiB of headers per new header it brings in a round, plus one full message (32 MiB); past
+that it is left out of the round.
+
+**DigiByte** (when it gets a checkpoint): multi-algo headers are checked as in a normal sync.
+Headers of the algorithms not implemented here (Groestl, Qubit, Odocrypt) count the minimum work,
+so DigiByte Core's chainwork (a geometric mean over all algorithms) can't be compared with ours,
+and DigiByte gets no `min_chain_work`: the checkpoint is its floor. The low-work-branch check keeps
+the best chain's header at every 1,000th height instead of every height's work (32 bytes a
+height, ~0.8 GB on DigiByte's 24.5 M); the list of blocks still to fetch is still one entry per
+height (~0.9 GB at the start of a DigiByte install).
 
 ## Why
 
@@ -31,7 +93,7 @@ a restart. `arcade chain status <key>` shows a row per phase (`Init · headers`,
 
 | Phase | What happens | Checked here |
 |---|---|---|
-| **headers** | Headers from up to 8 P2P peers (one per /16 or IPv6 /32) and the arcades offering the chain over bk. Each source is asked with a locator along our *best header* chain (the tip is still genesis). Then each is asked what follows our best header's *parent*. | Every header: link, proof of work, difficulty step, median time, future time (the normal header checks). Done only when **3 independent sources** answer with our best header itself, **and** its total work is at least the chain's `min_chain_work`. An empty answer never counts, nor a source on another tip, behind us, failing, or sending a bad header. Sources are keyed by network group (/16, IPv6 /32), P2P peers and arcades alike (an arcade by its address, resolved): one host, or one range, counts once however many ports or arcade ids it shows. **Header spam:** a source that sends more than 20,000 headers in a round on a branch with less work than ours at the same height (or, past our best header, less work than it) is left out of the round; Bitcoin has a checkpoint at 691,719 (the `min_chain_work` block), so no branch may start under it. |
+| **headers** | Headers from up to 8 P2P peers (one per /16 or IPv6 /32) and the arcades offering the chain over bk. Each source is asked with a locator along our *best header* chain (the tip is still genesis). Then each is asked what follows our best header's *parent*. | Every header: link, proof of work, difficulty step, median time, future time (the normal header checks). Done only when **3 independent sources** answer with our best header itself, **and** its total work is at least the chain's `min_chain_work`. An empty answer never counts, nor a source on another tip, behind us, failing, or sending a bad header. Sources are keyed by network group (/16, IPv6 /32), P2P peers and arcades alike (an arcade by its address, resolved): one host, or one range, counts once however many ports or arcade ids it shows. **And the best header chain runs through the release's init checkpoint.** **Header spam:** a source that sends more than 20,000 headers in a round on a branch with less work than ours at the same height (or, past our best header, less work than it), or more than 16 KiB of headers per new header it brings (plus one full message), is left out of the round; no branch may start under the init checkpoint. |
 | **blocks** | Every block on the best header chain not stored yet, fetched from every source at once (arcades + 24 P2P peers, as psync), **in any order**. Each worker checks and stores its own job (`ChainDb::init_store`). Nothing is connected, no index is touched. Then **headers again**: the two repeat until a headers round finds nothing new and no header lacks its block. | The block is the one asked for (hash), rebuilds byte-identically, coinbase first, merkle root = header's, no mutated tree (CVE-2012-2459), **no bytes after its transactions** (except Litecoin's MWEB block), **its own AuxPoW proves the work** (merge-mined chains: it is the copy kept and served), and **where SegWit is on at its height, the witness commitment matches** (a copy with witnesses stripped has the same txids and merkle root, so only this catches it). A refused or missing block goes back in the queue for a source that hasn't failed it yet; a source that refuses, leaves out or fails three batches in a row, or has failed every job left, steps aside. A round with no source working for 6 minutes ends and starts again. |
 | **build** | (1) the stored blocks join the main chain (HEIGHT rows); (2) the tx index in one sorted pass (`write_txs_for`); (3) the coin set derived from the blocks (`Replay` in memory up to `ARCADE_INIT_COINS_MB`, else `DiskReplay`), **while** `rules::replay` checks every block's rules and scripts on every core; (4) only once both passed, the coin set is written (`apply_coin_diff`); (5) the tip moves to *best − 288*. | Every input spends a coin made before it (an earlier block, or an earlier transaction of its own block) and not spent before (else the build stops); the chain's coin and block rules (`value_rules`, `block_rules`: subsidy, fees, maturity, sizes, sigops, BIP34, lock times, versions, scripts with the flags of their height above the newest checkpoint, or all with `ARCADE_VERIFY_ALL_SCRIPTS=1`; Bitcoin's one checkpoint is a header fence only, so all). A block the rules refuse is **dropped and fetched again once** (its body may be a source's damaged copy): its rows go, the phase goes back to blocks, and the build starts over from step 1 (STATE `init_refetched` lists them). Refused again, it is the chain's own: the build stops. |
 | **done** | The normal sync connects the last 288 blocks (with undo records, so the tip can reorg as usual) and follows. The address index and the protocol indexes are built from the stored blocks by their existing backfill paths (STATE `addr_backfill` from 1, the index walks). | As any sync. |
@@ -143,12 +205,13 @@ chain (Bitcoin) with limited disk; remove the chain afterwards. Not for real ins
 
 - During **headers**: nothing about blocks. Agreement is about our best header only; a peer
   set controlled by one party in three network groups could agree on a chain, but it must also
-  carry `min_chain_work` of real proof of work (which is why chains without one can't use init).
+  run through the release's init checkpoint and carry `min_chain_work` of real proof of work
+  where the chain has one (which is why chains without a checkpoint can't use init).
 - During **blocks**: no coin or script rule. A block whose body is the one its header commits
   to is stored even if it breaks a rule; the build finds it.
-- `min_chain_work` is empty (no floor, so no init installs) for every chain but Bitcoin.
-  Bitcoin's is Bitcoin Core 22.0's `nMinimumChainWork` (block 691,719), deliberately old: it is
-  still far more work than anyone can make up, and it never holds a real install back.
+- `min_chain_work` is each coin's Core `nMinimumChainWork` where it has one (Bitcoin Core 22.0's,
+  block 691,719, deliberately old: it is still far more work than anyone can make up, and it never
+  holds a real install back). DigiByte's Core has none, and ours would not compare (above).
 - The 288 blocks under the init tip have no undo records: a reorg deeper than that stops the
   sync (ReorgTooDeep), as after a coin-set copy.
 - Chains without `value_rules`/`block_rules` get no rules pass (blocks checked against their
@@ -156,6 +219,19 @@ chain (Bitcoin) with limited disk; remove the chain afterwards. Not for real ins
 - BIP30's duplicate coinbases (Bitcoin 91,812/91,842 and 91,722/91,880) stay as two coins each,
   as in a normal sync; the tx index points such a txid at the copy stored last, which in an init
   install is arrival order, not height.
+
+## Real-data runs (2026-11-22, the mini, throwaway arcade, `chain add <key> --init`)
+
+| Chain | Headers | Blocks | Build | Result |
+|---|---|---|---|---|
+| pep (1,303,664 built) | ~22 min, 8 P2P sources, Core's work reached, through 1,300,000 | ~25 min, 23 sources | 8 min 13 s (coins 6 m 23 s, rules 5 m 29 s on every block) | tip 1,303,963 `172dff89…`: **20,432,802 coins, 105,476,635,900.49606538 PEP, the same as Pepecoin Core's `gettxoutsetinfo` on node 2 at that block** |
+| lky (to best − 288) | ~15 min, through 1,180,000 | ~12 min, 16 sources | under 3 min | tip 1,191,761 `68328ddf…`: **339,201 coins, 19,990,625.40279840 LKY, the same as Luckycoin Core on node 2** |
+| flop (939,354 built) | ~12 min, 6 P2P sources, through 930,000 | ~10 min, then 8 short rounds chasing one-minute blocks | 43 s | tip 939,649 `66bbe496…`: **442,220 coins, 101,832,005,807 FLOP, the same as Flopcoin Core on node 3** |
+
+No source was left out for header volume on any of them (all three are merge-mined).
+Pepecoin testnet can't be tried this way: it is every arcade's home chain, installed by its own
+path (not `chains.add`), so `--init` answers that it is installed already. A new arcade's
+borrowed home chain held every install in the queue (fixed on this branch).
 
 ## Speed (Bitcoin, ~925k blocks, ~720 GB of blocks, ~1.2 billion transactions, ~3 billion inputs)
 
@@ -194,3 +270,17 @@ built.
 - `crates/arcaded/src/initsync.rs`: the phases in the chain thread, status rows.
 - `crates/arcaded/src/psync.rs`: `run_store` (store-only, any order).
 - `crates/arcade-chain/src/params.rs`: `ChainParams::min_chain_work`.
+
+## Sharing a drive
+
+An init install stores blocks and builds as fast as the drive allows. On a spinning disk that
+starves a chain on the same drive that was at its tip: each new block's reads wait behind the
+install (seen on node 2, 2026-11-23: Bitcoin stuck 8 blocks behind for 2 h while Dogecoin's
+init wrote ~50 MB/s to the same 8 TB disk). So bulk work yields (crate::drivepace): a monitor
+looks at every running chain every 5 s, and a chain that was at its tip in the last 6 h and is
+now more than 2 blocks behind marks its drive as starved. The init loops (each 16 MB stored,
+each 500 or 1,000 blocks of the tx index, coin set and rules replay) call
+`arcade_chaindb::pace::wait`, which waits while the drive is starved, at most 30 s at a time,
+so an install never stops for good. Chain status shows `drive_pace` while it yields; the event
+log says when it starts and stops. `ARCADE_DRIVE_PACE=0` turns it off.
+

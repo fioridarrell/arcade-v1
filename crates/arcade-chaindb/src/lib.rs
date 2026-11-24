@@ -12,6 +12,7 @@ pub mod initsync;
 pub mod ixconv;
 pub mod ixfile;
 pub mod ixset;
+pub mod pace;
 pub mod journal;
 pub mod rules;
 pub mod proven;

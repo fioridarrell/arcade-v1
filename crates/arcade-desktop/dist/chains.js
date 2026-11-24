@@ -198,6 +198,7 @@
     $("c-installer").hidden = false; $("c-choose").hidden = false; $("c-progress").hidden = true; msg("");
     $("c-title").textContent = `Install ${c.name}`;
     driveChoice(c);
+    coreChoice(c);
     // The ARCADE chain is kept whole and comes over the mesh: nothing to choose.
     for (const id of ["c-modes", "c-idx"]) { $(id).hidden = !!c.arcade; $(id).previousElementSibling.hidden = !!c.arcade; }
     if (c.arcade) {
@@ -248,6 +249,31 @@
     $("c-from").textContent = offers
       ? `From the arcade mesh first: ${offers} arcade${offers === 1 ? "" : "s"} offer ${c.name} right now. Then the coin's own P2P network for anything left.`
       : `Arcades on the mesh are asked first (this waits up to a minute and a half for their answers), then the coin's own P2P network.`;
+  }
+
+  // An operator who already runs the coin's Core reads its folder in place (chains.add core_dir);
+  // everyone else gets the default: an init install where the chain allows it.
+  let useCore = false, coreKey = null;
+  function coreChoice(c) {
+    const own = !c.arcade && !c.home;
+    $("c-core").hidden = !own;
+    if (coreKey !== c.key) { coreKey = c.key; useCore = false; $("c-core-dir").value = ""; }
+    if (!own) { useCore = false; return; }
+    $("c-core-q").textContent = `Do you already run ${c.name} Core on this computer?`;
+    $("c-core-no").textContent = c.init_install
+      ? "Download it: headers first, then the blocks from many sources at once, built in bulk."
+      : "Download it from the mesh and the coin's own network.";
+    const pick = (yes) => {
+      useCore = yes;
+      for (const l of $("c-core-pick").querySelectorAll("label")) {
+        const on = (l.querySelector("input").value === "yes") === yes;
+        l.classList.toggle("sel", on); l.querySelector("input").checked = on;
+      }
+      $("c-core-dir").hidden = !yes;
+      if (yes) $("c-core-dir").focus();
+    };
+    for (const l of $("c-core-pick").querySelectorAll("label")) l.onclick = () => pick(l.querySelector("input").value === "yes");
+    pick(useCore);
   }
 
   // Which drive a chain's file goes on (chains.drives): this arcade's own by default, or another
@@ -319,7 +345,14 @@
   async function install() {
     const withIdx = [...$("c-idx").querySelectorAll("input:checked")].map((i) => i.dataset.k);
     try {
-      const st = await api("chains.add", open.arcade ? { key: open.key } : { key: open.key, mode, with: withIdx, drive });
+      const req = open.arcade ? { key: open.key } : { key: open.key, mode, with: withIdx, drive };
+      if (!open.arcade && !open.home && useCore) {
+        const dir = $("c-core-dir").value.trim();
+        if (!dir) { msg(`Give the folder of your ${open.name} Core, or pick No.`, true); $("c-core-dir").focus(); return; }
+        if (!["full", "chain"].includes(mode)) { msg("Reading your Core's folder needs every block kept: pick Full or Chain storage.", true); return; }
+        req.core_dir = dir;
+      }
+      const st = await api("chains.add", req);
       if (st.queued) {
         // Another chain is still being installed, or others wait: this one starts by itself at its turn (smallest first).
         $("c-installer").hidden = true;
@@ -574,7 +607,8 @@
   };
   // ---------- which chains to use (chains.plan): on first start, and from "Choose chains…" ----------
   const PLAN_MODES = MODES.filter(([k]) => ["full", "shared", "chain"].includes(k));
-  let planMode = "full", planTicked = new Set(), planFirst = false;
+  let planMode = "full", planTicked = new Set(), planFirst = false, planCore = false;
+  const planDirs = {};   // key -> the operator's Core folder for that chain (chains.plan core_dirs)
   const pmsg = (text, bad) => say("cp-msg", text, bad);
   async function openPlan(first) {
     planFirst = !!first;
@@ -602,7 +636,7 @@
       const l = document.createElement("label"); l.className = "cp-row" + (fixed ? " fixed" : "");
       const cb = document.createElement("input"); cb.type = "checkbox";
       cb.checked = fixed || planTicked.has(c.key); cb.disabled = fixed;
-      cb.onchange = () => { if (cb.checked) planTicked.add(c.key); else planTicked.delete(c.key); planSum(); };
+      cb.onchange = () => { if (cb.checked) planTicked.add(c.key); else planTicked.delete(c.key); planCoreRender(); planSum(); };
       const n = document.createElement("div"); n.className = "cp-n";
       const b = document.createElement("b"); b.textContent = `${c.name} `;
       const t = document.createElement("span"); t.className = "bt"; t.textContent = TICKERS[c.key] || c.key; b.append(t);
@@ -625,7 +659,28 @@
       l.querySelector("input").onchange = () => { planMode = k; renderPlan(); };
       return l;
     }));
+    planCoreRender();
     planSum();
+  }
+  // "Do you already run a Core node…": Yes shows a folder box for each new chain ticked.
+  function planCoreRender() {
+    for (const l of $("cp-core-pick").querySelectorAll("label")) {
+      const on = (l.querySelector("input").value === "yes") === planCore;
+      l.classList.toggle("sel", on); l.querySelector("input").checked = on;
+      l.onclick = () => { planCore = l.querySelector("input").value === "yes"; planCoreRender(); };
+    }
+    const fresh = chains.filter((c) => planTicked.has(c.key) && !c.installed && !c.queued && !c.arcade && !c.home);
+    $("cp-core-dirs").hidden = !planCore;
+    $("cp-core-dirs").replaceChildren(...(planCore ? fresh.map((c) => {
+      const l = document.createElement("label"); l.className = "cp-core";
+      const b = document.createElement("b"); b.textContent = `${c.name} Core folder`;
+      const i = document.createElement("input"); i.type = "text"; i.spellcheck = false; i.autocomplete = "off";
+      i.placeholder = "Leave empty if you don't run it"; i.value = planDirs[c.key] || "";
+      i.oninput = () => { planDirs[c.key] = i.value; };
+      l.append(b, i);
+      return l;
+    }) : []));
+    if (planCore && !fresh.length) $("cp-core-dirs").textContent = "Tick a chain that isn't installed yet first.";
   }
   function planSum() {
     const fresh = chains.filter((c) => planTicked.has(c.key) && !c.installed && !c.queued);
@@ -638,7 +693,9 @@
   $("cp-start").onclick = async () => {
     $("cp-start").disabled = true;
     try {
-      const r = await api("chains.plan", { keys: [...planTicked], mode: planMode });
+      const core_dirs = {};
+      if (planCore) for (const k of planTicked) if ((planDirs[k] || "").trim()) core_dirs[k] = planDirs[k].trim();
+      const r = await api("chains.plan", { keys: [...planTicked], mode: planMode, core_dirs });
       closePlan();
       const q = (r.queued || []).map((k) => (chains.find((x) => x.key === k) || {}).name || k);
       bmsg(q.length ? `Queued, in this order: ${q.join(", ")}. They sync one at a time${r.arcade || chains.some((c) => c.arcade && c.installed) ? ", after the ARCADE chain" : ""}.` : "Your chains are chosen.", false);

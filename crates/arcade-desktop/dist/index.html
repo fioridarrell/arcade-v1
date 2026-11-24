@@ -379,6 +379,15 @@
         <div class="modes" id="c-drive"></div>
         <h3>Get it from</h3>
         <p class="opt" id="c-from">Arcades on the mesh first: other V1.0 arcades' blocks, or an existing arcade's Core node. This waits up to a minute and a half for their answers, then uses the coin's own P2P network for anything left.</p>
+        <div id="c-core">
+          <h3>Your own Core</h3>
+          <p class="opt" id="c-core-q">Do you already run this coin's Core node on this computer?</p>
+          <div class="modes" id="c-core-pick">
+            <label class="mode sel"><input type="radio" name="c-core" value="no" checked><b>No</b><small id="c-core-no">Download it: headers first, then the blocks from many sources at once, built in bulk.</small></label>
+            <label class="mode"><input type="radio" name="c-core" value="yes"><b>Yes, use its data</b><small>Its folder is read in place and never changed. Stop that Core before the install starts.</small></label>
+          </div>
+          <input id="c-core-dir" type="text" spellcheck="false" autocomplete="off" placeholder="Its data folder, e.g. /home/you/.dogecoin or C:\Users\you\AppData\Roaming\Dogecoin" hidden>
+        </div>
         <div class="est" id="c-est"></div>
         <div class="est total" id="c-total"></div>
         <div class="row"><button class="primary" id="c-go">Install</button><button id="c-cancel">Cancel</button></div>
@@ -568,6 +577,13 @@
     <h3>How to keep them</h3>
     <div class="modes" id="cp-modes"></div>
     <p class="opt">No indexes are added: every index is opt-in. Add the ones you want later from a chain's Manage… panel.</p>
+    <h3>Your own Core</h3>
+    <p class="opt">Do you already run a Core node for any of these coins on this computer?</p>
+    <div class="modes" id="cp-core-pick">
+      <label class="mode sel"><input type="radio" name="cp-core" value="no" checked><b>No</b><small>Download them: where a chain allows it, headers first, then the blocks from many sources at once, built in bulk.</small></label>
+      <label class="mode"><input type="radio" name="cp-core" value="yes"><b>Yes</b><small>Give its data folder below: it is read in place and never changed. Stop that Core before its chain's turn.</small></label>
+    </div>
+    <div id="cp-core-dirs" hidden></div>
     <p class="est" id="cp-sum"></p>
     <div class="row"><button class="primary" id="cp-start">Start</button><button id="cp-skip">Skip for now</button></div>
     <p class="msg" id="cp-msg"></p>

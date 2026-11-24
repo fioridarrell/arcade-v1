@@ -190,6 +190,15 @@ pub struct ChainParams {
     /// low-work chain: they would have to out-work this. Set well below the real tip, so a new
     /// release never waits for work the network hasn't done yet.
     pub min_chain_work: &'static str,
+    /// Init installs' trust floor: a release checkpoint (height, block hash) the header chain
+    /// must contain before the headers phase is done, taken from two independent sources (our
+    /// own nodes' chain data plus the coin's Core source or a public explorer; the sources are
+    /// in a comment beside each). Headers at its height must be this block, and no fork may
+    /// start under it, as with [`ChainParams::checkpoints`]; unlike those, scripts under it
+    /// are still checked (it is not an "assume valid" point). None: init installs are refused.
+    /// min_chain_work alone is weak on small merge-mined chains: a big scrypt pool can make
+    /// their work cheaply; it can't make a chain through this block.
+    pub init_checkpoint: Option<(u32, &'static str)>,
 }
 
 impl ChainParams {
@@ -264,9 +273,9 @@ impl ChainParams {
         if self.staked_from().is_some() { STAKE_LOCK_CONFIRMS } else { 1 }
     }
 
-    /// The checkpoint hash at `height`, if there is one.
+    /// The checkpoint hash at `height`, if there is one (the init checkpoint included).
     pub fn checkpoint_at(&self, height: u32) -> Option<Hash256> {
-        self.checkpoints.iter().find(|(h, _)| *h == height).map(|(_, x)| Hash256::from_hex(x).expect("valid checkpoint hex"))
+        self.checkpoints.iter().chain(self.init_checkpoint.iter()).find(|(h, _)| *h == height).map(|(_, x)| Hash256::from_hex(x).expect("valid checkpoint hex"))
     }
 
     /// [`ChainParams::min_chain_work`] as a number (zero = no floor).
@@ -292,19 +301,22 @@ impl ChainParams {
     }
 
     /// Scripts at or under this height are taken as valid unless ARCADE_VERIFY_ALL_SCRIPTS=1
-    /// (Core's "assume valid"): the newest checkpoint, since no fork may start under it.
-    /// Bitcoin's checkpoint is a fence against header spam only (init installs): its scripts are
-    /// all checked, as before it had one.
+    /// (Core's "assume valid"): the newest of [`ChainParams::checkpoints`], since no fork may
+    /// start under it. The init checkpoint is a fence against header spam only: scripts under
+    /// it are checked as before it was set.
     pub fn assume_valid(&self) -> Option<u32> {
-        if self.key == "btc" {
-            return None;
-        }
-        self.last_checkpoint(u32::MAX)
+        self.checkpoints.iter().map(|(h, _)| *h).max()
     }
 
-    /// The highest checkpoint height at or below `height`: no fork may start under it.
+    /// The highest checkpoint height (the init checkpoint included) at or below `height`: no
+    /// fork may start under it.
     pub fn last_checkpoint(&self, height: u32) -> Option<u32> {
-        self.checkpoints.iter().map(|(h, _)| *h).filter(|h| *h <= height).max()
+        self.checkpoints.iter().chain(self.init_checkpoint.iter()).map(|(h, _)| *h).filter(|h| *h <= height).max()
+    }
+
+    /// The init checkpoint as (height, hash).
+    pub fn init_floor(&self) -> Option<(u32, Hash256)> {
+        self.init_checkpoint.map(|(h, x)| (h, Hash256::from_hex(x).expect("valid checkpoint hex")))
     }
 }
 
@@ -460,6 +472,32 @@ pub fn check_header(
         Some(_) => Err(HeaderError::BadPow),
         None => Ok(PowCheck::NotCheckable),
     }
+}
+
+/// The parent proof of work an AuxPoW header at `height` must carry: the chain's own work
+/// algorithm there (merge mining shares the parent's work, so the parent is hashed the same
+/// way: Scrypt for the Litecoin-mined chains). None where the chain has no work algorithm to
+/// check at that height (proof of stake) or several (DigiByte, which has no AuxPoW).
+pub fn auxpow_parent_algo(params: &ChainParams, h: &Header, height: u32) -> Option<PowAlgo> {
+    match params.pow {
+        PowRule::Single(a) => Some(a),
+        PowRule::PowThenStake { .. } => params.pow.algo(h.version, height).flatten(),
+        PowRule::DigiByte => None,
+    }
+}
+
+/// An AuxPoW header's proof: the merged-mining proof commits to the header (`id`, its block id)
+/// under the chain's id, and its parent's work (hashed with [`auxpow_parent_algo`]) meets the
+/// header's own target. Every place that takes an AuxPoW header checks it here.
+pub fn check_auxpow_proof(params: &ChainParams, h: &Header, id: Hash256, a: &crate::auxpow::AuxPow, height: u32) -> Result<(), String> {
+    let chain_id = params.auxpow_chain_id.unwrap_or(h.chain_id());
+    a.check(id, chain_id, params.auxpow_strict_chain_id).map_err(|x| x.to_string())?;
+    let algo = auxpow_parent_algo(params, h, height).ok_or("AuxPoW on a chain without a single work algorithm here")?;
+    let ph = try_pow_hash(algo, &a.parent.encode()).ok_or("AuxPoW parent: its work algorithm isn't implemented")?;
+    if !meets_target(&ph, h.bits) {
+        return Err("AuxPoW parent misses target".into());
+    }
+    Ok(())
 }
 
 /// Settle a [`PowCheck::NeedsBlock`] header with its block: a proof-of-stake block (second
@@ -963,7 +1001,11 @@ pub static PEPECOIN_TEST: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 1_496_133,
-    min_chain_work: "",
+    // Pepecoin Core chainparams.cpp (pepecoinppc/pepecoin master 4fb5a0cd) testnet nMinimumChainWork (block 87,222).
+    min_chain_work: "00000000000000000000000000000000000000000000000000004813725c089e",
+    // Block 1,570,000 (checked 2026-11-22): our node 2 arcade and the pepecoind testnet nodes on
+    // node 2 and node 3, and testnet.pepeblocks.com.
+    init_checkpoint: Some((1_570_000, "74eb44737b57df19897887edac529fc1611d1cf794aa2e62468f51b5daa42522")),
 };
 
 pub static PEPECOIN_MAIN: ChainParams = ChainParams {
@@ -1018,7 +1060,11 @@ pub static PEPECOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 1_208_000,
-    min_chain_work: "",
+    // Pepecoin Core chainparams.cpp (pepecoinppc/pepecoin master 4fb5a0cd) nMinimumChainWork (block 327,239).
+    min_chain_work: "0000000000000000000000000000000000000000000000fbc373728599248648",
+    // Block 1,300,000 (checked 2026-11-22): our pepecoind nodes on node 2 and node 3, and two
+    // explorers (pepeblocks.com, pepeplorer.com).
+    init_checkpoint: Some((1_300_000, "369eabb46bdb2ee0ed241c5313c675f7f0501e05ff90b6ec039dde18b23c69c2")),
 };
 
 pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
@@ -1063,6 +1109,7 @@ pub static DIGIBYTE_MAIN: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 24_450_000,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// DigiByte testnet26 ("DigiDollar Reset"): DigiDollar active from height 600.
@@ -1103,6 +1150,7 @@ pub static DIGIBYTE_TEST: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 595_000,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Kotia: Blackcoin-style PoS on Bitcoin 0.14. Scrypt PoW to block 1,000,000, then PoS.
@@ -1143,6 +1191,7 @@ pub static KOTIA_MAIN: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 1_530_000,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Flopcoin: a Dogecoin 1.14 fork. AuxPoW required from 110,000 (chain id 0xA3, strict).
@@ -1179,7 +1228,10 @@ pub static FLOPCOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 914_000,
-    min_chain_work: "",
+    // Flopcoin Core chainparams.cpp (Flopcoin/Flopcoin master 6d9df5b3) nMinimumChainWork (block 111,006).
+    min_chain_work: "0000000000000000000000000000000000000000000000002cc6be9a704f58da",
+    // Block 930,000 (checked 2026-11-22): our flopcoind node on node 3, and explorer.flopcoin.net.
+    init_checkpoint: Some((930_000, "a6b8d3d3ca292012cea9982dac3735d4df78c935f21ba559a95d095c9bb64440")),
 };
 
 /// Litecoin: scrypt, SegWit, Taproot, MWEB (extension block after the HogEx tx).
@@ -1218,6 +1270,7 @@ pub static LITECOIN_MAIN: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 3_197_300,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 pub static LITECOIN_TEST: ChainParams = ChainParams {
@@ -1255,6 +1308,7 @@ pub static LITECOIN_TEST: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 4_926_300,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Dogecoin: scrypt, merge-mined (AuxPoW chain id 0x62) from 371,337.
@@ -1301,7 +1355,11 @@ pub static DOGECOIN_MAIN: ChainParams = ChainParams {
     coinbase_maturity: 240,
     coinbase_script_max: 100,
     index_start: 6_415_000,
-    min_chain_work: "",
+    // Dogecoin Core chainparams.cpp (master e7c95815; 1.14-maint the same) nMinimumChainWork (block 5,050,000).
+    min_chain_work: "000000000000000000000000000000000000000000000e993d2aa86cf246a49b",
+    // Block 4,800,000 (checked 2026-11-22): our node 2 arcade's Dogecoin headers, and two explorers
+    // (blockchair.com, blockcypher.com).
+    init_checkpoint: Some((4_800_000, "a1e58e27594bbc04f9c021c9f73771852260fce5e09e86071d34c74a8a116d01")),
 };
 
 /// Bitcoin: sha256d, SegWit, Taproot; difficulty retargets every 2016 blocks (at most 4x).
@@ -1336,11 +1394,7 @@ pub static BITCOIN_MAIN: ChainParams = ChainParams {
         "seed.bitcoin.sprovoost.nl", "dnsseed.emzy.de", "seed.bitcoin.wiz.biz",
     ],
     fixed_peers: &[],
-    // Block 691,719: the block min_chain_work below ends at (Core 22.0's nMinimumChainWork and
-    // defaultAssumeValid; hash checked against two block explorers). No header fork may start
-    // under it, so a made-up branch can't spread over the low-difficulty years. Scripts are still
-    // checked everywhere (assume_valid).
-    checkpoints: &[(691_719, "00000000000000000008a89e854d57e5667df88f1cdef6fde2fbca1de5b639ad")],
+    checkpoints: &[],
     coinbase_maturity: 100,
     coinbase_script_max: 100,
     index_start: 970_000,
@@ -1348,6 +1402,11 @@ pub static BITCOIN_MAIN: ChainParams = ChainParams {
     // over 200,000 blocks under today's tip). Deliberately old: it only has to be far more work
     // than anyone could make up, and an old value never holds back a real install.
     min_chain_work: "00000000000000000000000000000000000000001fa4663bbbe19f82de910280",
+    // Block 691,719: the block min_chain_work above ends at (Core 22.0's nMinimumChainWork and
+    // defaultAssumeValid; hash checked against two block explorers). No header fork may start
+    // under it, so a made-up branch can't spread over the low-difficulty years. Scripts are still
+    // checked everywhere (assume_valid).
+    init_checkpoint: Some((691_719, "00000000000000000008a89e854d57e5667df88f1cdef6fde2fbca1de5b639ad")),
 };
 
 /// Wojakcoin: a Bitcoin Core 0.21 fork with sha256d, 120 s blocks, no AuxPoW and no active
@@ -1394,6 +1453,7 @@ pub static WOJAKCOIN_MAIN: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 228_000,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Shibacoin (SHIC): a Scrypt chain built from Dogecoin Core like Pepecoin, merge-mined with AuxPoW from block
@@ -1447,6 +1507,7 @@ pub static SHIBACOIN_MAIN: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 0,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Bellscoin (BEL), Bells 3: Scrypt, AuxPoW (chain id 16, strict) and SegWit both from block 144,000, bech32 "bel".
@@ -1501,6 +1562,7 @@ pub static BELLSCOIN_MAIN: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 1_289_000,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Luckycoin (LKY), Luckycoin Core 5.0.1 on Dogecoin 1.14's code: Scrypt, Digishield from 69,360, AuxPoW chain id 0x2013
@@ -1549,7 +1611,10 @@ pub static LUCKYCOIN_MAIN: ChainParams = ChainParams {
     // The original arcade's Luckycoin floor (config.py LKY_MAINNET_FLOOR).
     coinbase_script_max: 100,
     index_start: 1_153_000,
-    min_chain_work: "",
+    // Luckycoin Core chainparams.cpp (LuckycoinFoundation/luckycoin master 8b1fa2b5) nMinimumChainWork (block 620,035).
+    min_chain_work: "000000000000000000000000000000000000000000000c6764d4993a848f6f28",
+    // Block 1,180,000 (checked 2026-11-22): our luckycoind node on node 2, and luckyscan.org.
+    init_checkpoint: Some((1_180_000, "ca47eb6ef6ef050a5dbb122ef434afd800cfae15c1f535f9cd720dfc483e0f65")),
 };
 
 /// Junkcoin (JKC), Junkcoin Core 4.0.3.1 on Litecoin 0.21's code: Scrypt, AuxPoW chain id 0x2020 (strict) from block
@@ -1601,6 +1666,7 @@ pub static JUNKCOIN_MAIN: ChainParams = ChainParams {
     coinbase_script_max: 110,
     index_start: 1_215_000,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Pepecoin regtest, for the consensus harness (tests/regtest): V1 and a real Pepecoin Core in
@@ -1643,6 +1709,7 @@ pub static PEPECOIN_REGTEST: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 0,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// Litecoin regtest, for the SegWit-era consensus harness (tests/regtest/ltcnet.py), as
@@ -1699,6 +1766,7 @@ pub static LITECOIN_REGTEST: ChainParams = ChainParams {
     coinbase_script_max: 100,
     index_start: 0,
     min_chain_work: "",
+    init_checkpoint: None,
 };
 
 /// The regtest chains of the consensus harnesses, by key.
@@ -1773,6 +1841,24 @@ mod tests {
 
     /// Dogecoin 1.14's AuxPoW header rules, on Pepecoin mainnet (merge mining from 42,000,
     /// strict chain id 63) and testnet (not strict).
+    #[test]
+    fn auxpow_parents_are_hashed_with_the_chains_own_algorithm() {
+        let h = Header::parse(&[0u8; 80]);
+        for p in ALL_CHAINS.iter().filter(|p| p.format.auxpow) {
+            // Every AuxPoW chain here is merge-mined under Litecoin: Scrypt, taken from its params.
+            assert_eq!(auxpow_parent_algo(p, &h, 1_000_000), Some(PowAlgo::Scrypt), "{}", p.key);
+        }
+        assert_eq!(auxpow_parent_algo(&DIGIBYTE_MAIN, &h, 1), None);
+        // A sha256d chain with AuxPoW would hash its parents with sha256d.
+        let mut q = PEPECOIN_MAIN.clone();
+        q.pow = PowRule::Single(PowAlgo::Sha256d);
+        assert_eq!(auxpow_parent_algo(&q, &h, 1), Some(PowAlgo::Sha256d));
+        // Past Kotia-style proof of work there is no parent work to check.
+        q.pow = PowRule::PowThenStake { algo: PowAlgo::Scrypt, last_pow_height: 10 };
+        assert_eq!(auxpow_parent_algo(&q, &h, 10), Some(PowAlgo::Scrypt));
+        assert_eq!(auxpow_parent_algo(&q, &h, 11), None);
+    }
+
     #[test]
     fn auxpow_header_rules() {
         let h = |version: i32| Header { version, prev: Hash256::ZERO, merkle_root: Hash256::ZERO, time: 0, bits: 0, nonce: 0 };

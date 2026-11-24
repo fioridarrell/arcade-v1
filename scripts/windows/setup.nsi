@@ -81,6 +81,11 @@ Function .onInit
   warning_silent_refused:
     Abort "Arcade V1 will not install until you read the security warning and check the box. Run Setup.exe and click through that screen. Silent install is refused."
   warning_screen_shown:
+  ; NSIS allows one .onInit: the payload verifier is unpacked here too, after the silent-install check.
+  InitPluginsDir
+  SetOutPath "$PLUGINSDIR"
+  ; The verifier is part of this stub, not part of the release payload.
+  File "/oname=$PLUGINSDIR\Verify-Payload.ps1" "scripts\windows\Verify-Payload.ps1"
 FunctionEnd
 
 VIProductVersion "0.0.0.0"
@@ -93,12 +98,6 @@ VIAddVersionKey "LegalCopyright" "Open source"
 ; out of the signed stub. Verify-Payload.ps1 is given the same value.
 VIAddVersionKey "Comments" "ARCADE_PAYLOAD_SHA256=${PAYLOAD_SHA256}"
 
-Function .onInit
-  InitPluginsDir
-  SetOutPath "$PLUGINSDIR"
-  ; The verifier is part of this stub, not part of the release payload.
-  File "/oname=$PLUGINSDIR\Verify-Payload.ps1" "scripts\windows\Verify-Payload.ps1"
-FunctionEnd
 
 Function OpenArcade
   ; The same launcher as the Start menu shortcut: it sets the data folder for the app.

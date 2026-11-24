@@ -487,6 +487,35 @@ fn a_deep_reorg_just_above_the_files() {
     same(&answers(&f, &all), &want, "settled rows only in files");
 }
 
+/// Files name blocks by height and position, never by this arcade's block numbers: an arcade
+/// whose main-chain blocks got other numbers (it held another branch first) writes the very
+/// same files, ids and bytes (design-v3 §4: files equal whichever builder made them).
+#[test]
+fn files_do_not_depend_on_local_block_numbers() {
+    let c = fixture().p.chain_no;
+    let (a, b) = (fixture(), fixture());
+    let blocks = ix_chain(&a.g, 1360);
+    a.db.connect_blocks(a.p, &blocks).unwrap();
+    // b first follows a short branch from genesis: its blocks take numbers 1..=7.
+    let mut prev = b.g.hash();
+    let mut side = Vec::new();
+    for h in 1..=7u32 {
+        let b = block(prev, vec![tx(&[], &[(5, script(900 + h))], h + 7_000_000)], 30_000 + h);
+        prev = b.hash();
+        side.push(b);
+    }
+    b.db.connect_blocks(b.p, &side).unwrap();
+    for _ in 0..7 {
+        b.db.disconnect_tip(c).unwrap();
+    }
+    b.db.connect_blocks(b.p, &blocks).unwrap();
+    assert_eq!(b.db.tip(c).unwrap().unwrap().hash, a.db.tip(c).unwrap().unwrap().hash);
+    convert(&a, &opts());
+    convert(&b, &opts());
+    assert!(!files(&a).is_empty());
+    assert_eq!(files(&a), files(&b));
+}
+
 /// A pass that wrote its files and merged an era, then stopped before switching the
 /// readers (as a crash there would leave it): the readers keep the old files, and the next
 /// pass checks the merged era before adopting it (merging it again when it is damaged).
@@ -569,12 +598,23 @@ fn a_conversion_holds_while_the_drive_is_short_then_goes_on() {
     // to the same files.
     FREE.store(1000, SeqCst);
     let mut notes = Vec::new();
+    // Room comes back once the pass has said it is held (not after a fixed time: on a loaded
+    // machine the pass may not have looked yet), or after a minute in any case.
+    let held = AtomicBool::new(false);
     std::thread::scope(|s| {
         s.spawn(|| {
-            std::thread::sleep(std::time::Duration::from_millis(300));
+            let t = std::time::Instant::now();
+            while !held.load(SeqCst) && t.elapsed() < std::time::Duration::from_secs(60) {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
             FREE.store(1 << 40, SeqCst);
         });
-        assert!(f.db.convert_to_index_files(f.p, &o, &AtomicBool::new(false), &mut |x| notes.push(x)).unwrap());
+        assert!(f.db.convert_to_index_files(f.p, &o, &AtomicBool::new(false), &mut |x| {
+            if x.contains("held:") {
+                held.store(true, SeqCst);
+            }
+            notes.push(x)
+        }).unwrap());
     });
     assert!(notes.iter().any(|n| n.contains("held:") && n.contains("ARCADE_IX_FREE_GB")), "{notes:?}");
     assert!(notes.iter().any(|n| n.contains("room again")), "{notes:?}");
@@ -598,7 +638,7 @@ fn a_file_not_checked_here_is_read_whole_before_it_is_used() {
     convert(&f, &opts());
     let dir = f.db.index_dir(c);
     let upto = f.db.index_files_upto(c, Kind::Hist).unwrap().unwrap();
-    let load = || KindSet::load(&dir, Kind::Hist, c, upto, |h| Ok(f.db.hash_at(c, h)?.map(|x| x.0)));
+    let load = || KindSet::load(&dir, Kind::Hist, c, upto, None, |h| Ok(f.db.hash_at(c, h)?.map(|x| x.0)));
     // Every file written here is marked as read back whole.
     let set = load().unwrap();
     for r in &set.files {
@@ -621,4 +661,9 @@ fn a_file_not_checked_here_is_read_whole_before_it_is_used() {
     std::fs::remove_file(checked_mark(&path)).ok();
     load().unwrap();
     assert!(checked_mark(&other).exists() && checked_mark(&path).exists());
+    // Files cut by another layout than the chain's (format 3 pins it in each header): refused.
+    let with = |l| KindSet::load(&dir, Kind::Hist, c, upto, Some(l), |h| Ok(f.db.hash_at(c, h)?.map(|x| x.0)));
+    assert!(with((100, 2)).is_ok());
+    assert!(with((100, 10)).err().is_some_and(|e| e.to_string().contains("layout")));
+    assert!(with((10_000, 10)).is_err());
 }

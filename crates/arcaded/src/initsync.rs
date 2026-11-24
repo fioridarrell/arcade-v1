@@ -94,10 +94,59 @@ pub fn check(p: &arcade_chain::params::ChainParams, mode: &str) -> Result<(), St
     if matches!(p.pow, arcade_chain::pow::PowRule::PowThenStake { .. }) || p.value_rules.is_some_and(|v| v.stake_reward.is_some()) {
         return Err(format!("{} has proof-of-stake blocks: an init install can't check stake (install it without --init)", p.name));
     }
-    if p.min_chain_work().is_zero() {
-        return Err(format!("{} has no minimum chain work set for init installs yet (only Bitcoin has one): install it without --init", p.name));
+    // Litecoin's MWEB: the extension block after a block's transactions is stored and served
+    // as part of the block, but nothing here checks it. Its header could be checked against
+    // the HogEx commitment, but not its body: the body's roots are MMR roots over every MWEB
+    // output and kernel ever made, which takes the whole MWEB state. So no init install, which
+    // takes blocks from sources it hasn't checked over, until it is checked.
+    if p.format.mweb {
+        return Err(format!(
+            "{} carries MWEB extension blocks, which this release can't check yet (their roots need the whole MWEB state): install it without --init",
+            p.name
+        ));
+    }
+    // The trust floor: a release checkpoint taken from two independent sources. Where none could
+    // be checked (no chain data of our own, or no second source), the chain stays refused.
+    if p.init_floor().is_none() {
+        return Err(format!(
+            "{} has no init checkpoint in this release (a block hash checked against two independent sources): install it without --init",
+            p.name
+        ));
     }
     Ok(())
+}
+
+/// Whether installs use init when chains.add doesn't say (ARCADE_INIT_DEFAULT, default on;
+/// 0, off, no or false turn it off).
+pub fn default_on() -> bool {
+    default_on_of(std::env::var("ARCADE_INIT_DEFAULT").ok().as_deref())
+}
+
+fn default_on_of(v: Option<&str>) -> bool {
+    !matches!(v.map(|s| s.trim().to_ascii_lowercase()).as_deref(), Some("0" | "off" | "no" | "false"))
+}
+
+/// The init choice for an install. `asked`: chains.add's init (None: not said, so init where the
+/// chain allows it); `fresh`: the chain isn't installed here yet; `allowed`: `check` for the chain
+/// and mode. Ok((true, _)): an init install; Ok((false, why)): a plain one, with the reason when
+/// the default couldn't use init. Err: init was asked for and can't be.
+pub fn choose(asked: Option<bool>, fresh: bool, allowed: Result<(), String>, default: bool) -> Result<(bool, Option<String>), String> {
+    match asked {
+        Some(true) => {
+            allowed?;
+            if !fresh {
+                return Err("installed already; an init install starts from nothing".into());
+            }
+            Ok((true, None))
+        }
+        Some(false) => Ok((false, None)),
+        None if !fresh => Ok((false, None)),
+        None if !default => Ok((false, Some("init installs are off by default here (ARCADE_INIT_DEFAULT)".into()))),
+        None => match allowed {
+            Ok(()) => Ok((true, None)),
+            Err(why) => Ok((false, Some(why))),
+        },
+    }
 }
 
 /// The init phases, until done (true) or the chain stops (false). Pausing waits here.
@@ -901,15 +950,54 @@ mod tests {
 
     #[test]
     fn init_only_where_it_can_be_checked() {
-        use arcade_chain::params::{BITCOIN_MAIN, DOGECOIN_MAIN, KOTIA_MAIN};
+        use arcade_chain::params::{ALL_CHAINS, BITCOIN_MAIN, DIGIBYTE_MAIN, DIGIBYTE_TEST, KOTIA_MAIN};
         assert!(check(&BITCOIN_MAIN, "full").is_ok() && check(&BITCOIN_MAIN, "chain").is_ok());
         assert!(check(&BITCOIN_MAIN, "light").is_err() && check(&BITCOIN_MAIN, "shared").is_err());
         // Bitcoin's floor is set and parses (a typo would turn it off).
         assert!(!BITCOIN_MAIN.min_chain_work().is_zero());
         // Proof of stake: refused, whatever else.
         assert!(check(&KOTIA_MAIN, "full").unwrap_err().contains("proof-of-stake"));
-        // No minimum chain work: refused.
-        assert!(check(&DOGECOIN_MAIN, "full").unwrap_err().contains("minimum chain work"));
+        // MWEB: refused, whatever else.
+        use arcade_chain::params::{JUNKCOIN_MAIN, LITECOIN_MAIN, LITECOIN_TEST};
+        for m in [&LITECOIN_MAIN, &LITECOIN_TEST, &JUNKCOIN_MAIN] {
+            assert!(check(m, "full").unwrap_err().contains("MWEB"), "{}", m.key);
+        }
+        // No checkpoint checked against two sources: refused.
+        assert!(check(&DIGIBYTE_MAIN, "full").unwrap_err().contains("no init checkpoint"));
+        assert!(check(&DIGIBYTE_TEST, "full").unwrap_err().contains("no init checkpoint"));
+        // Every chain init allows has a checkpoint, and a minimum chain work that parses where set.
+        for p in ALL_CHAINS.iter().filter(|p| check(p, "full").is_ok()) {
+            assert!(p.init_floor().is_some(), "{}", p.key);
+            assert!(p.min_chain_work.is_empty() || !p.min_chain_work().is_zero(), "{}", p.key);
+        }
+    }
+
+    #[test]
+    fn init_is_the_default_where_the_chain_allows_it() {
+        use arcade_chain::params::{BITCOIN_MAIN, DIGIBYTE_MAIN, DOGECOIN_MAIN, KOTIA_MAIN, LITECOIN_MAIN};
+        let ok = || Ok::<(), String>(());
+        // Not said: init on a new chain that allows it, plain (with the reason) on one that doesn't.
+        assert_eq!(choose(None, true, check(&BITCOIN_MAIN, "full"), true), Ok((true, None)));
+        assert_eq!(choose(None, true, check(&DOGECOIN_MAIN, "full"), true), Ok((true, None)));
+        for p in [&DIGIBYTE_MAIN, &KOTIA_MAIN, &LITECOIN_MAIN] {
+            let (init, why) = choose(None, true, check(p, "full"), true).unwrap();
+            assert!(!init && why.is_some(), "{}", p.key);
+        }
+        // A mode that doesn't keep every block: plain, not refused.
+        assert!(!choose(None, true, check(&BITCOIN_MAIN, "light"), true).unwrap().0);
+        // Installed already, or the default turned off: plain.
+        assert_eq!(choose(None, false, ok(), true), Ok((false, None)));
+        assert!(matches!(choose(None, true, ok(), false), Ok((false, Some(_)))));
+        // Said: false is plain; true is init or a refusal.
+        assert_eq!(choose(Some(false), true, ok(), true), Ok((false, None)));
+        assert_eq!(choose(Some(true), true, ok(), false), Ok((true, None)));
+        assert!(choose(Some(true), true, check(&KOTIA_MAIN, "full"), true).unwrap_err().contains("proof-of-stake"));
+        assert!(choose(Some(true), false, ok(), true).unwrap_err().contains("installed already"));
+        // ARCADE_INIT_DEFAULT
+        assert!(default_on_of(None) && default_on_of(Some("1")) && default_on_of(Some("on")));
+        for v in ["0", "off", "OFF", "no", "false", " 0 "] {
+            assert!(!default_on_of(Some(v)), "{v}");
+        }
     }
 
     #[test]

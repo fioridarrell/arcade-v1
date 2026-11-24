@@ -182,6 +182,8 @@ async function chainPicker(sel) {
   sel.replaceChildren(...list.map((c) => {
     const o = document.createElement("option");
     o.value = c.default ? "" : c.key;
+    o.dataset.unit = c.unit || "";
+    o.dataset.key = c.key || "";
     const bal = c.balance == null ? "" : ` · ${coinNum(c.balance)} ${c.unit}`;
     o.textContent = `${SCHEME[c.key] || ""} ${c.name}${c.default ? " (default)" : ""}${c.test ? "" : " · real coins"}${bal}${c.stalled ? " · stalled" : ""}`;
     return o;
@@ -191,7 +193,7 @@ async function chainPicker(sel) {
   sel.title = "Where it is written. ARCADE by default; Pepecoin testnet while ARCADE is stalled.";
 }
 // The fee in the chosen chain's coin (`chain` "" = the default chain's).
-const chainFee = (sel, sats) => { const t = sel && sel.selectedOptions[0] ? sel.selectedOptions[0].textContent : ""; const u = (t.match(/· [\d.,]+ (\S+)/) || [])[1]; return u ? coinNum(sats) + " " + u : homeCoins(sats); };
+const chainFee = (sel, sats) => { const opt = sel && sel.selectedOptions[0]; const u = (opt && opt.dataset.unit) || (opt ? (opt.textContent.match(/· [\d.,]+ (\S+)/) || [])[1] : ""); return u ? coinNum(sats) + " " + u : homeCoins(sats); };
 async function loadHome() {
   if (HOME.known) return HOME;
   try {

@@ -8,13 +8,17 @@
 //!                                                     the pass's estimated size)
 //!   ixfiles info    <shared chain.mdbx> <chain key>   what the readers use now
 //!   ixfiles off     <shared chain.mdbx> <chain key>   back to the tables alone
+//!   ixfiles check   <shared chain.mdbx> <chain key> [every]   the files against the tables:
+//!                                                     every n-th address's history, tx and
+//!                                                     spend (default 50), mapped to heights
+//!                                                     on their own (HEIGHT), not by ixconv
 //!   ixfiles verify  <file.ixf>...                     read files whole and check them (and
 //!                                                     mark them checked: <file>.ok)
 //!   ixfiles bench   <H|S|T> <out dir> <run file>...   address run files -> one index file (sizes)
 use arcade_chaindb::ixconv::Options;
 use arcade_chaindb::ixfile::{hist_row, spend_row, tx_row, Kind, Meta, Reader, Writer, LEVEL};
 use arcade_chaindb::ChainDb;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Read;
 
 /// Set by Ctrl-C: the conversion saves a checkpoint and stops.
@@ -146,7 +150,7 @@ fn bench(a: &[String]) {
     let (first, last) = rows.iter().fold((u32::MAX, 0), |(lo, hi), r| (lo.min(kind.height_of(r)), hi.max(kind.height_of(r))));
     let t = std::time::Instant::now();
     let threads = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4).min(8);
-    let mut w = Writer::create(out, Meta { kind, chain: 0, first, last, last_hash: [0; 32] }, LEVEL, threads).unwrap();
+    let mut w = Writer::create(out, Meta { kind, chain: 0, first, last, last_hash: [0; 32], range: last - first + 1, era_ranges: 1 }, LEVEL, threads).unwrap();
     for r in &rows {
         w.push(r).unwrap();
     }
@@ -166,9 +170,108 @@ fn bench(a: &[String]) {
     );
 }
 
+/// The files against the tables, every `every`-th row: history (per address: heights and
+/// amounts), tx index (each txid's height and position among the T files' candidates), spends
+/// (the spender found from the coin's height). Block numbers become heights through HEIGHT here.
+fn check(db: &ChainDb, p: &'static arcade_chain::params::ChainParams, every: usize) {
+    use arcade_chaindb::ixset::KindSet;
+    use arcade_chaindb::schema::{k_chain, HEIGHT, SCRIPT_HIST, SPENDS, TXS};
+    let c = p.chain_no;
+    let store = db.store(c);
+    let pre = k_chain(c);
+    let scan = |table: &str, f: &mut dyn FnMut(&[u8], &[u8])| {
+        let mut after: Option<Vec<u8>> = None;
+        loop {
+            let rows = store.read(|r| r.scan_after(table, &pre, after.as_deref(), 200_000)).unwrap();
+            let Some(last) = rows.last() else { break };
+            for (k, v) in &rows {
+                f(k, v);
+            }
+            after = Some(last.0.clone());
+        }
+    };
+    // Block number -> height on the main chain.
+    let mut h_of_b: HashMap<u32, u32> = HashMap::new();
+    scan(HEIGHT, &mut |k, v| {
+        h_of_b.insert(be32(v, 32), be32(k, 2));
+    });
+    let hash_at = |h: u32| -> arcade_store::Result<Option<[u8; 32]>> { Ok(db.hash_at(c, h)?.map(|x| x.0)) };
+    let layout = arcade_chaindb::ixconv::Layout::for_chain(p);
+    let load = |k: Kind| db.index_files_upto(c, k).unwrap().map(|upto| (upto, KindSet::load(&db.index_dir(c), k, c, upto, Some((layout.range, layout.era_ranges)), hash_at).unwrap()));
+    let (mut bad, mut seen) = (0u64, [0u64; 3]);
+    if let Some((upto, set)) = load(Kind::Hist) {
+        // Table key: C | script id (21) | height | txid prefix (12) -> received | spent.
+        let mut cur: Option<[u8; 21]> = None;
+        let mut rows: Vec<(u32, u64, u64)> = Vec::new();
+        let mut n = 0usize;
+        let mut done = |sid: [u8; 21], rows: &mut Vec<(u32, u64, u64)>| {
+            let mut want: Vec<(u32, u64, u64)> = rows.drain(..).filter(|r| r.0 <= upto).collect();
+            let mut got: Vec<(u32, u64, u64)> = set.history(&sid).unwrap().into_iter().map(|(h, _, r, s)| (h, r, s)).collect();
+            want.sort_unstable();
+            got.sort_unstable();
+            seen[0] += 1;
+            if want != got {
+                bad += 1;
+                println!("H differs for script id {}: table {} rows, files {}", hex::encode(sid), want.len(), got.len());
+            }
+        };
+        scan(SCRIPT_HIST, &mut |k, v| {
+            let sid: [u8; 21] = k[2..23].try_into().unwrap();
+            if cur != Some(sid) {
+                if let Some(prev) = cur.take() {
+                    if n.is_multiple_of(every) {
+                        done(prev, &mut rows);
+                    }
+                    n += 1;
+                }
+                rows.clear();
+                cur = Some(sid);
+            }
+            rows.push((be32(k, 23), be64(v, 0), be64(v, 8)));
+        });
+        if let Some(prev) = cur {
+            done(prev, &mut rows);
+        }
+    }
+    if let Some((upto, set)) = load(Kind::Txs) {
+        let mut n = 0usize;
+        scan(TXS, &mut |k, v| {
+            n += 1;
+            let Some(&h) = h_of_b.get(&be32(v, 0)) else { return };
+            if h > upto || !n.is_multiple_of(every) {
+                return;
+            }
+            seen[1] += 1;
+            if !set.tx_candidates(&k[2..10]).unwrap().contains(&(h, be32(v, 4))) {
+                bad += 1;
+                println!("T misses txid prefix {} at {h}/{}", hex::encode(&k[2..14]), be32(v, 4));
+            }
+        });
+    }
+    if let Some((upto, set)) = load(Kind::Spends) {
+        let mut n = 0usize;
+        scan(SPENDS, &mut |k, v| {
+            n += 1;
+            let (Some(&ch), Some(&sh)) = (h_of_b.get(&be32(k, 2)), h_of_b.get(&be32(v, 0))) else { return };
+            if sh > upto || !n.is_multiple_of(every) {
+                return;
+            }
+            seen[2] += 1;
+            if set.spender(ch, be32(k, 6), be32(k, 10)).unwrap() != Some((sh, be32(v, 4), be32(v, 8))) {
+                bad += 1;
+                println!("P differs for {ch}/{}/{}", be32(k, 6), be32(k, 10));
+            }
+        });
+    }
+    println!("checked: {} addresses, {} txs, {} spends; {bad} differ", seen[0], seen[1], seen[2]);
+    if bad > 0 {
+        std::process::exit(1);
+    }
+}
+
 fn main() {
     let a: Vec<String> = std::env::args().skip(1).collect();
-    let usage = "ixfiles convert|info|off <chain.mdbx> <chain key> | verify <file>... | bench <H|S|T> <out dir> <run file>...";
+    let usage = "ixfiles convert|info|off|check <chain.mdbx> <chain key> | verify <file>... | bench <H|S|T> <out dir> <run file>...";
     match a.first().map(String::as_str) {
         Some("bench") if a.len() >= 4 => bench(&a[1..]),
         Some("verify") if a.len() >= 2 => {
@@ -180,6 +283,10 @@ fn main() {
                 println!("{path}: {:?} heights {}..={} rows {} bytes {} id {} ok", r.meta.kind, r.meta.first, r.meta.last, r.rows, r.bytes, hex::encode(r.id));
             }
         }
+        Some("check") if a.len() == 3 || a.len() == 4 => {
+            let p = *arcade_chain::params::ALL_CHAINS.iter().find(|p| p.key == a[2]).expect("no chain of that key");
+            check(&ChainDb::open(&a[1]).unwrap(), p, a.get(3).map(|n| n.parse().expect("every: a number")).unwrap_or(50));
+        }
         Some(cmd @ ("convert" | "info" | "off")) if a.len() == 3 => {
             let p = *arcade_chain::params::ALL_CHAINS.iter().find(|p| p.key == a[2]).expect("no chain of that key");
             let db = ChainDb::open(&a[1]).unwrap();
@@ -190,7 +297,7 @@ fn main() {
                     // The drive is watched: held under ARCADE_IX_FREE_GB (default 50) plus a
                     // pass's estimated size.
                     let floor = std::env::var("ARCADE_IX_FREE_GB").ok().map(|v| v.trim().parse::<u64>().expect("ARCADE_IX_FREE_GB: a number of GB")).map(|g| g.saturating_mul(1 << 30));
-                    let o = Options { free_bytes: Some(free_bytes), floor_bytes: floor.unwrap_or(arcade_chaindb::ixconv::FLOOR_BYTES), ..Options::default() };
+                    let o = Options { free_bytes: Some(free_bytes), floor_bytes: floor.unwrap_or(arcade_chaindb::ixconv::FLOOR_BYTES), layout: arcade_chaindb::ixconv::Layout::for_chain(p), ..Options::default() };
                     let done = db.convert_to_index_files(p, &o, &STOP, &mut |s| println!("{s}")).unwrap();
                     println!("{}", if done { "done" } else { "stopped" });
                 }

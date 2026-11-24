@@ -196,6 +196,12 @@ impl Pool {
         self.txs.contains_key(id)
     }
 
+    /// How long a row this waiting transaction stands in, counting itself (1 when nothing it spends
+    /// is waiting). None when it is not in the pool.
+    pub fn row_of(&self, id: &Hash256) -> Option<usize> {
+        self.txs.get(id).map(|w| w.row)
+    }
+
     /// The waiting transactions in order of arrival.
     pub fn iter(&self) -> impl Iterator<Item = &Waiting> {
         self.order.values().map(|id| &self.txs[id])

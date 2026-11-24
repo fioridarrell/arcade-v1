@@ -95,6 +95,8 @@ mod richlist;
 mod tokensend;
 mod meshview;
 mod mempoolshare;
+mod chainlimit;
+mod inscqueue;
 mod msgsvc;
 mod namesites;
 mod ordtypes;
@@ -136,6 +138,7 @@ mod walletproofs;
 mod turnsvc;
 mod v1copy;
 mod vxshare;
+mod drivepace;
 mod watchdog;
 mod v1import;
 mod shares;
@@ -702,6 +705,7 @@ fn main() {
     // Pepecoin testnet installed here, or borrowed until someone installs it (crate::homeinst).
     homeinst::init(&node);
     chains::start_saved(&node);
+    drivepace::start(node.clone());
     borrow::start(node.clone());
     swaps::start(node.clone());
     richlist::start(node.clone());
@@ -809,6 +813,11 @@ fn main() {
         // Large blobs being published from here: parts over successive blocks, resumed after a restart (largeblob.rs).
         let n = node.clone();
         std::thread::Builder::new().name("large blobs".into()).spawn(move || largeblob::run(n)).unwrap();
+    }
+    {
+        // Inscriptions longer than a mempool chain: the rest goes out as earlier pieces confirm, including after a restart.
+        let n = node.clone();
+        std::thread::Builder::new().name("inscriptions".into()).spawn(move || inscqueue::run(n)).unwrap();
     }
     {
         // "cb" Core-data copies: asking, fetching, taking in, re-checking.

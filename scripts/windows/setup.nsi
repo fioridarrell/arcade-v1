@@ -47,11 +47,32 @@ ShowUninstDetails show
 !define MUI_FINISHPAGE_RUN_TEXT "Open Arcade V1.0"
 !define MUI_FINISHPAGE_RUN_FUNCTION OpenArcade
 !define MUI_FINISHPAGE_TEXT "Arcade V1.0 is installed, and its service is running: it starts by itself every time you log in.$\r$\n$\r$\nOpen it from the Start menu or the desktop. The first time, make a wallet (write its 12 words down) or restore one.$\r$\n$\r$\nArcade V1.0 is in beta: testing is happening now, and things can change or break (test coins have no value).$\r$\nThank you for trying it out! Questions, problems or ideas: team@arcade-nodes.com"
+
+; The warning screen is first. Next stays disabled until the box is checked (MUI_LICENSEPAGE_CHECKBOX),
+; so nothing is unpacked or installed before the user acknowledges it. Silent install skips pages,
+; so .onInit refuses /S rather than let it pass this screen.
+!define MUI_PAGE_HEADER_TEXT "Security warning"
+!define MUI_PAGE_HEADER_SUBTEXT "Read this before Arcade V1 is installed"
+!define MUI_LICENSEPAGE_TEXT_TOP "Arcade V1 is beta software with no independent security audit yet. Nothing is installed until you check the box."
+!define MUI_LICENSEPAGE_TEXT_BOTTOM "Details: SECURITY.md in the Arcade V1 repository. Security problems: team@arcade-nodes.com"
+!define MUI_LICENSEPAGE_BUTTON "Continue"
+!define MUI_LICENSEPAGE_CHECKBOX
+!define MUI_LICENSEPAGE_CHECKBOX_TEXT "I understand this warning. Install Arcade V1."
+!insertmacro MUI_PAGE_LICENSE "${__FILEDIR__}/SECURITY-WARNING.txt"
+; MUI consumes MUI_PAGE_HEADER_* for this page only, so the files and finish pages keep their own titles.
 !insertmacro MUI_PAGE_INSTFILES
 !insertmacro MUI_PAGE_FINISH
 !insertmacro MUI_UNPAGE_CONFIRM
 !insertmacro MUI_UNPAGE_INSTFILES
 !insertmacro MUI_LANGUAGE "English"
+
+Function .onInit
+  ; /S would skip the warning screen. Refuse it so the install cannot proceed without the checkbox.
+  IfSilent warning_silent_refused warning_screen_shown
+  warning_silent_refused:
+    Abort "Arcade V1 will not install until you read the security warning and check the box. Run Setup.exe and click through that screen. Silent install is refused."
+  warning_screen_shown:
+FunctionEnd
 
 VIProductVersion "0.0.0.0"
 VIAddVersionKey "ProductName" "${NAME}"

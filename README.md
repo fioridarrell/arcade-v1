@@ -2,6 +2,10 @@
 
 One arcade, many chains. Ordinals/inscriptions, a block explorer, an on-chain app store and a peer-to-peer mesh, in Rust. Self-host in one command; runs [app.dogecoinarcade.com](https://app.dogecoinarcade.com).
 
+> **Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.**
+>
+> What the service can access, the ports it opens, how updates are checked, and how to report a security problem: [SECURITY.md](SECURITY.md) (team@arcade-nodes.com).
+
 > **Try it before you install anything:** [app.dogecoinarcade.com](https://app.dogecoinarcade.com) runs this same software. [Make an account](https://app.dogecoinarcade.com/join), claim an @handle, and post to [the Feed](https://app.dogecoinarcade.com/feed) or install something from [the App Store](https://app.dogecoinarcade.com/apps) — in the browser, in a couple of minutes. It is Pepecoin testnet, and the arcade hands out testnet coins itself, so nothing you try there costs real money. Installing your own arcade takes one command (below) and it finds the other arcades on the mesh by itself.
 
 > **Arcade V1 carries and updates itself.** Every arcade keeps the arcade's own code (the whole repository with its history, every dependency so it rebuilds offline, and the prebuilt programs) and hands new releases to the arcades it is linked to. Releases are signed with Strawberry's release key, and an arcade with automatic updates on (Options tab) installs them from the network, with no website involved (since v0.1.67). Releases are still published here on GitHub as well for now. See [docs/ARCADECHAIN.md §14.25](docs/ARCADECHAIN.md). Running a node that earns ARCADE: [docs/EARN.md](docs/EARN.md) (when and how pay comes).
@@ -20,6 +24,8 @@ One arcade, many chains. Ordinals/inscriptions, a block explorer, an on-chain ap
 | **Borrowed chains** work like installed ones: Shibacoin here, borrowed over the mesh. | |
 
 ## Install on Linux
+
+> **Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.** See [SECURITY.md](SECURITY.md) before you install.
 
 Paste this one command into a terminal:
 
@@ -113,6 +119,8 @@ curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scr
 This removes everything: the programs, the app and its menu entry, the background service, **and your data in `~/.local/share/arcade`**: your wallet and its 12 words, imported wallets, messages and chains. It asks you to type `DELETE` first. If your wallet holds anything, write down your 12 words before (`arcade --home ~/.local/share/arcade wallet phrase`); on a new install you restore it from them on the Home tab.
 
 ## Install on Windows
+
+> **Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.** The Setup.exe shows this on its own screen and will not continue until you check the box. See [SECURITY.md](SECURITY.md).
 
 Windows 10 or 11, 64-bit. Paste this into PowerShell:
 

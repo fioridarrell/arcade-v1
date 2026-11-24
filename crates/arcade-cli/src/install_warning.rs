@@ -181,6 +181,11 @@ fn security_md_covers_access_ports_updates_and_how_to_report() {
 fn the_windows_installer_will_not_proceed_without_the_warning() {
     let script = repo("scripts/windows/setup.nsi");
     let warning = repo("scripts/windows/SECURITY-WARNING.txt");
+    // makensis refuses a script that defines a callback twice (v0.1.177's release build).
+    for f in [".onInit", ".onInstSuccess", "un.onInit"] {
+        let n = script.lines().filter(|l| l.trim() == format!("Function {f}")).count();
+        assert!(n <= 1, "setup.nsi defines {f} {n} times: makensis allows one");
+    }
     assert!(
         installer_may_proceed(&script, &warning, true, false),
         "checking the box on the warning screen is what lets the install continue"

@@ -1,7 +1,11 @@
 # Arcade V1.0 installer for Windows 10/11 x64.
 #
-# One line (PowerShell). It downloads the newest release, checks the sha256, and installs
-# it. Nothing to compile unless there is no download yet, or you ask with --build:
+# The install path to use is arcade-v1-windows-x86_64-setup.exe from the latest release.
+# That installer checks its payload against the SHA-256 embedded in the file before it
+# extracts anything. This script is the advanced one-liner, and what setup.exe runs
+# (via --prebuilt) after that check. The one-liner downloads the newest zip, checks its
+# sha256, and installs it. Nothing to compile unless there is no download yet, or you
+# ask with --build:
 #
 #   powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.ps1'))"
 #
@@ -73,11 +77,11 @@ for ($i = 0; $i -lt $argv.Count; $i++) {
             $i++; $StunPort = [int]$argv[$i]
         }
         '--help' {
-            Get-Content -LiteralPath $PSCommandPath -TotalCount 28
+            Get-Content -LiteralPath $PSCommandPath -TotalCount 29
             exit 0
         }
         '-h' {
-            Get-Content -LiteralPath $PSCommandPath -TotalCount 28
+            Get-Content -LiteralPath $PSCommandPath -TotalCount 29
             exit 0
         }
         default { throw "unknown option: $a" }

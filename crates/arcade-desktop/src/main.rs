@@ -65,6 +65,30 @@ fn answer_limit(cmd: &str, req: &Value) -> std::time::Duration {
     Duration::from_secs(if SLOW_COMMANDS.contains(&cmd) { SLOW_ANSWER_SECS } else { ANSWER_SECS })
 }
 
+/// Tell the signer which card the user just approved. Storage, market and repository cards are
+/// not transactions the signer holds, and a refusal never unlocks it.
+fn approve_on_signer(req: &Value) -> Result<(), String> {
+    let kind = req["kind"].as_str().unwrap_or("");
+    if !matches!(kind, "coins" | "token" | "inscription") {
+        return Ok(());
+    }
+    let outputs = req["outputs"].as_array().ok_or("the card has no outputs")?;
+    let card = arcade_signer::Card {
+        to: req["to"].as_str().unwrap_or("").to_string(),
+        amount: req["units"].as_u64().unwrap_or(0),
+        fee: req["fee"].as_u64().ok_or("the card has no fee")?,
+        outputs: outputs
+            .iter()
+            .map(|o| arcade_signer::ShownOutput {
+                address: o["address"].as_str().filter(|s| !s.is_empty()).map(|s| s.to_string()),
+                value: o["value"].as_u64().unwrap_or(0),
+                script: o["script"].as_str().map(|s| s.to_string()),
+            })
+            .collect(),
+    };
+    arcade_signer::Client::connect(&home())?.approve(&card)
+}
+
 /// Forward one request to arcaded and return its answer. Only what the asking window may send (window_may).
 ///
 /// The socket call blocks (some wait on purpose, such as realtime.poll), so it runs on the blocking pool: on the
@@ -83,6 +107,13 @@ fn ask(label: &str, req: Value) -> Value {
     let cmd = req["cmd"].as_str().unwrap_or("");
     if !window_may(label, cmd) {
         return json!({"ok": false, "error": format!("{cmd} is not for this window")});
+    }
+    // A coin, token or inscription card is approved on the signer directly. arcaded then asks
+    // the signer to sign that exact card. The page's HTTP API never reaches this socket.
+    if cmd == "wallet.approve" {
+        if let Err(e) = approve_on_signer(&req) {
+            return json!({"ok": false, "error": e});
+        }
     }
     let sock = arcade_local::socket_path(&home());
     let mut s = match UnixStream::connect(&sock) {

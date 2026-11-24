@@ -189,6 +189,7 @@ name = "arcade-desktop"
 version = "0.1.0"
 dependencies = [
  "arcade-local",
+ "arcade-signer",
  "base64 0.23.1",
  "serde_json",
  "tauri",
@@ -282,6 +283,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "arcade-signer"
+version = "0.1.0"
+dependencies = [
+ "arcade-app",
+ "arcade-chain",
+ "arcade-ledger",
+ "arcade-local",
+ "arcade-wallet",
+ "chacha20poly1305",
+ "getrandom 0.2.17",
+ "hex",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "zeroize",
+]
+
+[[package]]
 name = "arcade-store"
 version = "0.1.0"
 dependencies = [
@@ -325,6 +345,7 @@ dependencies = [
  "arcade-mesh",
  "arcade-msg",
  "arcade-oldimport",
+ "arcade-signer",
  "arcade-store",
  "arcade-wallet",
  "base64 0.23.1",

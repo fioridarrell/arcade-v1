@@ -25,8 +25,9 @@ const HELP: &str = "arcade — Arcade V1.0
   arcade events                  recent activity
   arcade mempool                 unconfirmed transactions and pending tag claims
   arcade chain list                         chains you can install, and their state (queued ones with their place)
-  arcade chain add <key> [--mode full|chain|light] [--with <index>,<index>,...] [--drive <mount>] [--init|--no-init]
-                     init (headers first, blocks stored, then built in bulk) is the default where the chain allows it
+  arcade chain add <key> [--mode full|chain|light] [--with <index>,<index>,...] [--drive <mount>] [--init|--no-init] [--core <datadir>]
+                     init (headers first, blocks stored, then built in bulk) is the default where the chain allows it;
+                     --core: you already run this chain's Core here: its folder is read in place instead (stop that Core first)
                      every index is opt-in (--mode chain: addresses only; light: none):
                        addresses, ledger, profiles     any chain
                        ord                             chains with inscriptions: pep, peptest, doge, dgb, ltc, ltctest, shic, flop, wjk
@@ -509,6 +510,7 @@ fn main() {
             let mut with: Vec<String> = vec![];
             let mut drive = String::new();
             let mut init: Option<bool> = None;
+            let mut core = String::new();
             let mut i = 0;
             while i < rest.len() {
                 match rest[i] {
@@ -517,6 +519,7 @@ fn main() {
                     "--drive" if i + 1 < rest.len() => { drive = rest[i + 1].to_string(); i += 1; }
                     "--init" => init = Some(true),
                     "--no-init" => init = Some(false),
+                    "--core" if i + 1 < rest.len() => { core = rest[i + 1].to_string(); i += 1; }
                     _ => {}
                 }
                 i += 1;
@@ -524,6 +527,9 @@ fn main() {
             let mut v = json!({"cmd": "chains.add", "key": k, "mode": mode, "with": with, "drive": drive});
             if let Some(on) = init {
                 v["init"] = json!(on);
+            }
+            if !core.is_empty() {
+                v["core_dir"] = json!(core);
             }
             v
         }

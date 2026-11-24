@@ -18,6 +18,14 @@ button, the startup chooser's queue) is an init install when `check` allows the 
 An installed chain, the home chain and the ARCADE chain keep their own installs. An operator turns
 the default off with `ARCADE_INIT_DEFAULT=0` in arcaded's environment.
 
+**An operator who already runs the coin's Core** is asked in the app's installer ("Do you already
+run Dogecoin Core on this computer?"). Yes, with its data folder: `chains.add` gets `core_dir`
+(CLI `--core <datadir>`), the folder is checked at once (a Core datadir of this chain, not pruned)
+and read in place when the install starts (`chains.copy_from_dir`, crate::localcopy), which is
+faster than any download. That Core must be stopped by then; if it isn't, the install carries on
+from the network and the event log says why. `chains.list` says per chain whether a new install
+would be an init install (`init_install`), for the installer's wording.
+
 **Which chains:** those with an **init checkpoint** in the release (`ChainParams::init_checkpoint`),
 no proof of stake and no MWEB. `chains.add` with init refuses the others with the reason (by default they install plain):
 

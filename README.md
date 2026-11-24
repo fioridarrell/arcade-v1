@@ -2,7 +2,11 @@
 
 One arcade, many chains. Ordinals/inscriptions, a block explorer, an on-chain app store and a peer-to-peer mesh, in Rust. Self-host in one command; runs [app.dogecoinarcade.com](https://app.dogecoinarcade.com).
 
-> **Try it before you install anything:** [app.dogecoinarcade.com](https://app.dogecoinarcade.com) runs this same software. [Make an account](https://app.dogecoinarcade.com/join), claim an @handle, and post to [the Feed](https://app.dogecoinarcade.com/feed) or install something from [the App Store](https://app.dogecoinarcade.com/apps) — in the browser, in a couple of minutes. It is Pepecoin testnet, and the arcade hands out testnet coins itself, so nothing you try there costs real money. Installing your own arcade takes one command (below) and it finds the other arcades on the mesh by itself.
+> **Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.**
+>
+> What the service can access, the ports it opens, how updates are checked, and how to report a security problem: [SECURITY.md](SECURITY.md) (team@arcade-nodes.com).
+
+> **Try it before you install anything:** [app.dogecoinarcade.com](https://app.dogecoinarcade.com) runs this same software. [Make an account](https://app.dogecoinarcade.com/join), claim an @handle, and post to [the Feed](https://app.dogecoinarcade.com/feed) or install something from [the App Store](https://app.dogecoinarcade.com/apps) — in the browser, in a couple of minutes. It is Pepecoin testnet, and the arcade hands out testnet coins itself, so nothing you try there costs real money. Installing your own arcade is a download you check, then run (below), and it finds the other arcades on the mesh by itself.
 
 > **Arcade V1 carries and updates itself.** Every arcade keeps the arcade's own code (the whole repository with its history, every dependency so it rebuilds offline, and the prebuilt programs) and hands new releases to the arcades it is linked to. Releases are signed with Strawberry's release key, and an arcade with automatic updates on (Options tab) installs them from the network, with no website involved (since v0.1.67). Releases are still published here on GitHub as well for now. See [docs/ARCADECHAIN.md §14.25](docs/ARCADECHAIN.md). Running a node that earns ARCADE: [docs/EARN.md](docs/EARN.md) (when and how pay comes).
 
@@ -21,25 +25,61 @@ One arcade, many chains. Ordinals/inscriptions, a block explorer, an on-chain ap
 
 ## Install on Linux
 
-Paste this one command into a terminal:
+> **Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.** See [SECURITY.md](SECURITY.md) before you install.
+
+Download the release, check it, then install it. These commands are for a 64-bit PC (Intel or AMD). On ARM, use `arcade-v1-linux-aarch64` everywhere this says `arcade-v1-linux-x86_64`.
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.sh | bash
+base=https://github.com/martinseeger2002/arcade-v1/releases/latest/download
+name=arcade-v1-linux-x86_64
+curl -fL -o "$name.tar.gz" "$base/$name.tar.gz"
+curl -fL -o "$name.tar.gz.sha256" "$base/$name.tar.gz.sha256"
+sha256sum -c "$name.tar.gz.sha256"
 ```
 
-That's all. It downloads the newest ready-made release for your PC (Intel/AMD or ARM), checks its checksum, and installs it in seconds, with nothing to compile. It installs:
+Stop if that check fails. Do not unpack the archive.
+
+When the release also has a detached signature, check it before you unpack. Until a signing key is configured for CI, the release has the `.sha256` and not the signature. The checksum above is the check that always runs.
+
+```sh
+# minisign, when $name.tar.gz.minisig is on the release (public key: arcade-v1-minisign.pub)
+curl -fL -o "$name.tar.gz.minisig" "$base/$name.tar.gz.minisig"
+curl -fL -o arcade-v1-minisign.pub "$base/arcade-v1-minisign.pub"
+minisign -V -p arcade-v1-minisign.pub -m "$name.tar.gz"
+
+# or GPG, when $name.tar.gz.asc is on the release (public key: arcade-v1-gpg.pub.asc)
+# curl -fL -o "$name.tar.gz.asc" "$base/$name.tar.gz.asc"
+# curl -fL -o arcade-v1-gpg.pub.asc "$base/arcade-v1-gpg.pub.asc"
+# gpg --import arcade-v1-gpg.pub.asc
+# gpg --verify "$name.tar.gz.asc" "$name.tar.gz"
+```
+
+Then install from the archive you just checked:
+
+```sh
+tar -xzf "$name.tar.gz"
+bash "$name/scripts/install-linux.sh" --prebuilt "$name"
+```
+
+That's all. It installs the programs from that archive, with nothing to compile. It installs:
 
 - **arcaded**, the arcade service, started now and at every login (`systemctl --user status arcaded`);
 - **arcade**, the command line (`arcade status`, `arcade setup`, ...);
 - **Arcade V1.0**, the desktop app, with its icon and a launcher in your app menu.
 
-Everything goes in your home folder: programs in `~/.local/bin`, data in `~/.local/share/arcade`. Run the same command again to update.
+Everything goes in your home folder: programs in `~/.local/bin`, data in `~/.local/share/arcade`. Run the same command again to update by hand. With automatic updates on in Options (off until you turn them on), the arcade also installs a newer signed release from the mesh; see [docs/RELEASE-KEY.md](docs/RELEASE-KEY.md).
 
 ### Requirements
 
 The ready-made downloads run on Ubuntu 22.04 or newer, Linux Mint 21 or newer, Debian 12 or newer, and similar. The app window uses the system's web engine (`libwebkit2gtk-4.1-0`). Most desktops already have it; if yours doesn't, the installer adds it with apt, asking for your password once.
 
-### Building from source instead
+### Advanced: one-line install
+
+The one-line command downloads the same archive, checks its sha256, and installs it. The download-verify-run steps above are the ones to use when you want to see the checksum and the signature yourself.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.sh | bash
+```
 
 It builds from source by itself when there's no download for your PC or the download doesn't run on your Linux. To force a build, run it as `... | ARCADE_BUILD=1 bash`.
 
@@ -47,7 +87,7 @@ A build installs what it needs with apt (`build-essential pkg-config clang libcl
 
 ### Making a release
 
-Push a tag such as `v0.1.1`, or run the **release** workflow on GitHub (Actions → release → Run workflow). It builds for x86_64 and aarch64 on Ubuntu 22.04 and for x86_64 on Windows, and attaches `arcade-v1-linux-<arch>.tar.gz`, `arcade-v1-windows-x86_64.zip`, and each file's `.sha256` to the release. The installers always take the latest release.
+Push a tag such as `v0.1.1`, or run the **release** workflow on GitHub (Actions → release → Run workflow). It builds for x86_64 and aarch64 on Ubuntu 22.04 and for x86_64 on Windows, and attaches the archives, `arcade-v1-windows-x86_64-setup.exe`, and each file's `.sha256`. The Windows installer carries the payload SHA-256 and checks it before it unpacks. Authenticode signatures are added when the repository secret `WINDOWS_CODESIGN_PFX` is set, and a detached minisign or GPG signature when `LINUX_MINISIGN_SECRET_KEY` or `LINUX_GPG_PRIVATE_KEY` is set. Until those secrets exist, the release still has the checksums and the log says signing was skipped.
 
 ### After it's installed
 
@@ -60,15 +100,23 @@ The service connects to the mesh and syncs Pepecoin testnet by itself.
 
 ### Update
 
+Run the download, checksum and install steps again with the newest release. Your wallet, its 12 words, your @handle, messages and chains are kept: only the programs and the service file are replaced. The service is stopped first (it finishes what it was writing) and started again on the new version. If the app was open, close it and open it again.
+
+The one-line updater does that same download and sha256 check:
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/update.sh | bash
 ```
 
-This installs the newest release over the one you have. Your wallet, its 12 words, your @handle, messages and chains are kept: only the programs and the service file are replaced. The service is stopped first (it finishes what it was writing) and started again on the new version. If the app was open, close it and open it again.
-
 ### Options
 
-Pass options after `bash -s --`:
+Pass options to the installer you just unpacked:
+
+```sh
+bash "$name/scripts/install-linux.sh" --prebuilt "$name" --no-desktop
+```
+
+With the one-line installer, pass them after `bash -s --`:
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.sh | bash -s -- --no-desktop
@@ -76,9 +124,11 @@ curl -fsSL https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scr
 
 | Option | Meaning |
 |---|---|
-| `--no-desktop` | Don't build the desktop app. |
+| `--no-desktop` | Don't install the desktop app. |
 | `--home DIR` | Data folder (default `~/.local/share/arcade`). |
 | `--http-port N`, `--mesh-port N`, `--stun-port N` | Ports. The defaults are 8420, 8421 and 3478. A port that's already taken (for example, by another arcade on the same PC) moves to the next free one. STUN turns off (`0`) if its port is taken. |
+
+The web port (8420) is this computer's HTTP API and the app window. It listens on 127.0.0.1 unless you pass both `--http-bind` and `--i-understand-remote-api`. The mesh port (8421) is how arcades exchange blocks and signed records (welcome records, code releases, ledger items). The STUN port (3478, UDP) answers binding requests so a peer can learn its public address, and carries call media when the relay is on. Neither the mesh port nor the STUN port serves the wallet or the HTTP API.
 
 If the web port is reached through a reverse proxy or a tunnel, put `ARCADED_OPTS=--behind-proxy` in `~/.config/arcade/arcaded.env` and restart the service (`systemctl --user restart arcaded`): then nothing that arrives over the web port counts as this computer, so the API and the wallet's page API answer only the local socket. That file is yours: installs and updates rewrite the service, never it. Don't edit the service's `ExecStart` line, which the next update replaces.
 
@@ -114,23 +164,47 @@ This removes everything: the programs, the app and its menu entry, the backgroun
 
 ## Install on Windows
 
-Windows 10 or 11, 64-bit. Paste this into PowerShell:
+> **Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.** The Setup.exe shows this on its own screen and will not continue until you check the box. See [SECURITY.md](SECURITY.md).
+
+Windows 10 or 11, 64-bit. Download **arcade-v1-windows-x86_64-setup.exe** from the [latest release](https://github.com/martinseeger2002/arcade-v1/releases/latest) and double-click it.
+
+You can check the published checksum first:
 
 ```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.ps1'))"
+$base = 'https://github.com/martinseeger2002/arcade-v1/releases/latest/download'
+$name = 'arcade-v1-windows-x86_64-setup.exe'
+Invoke-WebRequest "$base/$name" -OutFile $name -UseBasicParsing
+Invoke-WebRequest "$base/$name.sha256" -OutFile "$name.sha256" -UseBasicParsing
+$want = ((Get-Content -Raw "$name.sha256") -split '\s+')[0].ToLower()
+$got = (Get-FileHash -Algorithm SHA256 $name).Hash.ToLower()
+if ($got -ne $want) { throw "Checksum does not match. Expected $want, got $got. Nothing was installed." }
 ```
 
-That's all. It downloads `arcade-v1-windows-x86_64.zip` from the newest release of this repo that has that file (a pre-release counts), checks its sha256, and installs it for your user. Nothing is compiled, and it does not ask for an administrator password. It installs:
+The installer checks its payload against the SHA-256 embedded in the file before it extracts anything. If they differ, it stops, installs nothing, and says why. When CI has a code-signing certificate, that signature is Authenticode and Windows can show the publisher. There is no certificate in CI yet, so a release built before `WINDOWS_CODESIGN_PFX` is set is unsigned, and the release log says signing was skipped.
+
+Or download `arcade-v1-windows-x86_64.zip`, check `arcade-v1-windows-x86_64.zip.sha256` the same way, unpack it, and run **Install.exe**. `arcade-v1-windows-x86_64-binaries.sha256` on the same release lists `arcaded.exe`, `arcade.exe`, `arcade-desktop.exe`, `Install.exe` and `setup.exe`.
+
+That's all. Nothing is compiled, and it does not ask for an administrator password. It installs:
 
 - **arcaded**, the arcade service, started now and at every login (Task Scheduler → **Arcade V1.0**);
 - **arcade**, the command line (`arcade status`, `arcade setup`, ...);
 - **Arcade V1.0**, the desktop app, in the Start menu. The window uses Microsoft Edge WebView2, which Windows 11 already has. If yours doesn't, the installer adds the WebView2 runtime.
 
-Programs go in `%LOCALAPPDATA%\Programs\Arcade`. Data goes in `%LOCALAPPDATA%\arcade` (not `~/.local/share/arcade`). The ports are the same as on Linux: **8420** (http), **8421** (mesh) and **3478** (STUN). A port that's already taken moves to the next free one; STUN turns off (`0`) if 3478 is taken. Each database file can grow to 512 GiB on Windows (the library reserves that address space up front; on Linux the ceiling stays 4 TiB and is not reserved).
+Programs go in `%LOCALAPPDATA%\Programs\Arcade`. Data goes in `%LOCALAPPDATA%\arcade` (not `~/.local/share/arcade`). The ports are the same as on Linux: **8420** (http, this computer only), **8421** (mesh: blocks and signed records) and **3478** (STUN: binding requests and call media). Neither 8421 nor 3478 serves the wallet or the HTTP API. A port that's already taken moves to the next free one; STUN turns off (`0`) if 3478 is taken. Each database file can grow to 512 GiB on Windows (the library reserves that address space up front; on Linux the ceiling stays 4 TiB and is not reserved).
 
 Open **Arcade V1.0** from the Start menu, or run `arcade setup` in a new terminal. Either way you then make a new wallet, or restore one from its 12 words, and claim your @handle. The service connects to the mesh and syncs Pepecoin testnet by itself.
 
-Run the same command again to update. Your wallet, its 12 words, your @handle, messages and chains are kept. The service is asked to finish what it was writing (that can take a few minutes while a chain is catching up) and is then started on the new programs. If the app was open, close it and open it again.
+Windows builds update themselves over the mesh the same way Linux does, when automatic updates are on in Options. That switch is off until you turn it on. A release is installed only when it is signed by the release key, the archive hash matches that signed record, and the new program reports that version. An older version is never installed, and nothing skips the signature check. See [docs/RELEASE-KEY.md](docs/RELEASE-KEY.md).
+
+Run setup.exe from a newer release to update. Your wallet, its 12 words, your @handle, messages and chains are kept. The service is asked to finish what it was writing (that can take a few minutes while a chain is catching up) and is then started on the new programs. If the app was open, close it and open it again.
+
+### Advanced: remote PowerShell one-liner
+
+This downloads a script from the repository and runs it. setup.exe above is the install path to use. The one-liner is for a machine where you would rather not download the installer by hand. It downloads the zip, checks its sha256, and installs that.
+
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -Command "[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12; iex ((New-Object Net.WebClient).DownloadString('https://raw.githubusercontent.com/martinseeger2002/arcade-v1/main/scripts/install.ps1'))"
+```
 
 ### Options
 

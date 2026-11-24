@@ -1,0 +1,9 @@
+Arcade V1 is beta software with no independent security audit yet. Do not use funds you can't afford to lose. Do not restore a seed phrase that holds real savings. It installs a background service that starts at login and connects to other arcades.
+
+The service starts when you log in and connects to other arcades. It runs as you, not as Administrator. It keeps a wallet on this PC. Read SECURITY.md in the Arcade V1 repository before you put coins you care about in it:
+
+https://github.com/martinseeger2002/arcade-v1/blob/main/SECURITY.md
+
+Security problems: team@arcade-nodes.com
+
+Nothing is installed until you check the box on this screen.

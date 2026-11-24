@@ -697,3 +697,6 @@ mod tests {
         assert_eq!(p.unwrap(), "one two three");
     }
 }
+
+#[cfg(test)]
+mod install_warning;

@@ -3,7 +3,7 @@
 //! serves the local API for the `arcade` CLI and the desktop app.
 //!
 //!   arcaded [--home DIR] [--no-mesh] [--no-seeds] [--mesh-port N|0] [--mesh-peer HOST:PORT]... [--p2p-only]
-//!           [--http-port N|0] [--http-bind ADDR] [--site DIR] [--stun-port N|0]
+//!           [--http-port N|0] [--http-bind ADDR] [--i-understand-remote-api] [--site DIR] [--stun-port N|0]
 
 mod accountsvc;
 mod heldlock;
@@ -393,19 +393,27 @@ const USAGE: &str = "arcaded: the Arcade V1.0 service (normally started by the i
 usage: arcaded [options]
   --home DIR            the arcade's folder (default: $ARCADE_HOME, else %LOCALAPPDATA%\\arcade on Windows, ~/.local/share/arcade on Linux)
   --home-mode shared    keep Pepecoin testnet in shared storage (default full)
-  --http-port N|0       local web port for the app (0: none)
-  --http-bind ADDR      address the web port listens on
+  --http-port N|0       local web port for the app (0: none; default 8420)
+  --http-bind ADDR      address the web port listens on (default 127.0.0.1).
+                        Anything that is not loopback (127.0.0.0/8, ::1, localhost) is refused
+                        unless --i-understand-remote-api is also given
+  --i-understand-remote-api
+                        allow --http-bind on an address that is not loopback, and print a warning.
+                        The API still answers only a loopback Host header
   --site DIR            serve this folder as the app
   --behind-proxy        the web port is reached through a reverse proxy or tunnel: nothing
                         over it counts as this computer (the API answers the socket only)
   --ui-origin ORIGIN    a home-network entrance (https://host:port) that shows this arcade's
                         window: app pages may open inside it (repeatable; or ARCADE_UI_ORIGINS)
-  --mesh-port N|0       mesh port (default 8421; 0: none)
+  --mesh-port N|0       mesh port (default 8421; 0: none). Other arcades exchange blocks and
+                        signed records here. Not the wallet, and not the HTTP API
   --mesh-peer HOST:PORT also link to this arcade (repeatable)
   --no-mesh             no mesh links at all
   --no-seeds            don't dial the seed arcades
   --p2p-only            sync from coin peers only, no mesh bootstrap
-  --stun-port N|0       STUN port (0: none)
+  --stun-port N|0       STUN port (default 3478; 0: none). Binding requests, so a peer can learn
+                        its public address, and call media when the relay is on. Not the wallet,
+                        and not the HTTP API
   --import-node-key FILE  take this node identity (an original arcade's mesh.key: 64 hex digits), so the
                         arcade keeps its node id; only into a new home (or one with the same key)
   --help, --version     print this or the version and exit
@@ -618,7 +626,18 @@ fn main() {
     // The web port opens now too, before the chains: until api::set_ready below it answers every request 503
     // {"state": "starting"} at once (and once a stop begins, "stopping"), instead of not answering (ARCADE #25).
     let http_port: u16 = opt("--http-port").and_then(|v| v.parse().ok()).unwrap_or(8420);
+    let http_asked = opt("--http-bind");
+    let http_bind = if http_port != 0 || http_asked.is_some() {
+        let bind = http::resolve_http_bind(http_asked.as_deref(), args.iter().any(|a| a == "--i-understand-remote-api")).unwrap_or_else(|e| fail_start(&e));
+        if bind.remote && http_port != 0 {
+            eprintln!("arcaded: {}", http::remote_api_warning(&bind.addr));
+        }
+        Some(bind)
+    } else {
+        None
+    };
     if http_port != 0 {
+        let http_bind = http_bind.expect("checked above");
         match http::write_cookie(&home) {
             Ok(c) => {
                 let _ = node.rpc_cookie.set(c);
@@ -636,8 +655,8 @@ fn main() {
         }
         let _ = http::UI_ORIGINS.set(good);
         let o = http::Opts {
-            // 127.0.0.1 unless the operator opens it; the API and RPC still answer only this computer.
-            bind: opt("--http-bind").unwrap_or_else(|| "127.0.0.1".into()),
+            // Loopback unless --i-understand-remote-api was also given. The API still answers only a loopback Host.
+            bind: http_bind.addr,
             port: http_port,
             site: opt("--site").map(std::path::PathBuf::from),
             behind_proxy: args.iter().any(|a| a == "--behind-proxy"),

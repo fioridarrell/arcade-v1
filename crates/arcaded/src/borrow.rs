@@ -32,7 +32,7 @@
 use crate::node::Node;
 use crate::chains::{find as by_key, find_net as by_net};
 use arcade_chain::params::{check_block_work, check_context, check_header, ChainParams, PowCheck, MEDIAN_TIME_SPAN};
-use arcade_chain::pow::{bits_from_target, meets_target, pow_hash, target_from_bits, PowAlgo};
+use arcade_chain::pow::{bits_from_target, target_from_bits};
 use arcade_chain::{Block, Hash256, Header, OutPoint, Tx};
 use arcade_ledger::address::script_for_address;
 use arcade_mesh::link::{Frame, Link};
@@ -1052,11 +1052,7 @@ fn check_block(p: &ChainParams, raw: &[u8], want: &Hash256, parent: &Header, hei
     match check_header(p, &b.header, parent, height).map_err(|x| format!("block {want}: {x}"))? {
         PowCheck::AuxPow => {
             let a = b.auxpow.as_ref().ok_or("AuxPoW flag without data")?;
-            let chain_id = p.auxpow_chain_id.unwrap_or(b.header.chain_id());
-            a.check(b.id, chain_id, p.auxpow_strict_chain_id).map_err(|x| format!("block {want}: {x}"))?;
-            if !meets_target(&pow_hash(PowAlgo::Scrypt, &a.parent.encode()), b.header.bits) {
-                return Err(format!("block {want}: AuxPoW parent misses target"));
-            }
+            arcade_chain::params::check_auxpow_proof(p, &b.header, b.id, a, height).map_err(|x| format!("block {want}: {x}"))?;
         }
         PowCheck::NeedsBlock => {
             check_block_work(p, &b, height).map_err(|x| format!("block {want}: {x}"))?;

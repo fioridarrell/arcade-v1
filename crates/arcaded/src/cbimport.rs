@@ -1052,6 +1052,7 @@ mod tests {
         pp.pow_limit_bits = 0x207fffff;
         pp.digishield_from = None;
         pp.checkpoints = &[];
+        pp.init_checkpoint = None;
         // Made-up spends (no signatures): no script or block rules either.
         pp.block_rules = None;
         Box::leak(Box::new(pp))

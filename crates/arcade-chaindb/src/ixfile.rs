@@ -1,15 +1,17 @@
 //! Index files: settled address and tx index rows in immutable, compressed, sorted files
 //! (docs/INDEXFILES.md; the design is "A1" of the Bitcoin swarm plan).
 //!
-//! One file holds the rows of one kind for one span of heights (a range of 10,000 heights,
-//! or an era of 100,000). Rows are fixed-size and big-endian, so their bytes sort as their
+//! One file holds the rows of one kind for one span of heights: a range, or an era of ten
+//! ranges. The range's length is fixed per chain (ixconv::Layout::for_chain: 10,000 heights on
+//! Bitcoin, more on chains with faster blocks) and pinned in every file's header. Rows are fixed-size and big-endian, so their bytes sort as their
 //! keys do, and they name blocks by HEIGHT and POSITION, never by the local block number:
 //! two arcades on the same chain write the same rows, cut the same blocks and so the same
 //! file id.
 //!
 //! ```text
-//! header   64 bytes: magic, format, kind, chain, row and key size, rows per block,
-//!          first and last height, hash of the block at the last height
+//! header   80 bytes: magic, format, kind, chain, row and key size, rules version, rows per
+//!          block, first and last height, hash of the block at the last height, the
+//!          chain's range length and ranges per era
 //! blocks   a fixed number of rows each (the last one shorter); a block is its columns,
 //!          each delta/varint or byte-plane coded and then zstd-compressed on its own
 //! footer   per block: first key, file offset, sha256 of the block's canonical rows
@@ -34,8 +36,14 @@ pub const END_MAGIC: &[u8; 8] = b"ARCIXEND";
 /// is a new version: files of different versions never mix (their ids differ).
 /// Version 2: the file id also covers every block's first key, and every block starts with
 /// a membership filter of its lookup keys.
-pub const FMT: u16 = 2;
-pub const HEADER_LEN: usize = 64;
+/// Version 3: the header (80 bytes) also pins the chain's layout (range length, ranges per
+/// era) and the rules version, so files cut or filled differently never share an id.
+pub const FMT: u16 = 3;
+pub const HEADER_LEN: usize = 80;
+/// What the rows mean, beyond their byte layout: which outputs and inputs count as an
+/// address's (the script id, what is unspendable), what a position counts. A change there is
+/// a new rules version even when the format stays: the rows differ, so the ids must.
+pub const RULES: u16 = 1;
 const TRAILER_LEN: usize = 8 + 4 + 8 + 32 + 32 + 8;
 /// The largest footer a reader accepts (all of Bitcoin's history in one era file would be
 /// well under it).
@@ -236,6 +244,9 @@ pub struct Meta {
     pub last: u32,
     /// The hash of the block at `last`: which chain these rows belong to.
     pub last_hash: [u8; 32],
+    /// The chain's layout the file was cut by: heights per range, ranges per era.
+    pub range: u32,
+    pub era_ranges: u32,
 }
 
 impl Meta {
@@ -247,11 +258,22 @@ impl Meta {
         h[12..14].copy_from_slice(&self.chain.to_be_bytes());
         h[14..16].copy_from_slice(&(self.kind.row_len() as u16).to_be_bytes());
         h[16..18].copy_from_slice(&(self.kind.key_len() as u16).to_be_bytes());
+        h[18..20].copy_from_slice(&RULES.to_be_bytes());
         h[20..24].copy_from_slice(&(self.kind.block_rows() as u32).to_be_bytes());
         h[24..28].copy_from_slice(&self.first.to_be_bytes());
         h[28..32].copy_from_slice(&self.last.to_be_bytes());
         h[32..64].copy_from_slice(&self.last_hash);
+        h[64..68].copy_from_slice(&self.range.to_be_bytes());
+        h[68..72].copy_from_slice(&self.era_ranges.to_be_bytes());
         h
+    }
+
+    /// Whether the span is one whole range or one whole era of the file's layout, on its
+    /// boundaries: every builder cuts the same files.
+    pub fn on_layout(&self) -> bool {
+        let len = self.last as u64 - self.first as u64 + 1;
+        let (range, era) = (self.range as u64, self.range as u64 * self.era_ranges as u64);
+        range > 0 && (len == range || len == era) && (self.first as u64).is_multiple_of(len)
     }
 
     fn parse(h: &[u8]) -> std::result::Result<Meta, &'static str> {
@@ -266,11 +288,21 @@ impl Meta {
         if n(14) != kind.row_len() || n(16) != kind.key_len() || be_u32(h, 20) as usize != kind.block_rows() {
             return Err("row layout differs from this format version's");
         }
+        if n(18) != RULES as usize {
+            return Err("rows of another rules version");
+        }
         let (first, last) = (be_u32(h, 24), be_u32(h, 28));
         if first > last {
             return Err("bad height span");
         }
-        Ok(Meta { kind, chain: n(12) as u16, first, last, last_hash: h[32..64].try_into().unwrap() })
+        if h[11] != 0 || h[72..80].iter().any(|b| *b != 0) {
+            return Err("reserved header bytes set");
+        }
+        let (range, era_ranges) = (be_u32(h, 64), be_u32(h, 68));
+        if range == 0 || era_ranges == 0 {
+            return Err("no layout");
+        }
+        Ok(Meta { kind, chain: n(12) as u16, first, last, last_hash: h[32..64].try_into().unwrap(), range, era_ranges })
     }
 
     /// The file's name: kind and span, so a directory listing says what is there.
@@ -1070,7 +1102,10 @@ pub fn merge(dir: &Path, sources: &[Reader], level: i32, threads: usize) -> Resu
             return Err(bad(w[1].path(), "does not follow the file before it"));
         }
     }
-    let meta = Meta { kind: a.meta.kind, chain: a.meta.chain, first: a.meta.first, last: z.meta.last, last_hash: z.meta.last_hash };
+    if sources.iter().any(|r| (r.meta.range, r.meta.era_ranges) != (a.meta.range, a.meta.era_ranges)) {
+        return Err(StoreError::Other("index files: merging files cut by different layouts".into()));
+    }
+    let meta = Meta { last: z.meta.last, last_hash: z.meta.last_hash, ..a.meta };
     let kl = meta.kind.key_len();
     let mut out = Writer::create(dir, meta, level, threads)?;
     let mut cur = sources.iter().map(Cursor::new).collect::<Result<Vec<_>>>()?;
@@ -1130,7 +1165,7 @@ mod tests {
     }
 
     fn meta(kind: Kind, first: u32, last: u32) -> Meta {
-        Meta { kind, chain: 7, first, last, last_hash: [9; 32] }
+        Meta { kind, chain: 7, first, last, last_hash: [9; 32], range: 10_000, era_ranges: 10 }
     }
 
     fn write(dir: &Path, m: Meta, rows: &[Vec<u8>], level: i32, threads: usize) -> FileInfo {
@@ -1139,6 +1174,60 @@ mod tests {
             w.push(r).unwrap();
         }
         w.finish().unwrap()
+    }
+
+    #[test]
+    fn format_3_pins_the_layout_and_the_rules_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let rows = sample(Kind::Txs, 3000, 0, 9_999, 5);
+        let (a, b) = (dir.path().join("a"), dir.path().join("b"));
+        std::fs::create_dir_all(&a).unwrap();
+        std::fs::create_dir_all(&b).unwrap();
+        let one = write(&a, meta(Kind::Txs, 0, 9_999), &rows, 3, 1);
+        // The same rows cut by another chain's layout: another file id.
+        let other = write(&b, Meta { range: 10_000, era_ranges: 5, ..meta(Kind::Txs, 0, 9_999) }, &rows, 3, 1);
+        assert_ne!(one.id, other.id);
+        let r = Reader::open(&one.path).unwrap();
+        assert_eq!((r.meta.range, r.meta.era_ranges, r.meta.on_layout()), (10_000, 10, true));
+        // Spans: a whole range or a whole era, on its boundaries.
+        assert!(meta(Kind::Txs, 100_000, 199_999).on_layout());
+        assert!(meta(Kind::Txs, 20_000, 29_999).on_layout());
+        assert!(!meta(Kind::Txs, 5_000, 14_999).on_layout());
+        assert!(!meta(Kind::Txs, 10_000, 109_999).on_layout());
+        assert!(!meta(Kind::Txs, 0, 19_999).on_layout());
+        // Another rules version, a layout of zero, set reserved bytes: refused.
+        let good = std::fs::read(&one.path).unwrap();
+        for (at, v) in [(19usize, RULES as u8 + 1), (67, 0), (11, 1), (75, 1)] {
+            let mut h = good[..HEADER_LEN].to_vec();
+            if at == 67 {
+                h[64..68].fill(0);
+            } else {
+                h[at] = v;
+            }
+            assert!(Meta::parse(&h).is_err(), "byte {at}");
+        }
+        assert_eq!(Meta::parse(&good[..HEADER_LEN]).unwrap(), r.meta);
+    }
+
+    #[test]
+    fn values_have_room_for_every_chains_money() {
+        // A history row's amounts are one transaction's (received by, or spent from, one
+        // address): never more than MAX_MONEY, which consensus caps a transaction's outputs and
+        // inputs at, though Dogecoin's supply (~150 B DOGE, 1.5e19 koinu) nears u64::MAX. The
+        // largest real caps are DigiByte's 2.1e18; Kotia's (Blackcoin's) is i64::MAX, no cap at
+        // all, and still fits.
+        for p in arcade_chain::params::ALL_CHAINS.iter() {
+            if let Some(v) = p.value_rules {
+                assert!(v.max_money <= i64::MAX as u64, "{}: {}", p.key, v.max_money);
+                assert!(v.max_money <= u64::MAX / 8 || p.key == "kot", "{}: {}", p.key, v.max_money);
+            }
+        }
+        // And the columns carry the whole u64 range anyway (extreme_values_round_trip).
+        let dir = tempfile::tempdir().unwrap();
+        let rows = vec![hist_row(&[1; 21], 5, 0, u64::MAX, u64::MAX - 1).to_vec()];
+        let f = write(dir.path(), meta(Kind::Hist, 0, 9_999), &rows, 3, 1);
+        let r = Reader::open(&f.path).unwrap();
+        assert_eq!(r.block(0).unwrap(), rows.concat());
     }
 
     #[test]
@@ -1176,7 +1265,7 @@ mod tests {
     #[test]
     fn extreme_values_round_trip() {
         let dir = tempfile::tempdir().unwrap();
-        let m = |k| Meta { kind: k, chain: 1, first: 0, last: u32::MAX, last_hash: [0; 32] };
+        let m = |k| Meta { kind: k, chain: 1, first: 0, last: u32::MAX, last_hash: [0; 32], range: 1, era_ranges: 1 };
         let h = vec![
             hist_row(&[0; 21], 0, 0, 0, 0).to_vec(),
             hist_row(&[0; 21], 0, u32::MAX, u64::MAX, u64::MAX).to_vec(),
@@ -1398,7 +1487,7 @@ mod tests {
         std::fs::create_dir_all(&whole).unwrap();
         for kind in Kind::ALL {
             let rows = sample(kind, kind.block_rows() * 6, 0, 999, 31);
-            let m = |first, last| Meta { kind, chain: 7, first, last, last_hash: [(last % 251) as u8; 32] };
+            let m = |first, last| Meta { kind, chain: 7, first, last, last_hash: [(last % 251) as u8; 32], range: 10_000, era_ranges: 10 };
             let direct = write(&whole, m(0, 999), &rows, 3, 2);
             let mut readers = Vec::new();
             for i in 0..10u32 {

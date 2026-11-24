@@ -106,6 +106,8 @@ fn params(genesis: &Block, tweak: impl FnOnce(&mut ChainParams)) -> &'static Cha
     p.pow_limit_bits = EASY;
     p.checkpoints = &[];
     p.min_chain_work = "";
+    // The init checkpoint: the made-up genesis (tests of the floor move it).
+    p.init_checkpoint = Some((0, p.genesis));
     tweak(&mut p);
     Box::leak(Box::new(p))
 }
@@ -122,11 +124,13 @@ struct Src {
     asked: usize,
     /// Answer every headers request with nothing.
     mute: bool,
+    /// Send each header this many times over (1: once), as a source wasting bandwidth would.
+    repeat: usize,
 }
 
 impl Src {
     fn new(blocks: &[Block]) -> Src {
-        Src { headers: blocks.iter().map(|b| b.header).collect(), blocks: blocks.iter().map(|b| (b.hash(), b.encode())).collect(), corrupt: false, swap: HashMap::new(), asked: 0, mute: false }
+        Src { headers: blocks.iter().map(|b| b.header).collect(), blocks: blocks.iter().map(|b| (b.hash(), b.encode())).collect(), corrupt: false, swap: HashMap::new(), asked: 0, mute: false, repeat: 1 }
     }
 }
 
@@ -137,7 +141,8 @@ impl BlockSource for Src {
         }
         let ids: Vec<Hash256> = self.headers.iter().map(|h| h.hash()).collect();
         let from = locator.iter().find_map(|l| ids.iter().position(|x| x == l)).map(|i| i + 1).unwrap_or(0);
-        Ok(self.headers[from..].iter().take(2000).map(|h| HeaderEntry { header: *h, auxpow: None }).collect())
+        let r = self.repeat.max(1);
+        Ok(self.headers[from..].iter().take(2000 / r).flat_map(|h| std::iter::repeat_n(HeaderEntry { header: *h, auxpow: None }, r)).collect())
     }
     fn get_blocks(&mut self, hashes: &[Hash256]) -> Result<Vec<Vec<u8>>, String> {
         self.asked += hashes.len();
@@ -708,6 +713,84 @@ fn a_source_feeding_a_low_work_branch_is_left_out_of_the_headers_round() {
     let ag = round(&db, p, &mut [("l", &mut l), ("a", &mut a)]);
     assert_eq!(ag.best, good[40].hash());
     assert!(!ag.differ.iter().any(|x| x.contains("less work")), "{:?}", ag.differ);
+}
+
+#[test]
+fn headers_are_done_only_through_the_init_checkpoint() {
+    let blocks = chain(30);
+    let leak = |b: &Block| -> &'static str { Box::leak(b.hash().to_hex().into_boxed_str()) };
+    // Checkpoint at 12 on this chain: done.
+    let at12 = leak(&blocks[12]);
+    let p = params(&blocks[0], |p| p.init_checkpoint = Some((12, at12)));
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let (mut a, mut b, mut e) = (Src::new(&blocks), Src::new(&blocks), Src::new(&blocks));
+    begin(&db, p, &mut a);
+    let ag = round(&db, p, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert!(ag.floor_ok && ag.done(), "{}", ag.text());
+    // Checkpoint above every source's tip: not done, however many agree.
+    let p2 = params(&blocks[0], |p| p.init_checkpoint = Some((40, at12)));
+    let d2 = tempfile::tempdir().unwrap();
+    let db2 = open(d2.path());
+    begin(&db2, p2, &mut a);
+    let ag = round(&db2, p2, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert_eq!(ag.agree.len(), 3);
+    assert!(!ag.floor_ok && !ag.done(), "{}", ag.text());
+    assert!(ag.text().contains("release checkpoint"));
+    // Another block named at 12: the sources' chain is refused at 12 and never gets through.
+    let other = leak(&blocks[13]);
+    let p3 = params(&blocks[0], |p| p.init_checkpoint = Some((12, other)));
+    let d3 = tempfile::tempdir().unwrap();
+    let db3 = open(d3.path());
+    begin(&db3, p3, &mut a);
+    let ag = round(&db3, p3, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert!(ag.height < 12 && !ag.floor_ok && !ag.done(), "{}", ag.text());
+    // No init checkpoint at all: never done.
+    let p4 = params(&blocks[0], |p| p.init_checkpoint = None);
+    let d4 = tempfile::tempdir().unwrap();
+    let db4 = open(d4.path());
+    begin(&db4, p4, &mut a);
+    let ag = round(&db4, p4, &mut [("a", &mut a), ("b", &mut b), ("e", &mut e)]);
+    assert!(!ag.done());
+}
+
+#[test]
+fn a_source_sending_far_more_header_bytes_than_it_brings_is_left_out() {
+    let blocks = chain(30);
+    let p = params(&blocks[0], |_| {});
+    let d = tempfile::tempdir().unwrap();
+    let db = open(d.path());
+    let (mut a, mut b) = (Src::new(&blocks), Src::new(&blocks));
+    // 81 bytes a header, each sent 40 times: 3,240 bytes per new header, over the test's 1,000.
+    let mut waste = Src::new(&blocks);
+    waste.repeat = 40;
+    begin(&db, p, &mut a);
+    let ag = round(&db, p, &mut [("w", &mut waste), ("a", &mut a), ("b", &mut b)]);
+    assert!(ag.differ.iter().any(|x| x.starts_with("w:") && x.contains("KiB of headers")), "{:?}", ag.differ);
+    assert_eq!(ag.agree, vec!["a".to_string(), "b".to_string()]);
+    // Sent a few times over, within the allowance: heard as usual.
+    let d2 = tempfile::tempdir().unwrap();
+    let db2 = open(d2.path());
+    let mut twice = Src::new(&blocks);
+    twice.repeat = 2;
+    begin(&db2, p, &mut a);
+    let ag = round(&db2, p, &mut [("t", &mut twice), ("a", &mut a)]);
+    assert!(ag.agree.contains(&"t".to_string()), "{}", ag.text());
+}
+
+#[test]
+fn init_checkpoints_fence_headers_but_leave_scripts_checked() {
+    use arcade_chain::params::ALL_CHAINS;
+    for p in ALL_CHAINS.iter() {
+        let Some((h, hash)) = p.init_floor() else { continue };
+        assert_eq!(p.checkpoint_at(h), Some(hash), "{}", p.key);
+        assert!(p.last_checkpoint(u32::MAX) >= Some(h), "{}", p.key);
+        // assume_valid is only ever an older release checkpoint, never the init one.
+        assert!(p.assume_valid().is_none_or(|a| p.checkpoints.iter().any(|(x, _)| *x == a)), "{}", p.key);
+        if p.block_rules.is_some_and(|b| b.scripts) && p.assume_valid().is_none_or(|a| a < h) {
+            assert!(crate::rules::script_flags(p, h, false).is_some(), "{}: scripts at the init checkpoint are checked", p.key);
+        }
+    }
 }
 
 #[test]

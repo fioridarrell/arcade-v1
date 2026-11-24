@@ -802,6 +802,67 @@ pub fn start(node: &Arc<Node>, key: &str, what: &str) -> Result<Value, String> {
     Ok(chain_status(node, key))
 }
 
+/// chains.add with core_dir: the operator's own Core folder for a chain not installed yet,
+/// remembered until its install starts (now, or at its turn in the queue), then read by
+/// start_from_dir. Kept in the store so a queued install keeps it across a restart.
+const CORE_DIRS: &[u8] = b"chains_core_dirs";
+static CORE_DIRS_LOCK: Mutex<()> = Mutex::new(());
+
+fn core_dirs(node: &Node) -> BTreeMap<String, String> {
+    node.app.store.read(|r| r.get(arcade_app::META, CORE_DIRS)).ok().flatten().and_then(|v| serde_json::from_slice(&v).ok()).unwrap_or_default()
+}
+
+fn save_core_dirs(node: &Node, m: &BTreeMap<String, String>) {
+    let _ = node.app.store.write(|w| w.put(arcade_app::META, CORE_DIRS, &serde_json::to_vec(m).unwrap()));
+}
+
+/// Checks the folder now (a typo or the wrong chain fails at once, not at its turn) and remembers
+/// it; None forgets an earlier one. The Core may still run now: it must be stopped by the time
+/// the install starts, and start_from_dir checks again then.
+pub fn request_dir(node: &Node, key: &str, dir: Option<&str>) -> Result<(), String> {
+    let p = arcade_chain::params::by_key(key).ok_or_else(|| format!("unknown chain {key}"))?;
+    let dir = match dir {
+        Some(d) => Some(check_dir(p, d)?),
+        None => None,
+    };
+    remember_dir(node, p.key, dir);
+    Ok(())
+}
+
+/// A Core folder for `p`, normalized and checked: a datadir of this chain with every block. A
+/// Core still running on it passes here (it must be stopped by the time its install starts).
+pub fn check_dir(p: &arcade_chain::params::ChainParams, dir: &str) -> Result<String, String> {
+    let nd = crate::localcopy::normalize(dir);
+    match crate::localcopy::check_datadir(&nd, p) {
+        Ok(_) => {}
+        Err(e) if e.starts_with("a Core node is running") => {}
+        Err(e) => return Err(e),
+    }
+    Ok(nd.display().to_string())
+}
+
+/// Remembers (Some) or forgets (None) the Core folder for a chain's coming install, unchecked.
+pub fn remember_dir(node: &Node, key: &str, dir: Option<String>) {
+    let _g = CORE_DIRS_LOCK.lock().unwrap();
+    let mut m = core_dirs(node);
+    match dir {
+        Some(d) => m.insert(key.to_string(), d),
+        None => m.remove(key),
+    };
+    save_core_dirs(node, &m);
+}
+
+/// At the install: the Core folder asked for, if any (forgotten either way).
+pub fn take_dir(node: &Node, key: &str) -> Option<String> {
+    let _g = CORE_DIRS_LOCK.lock().unwrap();
+    let mut m = core_dirs(node);
+    let d = m.remove(key);
+    if d.is_some() {
+        save_core_dirs(node, &m);
+    }
+    d
+}
+
 /// chains.copy_from_dir: bootstrap a chain once from a Core datadir on this computer (an old
 /// arcade's node, stopped), read in place (crate::localcopy): its blocks and coin set are
 /// taken in as an "all" copy's are, then re-checked from the blocks in the background.

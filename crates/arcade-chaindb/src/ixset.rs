@@ -140,13 +140,21 @@ impl KindSet {
     /// height, and every file must end on it (files of another chain or fork are refused).
     /// A file not read back whole here (no matching [`checked_mark`]: copied in from another
     /// arcade, or written before marks) is verified whole first, and marked.
-    pub fn load(dir: &Path, kind: Kind, chain: u16, upto: u32, mut hash_at: impl FnMut(u32) -> Result<Option<[u8; 32]>>) -> Result<KindSet> {
-        let mut files = Vec::new();
+    ///
+    /// Every file must be cut by one layout (format 3 pins it in the header) on its boundaries,
+    /// and by `layout` (range, ranges per era) where given: the chain's own, so files cut
+    /// another way, which other arcades' would never equal, are refused.
+    pub fn load(dir: &Path, kind: Kind, chain: u16, upto: u32, layout: Option<(u32, u32)>, mut hash_at: impl FnMut(u32) -> Result<Option<[u8; 32]>>) -> Result<KindSet> {
+        let mut files: Vec<Reader> = Vec::new();
         for path in tiling(&list(dir, kind)?, upto)? {
             let r = Reader::open(&path)?;
             let named = path.file_name().and_then(|n| n.to_str()).and_then(ixfile::parse_name);
             if named != Some((r.meta.kind, r.meta.first, r.meta.last)) || r.meta.chain != chain {
                 return Err(StoreError::Other(format!("index file {}: its header is of another file", path.display())));
+            }
+            let cut = (r.meta.range, r.meta.era_ranges);
+            if !r.meta.on_layout() || layout.is_some_and(|l| l != cut) || files.first().is_some_and(|f| (f.meta.range, f.meta.era_ranges) != cut) {
+                return Err(StoreError::Other(format!("index file {}: not cut by this chain's layout (ranges of {}, eras of {})", path.display(), cut.0, cut.1)));
             }
             if hash_at(r.meta.last)? != Some(r.meta.last_hash) {
                 return Err(StoreError::Other(format!("index file {}: not of this chain (the block at {} differs)", path.display(), r.meta.last)));
@@ -275,7 +283,9 @@ impl ChainDb {
         // Loaded outside the lock (opening a big chain's files reads tens of MB of footers;
         // other chains and kinds keep reading meanwhile). Two readers may both load; the
         // first one stored wins.
-        let set = Arc::new(KindSet::load(&self.index_dir(c), kind, c, be_u32(&m, 0), |h| {
+        // The chain's own layout (the tests convert with small ones: any one layout there).
+        let layout = arcade_chain::params::ALL_CHAINS.iter().find(|p| p.chain_no == c).map(|p| crate::ixconv::Layout::for_chain(p)).filter(|_| !cfg!(test)).map(|l| (l.range, l.era_ranges));
+        let set = Arc::new(KindSet::load(&self.index_dir(c), kind, c, be_u32(&m, 0), layout, |h| {
             let v = r.get(HEIGHT, &k_height(c, h))?;
             Ok(v.and_then(|v| v.get(..32).and_then(|x| x.try_into().ok())))
         })?);

@@ -74,6 +74,10 @@ th { color: var(--muted); font-weight: 600; font-size: 12px; }
 .chain .state.on { color: var(--accent); }
 .chain button { margin-top: 4px; }
 .installer { margin-top: 18px; background: var(--panel); border: 1px solid var(--line); border-radius: 12px; padding: 16px; }
+#c-core-dir { display: block; width: 100%; box-sizing: border-box; margin-top: 8px; }
+#c-core-dir[hidden] { display: none; }
+#cp-core-dirs .cp-core { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+#cp-core-dirs .cp-core input { width: 100%; box-sizing: border-box; }
 .inst-head { display: flex; justify-content: space-between; align-items: center; }
 .inst-head h2 { margin: 0; color: var(--ink); font-size: 17px; }
 .inst-head button { border: 0; background: none; font-size: 16px; color: var(--muted); }
